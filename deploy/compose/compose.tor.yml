@@ -1,0 +1,26 @@
+services:
+  opencode2api:
+    image: ${OPENCODE2API_IMAGE:-ghcr.io/6kmfi6hp/opencode2api:latest}
+    container_name: opencode2api
+    restart: unless-stopped
+    depends_on:
+      - tor
+    ports:
+      - "${OPENCODE2API_HTTP_PORT:-8000}:8000"
+    environment:
+      OPENCODE2API_PORT: "8000"
+      OPENCODE2API_PASSWORD: ${OPENCODE2API_PASSWORD:-change-me}
+      OPENCODE2API_SOCKS5_NAME: tor
+      OPENCODE2API_SOCKS5_ADDR: tor:9050
+    volumes:
+      - opencode2api-data:/data
+
+  tor:
+    image: docker.io/leplusorg/tor:latest
+    container_name: opencode2api-tor
+    restart: unless-stopped
+    environment:
+      SOCKS_HOSTNAME: 0.0.0.0
+
+volumes:
+  opencode2api-data:

@@ -1,0 +1,15 @@
+services:
+  opencode2api:
+    image: ${OPENCODE2API_IMAGE:-ghcr.io/6kmfi6hp/opencode2api:latest}
+    container_name: opencode2api
+    restart: unless-stopped
+    ports:
+      - "${OPENCODE2API_HTTP_PORT:-8000}:8000"
+    environment:
+      OPENCODE2API_PORT: "8000"
+      OPENCODE2API_PASSWORD: ${OPENCODE2API_PASSWORD:-change-me}
+    volumes:
+      - opencode2api-data:/data
+
+volumes:
+  opencode2api-data:

@@ -1,0 +1,12 @@
+.git
+.github
+bin
+dist
+docs/superpowers
+config.json
+stats.json
+*.log
+.DS_Store
+.idea
+.vscode
+*.swp

@@ -1,5 +1,41 @@
 # 部署说明
 
+## Docker Compose
+
+项目提供三套 compose 模版：
+
+- `deploy/compose/compose.yml`：单独运行，直连上游。
+- `deploy/compose/compose.tor.yml`：通过 Tor SOCKS5 代理访问上游。
+- `deploy/compose/compose.warp.yml`：通过 Cloudflare WARP SOCKS5 代理访问上游。
+
+快速启动：
+
+```bash
+export OPENCODE2API_PASSWORD="change-me"
+docker compose -f deploy/compose/compose.yml up -d
+curl http://127.0.0.1:8000/health
+```
+
+使用 Tor：
+
+```bash
+docker compose -f deploy/compose/compose.tor.yml up -d
+```
+
+使用 WARP：
+
+```bash
+docker compose -f deploy/compose/compose.warp.yml up -d
+```
+
+默认镜像是 `ghcr.io/6kmfi6hp/opencode2api:latest`。如果使用 fork 或私有镜像，设置：
+
+```bash
+export OPENCODE2API_IMAGE="ghcr.io/OWNER/opencode2api:latest"
+```
+
+更多说明见 `deploy/compose/README.md`。
+
 ## 使用 release 二进制
 
 从 GitHub Releases 下载对应系统的包：

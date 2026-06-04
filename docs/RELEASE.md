@@ -48,6 +48,35 @@ go vet ./...
 
 `publish` job 会在所有平台构建完成后生成 `dist/checksums.txt`，其中包含所有压缩包的 SHA256。
 
+## Docker 镜像
+
+Docker 镜像由 `.github/workflows/docker.yml` 发布到 GHCR：
+
+- `main` 分支推送：发布 `ghcr.io/<owner>/<repo>:main`、`latest` 和 `sha-<short_sha>`。
+- `v*` tag 推送：发布 `ghcr.io/<owner>/<repo>:vX.Y.Z` 和 `sha-<short_sha>`。
+- 手动运行 workflow：按当前 ref 发布对应 tag。
+
+工作流会先执行：
+
+```bash
+go test ./...
+```
+
+然后通过 Buildx 构建并推送：
+
+- `linux/amd64`
+- `linux/arm64`
+
+发布 GHCR 需要 workflow 权限：
+
+```yaml
+permissions:
+  contents: read
+  packages: write
+```
+
+工作流使用仓库自带的 `GITHUB_TOKEN` 登录 `ghcr.io`。第一次发布的 package 可能默认为 private；如果要公开拉取，需要在 GitHub Packages 页面把可见性改为 public。
+
 ## 本地预检
 
 ```bash

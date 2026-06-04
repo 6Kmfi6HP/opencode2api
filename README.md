@@ -14,6 +14,7 @@
 - SOCKS5 直连、指定代理和轮询代理
 - Web 管理面板：配置、统计、刷新上游会话
 - GitHub Actions 自动构建 Linux、macOS、Windows、FreeBSD 多平台 release
+- GitHub Actions 自动发布 Docker 镜像到 GHCR
 
 ## 快速开始
 
@@ -104,12 +105,24 @@ git push origin v0.1.0
 
 Release 会包含每个平台的 `.tar.gz` 包和统一生成的 `checksums.txt`。
 
+## Docker Compose 部署
+
+项目提供单独运行、Tor 代理、WARP 代理三套 compose 模版：
+
+```bash
+export OPENCODE2API_PASSWORD="change-me"
+docker compose -f deploy/compose/compose.yml up -d
+```
+
+代理部署见 [Docker Compose 部署模版](deploy/compose/README.md)。
+
 ## 文档
 
 - [API 兼容说明](docs/API.md)
 - [配置说明](docs/CONFIGURATION.md)
 - [部署说明](docs/DEPLOYMENT.md)
 - [发布流程](docs/RELEASE.md)
+- [Docker Compose 部署模版](deploy/compose/README.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全说明](SECURITY.md)
 

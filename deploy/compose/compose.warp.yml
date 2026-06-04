@@ -1,0 +1,38 @@
+services:
+  opencode2api:
+    image: ${OPENCODE2API_IMAGE:-ghcr.io/6kmfi6hp/opencode2api:latest}
+    container_name: opencode2api
+    restart: unless-stopped
+    depends_on:
+      - warp
+    ports:
+      - "${OPENCODE2API_HTTP_PORT:-8000}:8000"
+    environment:
+      OPENCODE2API_PORT: "8000"
+      OPENCODE2API_PASSWORD: ${OPENCODE2API_PASSWORD:-change-me}
+      OPENCODE2API_SOCKS5_NAME: warp
+      OPENCODE2API_SOCKS5_ADDR: warp:1080
+    volumes:
+      - opencode2api-data:/data
+
+  warp:
+    image: docker.io/caomingjun/warp:latest
+    container_name: opencode2api-warp
+    restart: unless-stopped
+    environment:
+      WARP_SLEEP: "2"
+    device_cgroup_rules:
+      - "c 10:200 rwm"
+    cap_add:
+      - MKNOD
+      - AUDIT_WRITE
+      - NET_ADMIN
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv4.conf.all.src_valid_mark: "1"
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
+
+volumes:
+  opencode2api-data:
+  warp-data:
