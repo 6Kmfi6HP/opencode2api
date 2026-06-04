@@ -19,6 +19,12 @@ targets=(
   "freebsd/arm64"
 )
 
+if [[ -n "${TARGETS:-}" ]]; then
+  read -r -a targets <<< "$TARGETS"
+fi
+
+CHECKSUMS="${CHECKSUMS:-true}"
+
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
@@ -55,13 +61,16 @@ for target in "${targets[@]}"; do
   if [[ -f "$ROOT_DIR/LICENSE" ]]; then
     cp "$ROOT_DIR/LICENSE" "$work_dir/"
   fi
-  tar -C "$DIST_DIR" -czf "$DIST_DIR/$asset.tar.gz" "$asset"
+  archive="$asset.tar.gz"
+  tar -C "$DIST_DIR" -czf "$DIST_DIR/$archive" "$asset"
   rm -rf "$work_dir"
 done
 
-(
-  cd "$DIST_DIR"
-  sha256sum ./*.tar.gz > checksums.txt
-)
+if [[ "$CHECKSUMS" == "true" ]]; then
+  (
+    cd "$DIST_DIR"
+    sha256sum ./*.tar.gz > checksums.txt
+  )
+fi
 
 echo "release artifacts written to $DIST_DIR"

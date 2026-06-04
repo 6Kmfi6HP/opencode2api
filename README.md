@@ -83,7 +83,7 @@ ls dist/
 
 ## 自动 Release
 
-推送 `v*` tag 后，GitHub Actions 会运行测试并构建以下目标：
+推送 `v*` tag 后，GitHub Actions 会先运行一次格式、测试和 vet 检查，然后用 matrix 并发构建以下目标：
 
 - `linux/amd64`
 - `linux/arm64`
@@ -102,7 +102,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Release 会包含每个平台的 `.tar.gz` 包和 `checksums.txt`。
+Release 会包含每个平台的 `.tar.gz` 包和统一生成的 `checksums.txt`。
 
 ## 文档
 
