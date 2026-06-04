@@ -1,0 +1,16 @@
+# Runtime state
+config.json
+stats.json
+*.log
+
+# Build output
+dist/
+bin/
+opencode2api
+opencode2api.exe
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
