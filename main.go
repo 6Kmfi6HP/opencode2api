@@ -1310,6 +1310,10 @@ func buildOCRequest(modelID string, bodyMap map[string]any) (*http.Request, erro
 	return req, nil
 }
 
+func shouldRetryUpstreamStatus(status int) bool {
+	return status >= 400 && status < 600
+}
+
 func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Header, error) {
 	initOCSession()
 	modelIDs := getModelIDs()
@@ -1333,13 +1337,14 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Hea
 	var lastBody []byte
 	var lastStatus int
 	var lastHeader http.Header
-	for _, tryModel := range modelsToTry {
+	for i, tryModel := range modelsToTry {
 		up, err := buildOCRequest(tryModel, bodyMap)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		resp, err := getHTTPClient().Do(up)
+		client := getHTTPClient()
+		resp, err := client.Do(up)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1360,14 +1365,14 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Hea
 		if debugMode {
 			log.Printf("[upstream error] model=%s status=%d body=%s", tryModel, resp.StatusCode, string(errBody))
 		}
-		if resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("upstream error")
-			continue
-		}
 		lastBody = errBody
 		lastStatus = resp.StatusCode
 		lastHeader = resp.Header
 		lastErr = fmt.Errorf("upstream error")
+		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
+			client.CloseIdleConnections()
+			continue
+		}
 		break
 	}
 	return lastBody, lastStatus, lastHeader, lastErr
@@ -1391,12 +1396,16 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, 
 		return nil, 500, nil, fmt.Errorf("invalid request body")
 	}
 
-	for _, tryModel := range modelsToTry {
+	var lastBody []byte
+	var lastStatus int
+	var lastHeader http.Header
+	for i, tryModel := range modelsToTry {
 		up, err := buildOCRequest(tryModel, bodyMap)
 		if err != nil {
 			continue
 		}
-		resp, err := getHTTPClient().Do(up)
+		client := getHTTPClient()
+		resp, err := client.Do(up)
 		if err != nil {
 			continue
 		}
@@ -1408,11 +1417,18 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, 
 		if debugMode {
 			log.Printf("[upstream error] model=%s status=%d body=%s", tryModel, resp.StatusCode, string(errBody))
 		}
-		if resp.StatusCode >= 500 {
+		lastBody = errBody
+		lastStatus = resp.StatusCode
+		lastHeader = resp.Header
+		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
+			client.CloseIdleConnections()
 			continue
 		}
 		// 返回错误体供下游透传
-		return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header, nil
+		return io.NopCloser(bytes.NewReader(lastBody)), lastStatus, lastHeader, nil
+	}
+	if lastStatus != 0 {
+		return io.NopCloser(bytes.NewReader(lastBody)), lastStatus, lastHeader, nil
 	}
 	return nil, 500, nil, fmt.Errorf("all models failed")
 }
