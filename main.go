@@ -376,6 +376,26 @@ func getModelIDs() []string {
 	return ids
 }
 
+// startModelRefresh 定时刷新模型列表（每 10 分钟）
+func startModelRefresh() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetched, err := fetchModels()
+			if err == nil && len(fetched) > 0 {
+				modelMu.Lock()
+				modelsCache = fetched
+				modelsLoaded = true
+				modelMu.Unlock()
+				log.Printf("模型列表已自动刷新: %d 个模型", len(fetched))
+			} else if err != nil {
+				log.Printf("模型列表刷新失败: %v", err)
+			}
+		}
+	}()
+}
+
 // ======================== 配置 ========================
 
 var (
@@ -1288,19 +1308,69 @@ func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 	return json.Marshal(raw)
 }
 
-func buildOCRequest(modelID string, bodyMap map[string]any) (*http.Request, error) {
+// ======================== 认证层级 ========================
+
+type TierType int
+
+const (
+	TierFree TierType = iota
+	TierPaid
+)
+
+// tierUpstreamURL 返回对应层级的 upstream URL
+func (t TierType) upstreamURL() string {
+	if t == TierPaid {
+		return "https://opencode.ai/zen/go/v1/chat/completions"
+	}
+	return "https://opencode.ai/zen/v1/chat/completions"
+}
+
+// tierModelsURL 返回对应层级的模型列表 URL
+func (t TierType) modelsURL() string {
+	if t == TierPaid {
+		return "https://opencode.ai/zen/go/v1/models"
+	}
+	return "https://opencode.ai/zen/v1/models"
+}
+
+// extractAuthTier 从请求中提取 Bearer token 并判断层级
+func extractAuthTier(r *http.Request) (bearerToken string, tier TierType) {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return "", TierFree
+	}
+	token := strings.TrimPrefix(auth, "Bearer ")
+	if token == "public" {
+		return token, TierFree
+	}
+	return token, TierPaid
+}
+
+// isFreeModel 判断模型是否属于免费模型（以 -free 结尾）
+func isFreeModel(modelID string) bool {
+	return strings.HasSuffix(modelID, "-free")
+}
+
+func buildOCRequest(modelID string, bodyMap map[string]any, bearerToken string) (*http.Request, error) {
 	bodyMap["model"] = modelID
 	delete(bodyMap, "reasoning_effort")
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest("POST", "https://opencode.ai/zen/v1/chat/completions", bytes.NewReader(tryBody))
+	// 根据 bearerToken 决定层级和上游 URL
+	tier := TierFree
+	authValue := "Bearer public"
+	if bearerToken != "" && bearerToken != "public" {
+		tier = TierPaid
+		authValue = "Bearer " + bearerToken
+	}
+	req, err := http.NewRequest("POST", tier.upstreamURL(), bytes.NewReader(tryBody))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer public")
+	req.Header.Set("Authorization", authValue)
 	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s", ocClientVer))
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-project", ocProjectID)
@@ -1314,7 +1384,7 @@ func shouldRetryUpstreamStatus(status int) bool {
 	return status >= 400 && status < 600
 }
 
-func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Header, error) {
+func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string) ([]byte, int, http.Header, error) {
 	initOCSession()
 	modelIDs := getModelIDs()
 	modelsToTry := []string{modelID}
@@ -1338,7 +1408,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Hea
 	var lastStatus int
 	var lastHeader http.Header
 	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequest(tryModel, bodyMap)
+		up, err := buildOCRequest(tryModel, bodyMap, bearerToken)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1378,7 +1448,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Hea
 	return lastBody, lastStatus, lastHeader, lastErr
 }
 
-func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, int, http.Header, error) {
+func callOpenCodeAPIStream(upstreamBody []byte, modelID string, bearerToken string) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
 	modelIDs := getModelIDs()
 	modelsToTry := []string{modelID}
@@ -1400,7 +1470,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, 
 	var lastStatus int
 	var lastHeader http.Header
 	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequest(tryModel, bodyMap)
+		up, err := buildOCRequest(tryModel, bodyMap, bearerToken)
 		if err != nil {
 			continue
 		}
@@ -1460,6 +1530,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
+	bearerToken, _ := extractAuthTier(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -1494,7 +1565,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model, bearerToken)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -1575,7 +1646,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model, bearerToken)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -1649,6 +1720,22 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		aliasModels = append(aliasModels, ModelInfo{ID: alias, Object: "model", Created: now, OwnedBy: "alias"})
 	}
 	allModels := append(models, aliasModels...)
+
+	// 根据认证层级过滤模型
+	bearerToken, _ := extractAuthTier(r)
+	if bearerToken == "" || bearerToken == "public" {
+		filtered := make([]ModelInfo, 0, len(allModels))
+		for _, m := range allModels {
+			if isFreeModel(m.ID) {
+				filtered = append(filtered, m)
+			}
+		}
+		if len(filtered) > 0 {
+			allModels = filtered
+		}
+		// 如果没有 -free 模型，返回空列表
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
@@ -1970,6 +2057,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
+	bearerToken, _ := extractAuthTier(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -2024,7 +2112,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if claudeReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, bearerToken)
 		if err != nil || status < 200 || status >= 300 {
 			errResp := map[string]any{
 				"type":  "error",
@@ -2040,7 +2128,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, bearerToken)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -2589,6 +2677,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
+	bearerToken, _ := extractAuthTier(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -2663,7 +2752,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if respReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, bearerToken)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -2688,7 +2777,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, bearerToken)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -3784,10 +3873,11 @@ func main() {
 			log.Printf("  - %s", m.ID)
 		}
 	}
+	startModelRefresh()
 	log.Printf("OPENCODE TO API 代理服务器")
 	log.Printf("===================")
 	log.Printf("端口:     %s", port)
-	log.Printf("上游:     https://opencode.ai/zen/v1/chat/completions (API)")
+	log.Printf("上游:     https://opencode.ai/zen/v1/chat/completions (API) 或 /go/ (付费)")
 	log.Printf("模型：  %d 个模型已加载", len(getModelIDs()))
 	log.Printf("别名：  %d", len(modelAlias))
 	if adminPassword != "" {

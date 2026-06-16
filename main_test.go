@@ -178,7 +178,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			)
 			if tt.stream {
 				var respBody io.ReadCloser
-				respBody, status, _, err = callOpenCodeAPIStream([]byte(tt.requestBody), "primary-model")
+				respBody, status, _, err = callOpenCodeAPIStream([]byte(tt.requestBody), "primary-model", "public")
 				if respBody != nil {
 					defer respBody.Close()
 				}
@@ -186,7 +186,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 					body, err = io.ReadAll(respBody)
 				}
 			} else {
-				body, status, _, err = callOpenCodeAPI([]byte(tt.requestBody), "primary-model")
+				body, status, _, err = callOpenCodeAPI([]byte(tt.requestBody), "primary-model", "public")
 			}
 			if err != nil {
 				t.Fatalf("upstream call error = %v", err)
@@ -221,7 +221,7 @@ func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
 		},
 	})
 
-	body, status, header, err := callOpenCodeAPI([]byte(`{"model":"primary-model","messages":[]}`), "primary-model")
+	body, status, header, err := callOpenCodeAPI([]byte(`{"model":"primary-model","messages":[]}`), "primary-model", "public")
 	if err == nil {
 		t.Fatal("callOpenCodeAPI() error = nil, want upstream error")
 	}

@@ -14,3 +14,4 @@ opencode2api.exe
 .idea/
 .vscode/
 *.swp
+.env
