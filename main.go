@@ -1381,8 +1381,23 @@ func buildOCRequest(modelID string, bodyMap map[string]any, bearerToken string) 
 }
 
 func shouldRetryUpstreamStatus(status int) bool {
-	return status >= 400 && status < 600
+	// 仅重试可恢复的临时性错误
+	switch status {
+	case http.StatusUnauthorized, // 401 认证过期或 token 未同步
+		http.StatusTooManyRequests,          // 429 限流
+		http.StatusBadGateway,               // 502
+		http.StatusServiceUnavailable,       // 503
+		http.StatusGatewayTimeout:           // 504
+		return true
+	}
+	// 其他 5xx 也重试，但 4xx 中只有 401 和 429 重试
+	return status >= 500 && status < 600
 }
+
+const (
+	maxUpstreamRetries = 3
+	max401Retries      = 3
+)
 
 func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string) ([]byte, int, http.Header, error) {
 	initOCSession()
@@ -1404,6 +1419,8 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string) ([
 	}
 
 	var lastErr error
+	var retryCount int
+	var retry401Count int
 	var lastBody []byte
 	var lastStatus int
 	var lastHeader http.Header
@@ -1441,6 +1458,17 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string) ([
 		lastErr = fmt.Errorf("upstream error")
 		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
 			client.CloseIdleConnections()
+			if resp.StatusCode == http.StatusUnauthorized {
+				retry401Count++
+				if retry401Count >= max401Retries {
+					break
+				}
+			} else {
+				retryCount++
+				if retryCount >= maxUpstreamRetries {
+					break
+				}
+			}
 			continue
 		}
 		break
@@ -1469,6 +1497,8 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, bearerToken stri
 	var lastBody []byte
 	var lastStatus int
 	var lastHeader http.Header
+	var retryCount int
+	var retry401Count int
 	for i, tryModel := range modelsToTry {
 		up, err := buildOCRequest(tryModel, bodyMap, bearerToken)
 		if err != nil {
@@ -1492,6 +1522,17 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, bearerToken stri
 		lastHeader = resp.Header
 		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
 			client.CloseIdleConnections()
+			if resp.StatusCode == http.StatusUnauthorized {
+				retry401Count++
+				if retry401Count >= max401Retries {
+					break
+				}
+			} else {
+				retryCount++
+				if retryCount >= maxUpstreamRetries {
+					break
+				}
+			}
 			continue
 		}
 		// 返回错误体供下游透传
