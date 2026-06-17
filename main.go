@@ -1384,10 +1384,10 @@ func shouldRetryUpstreamStatus(status int) bool {
 	// 仅重试可恢复的临时性错误
 	switch status {
 	case http.StatusUnauthorized, // 401 认证过期或 token 未同步
-		http.StatusTooManyRequests,          // 429 限流
-		http.StatusBadGateway,               // 502
-		http.StatusServiceUnavailable,       // 503
-		http.StatusGatewayTimeout:           // 504
+		http.StatusTooManyRequests,    // 429 限流
+		http.StatusBadGateway,         // 502
+		http.StatusServiceUnavailable, // 503
+		http.StatusGatewayTimeout:     // 504
 		return true
 	}
 	// 其他 5xx 也重试，但 4xx 中只有 401 和 429 重试
