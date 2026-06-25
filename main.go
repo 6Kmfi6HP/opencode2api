@@ -10,7 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -30,7 +30,7 @@ var httpClient = &http.Client{
 }
 
 var (
-	version = "dev"
+	version = "v0.3.0"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -319,9 +319,9 @@ func initOCSession() {
 		ocClientVer = fetchOCVersion()
 		ocSessionID = "ses_" + randomString(24)
 		ocProjectID = randomHex(40)
-		log.Printf("OpenCode Version: %s", ocClientVer)
-		log.Printf("Session: %s", ocSessionID)
-		log.Printf("Project: %s", ocProjectID)
+		slog.Info("opencode version", "version", ocClientVer)
+		slog.Info("session initialized", "session_id", ocSessionID)
+		slog.Info("project initialized", "project_id", ocProjectID)
 	})
 }
 
@@ -329,7 +329,7 @@ func refreshOCSession() {
 	ocClientVer = fetchOCVersion()
 	ocSessionID = "ses_" + randomString(24)
 	ocProjectID = randomHex(40)
-	log.Printf("会话已刷新: version=%s session=%s", ocClientVer, ocSessionID)
+	slog.Info("session refreshed", "version", ocClientVer, "session_id", ocSessionID)
 	// 重置 Once 以便后续 initOCSession 调用直接通过
 	ocOnce = sync.Once{}
 }
@@ -344,9 +344,10 @@ type ModelInfo struct {
 }
 
 var (
-	modelsCache  []ModelInfo
-	modelMu      sync.RWMutex
-	modelsLoaded bool
+	modelsCache     []ModelInfo
+	paidModelsCache []ModelInfo
+	modelMu         sync.RWMutex
+	modelsLoaded    bool
 )
 
 func fetchModels() ([]ModelInfo, error) {
@@ -375,6 +376,51 @@ func fetchModels() ([]ModelInfo, error) {
 	return models, nil
 }
 
+// fetchPaidModels 从付费层级(/go/ endpoint)获取模型列表
+func fetchPaidModels() ([]ModelInfo, error) {
+	req, _ := http.NewRequest("GET", "https://opencode.ai/zen/go/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer public")
+	req.Header.Set("x-opencode-session", ocSessionID)
+	resp, err := getHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	var models []ModelInfo
+	now := time.Now().Unix()
+	for _, m := range result.Data {
+		models = append(models, ModelInfo{ID: m.ID, Object: "model", Created: now, OwnedBy: "opencode"})
+	}
+	return models, nil
+}
+
+// isPaidOnlyModel 检查模型是否仅在付费层级可用
+func isPaidOnlyModel(modelID string) bool {
+	modelMu.RLock()
+	defer modelMu.RUnlock()
+	for _, m := range paidModelsCache {
+		if m.ID == modelID {
+			// 检查该模型是否也在免费列表中
+			for _, fm := range modelsCache {
+				if fm.ID == modelID {
+					return false // 两个层级都有，优先用免费
+				}
+			}
+			return true // 仅在付费层级
+		}
+	}
+	return false
+}
+
 func getModelIDs() []string {
 	modelMu.RLock()
 	defer modelMu.RUnlock()
@@ -397,12 +443,98 @@ func startModelRefresh() {
 				modelsCache = fetched
 				modelsLoaded = true
 				modelMu.Unlock()
-				log.Printf("模型列表已自动刷新: %d 个模型", len(fetched))
+				slog.Info("models auto-refreshed", "count", len(fetched))
 			} else if err != nil {
-				log.Printf("模型列表刷新失败: %v", err)
+				slog.Error("free models refresh failed", "error", err)
+			}
+
+			paidFetched, paidErr := fetchPaidModels()
+			if paidErr == nil && len(paidFetched) > 0 {
+				modelMu.Lock()
+				paidModelsCache = paidFetched
+				modelMu.Unlock()
+				slog.Info("paid models auto-refreshed", "count", len(paidFetched))
+			} else if paidErr != nil {
+				slog.Error("paid models refresh failed", "error", paidErr)
 			}
 		}
 	}()
+}
+
+// ======================== 结构化日志 ========================
+
+type contextKey string
+
+const reqIDKey contextKey = "request_id"
+
+var (
+	logLevel string
+	logFile  string
+)
+
+func initLogger() *slog.Logger {
+	var w io.Writer = os.Stdout
+	if logFile != "" {
+		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			slog.Warn("cannot open log file, falling back to stdout", "path", logFile, "error", err)
+		} else {
+			w = f
+		}
+	}
+
+	var lvl slog.Level
+	switch strings.ToLower(logLevel) {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		lvl = slog.LevelInfo
+	}
+
+	handler := slog.NewTextHandler(w, &slog.HandlerOptions{
+		Level: lvl,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.String("time", a.Value.Time().Format("2006-01-02T15:04:05.000Z07:00"))
+			}
+			if a.Key == slog.SourceKey {
+				return slog.Attr{}
+			}
+			return a
+		},
+	})
+
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+	return logger
+}
+
+// loggingMiddleware 为每个请求注入 request_id 并记录请求信息
+func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		reqID := randomString(12)
+		ctx := context.WithValue(r.Context(), reqIDKey, reqID)
+		r = r.WithContext(ctx)
+
+		slog.DebugContext(ctx, "request started",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("remote", r.RemoteAddr),
+		)
+
+		next(w, r)
+	}
+}
+
+func getReqID(ctx context.Context) string {
+	if id, ok := ctx.Value(reqIDKey).(string); ok {
+		return id
+	}
+	return ""
 }
 
 // ======================== 配置 ========================
@@ -674,7 +806,7 @@ func loadConfig(path string) AppConfig {
 		return cfg
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		log.Printf("警告: 配置文件解析失败: %v", err)
+		slog.Warn("config parse failed", "error", err)
 	}
 	return cfg
 }
@@ -983,7 +1115,7 @@ func buildUpstreamBody(req *OpenAIRequest) []byte {
 	converted := convertRequest(req)
 	b, err := json.Marshal(converted)
 	if err != nil {
-		log.Printf("Error marshaling upstream body: %v", err)
+		slog.Error("marshal upstream body failed", "error", err)
 	}
 	return b
 }
@@ -1283,7 +1415,7 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
-		log.Printf("Warning: convertResponse unmarshal failed: %v", err)
+		slog.Warn("convertResponse unmarshal failed", "error", err)
 		return data, nil
 	}
 	if choices, ok := raw["choices"].([]any); ok {
@@ -1367,14 +1499,21 @@ func buildOCRequest(modelID string, bodyMap map[string]any, bearerToken string) 
 	if err != nil {
 		return nil, err
 	}
-	// 根据 bearerToken 决定层级和上游 URL
-	tier := TierFree
+	// 根据模型所在层级决定上游 URL
+	hasKey := bearerToken != "" && bearerToken != "public"
+	usePaidEndpoint := hasKey && isPaidOnlyModel(modelID)
+
 	authValue := "Bearer public"
-	if bearerToken != "" && bearerToken != "public" {
-		tier = TierPaid
+	if hasKey {
 		authValue = "Bearer " + bearerToken
 	}
-	req, err := http.NewRequest("POST", tier.upstreamURL(), bytes.NewReader(tryBody))
+	var upstreamURL string
+	if usePaidEndpoint {
+		upstreamURL = "https://opencode.ai/zen/go/v1/chat/completions"
+	} else {
+		upstreamURL = "https://opencode.ai/zen/v1/chat/completions"
+	}
+	req, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(tryBody))
 	if err != nil {
 		return nil, err
 	}
@@ -1458,9 +1597,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string, ti
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if debugMode {
-			log.Printf("[upstream error] model=%s status=%d body=%s", tryModel, resp.StatusCode, string(errBody))
-		}
+		slog.Error("upstream error", "model", tryModel, "status", resp.StatusCode, "body", string(errBody))
 		lastBody = errBody
 		lastStatus = resp.StatusCode
 		lastHeader = resp.Header
@@ -1523,9 +1660,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, bearerToken stri
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if debugMode {
-			log.Printf("[upstream error] model=%s status=%d body=%s", tryModel, resp.StatusCode, string(errBody))
-		}
+		slog.Error("upstream error", "model", tryModel, "status", resp.StatusCode, "body", string(errBody))
 		lastBody = errBody
 		lastStatus = resp.StatusCode
 		lastHeader = resp.Header
@@ -1588,9 +1723,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cnt := requestCount.Add(1)
-	if debugMode {
-		log.Printf("[request #%d] POST /v1/chat/completions\n%s", cnt, string(body))
-	}
+	slog.Debug("chat completion request body", "count", cnt, "body", string(body))
 
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -1648,7 +1781,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				if err == io.EOF {
 					break
 				}
-				log.Printf("Error reading stream: %v", err)
+				slog.Error("stream read error", "error", err)
 				// 发送错误事件通知客户端
 				w.Write([]byte("data: {\"error\":\"stream read error\"}\n\n"))
 				if f, ok := w.(http.Flusher); ok {
@@ -1775,11 +1908,45 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 	for _, alias := range aliases {
 		aliasModels = append(aliasModels, ModelInfo{ID: alias, Object: "model", Created: now, OwnedBy: "alias"})
 	}
-	allModels := append(models, aliasModels...)
 
 	// 根据认证层级过滤模型
 	bearerToken, _ := extractAuthTier(r)
-	if bearerToken == "" || bearerToken == "public" {
+	paid := bearerToken != "" && bearerToken != "public"
+
+	// 付费用户可以看到免费和付费两个层级的模型
+	var combinedModels []ModelInfo
+	if paid {
+		modelMu.RLock()
+		combinedModels = make([]ModelInfo, 0, len(models)+len(paidModelsCache))
+		combinedModels = append(combinedModels, models...)
+		for _, pm := range paidModelsCache {
+			dup := false
+			for _, fm := range models {
+				if fm.ID == pm.ID {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				combinedModels = append(combinedModels, pm)
+			}
+		}
+		modelMu.RUnlock()
+	} else {
+		combinedModels = models
+		filtered := make([]ModelInfo, 0, len(combinedModels))
+		for _, m := range combinedModels {
+			if isFreeModel(m.ID) {
+				filtered = append(filtered, m)
+			}
+		}
+		if len(filtered) > 0 {
+			combinedModels = filtered
+		}
+	}
+	allModels := append(combinedModels, aliasModels...)
+	// 免费用户还要过滤别名中的非免费模型
+	if !paid {
 		filtered := make([]ModelInfo, 0, len(allModels))
 		for _, m := range allModels {
 			if isFreeModel(m.ID) {
@@ -1789,7 +1956,6 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		if len(filtered) > 0 {
 			allModels = filtered
 		}
-		// 如果没有 -free 模型，返回空列表
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2026,7 +2192,7 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 		Usage map[string]any `json:"usage"`
 	}
 	if err := json.Unmarshal(chatBody, &chat); err != nil {
-		log.Printf("Warning: openAIToClaudeResponse unmarshal failed: %v", err)
+		slog.Warn("openAIToClaudeResponse unmarshal failed", "error", err)
 	}
 
 	content := []ClaudeContent{}
@@ -2121,9 +2287,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cnt := requestCount.Add(1)
-	if debugMode {
-		log.Printf("[request #%d] POST /v1/messages\n%s", cnt, string(body))
-	}
+	slog.Debug("claude messages request body", "count", cnt, "body", string(body))
 
 	var claudeReq ClaudeRequest
 	if err := json.Unmarshal(body, &claudeReq); err != nil {
@@ -2218,9 +2382,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if debugMode {
-		log.Printf("[client response]\n%s", string(claudeRespBody))
-	}
+	slog.Debug("claude response body", "body", string(claudeRespBody))
 	w.Write(claudeRespBody)
 }
 
@@ -2255,7 +2417,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 	emitClaudeEvent := func(event string, data any) {
 		jsonData, err := json.Marshal(data)
 		if err != nil {
-			log.Printf("Error marshaling Claude SSE event: %v", err)
+			slog.Error("marshal SSE event failed", "error", err)
 			return
 		}
 		w.Write([]byte("event: " + event + "\n"))
@@ -2295,11 +2457,11 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 			if err == io.EOF {
 				break
 			}
-			log.Printf("Error reading stream: %v", err)
+			slog.Error("stream read error", "error", err)
 			break
 		}
-		if debugMode && strings.HasPrefix(line, "data: ") {
-			log.Printf("[upstream raw chunk] %s", strings.TrimSpace(line[6:]))
+		if strings.HasPrefix(line, "data: ") {
+			slog.Debug("upstream raw chunk", "data", strings.TrimSpace(line[6:]))
 		}
 
 		trimmed := strings.TrimSpace(line)
@@ -2746,9 +2908,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cnt := requestCount.Add(1)
-	if debugMode {
-		log.Printf("[request #%d] POST /v1/responses\n%s", cnt, string(body))
-	}
+	slog.Debug("responses request body", "count", cnt, "body", string(body))
 
 	var respReq ResponsesAPIRequest
 	if err := json.Unmarshal(body, &respReq); err != nil {
@@ -2870,9 +3030,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if debugMode {
-		log.Printf("[responses response]\n%s", string(responsesBody))
-	}
+	slog.Debug("responses response body", "body", string(responsesBody))
 	w.Write(responsesBody)
 }
 
@@ -3050,11 +3208,11 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			if err == io.EOF {
 				break
 			}
-			log.Printf("Error reading stream: %v", err)
+			slog.Error("stream read error", "error", err)
 			return
 		}
-		if debugMode && strings.HasPrefix(line, "data: ") {
-			log.Printf("[upstream raw chunk] %s", strings.TrimSpace(line[6:]))
+		if strings.HasPrefix(line, "data: ") {
+			slog.Debug("upstream raw chunk", "data", strings.TrimSpace(line[6:]))
 		}
 
 		trimmed := strings.TrimSpace(line)
@@ -3380,7 +3538,7 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		Usage map[string]any `json:"usage"`
 	}
 	if err := json.Unmarshal(chatBody, &chat); err != nil {
-		log.Printf("Warning: convertChatToResponses unmarshal failed: %v", err)
+		slog.Warn("convertChatToResponses unmarshal failed", "error", err)
 	}
 
 	text := ""
@@ -3487,7 +3645,7 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 func emitSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, data map[string]any) {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		log.Printf("Error marshaling SSE event: %v", err)
+		slog.Error("marshal SSE event failed", "error", err)
 		return
 	}
 	w.Write([]byte("event: " + event + "\n"))
@@ -3511,16 +3669,24 @@ func reloadHandler(w http.ResponseWriter, r *http.Request) {
 		modelsCache = fetched
 		modelsLoaded = true
 		modelMu.Unlock()
-		log.Printf("模型列表已刷新: %d 个模型", len(fetched))
+		slog.Info("free models refreshed", "count", len(fetched))
+	}
+	paidFetched, paidErr := fetchPaidModels()
+	if paidErr == nil && len(paidFetched) > 0 {
+		modelMu.Lock()
+		paidModelsCache = paidFetched
+		modelMu.Unlock()
+		slog.Info("paid models refreshed", "count", len(paidFetched))
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"status":  "ok",
 		"session": ocSessionID,
-		"models":  len(modelsCache),
+		"free":    len(modelsCache),
+		"paid":    len(paidModelsCache),
 	})
-}
 
+}
 func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -3545,7 +3711,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		applyConfig(cfg)
 		if debugMode {
-			log.Printf("Config updated: aliases=%d, effort_map=%d, force_disable=%v", len(cfg.ModelAlias), len(cfg.ReasoningEffortMap), cfg.ForceDisableThinking)
+			slog.Info("config updated", "aliases", len(cfg.ModelAlias), "effort_map", len(cfg.ReasoningEffortMap), "force_disable", cfg.ForceDisableThinking)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -3909,8 +4075,12 @@ func main() {
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
 	flag.StringVar(&adminPassword, "password", "123456", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
+	flag.StringVar(&logLevel, "log-level", "info", "日志级别: debug/info/warn/error")
+	flag.StringVar(&logFile, "log-file", "", "日志文件路径（留空输出到 stdout）")
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	flag.Parse()
+
+	initLogger()
 
 	if showVersion {
 		fmt.Println(versionString())
@@ -3920,47 +4090,53 @@ func main() {
 	cfg := loadConfig(configPath)
 	applyConfig(cfg)
 	if err := saveConfig(configPath, cfg); err != nil {
-		log.Printf("警告: 无法保存配置: %v", err)
+		slog.Warn("failed to save config", "path", configPath, "error", err)
 	}
 
 	loadTokenStats()
-	log.Printf("配置已从 %s 加载", configPath)
+	slog.Info("config loaded", "path", configPath)
 	initOCSession()
 	models, err := fetchModels()
 	if err != nil {
-		log.Printf("警告: 无法获取模型列表: %v", err)
+		slog.Warn("failed to fetch models on startup", "error", err)
 	} else {
 		modelMu.Lock()
 		modelsCache = models
 		modelsLoaded = true
 		modelMu.Unlock()
-		log.Printf("已加载 %d 个模型:", len(models))
-		for _, m := range models {
-			log.Printf("  - %s", m.ID)
-		}
+		slog.Info("models loaded", "count", len(models))
+	}
+
+	paidModels, paidErr := fetchPaidModels()
+	if paidErr != nil {
+		slog.Warn("failed to fetch paid models on startup", "error", paidErr)
+	} else {
+		modelMu.Lock()
+		paidModelsCache = paidModels
+		modelMu.Unlock()
+		slog.Info("paid models loaded", "count", len(paidModels))
 	}
 	startModelRefresh()
-	log.Printf("OPENCODE TO API 代理服务器")
-	log.Printf("===================")
-	log.Printf("端口:     %s", port)
-	log.Printf("上游:     https://opencode.ai/zen/v1/chat/completions (API) 或 /go/ (付费)")
-	log.Printf("模型：  %d 个模型已加载", len(getModelIDs()))
-	log.Printf("别名：  %d", len(modelAlias))
+	slog.Info("server starting",
+		"port", port,
+		"log_level", logLevel,
+		"models", len(getModelIDs()),
+		"aliases", len(modelAlias),
+	)
 	if adminPassword != "" {
-		log.Printf("管理面板: http://localhost:%s/ （密码认证已启用）", port)
+		slog.Info("admin panel enabled", "url", fmt.Sprintf("http://localhost:%s/", port))
 	} else {
-		log.Printf("管理面板: http://localhost:%s/ （无密码）", port)
+		slog.Info("admin panel disabled (no password)")
 	}
-	log.Printf("===================")
-	http.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
-	http.HandleFunc("/v1/responses", responsesHandler)
-	http.HandleFunc("/v1/messages", claudeMessagesHandler)
-	http.HandleFunc("/v1/models", listModelsHandler)
-	http.HandleFunc("/login", loginHandler)
-	http.HandleFunc("/logout", logoutHandler)
-	http.HandleFunc("/api/config", requireAuth(adminConfigHandler))
-	http.HandleFunc("/api/stats", requireAuth(adminStatsHandler))
-	http.HandleFunc("/api/reload", requireAuth(reloadHandler))
+	http.HandleFunc("/v1/chat/completions", loggingMiddleware(chatCompletionsHandler))
+	http.HandleFunc("/v1/responses", loggingMiddleware(responsesHandler))
+	http.HandleFunc("/v1/messages", loggingMiddleware(claudeMessagesHandler))
+	http.HandleFunc("/v1/models", loggingMiddleware(listModelsHandler))
+	http.HandleFunc("/login", loggingMiddleware(loginHandler))
+	http.HandleFunc("/logout", loggingMiddleware(logoutHandler))
+	http.HandleFunc("/api/config", loggingMiddleware(requireAuth(adminConfigHandler)))
+	http.HandleFunc("/api/stats", loggingMiddleware(requireAuth(adminStatsHandler)))
+	http.HandleFunc("/api/reload", loggingMiddleware(requireAuth(reloadHandler)))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
@@ -3973,8 +4149,9 @@ func main() {
 		http.NotFound(w, r)
 	})
 	addr := ":" + port
-	log.Printf("服务器启动在 %s", addr)
+	slog.Info("listening", "addr", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatal(err)
+		slog.Error("server terminated", "error", err)
+		os.Exit(1)
 	}
 }
