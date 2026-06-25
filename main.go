@@ -255,6 +255,15 @@ func getHTTPClient() *http.Client {
 	return client
 }
 
+// getHTTPClientForTier 根据层级返回 HTTP 客户端
+// 付费层走直连，免费层（默认）走 SOCKS5 代理（如配置）
+func getHTTPClientForTier(tier TierType) *http.Client {
+	if tier == TierPaid {
+		return httpClient
+	}
+	return getHTTPClient()
+}
+
 // ======================== 随机 ID ========================
 
 func randomString(n int) string {
@@ -1399,7 +1408,7 @@ const (
 	max401Retries      = 3
 )
 
-func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string) ([]byte, int, http.Header, error) {
+func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string, tier TierType) ([]byte, int, http.Header, error) {
 	initOCSession()
 	modelIDs := getModelIDs()
 	modelsToTry := []string{modelID}
@@ -1430,7 +1439,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string) ([
 			lastErr = err
 			continue
 		}
-		client := getHTTPClient()
+		client := getHTTPClientForTier(tier)
 		resp, err := client.Do(up)
 		if err != nil {
 			lastErr = err
@@ -1476,7 +1485,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string) ([
 	return lastBody, lastStatus, lastHeader, lastErr
 }
 
-func callOpenCodeAPIStream(upstreamBody []byte, modelID string, bearerToken string) (io.ReadCloser, int, http.Header, error) {
+func callOpenCodeAPIStream(upstreamBody []byte, modelID string, bearerToken string, tier TierType) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
 	modelIDs := getModelIDs()
 	modelsToTry := []string{modelID}
@@ -1504,7 +1513,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, bearerToken stri
 		if err != nil {
 			continue
 		}
-		client := getHTTPClient()
+		client := getHTTPClientForTier(tier)
 		resp, err := client.Do(up)
 		if err != nil {
 			continue
@@ -1571,7 +1580,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	bearerToken, _ := extractAuthTier(r)
+	bearerToken, tier := extractAuthTier(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -1612,7 +1621,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model, bearerToken)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model, bearerToken, tier)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -1693,7 +1702,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model, bearerToken)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model, bearerToken, tier)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -2104,7 +2113,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	bearerToken, _ := extractAuthTier(r)
+	bearerToken, tier := extractAuthTier(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -2164,7 +2173,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if claudeReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, bearerToken)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, bearerToken, tier)
 		if err != nil || status < 200 || status >= 300 {
 			errResp := map[string]any{
 				"type":  "error",
@@ -2180,7 +2189,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, bearerToken)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, bearerToken, tier)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -2729,7 +2738,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	bearerToken, _ := extractAuthTier(r)
+	bearerToken, tier := extractAuthTier(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -2809,7 +2818,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if respReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, bearerToken)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, bearerToken, tier)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -2834,7 +2843,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, bearerToken)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, bearerToken, tier)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
