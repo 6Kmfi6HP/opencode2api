@@ -1603,6 +1603,12 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	req.Messages = fixToolCallGaps(req.Messages)
 	keepReasoning := wantsReasoning(&req)
 	req.Messages = ensureReasoningContent(req.Messages, keepReasoning)
+	if req.Stream {
+		if req.ExtraBody == nil {
+			req.ExtraBody = map[string]any{}
+		}
+		req.ExtraBody["stream_options"] = map[string]any{"include_usage": true}
+	}
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
@@ -2126,6 +2132,11 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		Model:    claudeReq.Model,
 		Messages: messages,
 		Stream:   claudeReq.Stream,
+	}
+	if claudeReq.Stream {
+		chatReq.ExtraBody = map[string]any{
+			"stream_options": map[string]any{"include_usage": true},
+		}
 	}
 	if claudeReq.MaxTokens > 0 {
 		chatReq.MaxTokens = claudeReq.MaxTokens
@@ -2759,6 +2770,11 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		Model:    respReq.Model,
 		Messages: messages,
 		Stream:   respReq.Stream,
+	}
+	if respReq.Stream {
+		chatReq.ExtraBody = map[string]any{
+			"stream_options": map[string]any{"include_usage": true},
+		}
 	}
 	if respReq.Temperature != 0 {
 		chatReq.Temperature = &respReq.Temperature
