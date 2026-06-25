@@ -547,6 +547,8 @@ var (
 	forceDisableThinking bool
 	debugMode            bool
 	configMu             sync.RWMutex
+	storedResponses      = map[string]StoredResponseState{}
+	storedResponsesMu    sync.RWMutex
 )
 
 // ======================== 管理面板认证 ========================
@@ -752,49 +754,61 @@ type ClaudeResponse struct {
 	Content    []ClaudeContent `json:"content"`
 	Model      string          `json:"model"`
 	StopReason string          `json:"stop_reason"`
-	Usage      *ClaudeUsage    `json:"usage,omitempty"`
+	Usage      ClaudeUsage     `json:"usage,omitempty"`
 }
 
-type ClaudeUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-}
+type ClaudeUsage map[string]any
 
 // ======================== Responses API 类型 ========================
 
 type ResponsesAPIRequest struct {
-	Model             string          `json:"model"`
-	Input             any             `json:"input"`
-	Messages          []Message       `json:"messages,omitempty"`
-	Instructions      string          `json:"instructions,omitempty"`
-	Stream            bool            `json:"stream,omitempty"`
-	Temperature       float64         `json:"temperature,omitempty"`
-	MaxTokens         int             `json:"max_output_tokens,omitempty"`
-	TopP              float64         `json:"top_p,omitempty"`
-	FrequencyPenalty  float64         `json:"frequency_penalty,omitempty"`
-	PresencePenalty   float64         `json:"presence_penalty,omitempty"`
-	Reasoning         ReasonEffort    `json:"reasoning,omitempty"`
-	Include           []string        `json:"include,omitempty"`
-	Store             *bool           `json:"store,omitempty"`
-	Tools             []ResponsesTool `json:"tools,omitempty"`
-	ToolChoice        any             `json:"tool_choice,omitempty"`
-	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
-	Stop              any             `json:"stop,omitempty"`
-	User              string          `json:"user,omitempty"`
-	StreamOptions     any             `json:"stream_options,omitempty"`
-	Metadata          any             `json:"metadata,omitempty"`
+	Model              string          `json:"model"`
+	Input              any             `json:"input"`
+	Messages           []Message       `json:"messages,omitempty"`
+	Instructions       string          `json:"instructions,omitempty"`
+	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	Stream             bool            `json:"stream,omitempty"`
+	Temperature        float64         `json:"temperature,omitempty"`
+	MaxTokens          int             `json:"max_output_tokens,omitempty"`
+	TopP               float64         `json:"top_p,omitempty"`
+	FrequencyPenalty   float64         `json:"frequency_penalty,omitempty"`
+	PresencePenalty    float64         `json:"presence_penalty,omitempty"`
+	Reasoning          ReasonEffort    `json:"reasoning,omitempty"`
+	Include            []string        `json:"include,omitempty"`
+	Store              *bool           `json:"store,omitempty"`
+	Tools              []ResponsesTool `json:"tools,omitempty"`
+	ToolChoice         any             `json:"tool_choice,omitempty"`
+	ParallelToolCalls  *bool           `json:"parallel_tool_calls,omitempty"`
+	Stop               any             `json:"stop,omitempty"`
+	User               string          `json:"user,omitempty"`
+	StreamOptions      any             `json:"stream_options,omitempty"`
+	Metadata           any             `json:"metadata,omitempty"`
 }
 
 type ResponsesTool struct {
-	Type        string         `json:"type"`
-	Name        string         `json:"name,omitempty"`
-	Description string         `json:"description,omitempty"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
-	Function    *ToolFunction  `json:"function,omitempty"`
+	Type            string         `json:"type"`
+	Name            string         `json:"name,omitempty"`
+	Description     string         `json:"description,omitempty"`
+	Parameters      map[string]any `json:"parameters,omitempty"`
+	Function        *ToolFunction  `json:"function,omitempty"`
+	ServerLabel     string         `json:"server_label,omitempty"`
+	ServerURL       string         `json:"server_url,omitempty"`
+	ConnectorID     string         `json:"connector_id,omitempty"`
+	Authorization   string         `json:"authorization,omitempty"`
+	AllowedTools    []string       `json:"allowed_tools,omitempty"`
+	RequireApproval any            `json:"require_approval,omitempty"`
 }
 
 type ReasonEffort struct {
 	Effort string `json:"effort,omitempty"`
+}
+
+type StoredResponseState struct {
+	Model        string          `json:"model"`
+	Instructions string          `json:"instructions,omitempty"`
+	Tools        []ResponsesTool `json:"tools,omitempty"`
+	ToolChoice   any             `json:"tool_choice,omitempty"`
+	Output       []any           `json:"output,omitempty"`
 }
 
 // ======================== 配置管理 ========================
@@ -2249,12 +2263,7 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 		StopReason: stopReason,
 	}
 	if chat.Usage != nil {
-		inputTokens, _ := chat.Usage["prompt_tokens"]
-		outputTokens, _ := chat.Usage["completion_tokens"]
-		resp.Usage = &ClaudeUsage{
-			InputTokens:  int(toFloat64(inputTokens)),
-			OutputTokens: int(toFloat64(outputTokens)),
-		}
+		resp.Usage = buildClaudeMessageUsage(chat.Usage)
 	}
 	result, _ := json.Marshal(resp)
 	return result
@@ -2271,6 +2280,109 @@ func toFloat64(v any) float64 {
 	default:
 		return 0
 	}
+}
+
+func usageIntField(fields map[string]any, key string) (int, bool) {
+	if fields == nil {
+		return 0, false
+	}
+	value, ok := fields[key]
+	if !ok || value == nil {
+		return 0, false
+	}
+	return int(toFloat64(value)), true
+}
+
+func usageMapField(fields map[string]any, key string) (map[string]any, bool) {
+	if fields == nil {
+		return nil, false
+	}
+	value, ok := fields[key]
+	if !ok || value == nil {
+		return nil, false
+	}
+	mapped, ok := value.(map[string]any)
+	return mapped, ok
+}
+
+func buildClaudeUsageCore(upstreamUsage map[string]any) ClaudeUsage {
+	if len(upstreamUsage) == 0 {
+		return nil
+	}
+
+	usage := ClaudeUsage{}
+	if value, ok := usageIntField(upstreamUsage, "prompt_tokens"); ok {
+		usage["input_tokens"] = value
+	}
+	if value, ok := usageIntField(upstreamUsage, "input_tokens"); ok {
+		if _, exists := usage["input_tokens"]; !exists {
+			usage["input_tokens"] = value
+		}
+	}
+	if value, ok := usageIntField(upstreamUsage, "completion_tokens"); ok {
+		usage["output_tokens"] = value
+	}
+	if value, ok := usageIntField(upstreamUsage, "output_tokens"); ok {
+		if _, exists := usage["output_tokens"]; !exists {
+			usage["output_tokens"] = value
+		}
+	}
+	if value, ok := usageIntField(upstreamUsage, "cache_creation_input_tokens"); ok {
+		usage["cache_creation_input_tokens"] = value
+	}
+	if value, ok := usageIntField(upstreamUsage, "cache_read_input_tokens"); ok {
+		usage["cache_read_input_tokens"] = value
+	} else if promptDetails, ok := usageMapField(upstreamUsage, "prompt_tokens_details"); ok {
+		if value, ok := usageIntField(promptDetails, "cached_tokens"); ok {
+			usage["cache_read_input_tokens"] = value
+		}
+	}
+	if outputDetails, ok := usageMapField(upstreamUsage, "output_tokens_details"); ok {
+		usage["output_tokens_details"] = outputDetails
+	} else if outputDetails, ok := usageMapField(upstreamUsage, "completion_tokens_details"); ok {
+		usage["output_tokens_details"] = outputDetails
+	}
+	if serverToolUse, ok := usageMapField(upstreamUsage, "server_tool_use"); ok {
+		usage["server_tool_use"] = serverToolUse
+	}
+	if len(usage) == 0 {
+		return nil
+	}
+	return usage
+}
+
+func buildClaudeMessageUsage(upstreamUsage map[string]any) ClaudeUsage {
+	usage := buildClaudeUsageCore(upstreamUsage)
+	if usage == nil {
+		usage = ClaudeUsage{}
+	}
+	if cacheCreation, ok := usageMapField(upstreamUsage, "cache_creation"); ok {
+		usage["cache_creation"] = cacheCreation
+	}
+	if serviceTier, ok := upstreamUsage["service_tier"].(string); ok && serviceTier != "" {
+		usage["service_tier"] = serviceTier
+	}
+	if inferenceGeo, ok := upstreamUsage["inference_geo"].(string); ok && inferenceGeo != "" {
+		usage["inference_geo"] = inferenceGeo
+	}
+	if _, exists := usage["input_tokens"]; !exists {
+		usage["input_tokens"] = 0
+	}
+	if _, exists := usage["output_tokens"]; !exists {
+		usage["output_tokens"] = 0
+	}
+	return usage
+}
+
+func buildClaudeDeltaUsage(upstreamUsage map[string]any) ClaudeUsage {
+	usage := buildClaudeUsageCore(upstreamUsage)
+	if usage == nil {
+		usage = ClaudeUsage{}
+	}
+	if _, exists := usage["output_tokens"]; !exists {
+		usage["output_tokens"] = 0
+	}
+	return usage
 }
 
 func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
@@ -2476,12 +2588,12 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		if err := json.Unmarshal([]byte(line[6:]), &chunk); err != nil {
 			continue
 		}
+		if usage, ok := chunk["usage"].(map[string]any); ok {
+			fullUsage = usage
+		}
 
 		choices, ok := chunk["choices"].([]any)
 		if !ok || len(choices) == 0 {
-			if usage, ok := chunk["usage"].(map[string]any); ok {
-				fullUsage = usage
-			}
 			continue
 		}
 
@@ -2500,7 +2612,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 					"content":     []any{},
 					"model":       model,
 					"stop_reason": nil,
-					"usage":       map[string]any{"input_tokens": 0, "output_tokens": 0},
+					"usage":       buildClaudeMessageUsage(fullUsage),
 				},
 			})
 			emitClaudeEvent("ping", map[string]any{"type": "ping"})
@@ -2613,10 +2725,6 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 			}
 		}
 
-		if usage, ok := chunk["usage"].(map[string]any); ok {
-			fullUsage = usage
-		}
-
 		if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
 			closeThinkingBlock()
 			closeTextBlock()
@@ -2643,23 +2751,12 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 				stopReason = "tool_use"
 			}
 
-			usage := map[string]any{}
-			if len(fullUsage) > 0 {
-				usage["input_tokens"] = fullUsage["prompt_tokens"]
-				usage["output_tokens"] = fullUsage["completion_tokens"]
-			} else {
-				usage["input_tokens"] = 0
-				usage["output_tokens"] = 0
-			}
-
 			emitClaudeEvent("message_delta", map[string]any{
 				"type": "message_delta",
 				"delta": map[string]any{
 					"stop_reason": stopReason,
 				},
-				"usage": map[string]any{
-					"output_tokens": usage["output_tokens"],
-				},
+				"usage": buildClaudeDeltaUsage(fullUsage),
 			})
 			emitClaudeEvent("message_stop", map[string]any{
 				"type": "message_stop",
@@ -2673,7 +2770,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 	emitClaudeEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": "end_turn"},
-		"usage": map[string]any{"output_tokens": 0},
+		"usage": buildClaudeDeltaUsage(nil),
 	})
 	emitClaudeEvent("message_stop", map[string]any{"type": "message_stop"})
 }
@@ -2706,12 +2803,20 @@ func responsesInputToMessages(input any, instructions string) []Message {
 			case map[string]any:
 				itemType, _ := elem["type"].(string)
 				switch itemType {
-				case "function_call", "tool_call":
+				case "function_call", "tool_call", "apply_patch_call", "shell_call":
 					callID, _ := elem["call_id"].(string)
 					if callID == "" {
 						callID, _ = elem["id"].(string)
 					}
 					name, _ := elem["name"].(string)
+					if name == "" {
+						switch itemType {
+						case "apply_patch_call":
+							name = "apply_patch"
+						case "shell_call":
+							name = "shell"
+						}
+					}
 					args, _ := elem["arguments"].(string)
 					if name == "" {
 						if tu, ok := elem["tool_use"].(map[string]any); ok {
@@ -2724,6 +2829,9 @@ func responsesInputToMessages(input any, instructions string) []Message {
 								args = string(b)
 							}
 						}
+					}
+					if args == "" {
+						args = buildBuiltInToolCallArguments(itemType, elem)
 					}
 					if args == "" {
 						args = "{}"
@@ -2747,7 +2855,7 @@ func responsesInputToMessages(input any, instructions string) []Message {
 						}
 						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
 					}
-				case "function_call_output", "tool_result":
+				case "function_call_output", "tool_result", "apply_patch_call_output", "shell_call_output":
 					callID, _ := elem["call_id"].(string)
 					if callID == "" {
 						callID, _ = elem["tool_use_id"].(string)
@@ -2763,6 +2871,12 @@ func responsesInputToMessages(input any, instructions string) []Message {
 									b, _ := json.Marshal(o)
 									output = string(b)
 								}
+							}
+						}
+						if output == "" {
+							b, err := json.Marshal(elem)
+							if err == nil {
+								output = string(b)
 							}
 						}
 						if output == "" {
@@ -2784,19 +2898,31 @@ func responsesInputToMessages(input any, instructions string) []Message {
 					if role == "developer" {
 						role = "system"
 					}
-					text := extractTextFromContentParts(elem["content"])
-					messages = append(messages, Message{Role: role, Content: text})
+					content := responsesContentToMessageContent(elem["content"])
+					messages = append(messages, Message{Role: role, Content: content})
 				default:
 					role := "user"
 					if r, ok := elem["role"].(string); ok && r != "" {
 						role = r
 					}
-					text := extractTextFromContentParts(elem["content"])
-					if text == "" {
-						b, _ := json.Marshal(elem)
-						text = string(b)
+					content := responsesContentToMessageContent(elem["content"])
+					emptyContent := false
+					switch v := content.(type) {
+					case nil:
+						emptyContent = true
+					case string:
+						emptyContent = v == ""
+					case []any:
+						emptyContent = len(v) == 0
 					}
-					messages = append(messages, Message{Role: role, Content: text})
+					if emptyContent {
+						b, err := json.Marshal(elem)
+						if err != nil {
+							continue
+						}
+						content = string(b)
+					}
+					messages = append(messages, Message{Role: role, Content: content})
 				}
 			default:
 				b, _ := json.Marshal(elem)
@@ -2813,9 +2939,18 @@ func responsesInputToMessages(input any, instructions string) []Message {
 func convertResponsesTools(tools []ResponsesTool) []Tool {
 	converted := make([]Tool, 0, len(tools))
 	for _, tool := range tools {
-		if tool.Type != "function" {
+		fn, ok := responsesToolFunction(tool)
+		if !ok {
 			continue
 		}
+		converted = append(converted, Tool{Type: "function", Function: fn})
+	}
+	return converted
+}
+
+func responsesToolFunction(tool ResponsesTool) (ToolFunction, bool) {
+	switch tool.Type {
+	case "function":
 		fn := ToolFunction{
 			Name:        tool.Name,
 			Description: tool.Description,
@@ -2827,9 +2962,94 @@ func convertResponsesTools(tools []ResponsesTool) []Tool {
 		if fn.Parameters == nil {
 			fn.Parameters = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
-		converted = append(converted, Tool{Type: "function", Function: fn})
+		return fn, true
+	case "apply_patch":
+		return ToolFunction{
+			Name:        "apply_patch",
+			Description: "Create, update, or delete files using a structured patch operation or unified diff.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"input": map[string]any{
+						"type":        "string",
+						"description": "Patch diff or patch instructions to apply.",
+					},
+					"operation": map[string]any{
+						"type":        "object",
+						"description": "Structured patch operation, including file action and diff payload.",
+					},
+				},
+			},
+		}, true
+	case "shell":
+		return ToolFunction{
+			Name:        "shell",
+			Description: "Run a shell command in the local workspace and return stdout, stderr, and exit details.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"command": map[string]any{
+						"type":        "string",
+						"description": "Shell command to execute.",
+					},
+					"timeout_ms": map[string]any{
+						"type":        "integer",
+						"description": "Optional timeout in milliseconds.",
+					},
+					"working_directory": map[string]any{
+						"type":        "string",
+						"description": "Optional working directory for the command.",
+					},
+					"max_output_tokens": map[string]any{
+						"type":        "integer",
+						"description": "Optional output budget hint.",
+					},
+				},
+				"required": []string{"command"},
+			},
+		}, true
+	default:
+		return ToolFunction{}, false
 	}
-	return converted
+}
+
+func responsesToolName(tool ResponsesTool) string {
+	switch tool.Type {
+	case "function":
+		if tool.Function != nil && tool.Function.Name != "" {
+			return tool.Function.Name
+		}
+		return tool.Name
+	case "apply_patch":
+		return "apply_patch"
+	case "shell":
+		return "shell"
+	default:
+		return ""
+	}
+}
+
+func responsesToolKindMap(tools []ResponsesTool) map[string]string {
+	kinds := make(map[string]string, len(tools))
+	for _, tool := range tools {
+		name := responsesToolName(tool)
+		if name == "" {
+			continue
+		}
+		kinds[name] = tool.Type
+	}
+	return kinds
+}
+
+func toolCallOutputType(name string, kinds map[string]string) string {
+	switch kinds[name] {
+	case "apply_patch":
+		return "apply_patch_call"
+	case "shell":
+		return "shell_call"
+	default:
+		return "function_call"
+	}
 }
 
 func convertResponsesToolChoice(choice any) any {
@@ -2848,6 +3068,15 @@ func convertResponsesToolChoice(choice any) any {
 			}
 		}
 	}
+	if choiceType, ok := choiceMap["type"].(string); ok {
+		switch choiceType {
+		case "apply_patch", "shell":
+			return map[string]any{
+				"type":     "function",
+				"function": map[string]any{"name": choiceType},
+			}
+		}
+	}
 	return choice
 }
 
@@ -2855,7 +3084,13 @@ func collectFunctionOutputs(items []any) map[string]string {
 	outputs := map[string]string{}
 	for _, item := range items {
 		elem, ok := item.(map[string]any)
-		if !ok || elem["type"] != "function_call_output" {
+		if !ok {
+			continue
+		}
+		itemType, _ := elem["type"].(string)
+		switch itemType {
+		case "function_call_output", "apply_patch_call_output", "shell_call_output":
+		default:
 			continue
 		}
 		callID, _ := elem["call_id"].(string)
@@ -2871,6 +3106,131 @@ func collectFunctionOutputs(items []any) map[string]string {
 		}
 	}
 	return outputs
+}
+
+func parseJSONString(input string) any {
+	var parsed any
+	if input == "" {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(input), &parsed); err != nil {
+		return nil
+	}
+	return parsed
+}
+
+func buildBuiltInToolCallArguments(itemType string, elem map[string]any) string {
+	if arguments, ok := elem["arguments"].(string); ok && arguments != "" {
+		return arguments
+	}
+
+	payload := map[string]any{}
+	switch itemType {
+	case "apply_patch_call":
+		if input, ok := elem["input"].(string); ok && input != "" {
+			payload["input"] = input
+		}
+		if operation, ok := elem["operation"]; ok && operation != nil {
+			payload["operation"] = operation
+		}
+	case "shell_call":
+		for _, key := range []string{"command", "timeout_ms", "working_directory", "max_output_tokens"} {
+			if value, ok := elem[key]; ok && value != nil {
+				payload[key] = value
+			}
+		}
+	}
+	if len(payload) == 0 {
+		payload = elem
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
+}
+
+func buildResponseToolCallItem(tc ToolCall, outputType string) map[string]any {
+	switch outputType {
+	case "apply_patch_call":
+		item := map[string]any{
+			"id":      "apc_" + tc.ID,
+			"type":    outputType,
+			"status":  "completed",
+			"call_id": tc.ID,
+		}
+		if parsed, ok := parseJSONString(tc.Function.Arguments).(map[string]any); ok {
+			for key, value := range parsed {
+				item[key] = value
+			}
+		} else if tc.Function.Arguments != "" {
+			item["arguments"] = tc.Function.Arguments
+		}
+		return item
+	case "shell_call":
+		item := map[string]any{
+			"id":      "shc_" + tc.ID,
+			"type":    outputType,
+			"status":  "completed",
+			"call_id": tc.ID,
+		}
+		if parsed, ok := parseJSONString(tc.Function.Arguments).(map[string]any); ok {
+			for key, value := range parsed {
+				item[key] = value
+			}
+		} else if tc.Function.Arguments != "" {
+			item["arguments"] = tc.Function.Arguments
+		}
+		return item
+	default:
+		return map[string]any{
+			"id":        "fc_" + tc.ID,
+			"type":      "function_call",
+			"status":    "completed",
+			"arguments": tc.Function.Arguments,
+			"call_id":   tc.ID,
+			"name":      tc.Function.Name,
+		}
+	}
+}
+
+func cloneJSONValue[T any](value T) T {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return value
+	}
+	var cloned T
+	if err := json.Unmarshal(encoded, &cloned); err != nil {
+		return value
+	}
+	return cloned
+}
+
+func storeResponseState(response map[string]any, req ResponsesAPIRequest) {
+	responseID, _ := response["id"].(string)
+	if responseID == "" {
+		return
+	}
+	output, _ := response["output"].([]any)
+	storedResponsesMu.Lock()
+	storedResponses[responseID] = StoredResponseState{
+		Model:        req.Model,
+		Instructions: req.Instructions,
+		Tools:        cloneJSONValue(req.Tools),
+		ToolChoice:   cloneJSONValue(req.ToolChoice),
+		Output:       cloneJSONValue(output),
+	}
+	storedResponsesMu.Unlock()
+}
+
+func loadResponseState(responseID string) (StoredResponseState, bool) {
+	storedResponsesMu.RLock()
+	defer storedResponsesMu.RUnlock()
+	state, ok := storedResponses[responseID]
+	if !ok {
+		return StoredResponseState{}, false
+	}
+	return cloneJSONValue(state), true
 }
 
 func extractTextFromContentParts(content any) string {
@@ -2892,6 +3252,162 @@ func extractTextFromContentParts(content any) string {
 		}
 	}
 	return strings.Join(texts, "\n")
+}
+
+func convertResponsesContentPart(part map[string]any) (map[string]any, bool) {
+	partType, _ := part["type"].(string)
+	switch partType {
+	case "input_text", "output_text", "text":
+		text, _ := part["text"].(string)
+		if text == "" {
+			return nil, false
+		}
+		return map[string]any{
+			"type": "text",
+			"text": text,
+		}, true
+	case "input_image":
+		imageURL, _ := part["image_url"].(string)
+		if imageURL == "" {
+			return nil, false
+		}
+		imageURLValue := map[string]any{
+			"url": imageURL,
+		}
+		if detail, ok := part["detail"].(string); ok && detail != "" {
+			imageURLValue["detail"] = detail
+		}
+		return map[string]any{
+			"type":      "image_url",
+			"image_url": imageURLValue,
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func responsesContentToMessageContent(content any) any {
+	if content == nil {
+		return nil
+	}
+	if s, ok := content.(string); ok {
+		return s
+	}
+
+	parts, ok := content.([]any)
+	if !ok {
+		b, err := json.Marshal(content)
+		if err != nil {
+			return nil
+		}
+		return string(b)
+	}
+
+	convertedParts := make([]any, 0, len(parts))
+	texts := make([]string, 0, len(parts))
+	onlyTextParts := true
+
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			continue
+		}
+		convertedPart, ok := convertResponsesContentPart(part)
+		if !ok {
+			text := extractTextFromContentParts([]any{part})
+			if text == "" {
+				b, err := json.Marshal(part)
+				if err != nil {
+					continue
+				}
+				text = string(b)
+			}
+			convertedParts = append(convertedParts, map[string]any{
+				"type": "text",
+				"text": text,
+			})
+			texts = append(texts, text)
+			continue
+		}
+
+		if convertedPart["type"] != "text" {
+			onlyTextParts = false
+		}
+		if text, ok := convertedPart["text"].(string); ok && text != "" {
+			texts = append(texts, text)
+		}
+		convertedParts = append(convertedParts, convertedPart)
+	}
+
+	if len(convertedParts) == 0 {
+		return ""
+	}
+	if onlyTextParts {
+		return strings.Join(texts, "\n")
+	}
+	return convertedParts
+}
+
+func chatContentToResponsesContent(content any) ([]any, string) {
+	switch v := content.(type) {
+	case nil:
+		return nil, ""
+	case string:
+		if v == "" {
+			return nil, ""
+		}
+		return []any{map[string]any{
+			"type":        "output_text",
+			"text":        v,
+			"annotations": []any{},
+			"logprobs":    []any{},
+		}}, v
+	case []any:
+		parts := make([]any, 0, len(v))
+		texts := make([]string, 0, len(v))
+		for _, rawPart := range v {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				continue
+			}
+			partType, _ := part["type"].(string)
+			switch partType {
+			case "text", "input_text", "output_text":
+				text, _ := part["text"].(string)
+				if text == "" {
+					continue
+				}
+				annotations, ok := part["annotations"]
+				if !ok {
+					annotations = []any{}
+				}
+				logprobs, ok := part["logprobs"]
+				if !ok {
+					logprobs = []any{}
+				}
+				texts = append(texts, text)
+				parts = append(parts, map[string]any{
+					"type":        "output_text",
+					"text":        text,
+					"annotations": annotations,
+					"logprobs":    logprobs,
+				})
+			}
+		}
+		return parts, strings.Join(texts, "\n")
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, ""
+		}
+		text := string(b)
+		return []any{map[string]any{
+			"type":        "output_text",
+			"text":        text,
+			"annotations": []any{},
+			"logprobs":    []any{},
+		}}, text
+	}
 }
 
 func responsesHandler(w http.ResponseWriter, r *http.Request) {
@@ -2917,6 +3433,19 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respReq.Model = resolveModel(respReq.Model)
+	previousState, hasPreviousState := StoredResponseState{}, false
+	if respReq.PreviousResponseID != "" {
+		previousState, hasPreviousState = loadResponseState(respReq.PreviousResponseID)
+		if respReq.Model == "" && previousState.Model != "" {
+			respReq.Model = previousState.Model
+		}
+		if len(respReq.Tools) == 0 && len(previousState.Tools) > 0 {
+			respReq.Tools = previousState.Tools
+		}
+		if respReq.ToolChoice == nil && previousState.ToolChoice != nil {
+			respReq.ToolChoice = previousState.ToolChoice
+		}
+	}
 	if respReq.Model == "" {
 		modelIDs := getModelIDs()
 		if len(modelIDs) > 0 {
@@ -2930,7 +3459,10 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 	messages := respReq.Messages
 	if len(messages) == 0 {
-		messages = responsesInputToMessages(respReq.Input, respReq.Instructions)
+		if hasPreviousState && len(previousState.Output) > 0 {
+			messages = append(messages, responsesInputToMessages(previousState.Output, "")...)
+		}
+		messages = append(messages, responsesInputToMessages(respReq.Input, respReq.Instructions)...)
 	} else if respReq.Instructions != "" {
 		messages = append([]Message{{Role: "system", Content: respReq.Instructions}}, messages...)
 	}
@@ -2961,7 +3493,23 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		chatReq.ToolChoice = convertResponsesToolChoice(respReq.ToolChoice)
 	}
 	if respReq.ParallelToolCalls != nil {
-		chatReq.ExtraBody = map[string]any{"parallel_tool_calls": *respReq.ParallelToolCalls}
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["parallel_tool_calls"] = *respReq.ParallelToolCalls
+	}
+	if respReq.StreamOptions != nil {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		streamOptions, ok := respReq.StreamOptions.(map[string]any)
+		if !ok {
+			streamOptions = map[string]any{}
+		}
+		if _, exists := streamOptions["include_usage"]; !exists && respReq.Stream {
+			streamOptions["include_usage"] = true
+		}
+		chatReq.ExtraBody["stream_options"] = streamOptions
 	}
 	// 将 Responses API reasoning.effort 映射到 Chat Completions
 	if !getForceDisableThinking() && respReq.Reasoning.Effort != "" {
@@ -2999,7 +3547,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			Body:       upResp,
 			Header:     make(http.Header),
 		}
-		responsesStreamHandler(w, r, resp, chatReq.Model, chatReq.Model, wantReasoning, chatReq.Tools, chatReq.ToolChoice)
+		responsesStreamHandler(w, r, resp, chatReq.Model, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice, respReq)
 		return
 	}
 
@@ -3015,7 +3563,11 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responsesBody := convertChatToResponses(respBody, chatReq.Model, wantReasoning, chatReq.Tools, chatReq.ToolChoice)
+	responsesBody := convertChatToResponses(respBody, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice)
+	var responseMap map[string]any
+	if json.Unmarshal(responsesBody, &responseMap) == nil {
+		storeResponseState(responseMap, respReq)
+	}
 
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
@@ -3036,7 +3588,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 // ======================== Responses Stream Handler ========================
 
-func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.Response, model string, _ string, wantReasoning bool, tools []Tool, toolChoice any) {
+func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.Response, model string, _ string, wantReasoning bool, tools []ResponsesTool, toolChoice any, originalReq ResponsesAPIRequest) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -3061,6 +3613,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	createdSent := false
 	toolCalls := map[int]map[string]any{}
 	toolOrder := []int{}
+	toolKinds := responsesToolKindMap(tools)
 
 	messageOutputIndex := func() int {
 		if reasoningStarted {
@@ -3187,18 +3740,15 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			"arguments":       args,
 		})
 		seq++
+		itemType, _ := call["item_type"].(string)
+		if itemType == "" {
+			itemType = "function_call"
+		}
 		emitSSEEvent(w, flusher, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    idx,
-			"item": map[string]any{
-				"id":        itemID,
-				"type":      "function_call",
-				"status":    "completed",
-				"arguments": args,
-				"call_id":   callID,
-				"name":      name,
-			},
+			"item":            buildResponseToolCallItem(ToolCall{ID: callID, Function: FunctionCall{Name: name, Arguments: args}}, itemType),
 		})
 	}
 
@@ -3357,6 +3907,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 				}
 				fn, _ := tc["function"].(map[string]any)
 				name, _ := fn["name"].(string)
+				itemType := toolCallOutputType(name, toolKinds)
 				call = map[string]any{
 					"output_index": outputIndex,
 					"item_id":      "fc_" + callID,
@@ -3364,6 +3915,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 					"name":         name,
 					"arguments":    "",
 					"done":         false,
+					"item_type":    itemType,
 				}
 				toolCalls[upstreamIndex] = call
 				toolOrder = append(toolOrder, upstreamIndex)
@@ -3374,7 +3926,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 					"output_index":    outputIndex,
 					"item": map[string]any{
 						"id":        call["item_id"],
-						"type":      "function_call",
+						"type":      itemType,
 						"status":    "in_progress",
 						"arguments": "",
 						"call_id":   callID,
@@ -3385,6 +3937,9 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			fn, _ := tc["function"].(map[string]any)
 			if name, _ := fn["name"].(string); name != "" {
 				call["name"] = name
+				if call["item_type"] == "function_call" {
+					call["item_type"] = toolCallOutputType(name, toolKinds)
+				}
 			}
 			if argDelta, _ := fn["arguments"].(string); argDelta != "" {
 				call["arguments"] = call["arguments"].(string) + argDelta
@@ -3446,14 +4001,17 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	}
 	for _, idx := range toolOrder {
 		call := toolCalls[idx]
-		output = append(output, map[string]any{
-			"id":        call["item_id"],
-			"type":      "function_call",
-			"status":    "completed",
-			"arguments": call["arguments"],
-			"call_id":   call["call_id"],
-			"name":      call["name"],
-		})
+		itemType, _ := call["item_type"].(string)
+		if itemType == "" {
+			itemType = "function_call"
+		}
+		output = append(output, buildResponseToolCallItem(ToolCall{
+			ID: call["call_id"].(string),
+			Function: FunctionCall{
+				Name:      call["name"].(string),
+				Arguments: call["arguments"].(string),
+			},
+		}, itemType))
 	}
 
 	completedResponse := map[string]any{
@@ -3521,16 +4079,17 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	if flusher != nil {
 		flusher.Flush()
 	}
+	storeResponseState(completedResponse, originalReq)
 }
 
-func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, tools []Tool, toolChoice any) []byte {
+func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, tools []ResponsesTool, toolChoice any) []byte {
 	var chat struct {
 		ID      string `json:"id"`
 		Created int64  `json:"created"`
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
 			Message      struct {
-				Content          string     `json:"content"`
+				Content          any        `json:"content"`
 				ReasoningContent string     `json:"reasoning_content"`
 				ToolCalls        []ToolCall `json:"tool_calls"`
 			} `json:"message"`
@@ -3541,12 +4100,13 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		slog.Warn("convertChatToResponses unmarshal failed", "error", err)
 	}
 
-	text := ""
 	reasoning := ""
 	finishReason := ""
 	var toolCalls []ToolCall
+	messageContent := []any(nil)
+	toolKinds := responsesToolKindMap(tools)
 	if len(chat.Choices) > 0 {
-		text = chat.Choices[0].Message.Content
+		messageContent, _ = chatContentToResponsesContent(chat.Choices[0].Message.Content)
 		if wantReasoning {
 			reasoning = chat.Choices[0].Message.ReasoningContent
 		}
@@ -3585,29 +4145,17 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 			"summary":           []any{map[string]any{"type": "summary_text", "text": reasoning}},
 		})
 	}
-	if text != "" {
+	if len(messageContent) > 0 {
 		output = append(output, map[string]any{
-			"id":     outputID,
-			"type":   "message",
-			"status": "completed",
-			"role":   "assistant",
-			"content": []any{map[string]any{
-				"type":        "output_text",
-				"text":        text,
-				"annotations": []any{},
-				"logprobs":    []any{},
-			}},
+			"id":      outputID,
+			"type":    "message",
+			"status":  "completed",
+			"role":    "assistant",
+			"content": messageContent,
 		})
 	}
 	for _, tc := range toolCalls {
-		output = append(output, map[string]any{
-			"id":        "fc_" + tc.ID,
-			"type":      "function_call",
-			"status":    "completed",
-			"arguments": tc.Function.Arguments,
-			"call_id":   tc.ID,
-			"name":      tc.Function.Name,
-		})
+		output = append(output, buildResponseToolCallItem(tc, toolCallOutputType(tc.Function.Name, toolKinds)))
 	}
 	responses["output"] = output
 	if chat.Usage != nil {

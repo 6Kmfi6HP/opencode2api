@@ -38,6 +38,7 @@ type fakeRetryTransport struct {
 	t               *testing.T
 	responses       []fakeUpstreamResponse
 	requestedModels []string
+	requestPayloads []map[string]any
 	closeIdleCalls  int
 }
 
@@ -56,6 +57,7 @@ func (f *fakeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 	model, _ := payload["model"].(string)
 	f.requestedModels = append(f.requestedModels, model)
+	f.requestPayloads = append(f.requestPayloads, payload)
 
 	next := f.responses[0]
 	f.responses = f.responses[1:]
