@@ -1,6 +1,20 @@
 # API 兼容说明
 
-服务默认监听 `http://127.0.0.1:8000`，所有接口都不要求客户端传入真实 OpenAI 或 Anthropic API key。
+服务默认监听 `http://127.0.0.1:8000`，客户端不需要传入真实 OpenAI 或 Anthropic API key，但可以通过 `Authorization` 指定 OpenCode 上游模式。
+
+## 鉴权与上游选择
+
+- 无 `Authorization`，或 `Bearer public`
+  - 走 public Zen 免费模型。
+  - `/v1/models` 只返回 `-free` 模型和免费别名。
+- `Bearer <opencode-api-key>`
+  - 默认走 Zen。
+  - 如果请求的是仅存在于 Go 目录中的模型，代理会自动切到 Go。
+- `Bearer zen:<opencode-api-key>`
+  - 强制走 Zen。
+- `Bearer go:<opencode-api-key>`
+  - 优先走 Go 订阅目录。
+  - 对同时存在于 Zen 和 Go 的模型，也会按 Go 路径请求。
 
 ## 路由
 
@@ -14,6 +28,12 @@
 | `/api/config` | `GET`/`POST` | 管理面板配置接口 |
 | `/api/stats` | `GET`/`DELETE` | token 统计接口 |
 | `/api/reload` | `POST` | 刷新 OpenCode 会话和模型列表 |
+
+`GET /v1/models` 的返回会随鉴权模式变化：
+
+- `public` 只显示免费 Zen 模型。
+- 默认或 `zen:` 模式显示 Zen 目录。
+- `go:` 模式显示 Go 目录，并附带 public 可用的免费模型。
 
 ## Chat Completions
 

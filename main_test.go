@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -82,6 +83,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 
 	oldHTTPClient := httpClient
 	oldModelsCache := modelsCache
+	oldGoModelsCache := goModelsCache
 	oldOCClientVer := ocClientVer
 	oldOCSessionID := ocSessionID
 	oldOCProjectID := ocProjectID
@@ -97,6 +99,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 
 	modelMu.Lock()
 	modelsCache = []ModelInfo{{ID: "fallback-model"}}
+	goModelsCache = nil
 	modelMu.Unlock()
 
 	socks5Mu.Lock()
@@ -115,6 +118,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 		httpClient = oldHTTPClient
 		modelMu.Lock()
 		modelsCache = oldModelsCache
+		goModelsCache = oldGoModelsCache
 		modelMu.Unlock()
 		socks5Mu.Lock()
 		activeSocks5 = oldActiveSocks5
@@ -180,7 +184,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			)
 			if tt.stream {
 				var respBody io.ReadCloser
-				respBody, status, _, err = callOpenCodeAPIStream([]byte(tt.requestBody), "primary-model", "public", TierFree)
+				respBody, status, _, err = callOpenCodeAPIStream([]byte(tt.requestBody), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 				if respBody != nil {
 					defer respBody.Close()
 				}
@@ -188,7 +192,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 					body, err = io.ReadAll(respBody)
 				}
 			} else {
-				body, status, _, err = callOpenCodeAPI([]byte(tt.requestBody), "primary-model", "public", TierFree)
+				body, status, _, err = callOpenCodeAPI([]byte(tt.requestBody), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 			}
 			if err != nil {
 				t.Fatalf("upstream call error = %v", err)
@@ -223,7 +227,7 @@ func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
 		},
 	})
 
-	body, status, header, err := callOpenCodeAPI([]byte(`{"model":"primary-model","messages":[]}`), "primary-model", "public", TierFree)
+	body, status, header, err := callOpenCodeAPI([]byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 	if err == nil {
 		t.Fatal("callOpenCodeAPI() error = nil, want upstream error")
 	}
@@ -242,5 +246,165 @@ func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
 	}
 	if transport.closeIdleCalls != 1 {
 		t.Fatalf("CloseIdleConnections calls = %d, want 1", transport.closeIdleCalls)
+	}
+}
+
+func TestBuildOCRequestRoutesSharedAndGoOnlyModelsByAuthMode(t *testing.T) {
+	oldModelsCache := modelsCache
+	oldGoModelsCache := goModelsCache
+	modelMu.Lock()
+	modelsCache = []ModelInfo{
+		{ID: "glm-5.2"},
+		{ID: "gpt-5.5"},
+	}
+	goModelsCache = []ModelInfo{
+		{ID: "glm-5.2"},
+		{ID: "kimi-k2.7-code"},
+	}
+	modelMu.Unlock()
+	t.Cleanup(func() {
+		modelMu.Lock()
+		modelsCache = oldModelsCache
+		goModelsCache = oldGoModelsCache
+		modelMu.Unlock()
+	})
+
+	tests := []struct {
+		name    string
+		auth    UpstreamAuth
+		modelID string
+		wantURL string
+	}{
+		{
+			name:    "public stays on zen free surface",
+			auth:    UpstreamAuth{Mode: AuthRoutePublic},
+			modelID: "deepseek-v4-flash-free",
+			wantURL: "https://opencode.ai/zen/v1/chat/completions",
+		},
+		{
+			name:    "bare key keeps shared model on zen",
+			auth:    UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-auto"},
+			modelID: "glm-5.2",
+			wantURL: "https://opencode.ai/zen/v1/chat/completions",
+		},
+		{
+			name:    "go prefix sends shared model to go surface",
+			auth:    UpstreamAuth{Mode: AuthRouteGo, Token: "sk-go"},
+			modelID: "glm-5.2",
+			wantURL: "https://opencode.ai/zen/go/v1/chat/completions",
+		},
+		{
+			name:    "bare key still reaches go only models",
+			auth:    UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-auto"},
+			modelID: "kimi-k2.7-code",
+			wantURL: "https://opencode.ai/zen/go/v1/chat/completions",
+		},
+		{
+			name:    "zen prefix forces zen surface",
+			auth:    UpstreamAuth{Mode: AuthRouteZen, Token: "sk-zen"},
+			modelID: "glm-5.2",
+			wantURL: "https://opencode.ai/zen/v1/chat/completions",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := buildOCRequest(tt.modelID, map[string]any{"messages": []any{}}, tt.auth)
+			if err != nil {
+				t.Fatalf("buildOCRequest() error = %v", err)
+			}
+			if got := req.URL.String(); got != tt.wantURL {
+				t.Fatalf("buildOCRequest() URL = %q, want %q", got, tt.wantURL)
+			}
+			wantAuth := "Bearer public"
+			if tt.auth.Mode != AuthRoutePublic {
+				wantAuth = "Bearer " + tt.auth.Token
+			}
+			if got := req.Header.Get("Authorization"); got != wantAuth {
+				t.Fatalf("buildOCRequest() Authorization = %q, want %q", got, wantAuth)
+			}
+		})
+	}
+}
+
+func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
+	oldModelsCache := modelsCache
+	oldGoModelsCache := goModelsCache
+	oldModelsLoaded := modelsLoaded
+	oldModelAlias := modelAlias
+	modelMu.Lock()
+	modelsCache = []ModelInfo{
+		{ID: "deepseek-v4-flash-free"},
+		{ID: "glm-5.2"},
+		{ID: "gpt-5.5"},
+	}
+	goModelsCache = []ModelInfo{
+		{ID: "glm-5.2"},
+		{ID: "kimi-k2.7-code"},
+	}
+	modelsLoaded = true
+	modelMu.Unlock()
+	configMu.Lock()
+	modelAlias = map[string]string{}
+	configMu.Unlock()
+	t.Cleanup(func() {
+		modelMu.Lock()
+		modelsCache = oldModelsCache
+		goModelsCache = oldGoModelsCache
+		modelsLoaded = oldModelsLoaded
+		modelMu.Unlock()
+		configMu.Lock()
+		modelAlias = oldModelAlias
+		configMu.Unlock()
+	})
+
+	tests := []struct {
+		name       string
+		authHeader string
+		wantIDs    []string
+	}{
+		{
+			name:    "public only sees free zen models",
+			wantIDs: []string{"deepseek-v4-flash-free"},
+		},
+		{
+			name:       "bare zen key sees zen catalog only",
+			authHeader: "Bearer sk-auto",
+			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "gpt-5.5"},
+		},
+		{
+			name:       "go prefix sees free and go catalog",
+			authHeader: "Bearer go:sk-go",
+			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "kimi-k2.7-code"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+			rec := httptest.NewRecorder()
+
+			listModelsHandler(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("listModelsHandler() status = %d, want %d", rec.Code, http.StatusOK)
+			}
+			var payload struct {
+				Data []ModelInfo `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("unmarshal models response: %v", err)
+			}
+			gotIDs := make([]string, 0, len(payload.Data))
+			for _, model := range payload.Data {
+				gotIDs = append(gotIDs, model.ID)
+			}
+			if !reflect.DeepEqual(gotIDs, tt.wantIDs) {
+				t.Fatalf("listModelsHandler() ids = %#v, want %#v", gotIDs, tt.wantIDs)
+			}
+		})
 	}
 }

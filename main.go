@@ -344,10 +344,10 @@ type ModelInfo struct {
 }
 
 var (
-	modelsCache     []ModelInfo
-	paidModelsCache []ModelInfo
-	modelMu         sync.RWMutex
-	modelsLoaded    bool
+	modelsCache   []ModelInfo
+	goModelsCache []ModelInfo
+	modelMu       sync.RWMutex
+	modelsLoaded  bool
 )
 
 func fetchModels() ([]ModelInfo, error) {
@@ -376,8 +376,7 @@ func fetchModels() ([]ModelInfo, error) {
 	return models, nil
 }
 
-// fetchPaidModels 从付费层级(/go/ endpoint)获取模型列表
-func fetchPaidModels() ([]ModelInfo, error) {
+func fetchGoModels() ([]ModelInfo, error) {
 	req, _ := http.NewRequest("GET", "https://opencode.ai/zen/go/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
 	req.Header.Set("x-opencode-session", ocSessionID)
@@ -403,22 +402,25 @@ func fetchPaidModels() ([]ModelInfo, error) {
 	return models, nil
 }
 
-// isPaidOnlyModel 检查模型是否仅在付费层级可用
-func isPaidOnlyModel(modelID string) bool {
-	modelMu.RLock()
-	defer modelMu.RUnlock()
-	for _, m := range paidModelsCache {
-		if m.ID == modelID {
-			// 检查该模型是否也在免费列表中
-			for _, fm := range modelsCache {
-				if fm.ID == modelID {
-					return false // 两个层级都有，优先用免费
-				}
-			}
-			return true // 仅在付费层级
+func containsModelWithID(models []ModelInfo, modelID string) bool {
+	for _, model := range models {
+		if model.ID == modelID {
+			return true
 		}
 	}
 	return false
+}
+
+func isModelInGoCatalog(modelID string) bool {
+	modelMu.RLock()
+	defer modelMu.RUnlock()
+	return containsModelWithID(goModelsCache, modelID)
+}
+
+func isGoCatalogOnlyModel(modelID string) bool {
+	modelMu.RLock()
+	defer modelMu.RUnlock()
+	return containsModelWithID(goModelsCache, modelID) && !containsModelWithID(modelsCache, modelID)
 }
 
 func getModelIDs() []string {
@@ -448,14 +450,14 @@ func startModelRefresh() {
 				slog.Error("free models refresh failed", "error", err)
 			}
 
-			paidFetched, paidErr := fetchPaidModels()
-			if paidErr == nil && len(paidFetched) > 0 {
+			goFetched, goErr := fetchGoModels()
+			if goErr == nil && len(goFetched) > 0 {
 				modelMu.Lock()
-				paidModelsCache = paidFetched
+				goModelsCache = goFetched
 				modelMu.Unlock()
-				slog.Info("paid models auto-refreshed", "count", len(paidFetched))
-			} else if paidErr != nil {
-				slog.Error("paid models refresh failed", "error", paidErr)
+				slog.Info("go catalog auto-refreshed", "count", len(goFetched))
+			} else if goErr != nil {
+				slog.Error("go catalog refresh failed", "error", goErr)
 			}
 		}
 	}()
@@ -1472,33 +1474,65 @@ const (
 	TierPaid
 )
 
-// tierUpstreamURL 返回对应层级的 upstream URL
-func (t TierType) upstreamURL() string {
-	if t == TierPaid {
-		return "https://opencode.ai/zen/go/v1/chat/completions"
-	}
-	return "https://opencode.ai/zen/v1/chat/completions"
+type AuthRouteMode int
+
+const (
+	AuthRoutePublic AuthRouteMode = iota
+	AuthRouteAuto
+	AuthRouteZen
+	AuthRouteGo
+)
+
+type UpstreamAuth struct {
+	Token string
+	Mode  AuthRouteMode
 }
 
-// tierModelsURL 返回对应层级的模型列表 URL
-func (t TierType) modelsURL() string {
-	if t == TierPaid {
-		return "https://opencode.ai/zen/go/v1/models"
-	}
-	return "https://opencode.ai/zen/v1/models"
-}
-
-// extractAuthTier 从请求中提取 Bearer token 并判断层级
-func extractAuthTier(r *http.Request) (bearerToken string, tier TierType) {
+func extractUpstreamAuth(r *http.Request) UpstreamAuth {
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, "Bearer ") {
-		return "", TierFree
+		return UpstreamAuth{Mode: AuthRoutePublic}
 	}
 	token := strings.TrimPrefix(auth, "Bearer ")
 	if token == "public" {
-		return token, TierFree
+		return UpstreamAuth{Mode: AuthRoutePublic}
 	}
-	return token, TierPaid
+	if strings.HasPrefix(token, "go:") {
+		return UpstreamAuth{Token: strings.TrimPrefix(token, "go:"), Mode: AuthRouteGo}
+	}
+	if strings.HasPrefix(token, "zen:") {
+		return UpstreamAuth{Token: strings.TrimPrefix(token, "zen:"), Mode: AuthRouteZen}
+	}
+	return UpstreamAuth{Token: token, Mode: AuthRouteAuto}
+}
+
+func (auth UpstreamAuth) tier() TierType {
+	if auth.Mode == AuthRoutePublic {
+		return TierFree
+	}
+	return TierPaid
+}
+
+func (auth UpstreamAuth) authorizationHeader() string {
+	if auth.Mode == AuthRoutePublic {
+		return "Bearer public"
+	}
+	return "Bearer " + auth.Token
+}
+
+func (auth UpstreamAuth) shouldUseGoCatalog() bool {
+	return auth.Mode == AuthRouteGo
+}
+
+func (auth UpstreamAuth) shouldUseGoEndpoint(modelID string) bool {
+	switch auth.Mode {
+	case AuthRouteGo:
+		return isModelInGoCatalog(modelID)
+	case AuthRouteAuto:
+		return isGoCatalogOnlyModel(modelID)
+	default:
+		return false
+	}
 }
 
 // isFreeModel 判断模型是否属于免费模型（以 -free 结尾）
@@ -1506,23 +1540,15 @@ func isFreeModel(modelID string) bool {
 	return strings.HasSuffix(modelID, "-free")
 }
 
-func buildOCRequest(modelID string, bodyMap map[string]any, bearerToken string) (*http.Request, error) {
+func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (*http.Request, error) {
 	bodyMap["model"] = modelID
 	delete(bodyMap, "reasoning_effort")
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
 		return nil, err
 	}
-	// 根据模型所在层级决定上游 URL
-	hasKey := bearerToken != "" && bearerToken != "public"
-	usePaidEndpoint := hasKey && isPaidOnlyModel(modelID)
-
-	authValue := "Bearer public"
-	if hasKey {
-		authValue = "Bearer " + bearerToken
-	}
 	var upstreamURL string
-	if usePaidEndpoint {
+	if auth.shouldUseGoEndpoint(modelID) {
 		upstreamURL = "https://opencode.ai/zen/go/v1/chat/completions"
 	} else {
 		upstreamURL = "https://opencode.ai/zen/v1/chat/completions"
@@ -1532,7 +1558,7 @@ func buildOCRequest(modelID string, bodyMap map[string]any, bearerToken string) 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authValue)
+	req.Header.Set("Authorization", auth.authorizationHeader())
 	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s", ocClientVer))
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-project", ocProjectID)
@@ -1561,7 +1587,7 @@ const (
 	max401Retries      = 3
 )
 
-func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string, tier TierType) ([]byte, int, http.Header, error) {
+func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {
 	initOCSession()
 	modelIDs := getModelIDs()
 	modelsToTry := []string{modelID}
@@ -1587,12 +1613,12 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string, ti
 	var lastStatus int
 	var lastHeader http.Header
 	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequest(tryModel, bodyMap, bearerToken)
+		up, err := buildOCRequest(tryModel, bodyMap, auth)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		client := getHTTPClientForTier(tier)
+		client := getHTTPClientForTier(auth.tier())
 		resp, err := client.Do(up)
 		if err != nil {
 			lastErr = err
@@ -1636,7 +1662,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, bearerToken string, ti
 	return lastBody, lastStatus, lastHeader, lastErr
 }
 
-func callOpenCodeAPIStream(upstreamBody []byte, modelID string, bearerToken string, tier TierType) (io.ReadCloser, int, http.Header, error) {
+func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
 	modelIDs := getModelIDs()
 	modelsToTry := []string{modelID}
@@ -1660,11 +1686,11 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, bearerToken stri
 	var retryCount int
 	var retry401Count int
 	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequest(tryModel, bodyMap, bearerToken)
+		up, err := buildOCRequest(tryModel, bodyMap, auth)
 		if err != nil {
 			continue
 		}
-		client := getHTTPClientForTier(tier)
+		client := getHTTPClientForTier(auth.tier())
 		resp, err := client.Do(up)
 		if err != nil {
 			continue
@@ -1729,7 +1755,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	bearerToken, tier := extractAuthTier(r)
+	auth := extractUpstreamAuth(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -1768,7 +1794,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model, bearerToken, tier)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model, auth)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -1849,7 +1875,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model, bearerToken, tier)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -1923,30 +1949,24 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		aliasModels = append(aliasModels, ModelInfo{ID: alias, Object: "model", Created: now, OwnedBy: "alias"})
 	}
 
-	// 根据认证层级过滤模型
-	bearerToken, _ := extractAuthTier(r)
-	paid := bearerToken != "" && bearerToken != "public"
-
-	// 付费用户可以看到免费和付费两个层级的模型
+	auth := extractUpstreamAuth(r)
 	var combinedModels []ModelInfo
-	if paid {
+	switch {
+	case auth.shouldUseGoCatalog():
 		modelMu.RLock()
-		combinedModels = make([]ModelInfo, 0, len(models)+len(paidModelsCache))
-		combinedModels = append(combinedModels, models...)
-		for _, pm := range paidModelsCache {
-			dup := false
-			for _, fm := range models {
-				if fm.ID == pm.ID {
-					dup = true
-					break
-				}
+		combinedModels = make([]ModelInfo, 0, len(models)+len(goModelsCache))
+		for _, model := range models {
+			if isFreeModel(model.ID) {
+				combinedModels = append(combinedModels, model)
 			}
-			if !dup {
-				combinedModels = append(combinedModels, pm)
+		}
+		for _, goModel := range goModelsCache {
+			if !containsModelWithID(combinedModels, goModel.ID) {
+				combinedModels = append(combinedModels, goModel)
 			}
 		}
 		modelMu.RUnlock()
-	} else {
+	case auth.Mode == AuthRoutePublic:
 		combinedModels = models
 		filtered := make([]ModelInfo, 0, len(combinedModels))
 		for _, m := range combinedModels {
@@ -1957,10 +1977,11 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		if len(filtered) > 0 {
 			combinedModels = filtered
 		}
+	default:
+		combinedModels = models
 	}
 	allModels := append(combinedModels, aliasModels...)
-	// 免费用户还要过滤别名中的非免费模型
-	if !paid {
+	if auth.Mode == AuthRoutePublic {
 		filtered := make([]ModelInfo, 0, len(allModels))
 		for _, m := range allModels {
 			if isFreeModel(m.ID) {
@@ -2391,7 +2412,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	bearerToken, tier := extractAuthTier(r)
+	auth := extractUpstreamAuth(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -2449,7 +2470,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if claudeReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, bearerToken, tier)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, auth)
 		if err != nil || status < 200 || status >= 300 {
 			errResp := map[string]any{
 				"type":  "error",
@@ -2465,7 +2486,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, bearerToken, tier)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -3416,7 +3437,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	bearerToken, tier := extractAuthTier(r)
+	auth := extractUpstreamAuth(r)
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -3526,7 +3547,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if respReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, bearerToken, tier)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, auth)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -3551,7 +3572,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, bearerToken, tier)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -4219,19 +4240,19 @@ func reloadHandler(w http.ResponseWriter, r *http.Request) {
 		modelMu.Unlock()
 		slog.Info("free models refreshed", "count", len(fetched))
 	}
-	paidFetched, paidErr := fetchPaidModels()
-	if paidErr == nil && len(paidFetched) > 0 {
+	goFetched, goErr := fetchGoModels()
+	if goErr == nil && len(goFetched) > 0 {
 		modelMu.Lock()
-		paidModelsCache = paidFetched
+		goModelsCache = goFetched
 		modelMu.Unlock()
-		slog.Info("paid models refreshed", "count", len(paidFetched))
+		slog.Info("go catalog refreshed", "count", len(goFetched))
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"status":  "ok",
 		"session": ocSessionID,
 		"free":    len(modelsCache),
-		"paid":    len(paidModelsCache),
+		"go":      len(goModelsCache),
 	})
 
 }
@@ -4655,14 +4676,14 @@ func main() {
 		slog.Info("models loaded", "count", len(models))
 	}
 
-	paidModels, paidErr := fetchPaidModels()
-	if paidErr != nil {
-		slog.Warn("failed to fetch paid models on startup", "error", paidErr)
+	goModels, goErr := fetchGoModels()
+	if goErr != nil {
+		slog.Warn("failed to fetch go catalog on startup", "error", goErr)
 	} else {
 		modelMu.Lock()
-		paidModelsCache = paidModels
+		goModelsCache = goModels
 		modelMu.Unlock()
-		slog.Info("paid models loaded", "count", len(paidModels))
+		slog.Info("go catalog loaded", "count", len(goModels))
 	}
 	startModelRefresh()
 	slog.Info("server starting",
