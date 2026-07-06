@@ -43,6 +43,7 @@ curl http://127.0.0.1:8000/v1/models
 - 使用 `Bearer <api-key>`：默认走 Zen；如果请求的是仅存在于 Go 目录中的模型，会自动切到 Go。
 - 使用 `Bearer zen:<api-key>`：强制走 Zen，适合你明确要用 Zen 按量计费目录时。
 - 使用 `Bearer go:<api-key>`：优先走 Go 订阅目录；共享模型也会按 Go 路径请求。
+- 无效或占位 key（如 `no-key-required`）会自动回退到 public 模式。
 
 Chat Completions 示例：
 
