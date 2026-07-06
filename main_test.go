@@ -98,7 +98,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	httpClient = &http.Client{Transport: transport}
 
 	modelMu.Lock()
-	modelsCache = []ModelInfo{{ID: "fallback-model"}}
+	modelsCache = []ModelInfo{{ID: "fallback-model-free"}}
 	goModelsCache = nil
 	modelMu.Unlock()
 
@@ -154,7 +154,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			},
 			wantStatus:  http.StatusOK,
 			wantBody:    `{"id":"chatcmpl_test","choices":[]}`,
-			wantModels:  []string{"primary-model", "fallback-model"},
+			wantModels:  []string{"primary-model", "fallback-model-free"},
 			wantCloses:  1,
 			requestBody: `{"model":"primary-model","messages":[]}`,
 		},
@@ -167,7 +167,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			},
 			wantStatus:  http.StatusOK,
 			wantBody:    "data: ok\n\n",
-			wantModels:  []string{"primary-model", "fallback-model"},
+			wantModels:  []string{"primary-model", "fallback-model-free"},
 			wantCloses:  1,
 			requestBody: `{"model":"primary-model","messages":[],"stream":true}`,
 		},
@@ -240,7 +240,7 @@ func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
 	if header.Get("X-Upstream-Error") != "last" {
 		t.Fatalf("final header = %q, want last", header.Get("X-Upstream-Error"))
 	}
-	wantModels := []string{"primary-model", "fallback-model"}
+	wantModels := []string{"primary-model", "fallback-model-free"}
 	if !reflect.DeepEqual(transport.requestedModels, wantModels) {
 		t.Fatalf("requested models = %#v, want %#v", transport.requestedModels, wantModels)
 	}

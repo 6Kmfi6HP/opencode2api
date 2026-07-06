@@ -433,6 +433,38 @@ func getModelIDs() []string {
 	return ids
 }
 
+func getGoModelIDs() []string {
+	modelMu.RLock()
+	defer modelMu.RUnlock()
+	ids := make([]string, len(goModelsCache))
+	for i, m := range goModelsCache {
+		ids[i] = m.ID
+	}
+	return ids
+}
+
+func filterFreeModels(ids []string) []string {
+	free := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if isFreeModel(id) {
+			free = append(free, id)
+		}
+	}
+	return free
+}
+
+// getCandidateModels 返回与当前认证权限一致的回退候选模型列表。
+// public 模式只回退到免费模型；带 key 的模式只回退到与目标模型走相同端点的模型，避免跨目录 401。
+func getCandidateModels(auth UpstreamAuth, modelID string) []string {
+	if auth.Mode == AuthRoutePublic {
+		return filterFreeModels(getModelIDs())
+	}
+	if auth.shouldUseGoEndpoint(modelID) {
+		return getGoModelIDs()
+	}
+	return getModelIDs()
+}
+
 // startModelRefresh 定时刷新模型列表（每 10 分钟）
 func startModelRefresh() {
 	go func() {
@@ -1589,9 +1621,9 @@ const (
 
 func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {
 	initOCSession()
-	modelIDs := getModelIDs()
+	candidates := getCandidateModels(auth, modelID)
 	modelsToTry := []string{modelID}
-	for _, m := range modelIDs {
+	for _, m := range candidates {
 		if m != modelID {
 			modelsToTry = append(modelsToTry, m)
 		}
@@ -1664,9 +1696,9 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 
 func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
-	modelIDs := getModelIDs()
+	candidates := getCandidateModels(auth, modelID)
 	modelsToTry := []string{modelID}
-	for _, m := range modelIDs {
+	for _, m := range candidates {
 		if m != modelID {
 			modelsToTry = append(modelsToTry, m)
 		}
