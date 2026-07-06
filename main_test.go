@@ -369,12 +369,12 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 		},
 		{
 			name:       "bare zen key sees zen catalog only",
-			authHeader: "Bearer sk-auto",
+			authHeader: "Bearer sk-auto0123456789abcdef",
 			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "gpt-5.5"},
 		},
 		{
 			name:       "go prefix sees free and go catalog",
-			authHeader: "Bearer go:sk-go",
+			authHeader: "Bearer go:sk-go0123456789abcdef",
 			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "kimi-k2.7-code"},
 		},
 	}
@@ -404,6 +404,42 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotIDs, tt.wantIDs) {
 				t.Fatalf("listModelsHandler() ids = %#v, want %#v", gotIDs, tt.wantIDs)
+			}
+		})
+	}
+}
+
+func TestExtractUpstreamAuthKeyValidation(t *testing.T) {
+	tests := []struct {
+		name       string
+		authHeader string
+		wantMode   AuthRouteMode
+		wantToken  string
+	}{
+		{"no header", "", AuthRoutePublic, ""},
+		{"bearer empty", "Bearer ", AuthRoutePublic, ""},
+		{"bearer public", "Bearer public", AuthRoutePublic, ""},
+		{"bearer no-key-required placeholder", "Bearer no-key-required", AuthRoutePublic, ""},
+		{"bearer random non-key", "Bearer abc123xyz", AuthRoutePublic, ""},
+		{"valid sk key", "Bearer sk-validkey0123456789abcdef", AuthRouteAuto, "sk-validkey0123456789abcdef"},
+		{"go prefix with sk key", "Bearer go:sk-gokey0123456789abcdef", AuthRouteGo, "sk-gokey0123456789abcdef"},
+		{"zen prefix with sk key", "Bearer zen:sk-zenkey0123456789abcdef", AuthRouteZen, "sk-zenkey0123456789abcdef"},
+		{"go prefix with placeholder falls to public", "Bearer go:no-key-required", AuthRoutePublic, ""},
+		{"bare sk- with no suffix is invalid", "Bearer sk-", AuthRoutePublic, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+			auth := extractUpstreamAuth(req)
+			if auth.Mode != tt.wantMode {
+				t.Fatalf("mode = %v, want %v", auth.Mode, tt.wantMode)
+			}
+			if auth.Token != tt.wantToken {
+				t.Fatalf("token = %q, want %q", auth.Token, tt.wantToken)
 			}
 		})
 	}

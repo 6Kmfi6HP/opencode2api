@@ -1525,17 +1525,27 @@ func extractUpstreamAuth(r *http.Request) UpstreamAuth {
 	if !strings.HasPrefix(auth, "Bearer ") {
 		return UpstreamAuth{Mode: AuthRoutePublic}
 	}
-	token := strings.TrimPrefix(auth, "Bearer ")
-	if token == "public" {
+	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	if token == "" || token == "public" {
 		return UpstreamAuth{Mode: AuthRoutePublic}
 	}
-	if strings.HasPrefix(token, "go:") {
-		return UpstreamAuth{Token: strings.TrimPrefix(token, "go:"), Mode: AuthRouteGo}
+	// go:/zen: 前缀路由：去掉前缀后剩余部分仍需是有效 key（sk- 开头）
+	if rest, ok := strings.CutPrefix(token, "go:"); ok && isValidOpenCodeKey(rest) {
+		return UpstreamAuth{Token: rest, Mode: AuthRouteGo}
 	}
-	if strings.HasPrefix(token, "zen:") {
-		return UpstreamAuth{Token: strings.TrimPrefix(token, "zen:"), Mode: AuthRouteZen}
+	if rest, ok := strings.CutPrefix(token, "zen:"); ok && isValidOpenCodeKey(rest) {
+		return UpstreamAuth{Token: rest, Mode: AuthRouteZen}
 	}
-	return UpstreamAuth{Token: token, Mode: AuthRouteAuto}
+	// 只有 sk- 开头的才是有效 key，其余（no-key-required 等占位符）一律走 public
+	if isValidOpenCodeKey(token) {
+		return UpstreamAuth{Token: token, Mode: AuthRouteAuto}
+	}
+	return UpstreamAuth{Mode: AuthRoutePublic}
+}
+
+// 只认 sk- 开头的 key，避免客户端占位 key（如 no-key-required）被透传给上游导致 401
+func isValidOpenCodeKey(token string) bool {
+	return strings.HasPrefix(token, "sk-") && len(token) > 15
 }
 
 func (auth UpstreamAuth) tier() TierType {
