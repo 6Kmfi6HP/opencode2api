@@ -39,6 +39,7 @@ type fakeRetryTransport struct {
 	t               *testing.T
 	responses       []fakeUpstreamResponse
 	requestedModels []string
+	requestedURLs   []string
 	requestPayloads []map[string]any
 	closeIdleCalls  int
 }
@@ -58,6 +59,7 @@ func (f *fakeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 	model, _ := payload["model"].(string)
 	f.requestedModels = append(f.requestedModels, model)
+	f.requestedURLs = append(f.requestedURLs, req.URL.String())
 	f.requestPayloads = append(f.requestPayloads, payload)
 
 	next := f.responses[0]
@@ -208,6 +210,58 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			}
 			if transport.closeIdleCalls != tt.wantCloses {
 				t.Fatalf("CloseIdleConnections calls = %d, want %d", transport.closeIdleCalls, tt.wantCloses)
+			}
+		})
+	}
+}
+
+func TestCallOpenCodeAPIFallbackKeepsOriginalGoEndpoint(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non-stream", stream: false},
+		{name: "stream", stream: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+				{status: http.StatusUnauthorized, body: `{"error":"unauthorized"}`},
+				{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
+			})
+			modelMu.Lock()
+			modelsCache = []ModelInfo{{ID: "shared-model"}}
+			goModelsCache = []ModelInfo{{ID: "go-only-model"}, {ID: "shared-model"}}
+			modelMu.Unlock()
+
+			auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-validkey0123456789abcdef"}
+			body := []byte(`{"model":"go-only-model","messages":[]}`)
+			if tt.stream {
+				body = []byte(`{"model":"go-only-model","messages":[],"stream":true}`)
+				respBody, status, _, err := callOpenCodeAPIStream(body, "go-only-model", auth)
+				if respBody != nil {
+					defer respBody.Close()
+				}
+				if err != nil {
+					t.Fatalf("callOpenCodeAPIStream() error = %v", err)
+				}
+				if status != http.StatusOK {
+					t.Fatalf("callOpenCodeAPIStream() status = %d, want %d", status, http.StatusOK)
+				}
+			} else {
+				_, status, _, err := callOpenCodeAPI(body, "go-only-model", auth)
+				if err != nil {
+					t.Fatalf("callOpenCodeAPI() error = %v", err)
+				}
+				if status != http.StatusOK {
+					t.Fatalf("callOpenCodeAPI() status = %d, want %d", status, http.StatusOK)
+				}
+			}
+
+			wantURL := "https://opencode.ai/zen/go/v1/chat/completions"
+			if !reflect.DeepEqual(transport.requestedURLs, []string{wantURL, wantURL}) {
+				t.Fatalf("requested URLs = %#v, want both requests to %q", transport.requestedURLs, wantURL)
 			}
 		})
 	}

@@ -1583,6 +1583,10 @@ func isFreeModel(modelID string) bool {
 }
 
 func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (*http.Request, error) {
+	return buildOCRequestWithEndpoint(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID))
+}
+
+func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool) (*http.Request, error) {
 	bodyMap["model"] = modelID
 	delete(bodyMap, "reasoning_effort")
 	tryBody, err := json.Marshal(bodyMap)
@@ -1590,7 +1594,7 @@ func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (
 		return nil, err
 	}
 	var upstreamURL string
-	if auth.shouldUseGoEndpoint(modelID) {
+	if useGoEndpoint {
 		upstreamURL = "https://opencode.ai/zen/go/v1/chat/completions"
 	} else {
 		upstreamURL = "https://opencode.ai/zen/v1/chat/completions"
@@ -1642,11 +1646,11 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 		modelsToTry = []string{modelID}
 	}
 
-	// 循环外解析一次
 	var bodyMap map[string]any
 	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
 		return nil, 500, nil, fmt.Errorf("invalid request body")
 	}
+	useGoEndpoint := auth.shouldUseGoEndpoint(modelID)
 
 	var lastErr error
 	var retryCount int
@@ -1655,7 +1659,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 	var lastStatus int
 	var lastHeader http.Header
 	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequest(tryModel, bodyMap, auth)
+		up, err := buildOCRequestWithEndpoint(tryModel, bodyMap, auth, useGoEndpoint)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1721,6 +1725,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAut
 	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
 		return nil, 500, nil, fmt.Errorf("invalid request body")
 	}
+	useGoEndpoint := auth.shouldUseGoEndpoint(modelID)
 
 	var lastBody []byte
 	var lastStatus int
@@ -1728,7 +1733,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAut
 	var retryCount int
 	var retry401Count int
 	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequest(tryModel, bodyMap, auth)
+		up, err := buildOCRequestWithEndpoint(tryModel, bodyMap, auth, useGoEndpoint)
 		if err != nil {
 			continue
 		}
