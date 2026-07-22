@@ -39,6 +39,7 @@ type fakeRetryTransport struct {
 	t               *testing.T
 	responses       []fakeUpstreamResponse
 	requestedModels []string
+	requestedURLs   []string
 	requestPayloads []map[string]any
 	closeIdleCalls  int
 }
@@ -58,6 +59,7 @@ func (f *fakeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 	model, _ := payload["model"].(string)
 	f.requestedModels = append(f.requestedModels, model)
+	f.requestedURLs = append(f.requestedURLs, req.URL.String())
 	f.requestPayloads = append(f.requestPayloads, payload)
 
 	next := f.responses[0]
@@ -98,7 +100,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	httpClient = &http.Client{Transport: transport}
 
 	modelMu.Lock()
-	modelsCache = []ModelInfo{{ID: "fallback-model"}}
+	modelsCache = []ModelInfo{{ID: "fallback-model-free"}}
 	goModelsCache = nil
 	modelMu.Unlock()
 
@@ -154,7 +156,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			},
 			wantStatus:  http.StatusOK,
 			wantBody:    `{"id":"chatcmpl_test","choices":[]}`,
-			wantModels:  []string{"primary-model", "fallback-model"},
+			wantModels:  []string{"primary-model", "fallback-model-free"},
 			wantCloses:  1,
 			requestBody: `{"model":"primary-model","messages":[]}`,
 		},
@@ -167,7 +169,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			},
 			wantStatus:  http.StatusOK,
 			wantBody:    "data: ok\n\n",
-			wantModels:  []string{"primary-model", "fallback-model"},
+			wantModels:  []string{"primary-model", "fallback-model-free"},
 			wantCloses:  1,
 			requestBody: `{"model":"primary-model","messages":[],"stream":true}`,
 		},
@@ -213,6 +215,58 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 	}
 }
 
+func TestCallOpenCodeAPIFallbackKeepsOriginalGoEndpoint(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non-stream", stream: false},
+		{name: "stream", stream: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+				{status: http.StatusUnauthorized, body: `{"error":"unauthorized"}`},
+				{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
+			})
+			modelMu.Lock()
+			modelsCache = []ModelInfo{{ID: "shared-model"}}
+			goModelsCache = []ModelInfo{{ID: "go-only-model"}, {ID: "shared-model"}}
+			modelMu.Unlock()
+
+			auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-validkey0123456789abcdef"}
+			body := []byte(`{"model":"go-only-model","messages":[]}`)
+			if tt.stream {
+				body = []byte(`{"model":"go-only-model","messages":[],"stream":true}`)
+				respBody, status, _, err := callOpenCodeAPIStream(body, "go-only-model", auth)
+				if respBody != nil {
+					defer respBody.Close()
+				}
+				if err != nil {
+					t.Fatalf("callOpenCodeAPIStream() error = %v", err)
+				}
+				if status != http.StatusOK {
+					t.Fatalf("callOpenCodeAPIStream() status = %d, want %d", status, http.StatusOK)
+				}
+			} else {
+				_, status, _, err := callOpenCodeAPI(body, "go-only-model", auth)
+				if err != nil {
+					t.Fatalf("callOpenCodeAPI() error = %v", err)
+				}
+				if status != http.StatusOK {
+					t.Fatalf("callOpenCodeAPI() status = %d, want %d", status, http.StatusOK)
+				}
+			}
+
+			wantURL := "https://opencode.ai/zen/go/v1/chat/completions"
+			if !reflect.DeepEqual(transport.requestedURLs, []string{wantURL, wantURL}) {
+				t.Fatalf("requested URLs = %#v, want both requests to %q", transport.requestedURLs, wantURL)
+			}
+		})
+	}
+}
+
 func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
 		{
@@ -240,7 +294,7 @@ func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
 	if header.Get("X-Upstream-Error") != "last" {
 		t.Fatalf("final header = %q, want last", header.Get("X-Upstream-Error"))
 	}
-	wantModels := []string{"primary-model", "fallback-model"}
+	wantModels := []string{"primary-model", "fallback-model-free"}
 	if !reflect.DeepEqual(transport.requestedModels, wantModels) {
 		t.Fatalf("requested models = %#v, want %#v", transport.requestedModels, wantModels)
 	}
@@ -369,12 +423,12 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 		},
 		{
 			name:       "bare zen key sees zen catalog only",
-			authHeader: "Bearer sk-auto",
+			authHeader: "Bearer sk-auto0123456789abcdef",
 			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "gpt-5.5"},
 		},
 		{
 			name:       "go prefix sees free and go catalog",
-			authHeader: "Bearer go:sk-go",
+			authHeader: "Bearer go:sk-go0123456789abcdef",
 			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "kimi-k2.7-code"},
 		},
 	}
@@ -404,6 +458,42 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotIDs, tt.wantIDs) {
 				t.Fatalf("listModelsHandler() ids = %#v, want %#v", gotIDs, tt.wantIDs)
+			}
+		})
+	}
+}
+
+func TestExtractUpstreamAuthKeyValidation(t *testing.T) {
+	tests := []struct {
+		name       string
+		authHeader string
+		wantMode   AuthRouteMode
+		wantToken  string
+	}{
+		{"no header", "", AuthRoutePublic, ""},
+		{"bearer empty", "Bearer ", AuthRoutePublic, ""},
+		{"bearer public", "Bearer public", AuthRoutePublic, ""},
+		{"bearer no-key-required placeholder", "Bearer no-key-required", AuthRoutePublic, ""},
+		{"bearer random non-key", "Bearer abc123xyz", AuthRoutePublic, ""},
+		{"valid sk key", "Bearer sk-validkey0123456789abcdef", AuthRouteAuto, "sk-validkey0123456789abcdef"},
+		{"go prefix with sk key", "Bearer go:sk-gokey0123456789abcdef", AuthRouteGo, "sk-gokey0123456789abcdef"},
+		{"zen prefix with sk key", "Bearer zen:sk-zenkey0123456789abcdef", AuthRouteZen, "sk-zenkey0123456789abcdef"},
+		{"go prefix with placeholder falls to public", "Bearer go:no-key-required", AuthRoutePublic, ""},
+		{"bare sk- with no suffix is invalid", "Bearer sk-", AuthRoutePublic, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+			auth := extractUpstreamAuth(req)
+			if auth.Mode != tt.wantMode {
+				t.Fatalf("mode = %v, want %v", auth.Mode, tt.wantMode)
+			}
+			if auth.Token != tt.wantToken {
+				t.Fatalf("token = %q, want %q", auth.Token, tt.wantToken)
 			}
 		})
 	}

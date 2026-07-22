@@ -433,6 +433,38 @@ func getModelIDs() []string {
 	return ids
 }
 
+func getGoModelIDs() []string {
+	modelMu.RLock()
+	defer modelMu.RUnlock()
+	ids := make([]string, len(goModelsCache))
+	for i, m := range goModelsCache {
+		ids[i] = m.ID
+	}
+	return ids
+}
+
+func filterFreeModels(ids []string) []string {
+	free := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if isFreeModel(id) {
+			free = append(free, id)
+		}
+	}
+	return free
+}
+
+// getCandidateModels 返回与当前认证权限一致的回退候选模型列表。
+// public 模式只回退到免费模型；带 key 的模式只回退到与目标模型走相同端点的模型，避免跨目录 401。
+func getCandidateModels(auth UpstreamAuth, modelID string) []string {
+	if auth.Mode == AuthRoutePublic {
+		return filterFreeModels(getModelIDs())
+	}
+	if auth.shouldUseGoEndpoint(modelID) {
+		return getGoModelIDs()
+	}
+	return getModelIDs()
+}
+
 // startModelRefresh 定时刷新模型列表（每 10 分钟）
 func startModelRefresh() {
 	go func() {
@@ -1493,17 +1525,27 @@ func extractUpstreamAuth(r *http.Request) UpstreamAuth {
 	if !strings.HasPrefix(auth, "Bearer ") {
 		return UpstreamAuth{Mode: AuthRoutePublic}
 	}
-	token := strings.TrimPrefix(auth, "Bearer ")
-	if token == "public" {
+	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	if token == "" || token == "public" {
 		return UpstreamAuth{Mode: AuthRoutePublic}
 	}
-	if strings.HasPrefix(token, "go:") {
-		return UpstreamAuth{Token: strings.TrimPrefix(token, "go:"), Mode: AuthRouteGo}
+	// go:/zen: 前缀路由：去掉前缀后剩余部分仍需是有效 key（sk- 开头）
+	if rest, ok := strings.CutPrefix(token, "go:"); ok && isValidOpenCodeKey(rest) {
+		return UpstreamAuth{Token: rest, Mode: AuthRouteGo}
 	}
-	if strings.HasPrefix(token, "zen:") {
-		return UpstreamAuth{Token: strings.TrimPrefix(token, "zen:"), Mode: AuthRouteZen}
+	if rest, ok := strings.CutPrefix(token, "zen:"); ok && isValidOpenCodeKey(rest) {
+		return UpstreamAuth{Token: rest, Mode: AuthRouteZen}
 	}
-	return UpstreamAuth{Token: token, Mode: AuthRouteAuto}
+	// 只有 sk- 开头的才是有效 key，其余（no-key-required 等占位符）一律走 public
+	if isValidOpenCodeKey(token) {
+		return UpstreamAuth{Token: token, Mode: AuthRouteAuto}
+	}
+	return UpstreamAuth{Mode: AuthRoutePublic}
+}
+
+// 只认 sk- 开头的 key，避免客户端占位 key（如 no-key-required）被透传给上游导致 401
+func isValidOpenCodeKey(token string) bool {
+	return strings.HasPrefix(token, "sk-") && len(token) > 15
 }
 
 func (auth UpstreamAuth) tier() TierType {
@@ -1541,6 +1583,10 @@ func isFreeModel(modelID string) bool {
 }
 
 func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (*http.Request, error) {
+	return buildOCRequestWithEndpoint(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID))
+}
+
+func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool) (*http.Request, error) {
 	bodyMap["model"] = modelID
 	delete(bodyMap, "reasoning_effort")
 	tryBody, err := json.Marshal(bodyMap)
@@ -1548,7 +1594,7 @@ func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (
 		return nil, err
 	}
 	var upstreamURL string
-	if auth.shouldUseGoEndpoint(modelID) {
+	if useGoEndpoint {
 		upstreamURL = "https://opencode.ai/zen/go/v1/chat/completions"
 	} else {
 		upstreamURL = "https://opencode.ai/zen/v1/chat/completions"
@@ -1589,9 +1635,9 @@ const (
 
 func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {
 	initOCSession()
-	modelIDs := getModelIDs()
+	candidates := getCandidateModels(auth, modelID)
 	modelsToTry := []string{modelID}
-	for _, m := range modelIDs {
+	for _, m := range candidates {
 		if m != modelID {
 			modelsToTry = append(modelsToTry, m)
 		}
@@ -1600,11 +1646,11 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 		modelsToTry = []string{modelID}
 	}
 
-	// 循环外解析一次
 	var bodyMap map[string]any
 	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
 		return nil, 500, nil, fmt.Errorf("invalid request body")
 	}
+	useGoEndpoint := auth.shouldUseGoEndpoint(modelID)
 
 	var lastErr error
 	var retryCount int
@@ -1613,7 +1659,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 	var lastStatus int
 	var lastHeader http.Header
 	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequest(tryModel, bodyMap, auth)
+		up, err := buildOCRequestWithEndpoint(tryModel, bodyMap, auth, useGoEndpoint)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1664,9 +1710,9 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 
 func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
-	modelIDs := getModelIDs()
+	candidates := getCandidateModels(auth, modelID)
 	modelsToTry := []string{modelID}
-	for _, m := range modelIDs {
+	for _, m := range candidates {
 		if m != modelID {
 			modelsToTry = append(modelsToTry, m)
 		}
@@ -1679,6 +1725,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAut
 	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
 		return nil, 500, nil, fmt.Errorf("invalid request body")
 	}
+	useGoEndpoint := auth.shouldUseGoEndpoint(modelID)
 
 	var lastBody []byte
 	var lastStatus int
@@ -1686,7 +1733,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAut
 	var retryCount int
 	var retry401Count int
 	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequest(tryModel, bodyMap, auth)
+		up, err := buildOCRequestWithEndpoint(tryModel, bodyMap, auth, useGoEndpoint)
 		if err != nil {
 			continue
 		}
