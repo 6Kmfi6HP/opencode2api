@@ -37,7 +37,7 @@
 
 ## Chat Completions
 
-支持常见字段：
+### 准确支持
 
 - `model`
 - `messages`
@@ -51,11 +51,37 @@
 - `tools`
 - `tool_choice`
 
+流式响应会原样保留合法的 usage-only 尾块（`choices: []`）以及完整 usage details。
+
+### Best-effort
+
+- 上游 Anthropic 响应会转换 stop reason、usage、reasoning、refusal 和工具调用。
+- 不同上游模型对 `thinking` / `reasoning_effort` 的支持可能不同。
+
+### 不支持
+
+- 本项目未声明支持的 Chat Completions beta 字段不会被合成或伪造。
+
 `model` 会先经过 `model_alias` 解析。`reasoning_effort` 会按 `reasoning_effort_map` 转换。
 
 ## Responses API
 
-支持从 `input`、`instructions` 或 `messages` 转换为 Chat Completions 形状。函数调用输出会尽量映射到 OpenAI tool message。
+### 准确支持
+
+- `input`、`instructions`、`messages`、`previous_response_id`
+- 显式零值的 `temperature`、`top_p`、`frequency_penalty`、`presence_penalty`
+- `max_output_tokens`、`stop`、`user`、`parallel_tool_calls`、`stream_options`
+- 函数工具、项目已有的内置工具、`tool_choice`、`reasoning`、`metadata`
+- 正常终态 `response.completed`；长度截断终态 `response.incomplete`，reason 为 `max_tokens`
+
+### Best-effort
+
+- Responses 会通过 Chat Completions 上游实现；内置工具被编码为函数工具后再还原。
+- 仅在上游实际返回 reasoning 时生成 reasoning output item。
+
+### 不支持
+
+- 未在上面列出的可选 Responses 字段不会用占位值伪装成已支持。
 
 示例：
 
@@ -71,7 +97,22 @@ curl http://127.0.0.1:8000/v1/responses \
 
 ## Anthropic Messages
 
-支持 `system`、文本消息、base64 image block、thinking block、tool_use 和 tool_result 的基础转换。
+### 准确支持
+
+- `system`、`stop_sequences`、采样参数（包括显式零值）和 `metadata.user_id`
+- 文本、base64/URL image、`tool_use`、`tool_result`（包括 `is_error`）
+- `tool_choice` 的 `auto`、`any`、`tool`、`none`
+- JSON Schema 约束字段（包括 `additionalProperties`、`format`）
+- stop reason、usage 以及流式 content block 配对
+
+### Best-effort
+
+- thinking 会在没有 signature 时继续输出，以提高客户端兼容性。代理不会伪造 signature 或发送假的 `signature_delta`。
+- `redacted_thinking.data` 是不可解释的加密数据，无法无损转成 reasoning；代理忽略该内容且不记录其数据。
+
+### 不支持
+
+- Anthropic beta、server tools、fallback 等本项目未承诺的扩展。
 
 示例：
 
