@@ -752,6 +752,7 @@ type ClaudeRequest struct {
 	MaxTokens     *int            `json:"max_tokens,omitempty"`
 	Temperature   *float64        `json:"temperature,omitempty"`
 	TopP          *float64        `json:"top_p,omitempty"`
+	TopK          *int            `json:"top_k,omitempty"`
 	Stream        bool            `json:"stream,omitempty"`
 	Tools         []ClaudeTool    `json:"tools,omitempty"`
 	ToolChoice    any             `json:"tool_choice,omitempty"`
@@ -2241,8 +2242,18 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 			if len(toolCalls) > 0 {
 				om.ToolCalls = toolCalls
 			}
-			messages = append(messages, om)
-			messages = append(messages, toolResults...)
+			// Anthropic requires tool_result blocks to precede ordinary user
+			// content. Preserve that order when translating them to Chat
+			// Completions' separate tool messages.
+			if msg.Role == "user" {
+				messages = append(messages, toolResults...)
+			}
+			if len(orderedContent) > 0 || len(reasoningParts) > 0 || len(toolCalls) > 0 || len(toolResults) == 0 {
+				messages = append(messages, om)
+			}
+			if msg.Role != "user" {
+				messages = append(messages, toolResults...)
+			}
 		default:
 			b, _ := json.Marshal(content)
 			messages = append(messages, Message{Role: msg.Role, Content: string(b)})
@@ -2581,6 +2592,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 	thinkingBlockOpen := false
 	textBlockOpen := false
 	toolCallAccumulator := map[int]map[string]string{}
+	toolBlockIndices := map[int]int{}
 	toolCallOrder := []int{}
 	messageStartSent := false
 	fullUsage := map[string]any{}
@@ -2766,6 +2778,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 						"args": "",
 					}
 					toolCallOrder = append(toolCallOrder, upstreamIndex)
+					toolBlockIndices[upstreamIndex] = blockIndex
 					emitClaudeEvent("content_block_start", map[string]any{
 						"type":  "content_block_start",
 						"index": blockIndex,
@@ -2784,7 +2797,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 					toolCallAccumulator[upstreamIndex]["args"] += argDelta
 					emitClaudeEvent("content_block_delta", map[string]any{
 						"type":  "content_block_delta",
-						"index": blockIndex - 1,
+						"index": toolBlockIndices[upstreamIndex],
 						"delta": map[string]any{
 							"type":         "input_json_delta",
 							"partial_json": argDelta,
@@ -2802,7 +2815,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 				acc := toolCallAccumulator[idx]
 				emitClaudeEvent("content_block_stop", map[string]any{
 					"type":  "content_block_stop",
-					"index": blockIndex - len(toolCallOrder) + indexOfInt(toolCallOrder, idx),
+					"index": toolBlockIndices[idx],
 					"content_block": map[string]any{
 						"type":  "tool_use",
 						"id":    acc["id"],
@@ -3278,6 +3291,9 @@ func cloneJSONValue[T any](value T) T {
 }
 
 func storeResponseState(response map[string]any, req ResponsesAPIRequest) {
+	if req.Store != nil && !*req.Store {
+		return
+	}
 	responseID, _ := response["id"].(string)
 	if responseID == "" {
 		return
@@ -3788,7 +3804,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    reasoningOutputIndex,
-			"item":            reasoningItem("completed"),
+			"item":            reasoningItem(itemStatus),
 		})
 		reasoningDone = true
 	}
@@ -3822,7 +3838,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    idx,
-			"item":            messageItem("completed"),
+			"item":            messageItem(itemStatus),
 		})
 		messageDone = true
 	}
@@ -3850,11 +3866,13 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		if itemType == "" {
 			itemType = "function_call"
 		}
+		item := buildResponseToolCallItem(ToolCall{ID: callID, Function: FunctionCall{Name: name, Arguments: args}}, itemType)
+		item["status"] = itemStatus
 		emitSSEEvent(w, flusher, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    idx,
-			"item":            buildResponseToolCallItem(ToolCall{ID: callID, Function: FunctionCall{Name: name, Arguments: args}}, itemType),
+			"item":            item,
 		})
 	}
 
@@ -3959,7 +3977,9 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			contentStr, _ = c.(string)
 		}
 		if contentStr != "" {
-			emitReasoningDone()
+			// The terminal finish reason determines the item's final status. Keep the
+			// reasoning item open until that reason is known so a truncation cannot
+			// first announce it as completed.
 			if !messageStarted {
 				idx := messageOutputIndex()
 				seq++
@@ -4136,7 +4156,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		"output":             output,
 	}
 	if terminalStatus == "incomplete" {
-		completedResponse["incomplete_details"] = map[string]any{"reason": "max_tokens"}
+		completedResponse["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 	}
 	applyResponsesRequestEcho(completedResponse, originalReq)
 	if len(tools) > 0 {

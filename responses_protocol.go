@@ -10,7 +10,7 @@ type responseOutcome struct {
 
 func responsesOutcome(finishReason string) responseOutcome {
 	if finishReason == "length" {
-		return responseOutcome{Status: "incomplete", Event: "response.incomplete", IncompleteDetails: map[string]any{"reason": "max_tokens"}}
+		return responseOutcome{Status: "incomplete", Event: "response.incomplete", IncompleteDetails: map[string]any{"reason": "max_output_tokens"}}
 	}
 	return responseOutcome{Status: "completed", Event: "response.completed"}
 }
@@ -45,5 +45,8 @@ func applyResponsesRequestEcho(response map[string]any, req ResponsesAPIRequest)
 	}
 	if req.MaxTokens != nil {
 		response["max_output_tokens"] = *req.MaxTokens
+	}
+	if req.Store != nil {
+		response["store"] = *req.Store
 	}
 }

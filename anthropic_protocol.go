@@ -9,8 +9,17 @@ func convertClaudeRequest(req ClaudeRequest) OpenAIRequest {
 		TopP: req.TopP, Tools: claudeToOpenAITools(req.Tools),
 		ToolChoice: convertClaudeToolChoice(req.ToolChoice),
 	}
+	if req.TopK != nil {
+		if out.ExtraBody == nil {
+			out.ExtraBody = map[string]any{}
+		}
+		out.ExtraBody["top_k"] = *req.TopK
+	}
 	if len(req.StopSequences) > 0 {
-		out.ExtraBody = map[string]any{"stop": append([]string(nil), req.StopSequences...)}
+		if out.ExtraBody == nil {
+			out.ExtraBody = map[string]any{}
+		}
+		out.ExtraBody["stop"] = append([]string(nil), req.StopSequences...)
 	}
 	if metadata, ok := req.Metadata.(map[string]any); ok {
 		if user, ok := metadata["user_id"].(string); ok && user != "" {

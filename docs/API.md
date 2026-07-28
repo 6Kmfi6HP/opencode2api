@@ -20,7 +20,7 @@
 
 | 路由 | 方法 | 说明 |
 | --- | --- | --- |
-| `/v1/models` | `GET` | 返回上游模型和本地别名模型 |
+| `/v1/models` | `GET` | 返回权限范围内的模型；已配置别名会替换对应上游模型 ID |
 | `/v1/chat/completions` | `POST` | OpenAI Chat Completions 兼容入口 |
 | `/v1/responses` | `POST` | OpenAI Responses 兼容入口 |
 | `/v1/messages` | `POST` | Anthropic Messages 兼容入口 |
@@ -68,11 +68,12 @@
 
 ### 准确支持
 
-- `input`、`instructions`、`messages`、`previous_response_id`
+- 字符串 `input`；含 `input_text` / `input_image` 的 message item；函数及内置工具的 call/output item
+- `instructions`、`messages`、`previous_response_id`
 - 显式零值的 `temperature`、`top_p`、`frequency_penalty`、`presence_penalty`
-- `max_output_tokens`、`stop`、`user`、`parallel_tool_calls`、`stream_options`
+- `max_output_tokens`、`stop`、`user`、`parallel_tool_calls`、`stream_options`、`store`
 - 函数工具、项目已有的内置工具、`tool_choice`、`reasoning`、`metadata`
-- 正常终态 `response.completed`；长度截断终态 `response.incomplete`，reason 为 `max_tokens`
+- 正常终态 `response.completed`；长度截断终态 `response.incomplete`，reason 为 `max_output_tokens`
 
 ### Best-effort
 
@@ -81,7 +82,8 @@
 
 ### 不支持
 
-- 未在上面列出的可选 Responses 字段不会用占位值伪装成已支持。
+- `input_file` 等未在准确支持列表中的 input item 类型。
+- `include` 及未在上面列出的可选 Responses 字段；这些字段不会用占位值伪装成已支持。
 
 示例：
 
@@ -99,8 +101,8 @@ curl http://127.0.0.1:8000/v1/responses \
 
 ### 准确支持
 
-- `system`、`stop_sequences`、采样参数（包括显式零值）和 `metadata.user_id`
-- 文本、base64/URL image、`tool_use`、`tool_result`（包括 `is_error`）
+- `system`、`stop_sequences`、`temperature` / `top_p` / `top_k`（包括显式零值）和 `metadata.user_id`
+- 文本、base64/URL image、`tool_use`、`tool_result`（包括 `is_error`）；合法的 tool result 在普通用户内容之前的顺序会被保留
 - `tool_choice` 的 `auto`、`any`、`tool`、`none`
 - JSON Schema 约束字段（包括 `additionalProperties`、`format`）
 - stop reason、usage 以及流式 content block 配对
