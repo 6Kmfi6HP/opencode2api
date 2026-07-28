@@ -463,6 +463,79 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 	}
 }
 
+func TestListModelsHandlerReplacesMappedModelIDsWithAliases(t *testing.T) {
+	oldModelsCache := modelsCache
+	oldGoModelsCache := goModelsCache
+	oldModelsLoaded := modelsLoaded
+	oldModelAlias := modelAlias
+	modelMu.Lock()
+	modelsCache = []ModelInfo{
+		{ID: "deepseek-v4-flash-free", Object: "model", OwnedBy: "opencode"},
+		{ID: "gpt-5.5", Object: "model", OwnedBy: "opencode"},
+	}
+	goModelsCache = nil
+	modelsLoaded = true
+	modelMu.Unlock()
+	configMu.Lock()
+	modelAlias = map[string]string{
+		"deepseek-v4-flash": "deepseek-v4-flash-free",
+	}
+	configMu.Unlock()
+	t.Cleanup(func() {
+		modelMu.Lock()
+		modelsCache = oldModelsCache
+		goModelsCache = oldGoModelsCache
+		modelsLoaded = oldModelsLoaded
+		modelMu.Unlock()
+		configMu.Lock()
+		modelAlias = oldModelAlias
+		configMu.Unlock()
+	})
+
+	for _, tt := range []struct {
+		name       string
+		authHeader string
+		wantIDs    []string
+	}{
+		{
+			name:    "public sees free alias instead of upstream name",
+			wantIDs: []string{"deepseek-v4-flash"},
+		},
+		{
+			name:       "authenticated catalog replaces upstream name",
+			authHeader: "Bearer sk-auto0123456789abcdef",
+			wantIDs:    []string{"deepseek-v4-flash", "gpt-5.5"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+			rec := httptest.NewRecorder()
+
+			listModelsHandler(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("listModelsHandler() status = %d, want %d", rec.Code, http.StatusOK)
+			}
+			var payload struct {
+				Data []ModelInfo `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("unmarshal models response: %v", err)
+			}
+			gotIDs := make([]string, 0, len(payload.Data))
+			for _, model := range payload.Data {
+				gotIDs = append(gotIDs, model.ID)
+			}
+			if !reflect.DeepEqual(gotIDs, tt.wantIDs) {
+				t.Fatalf("listModelsHandler() ids = %#v, want %#v", gotIDs, tt.wantIDs)
+			}
+		})
+	}
+}
+
 func TestExtractUpstreamAuthKeyValidation(t *testing.T) {
 	tests := []struct {
 		name       string

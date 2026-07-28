@@ -15,7 +15,12 @@ cp config.example.json config.json
 ```json
 {
   "model_alias": {
-    "gpt-4o-mini": "deepseek-v4-flash-free"
+    "deepseek-v4-flash": "deepseek-v4-flash-free",
+    "mimo-v2.5": "mimo-v2.5-free",
+    "ling-3.0-flash": "ling-3.0-flash-free",
+    "nemotron-3-ultra": "nemotron-3-ultra-free",
+    "north-mini-code": "north-mini-code-free",
+    "laguna-s-2.1": "laguna-s-2.1-free"
   }
 }
 ```

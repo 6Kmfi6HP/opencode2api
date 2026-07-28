@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -694,7 +695,7 @@ type OpenAIRequest struct {
 	Messages        []Message      `json:"messages"`
 	Stream          bool           `json:"stream"`
 	Temperature     *float64       `json:"temperature,omitempty"`
-	MaxTokens       int            `json:"max_tokens,omitempty"`
+	MaxTokens       *int           `json:"max_tokens,omitempty"`
 	TopP            *float64       `json:"top_p,omitempty"`
 	Thinking        any            `json:"thinking,omitempty"`
 	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
@@ -745,17 +746,19 @@ type AppConfig struct {
 // ======================== Claude Messages API 类型 ========================
 
 type ClaudeRequest struct {
-	Model       string          `json:"model"`
-	Messages    []ClaudeMessage `json:"messages"`
-	System      any             `json:"system,omitempty"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature *float64        `json:"temperature,omitempty"`
-	TopP        *float64        `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Tools       []ClaudeTool    `json:"tools,omitempty"`
-	ToolChoice  any             `json:"tool_choice,omitempty"`
-	Metadata    any             `json:"metadata,omitempty"`
-	Thinking    any             `json:"thinking,omitempty"`
+	Model         string          `json:"model"`
+	Messages      []ClaudeMessage `json:"messages"`
+	System        any             `json:"system,omitempty"`
+	MaxTokens     *int            `json:"max_tokens,omitempty"`
+	Temperature   *float64        `json:"temperature,omitempty"`
+	TopP          *float64        `json:"top_p,omitempty"`
+	TopK          *int            `json:"top_k,omitempty"`
+	Stream        bool            `json:"stream,omitempty"`
+	Tools         []ClaudeTool    `json:"tools,omitempty"`
+	ToolChoice    any             `json:"tool_choice,omitempty"`
+	StopSequences []string        `json:"stop_sequences,omitempty"`
+	Metadata      any             `json:"metadata,omitempty"`
+	Thinking      any             `json:"thinking,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -802,11 +805,11 @@ type ResponsesAPIRequest struct {
 	Instructions       string          `json:"instructions,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 	Stream             bool            `json:"stream,omitempty"`
-	Temperature        float64         `json:"temperature,omitempty"`
-	MaxTokens          int             `json:"max_output_tokens,omitempty"`
-	TopP               float64         `json:"top_p,omitempty"`
-	FrequencyPenalty   float64         `json:"frequency_penalty,omitempty"`
-	PresencePenalty    float64         `json:"presence_penalty,omitempty"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	MaxTokens          *int            `json:"max_output_tokens,omitempty"`
+	TopP               *float64        `json:"top_p,omitempty"`
+	FrequencyPenalty   *float64        `json:"frequency_penalty,omitempty"`
+	PresencePenalty    *float64        `json:"presence_penalty,omitempty"`
 	Reasoning          ReasonEffort    `json:"reasoning,omitempty"`
 	Include            []string        `json:"include,omitempty"`
 	Store              *bool           `json:"store,omitempty"`
@@ -1115,8 +1118,8 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	if req.Temperature != nil {
 		converted["temperature"] = *req.Temperature
 	}
-	if req.MaxTokens != 0 {
-		converted["max_tokens"] = req.MaxTokens
+	if req.MaxTokens != nil {
+		converted["max_tokens"] = *req.MaxTokens
 	}
 	if req.TopP != nil {
 		converted["top_p"] = *req.TopP
@@ -1279,9 +1282,7 @@ func buildOpenAIResponse(anthropicMsg map[string]any, text string, toolUseBlocks
 		role = "assistant"
 	}
 	finishReason, _ := anthropicMsg["stop_reason"].(string)
-	if finishReason == "tool_use" {
-		finishReason = "tool_calls"
-	}
+	finishReason = normalizeFinishReason(finishReason)
 	choice := map[string]any{
 		"index":         0,
 		"message":       map[string]any{"role": role, "content": text},
@@ -1313,8 +1314,8 @@ func buildOpenAIResponse(anthropicMsg map[string]any, text string, toolUseBlocks
 		"model":   modelID,
 		"choices": []map[string]any{choice},
 	}
-	if usage, ok := anthropicMsg["usage"]; ok {
-		resp["usage"] = usage
+	if usage, ok := anthropicMsg["usage"].(map[string]any); ok {
+		resp["usage"] = anthropicUsageToChat(usage)
 	}
 	result, _ := json.Marshal(resp)
 	return result
@@ -1419,7 +1420,14 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 
 	choices, ok := raw["choices"].([]any)
 	if !ok || len(choices) == 0 {
-		return "", usage
+		// Chat Completions deliberately uses an empty choices array for the
+		// terminal usage chunk. It is part of the client-visible stream.
+		delete(raw, "cost")
+		converted, err := json.Marshal(raw)
+		if err != nil {
+			return line, usage
+		}
+		return "data: " + string(converted), usage
 	}
 	for i, c := range choices {
 		choice, ok := c.(map[string]any)
@@ -1484,16 +1492,7 @@ func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 		}
 		raw["choices"] = choices
 	}
-	if usage, ok := raw["usage"].(map[string]any); ok {
-		cleanU := map[string]any{
-			"prompt_tokens":     usage["prompt_tokens"],
-			"completion_tokens": usage["completion_tokens"],
-			"total_tokens":      usage["total_tokens"],
-		}
-		raw["usage"] = cleanU
-	}
 	delete(raw, "cost")
-	delete(raw, "system_fingerprint")
 	return json.Marshal(raw)
 }
 
@@ -1983,18 +1982,13 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// 追加别名模型
+	// 保存别名快照；目录权限仍按真实上游模型判断，最后再替换为客户端可见名称。
 	configMu.RLock()
-	aliases := make([]string, 0, len(modelAlias))
-	for k := range modelAlias {
-		aliases = append(aliases, k)
+	aliases := make(map[string]string, len(modelAlias))
+	for alias, upstream := range modelAlias {
+		aliases[alias] = upstream
 	}
 	configMu.RUnlock()
-	now := time.Now().Unix()
-	aliasModels := make([]ModelInfo, 0, len(aliases))
-	for _, alias := range aliases {
-		aliasModels = append(aliasModels, ModelInfo{ID: alias, Object: "model", Created: now, OwnedBy: "alias"})
-	}
 
 	auth := extractUpstreamAuth(r)
 	var combinedModels []ModelInfo
@@ -2027,24 +2021,50 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		combinedModels = models
 	}
-	allModels := append(combinedModels, aliasModels...)
-	if auth.Mode == AuthRoutePublic {
-		filtered := make([]ModelInfo, 0, len(allModels))
-		for _, m := range allModels {
-			if isFreeModel(m.ID) {
-				filtered = append(filtered, m)
-			}
-		}
-		if len(filtered) > 0 {
-			allModels = filtered
-		}
-	}
+	allModels := replaceModelIDsWithAliases(combinedModels, aliases)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
 		"data":   allModels,
 	})
+}
+
+func replaceModelIDsWithAliases(models []ModelInfo, aliases map[string]string) []ModelInfo {
+	aliasesByUpstream := make(map[string][]string, len(aliases))
+	for alias, upstream := range aliases {
+		alias = strings.TrimSpace(alias)
+		upstream = strings.TrimSpace(upstream)
+		if alias == "" || upstream == "" {
+			continue
+		}
+		aliasesByUpstream[upstream] = append(aliasesByUpstream[upstream], alias)
+	}
+	for upstream := range aliasesByUpstream {
+		sort.Strings(aliasesByUpstream[upstream])
+	}
+
+	result := make([]ModelInfo, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		visibleIDs := aliasesByUpstream[model.ID]
+		if len(visibleIDs) == 0 {
+			visibleIDs = []string{model.ID}
+		}
+		for _, visibleID := range visibleIDs {
+			if _, exists := seen[visibleID]; exists {
+				continue
+			}
+			visibleModel := model
+			visibleModel.ID = visibleID
+			if visibleID != model.ID {
+				visibleModel.OwnedBy = "alias"
+			}
+			result = append(result, visibleModel)
+			seen[visibleID] = struct{}{}
+		}
+	}
+	return result
 }
 
 // ======================== Claude Messages API ========================
@@ -2079,27 +2099,27 @@ func cleanJsonSchema(schema any) any {
 	if !ok {
 		return schema
 	}
-	delete(m, "$schema")
-	delete(m, "title")
-	delete(m, "examples")
-	delete(m, "additionalProperties")
-	if m["type"] == "string" {
-		delete(m, "format")
-	}
+	clean := make(map[string]any, len(m))
 	for k, v := range m {
-		if sub, ok := v.(map[string]any); ok {
-			m[k] = cleanJsonSchema(sub)
+		// Annotation-only keys are omitted for upstream compatibility. Constraint
+		// keys such as additionalProperties and format are preserved.
+		if k == "$schema" || k == "title" || k == "examples" {
+			continue
 		}
-		if arr, ok := v.([]any); ok {
-			for i, elem := range arr {
-				if sub, ok := elem.(map[string]any); ok {
-					arr[i] = cleanJsonSchema(sub)
-				}
+		switch child := v.(type) {
+		case map[string]any:
+			clean[k] = cleanJsonSchema(child)
+		case []any:
+			copyArray := make([]any, len(child))
+			for i, elem := range child {
+				copyArray[i] = cleanJsonSchema(elem)
 			}
-			m[k] = arr
+			clean[k] = copyArray
+		default:
+			clean[k] = v
 		}
 	}
-	return m
+	return clean
 }
 
 func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
@@ -2112,11 +2132,10 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 		case string:
 			messages = append(messages, Message{Role: msg.Role, Content: content})
 		case []any:
-			var textParts []string
+			var orderedContent []any
 			var reasoningParts []string
 			var toolCalls []ToolCall
 			var toolResults []Message
-			var imageParts []map[string]any
 			for _, item := range content {
 				block, ok := item.(map[string]any)
 				if !ok {
@@ -2126,7 +2145,7 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 				switch blockType {
 				case "text":
 					if text, ok := block["text"].(string); ok && text != "" {
-						textParts = append(textParts, text)
+						orderedContent = append(orderedContent, map[string]any{"type": "text", "text": text})
 					}
 				case "image":
 					source, _ := block["source"].(map[string]any)
@@ -2134,11 +2153,15 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 						srcType, _ := source["type"].(string)
 						mediaType, _ := source["media_type"].(string)
 						data, _ := source["data"].(string)
+						url, _ := source["url"].(string)
+						if srcType == "url" && url != "" {
+							orderedContent = append(orderedContent, map[string]any{"type": "image_url", "image_url": map[string]string{"url": url}})
+						}
 						if srcType == "base64" && data != "" {
 							if mediaType == "" {
 								mediaType = "image/png"
 							}
-							imageParts = append(imageParts, map[string]any{
+							orderedContent = append(orderedContent, map[string]any{
 								"type": "image_url",
 								"image_url": map[string]string{
 									"url": "data:" + mediaType + ";base64," + data,
@@ -2196,6 +2219,9 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 							resultText = string(b)
 						}
 					}
+					if isError, _ := block["is_error"].(bool); isError {
+						resultText = "Error: " + resultText
+					}
 					toolResults = append(toolResults, Message{
 						Role:       "tool",
 						ToolCallID: toolUseID,
@@ -2204,20 +2230,8 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 				}
 			}
 			om := Message{Role: msg.Role}
-			if len(imageParts) > 0 {
-				var contentArr []any
-				for _, img := range imageParts {
-					contentArr = append(contentArr, img)
-				}
-				if len(textParts) > 0 {
-					contentArr = append(contentArr, map[string]any{
-						"type": "text",
-						"text": strings.Join(textParts, "\n"),
-					})
-				}
-				om.Content = contentArr
-			} else if len(textParts) > 0 {
-				om.Content = strings.Join(textParts, "\n")
+			if len(orderedContent) > 0 {
+				om.Content = orderedContent
 			} else if len(toolCalls) == 0 {
 				om.Content = ""
 			}
@@ -2228,8 +2242,18 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 			if len(toolCalls) > 0 {
 				om.ToolCalls = toolCalls
 			}
-			messages = append(messages, om)
-			messages = append(messages, toolResults...)
+			// Anthropic requires tool_result blocks to precede ordinary user
+			// content. Preserve that order when translating them to Chat
+			// Completions' separate tool messages.
+			if msg.Role == "user" {
+				messages = append(messages, toolResults...)
+			}
+			if len(orderedContent) > 0 || len(reasoningParts) > 0 || len(toolCalls) > 0 || len(toolResults) == 0 {
+				messages = append(messages, om)
+			}
+			if msg.Role != "user" {
+				messages = append(messages, toolResults...)
+			}
 		default:
 			b, _ := json.Marshal(content)
 			messages = append(messages, Message{Role: msg.Role, Content: string(b)})
@@ -2246,12 +2270,16 @@ func claudeToOpenAITools(claudeTools []ClaudeTool) []Tool {
 			params = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
 		params = cleanJsonSchema(params)
+		paramsMap, ok := params.(map[string]any)
+		if !ok {
+			paramsMap = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
 		tools = append(tools, Tool{
 			Type: "function",
 			Function: ToolFunction{
 				Name:        ct.Name,
 				Description: ct.Description,
-				Parameters:  params.(map[string]any),
+				Parameters:  paramsMap,
 			},
 		})
 	}
@@ -2315,6 +2343,8 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 			stopReason = "max_tokens"
 		case "tool_calls", "function_call":
 			stopReason = "tool_use"
+		case "content_filter":
+			stopReason = "refusal"
 		}
 	}
 
@@ -2478,31 +2508,13 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 多模态路由
 
-	messages := claudeToOpenAIMessages(claudeReq.Messages, claudeReq.System)
-	messages = fixToolCallGaps(messages)
-
-	chatReq := OpenAIRequest{
-		Model:    claudeReq.Model,
-		Messages: messages,
-		Stream:   claudeReq.Stream,
-	}
+	chatReq := convertClaudeRequest(claudeReq)
+	chatReq.Messages = fixToolCallGaps(chatReq.Messages)
 	if claudeReq.Stream {
-		chatReq.ExtraBody = map[string]any{
-			"stream_options": map[string]any{"include_usage": true},
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
 		}
-	}
-	if claudeReq.MaxTokens > 0 {
-		chatReq.MaxTokens = claudeReq.MaxTokens
-	}
-	if claudeReq.Temperature != nil {
-		chatReq.Temperature = claudeReq.Temperature
-	}
-	if claudeReq.TopP != nil {
-		chatReq.TopP = claudeReq.TopP
-	}
-	if len(claudeReq.Tools) > 0 {
-		chatReq.Tools = claudeToOpenAITools(claudeReq.Tools)
-		chatReq.ToolChoice = "auto"
+		chatReq.ExtraBody["stream_options"] = map[string]any{"include_usage": true}
 	}
 
 	wantReasoning := !getForceDisableThinking()
@@ -2580,6 +2592,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 	thinkingBlockOpen := false
 	textBlockOpen := false
 	toolCallAccumulator := map[int]map[string]string{}
+	toolBlockIndices := map[int]int{}
 	toolCallOrder := []int{}
 	messageStartSent := false
 	fullUsage := map[string]any{}
@@ -2765,6 +2778,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 						"args": "",
 					}
 					toolCallOrder = append(toolCallOrder, upstreamIndex)
+					toolBlockIndices[upstreamIndex] = blockIndex
 					emitClaudeEvent("content_block_start", map[string]any{
 						"type":  "content_block_start",
 						"index": blockIndex,
@@ -2783,7 +2797,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 					toolCallAccumulator[upstreamIndex]["args"] += argDelta
 					emitClaudeEvent("content_block_delta", map[string]any{
 						"type":  "content_block_delta",
-						"index": blockIndex - 1,
+						"index": toolBlockIndices[upstreamIndex],
 						"delta": map[string]any{
 							"type":         "input_json_delta",
 							"partial_json": argDelta,
@@ -2801,7 +2815,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 				acc := toolCallAccumulator[idx]
 				emitClaudeEvent("content_block_stop", map[string]any{
 					"type":  "content_block_stop",
-					"index": blockIndex - len(toolCallOrder) + indexOfInt(toolCallOrder, idx),
+					"index": toolBlockIndices[idx],
 					"content_block": map[string]any{
 						"type":  "tool_use",
 						"id":    acc["id"],
@@ -2817,6 +2831,8 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 				stopReason = "max_tokens"
 			case "tool_calls", "function_call":
 				stopReason = "tool_use"
+			case "content_filter":
+				stopReason = "refusal"
 			}
 
 			emitClaudeEvent("message_delta", map[string]any{
@@ -3275,6 +3291,9 @@ func cloneJSONValue[T any](value T) T {
 }
 
 func storeResponseState(response map[string]any, req ResponsesAPIRequest) {
+	if req.Store != nil && !*req.Store {
+		return
+	}
 	responseID, _ := response["id"].(string)
 	if responseID == "" {
 		return
@@ -3545,14 +3564,14 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			"stream_options": map[string]any{"include_usage": true},
 		}
 	}
-	if respReq.Temperature != 0 {
-		chatReq.Temperature = &respReq.Temperature
+	if respReq.Temperature != nil {
+		chatReq.Temperature = respReq.Temperature
 	}
-	if respReq.MaxTokens != 0 {
+	if respReq.MaxTokens != nil {
 		chatReq.MaxTokens = respReq.MaxTokens
 	}
-	if respReq.TopP != 0 {
-		chatReq.TopP = &respReq.TopP
+	if respReq.TopP != nil {
+		chatReq.TopP = respReq.TopP
 	}
 	if len(respReq.Tools) > 0 {
 		chatReq.Tools = convertResponsesTools(respReq.Tools)
@@ -3565,6 +3584,30 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			chatReq.ExtraBody = map[string]any{}
 		}
 		chatReq.ExtraBody["parallel_tool_calls"] = *respReq.ParallelToolCalls
+	}
+	if respReq.Stop != nil {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["stop"] = respReq.Stop
+	}
+	if respReq.FrequencyPenalty != nil {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["frequency_penalty"] = *respReq.FrequencyPenalty
+	}
+	if respReq.PresencePenalty != nil {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["presence_penalty"] = *respReq.PresencePenalty
+	}
+	if respReq.User != "" {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["user"] = respReq.User
 	}
 	if respReq.StreamOptions != nil {
 		if chatReq.ExtraBody == nil {
@@ -3634,6 +3677,10 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	responsesBody := convertChatToResponses(respBody, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice)
 	var responseMap map[string]any
 	if json.Unmarshal(responsesBody, &responseMap) == nil {
+		applyResponsesRequestEcho(responseMap, respReq)
+		if enriched, marshalErr := json.Marshal(responseMap); marshalErr == nil {
+			responsesBody = enriched
+		}
 		storeResponseState(responseMap, respReq)
 	}
 
@@ -3679,15 +3726,21 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	fullText := ""
 	totalUsage := map[string]any{}
 	createdSent := false
+	terminalStatus := "completed"
+	terminalEvent := "response.completed"
+	itemStatus := "completed"
 	toolCalls := map[int]map[string]any{}
 	toolOrder := []int{}
 	toolKinds := responsesToolKindMap(tools)
+	indexAllocator := outputIndexAllocator{}
+	reasoningOutputIndex := -1
+	messageIndex := -1
 
 	messageOutputIndex := func() int {
-		if reasoningStarted {
-			return 1
+		if messageIndex < 0 {
+			messageIndex = indexAllocator.Allocate()
 		}
-		return 0
+		return messageIndex
 	}
 
 	reasoningItem := func(status string) map[string]any {
@@ -3733,7 +3786,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			"type":            "response.reasoning_summary_text.done",
 			"sequence_number": seq,
 			"item_id":         reasoningID,
-			"output_index":    0,
+			"output_index":    reasoningOutputIndex,
 			"summary_index":   0,
 			"text":            fullReasoning,
 		})
@@ -3742,7 +3795,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			"type":            "response.reasoning_summary_part.done",
 			"sequence_number": seq,
 			"item_id":         reasoningID,
-			"output_index":    0,
+			"output_index":    reasoningOutputIndex,
 			"summary_index":   0,
 			"part":            map[string]any{"type": "summary_text", "text": fullReasoning},
 		})
@@ -3750,8 +3803,8 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		emitSSEEvent(w, flusher, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
-			"output_index":    0,
-			"item":            reasoningItem("completed"),
+			"output_index":    reasoningOutputIndex,
+			"item":            reasoningItem(itemStatus),
 		})
 		reasoningDone = true
 	}
@@ -3785,7 +3838,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    idx,
-			"item":            messageItem("completed"),
+			"item":            messageItem(itemStatus),
 		})
 		messageDone = true
 	}
@@ -3805,6 +3858,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			"sequence_number": seq,
 			"item_id":         itemID,
 			"output_index":    idx,
+			"name":            name,
 			"arguments":       args,
 		})
 		seq++
@@ -3812,11 +3866,13 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		if itemType == "" {
 			itemType = "function_call"
 		}
+		item := buildResponseToolCallItem(ToolCall{ID: callID, Function: FunctionCall{Name: name, Arguments: args}}, itemType)
+		item["status"] = itemStatus
 		emitSSEEvent(w, flusher, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    idx,
-			"item":            buildResponseToolCallItem(ToolCall{ID: callID, Function: FunctionCall{Name: name, Arguments: args}}, itemType),
+			"item":            item,
 		})
 	}
 
@@ -3884,11 +3940,12 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			rcStr, _ := rc.(string)
 			if rcStr != "" {
 				if !reasoningStarted {
+					reasoningOutputIndex = indexAllocator.Allocate()
 					seq++
 					emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
 						"type":            "response.output_item.added",
 						"sequence_number": seq,
-						"output_index":    0,
+						"output_index":    reasoningOutputIndex,
 						"item":            reasoningItem("in_progress"),
 					})
 					seq++
@@ -3896,7 +3953,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 						"type":            "response.reasoning_summary_part.added",
 						"sequence_number": seq,
 						"item_id":         reasoningID,
-						"output_index":    0,
+						"output_index":    reasoningOutputIndex,
 						"summary_index":   0,
 						"part":            map[string]any{"type": "summary_text", "text": ""},
 					})
@@ -3908,7 +3965,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 					"type":            "response.reasoning_summary_text.delta",
 					"sequence_number": seq,
 					"item_id":         reasoningID,
-					"output_index":    0,
+					"output_index":    reasoningOutputIndex,
 					"summary_index":   0,
 					"delta":           rcStr,
 				})
@@ -3920,7 +3977,9 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			contentStr, _ = c.(string)
 		}
 		if contentStr != "" {
-			emitReasoningDone()
+			// The terminal finish reason determines the item's final status. Keep the
+			// reasoning item open until that reason is known so a truncation cannot
+			// first announce it as completed.
 			if !messageStarted {
 				idx := messageOutputIndex()
 				seq++
@@ -3964,11 +4023,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			upstreamIndex := int(idxFloat)
 			call, exists := toolCalls[upstreamIndex]
 			if !exists {
-				outputIndex := messageOutputIndex()
-				if messageStarted {
-					outputIndex++
-				}
-				outputIndex += len(toolOrder)
+				outputIndex := indexAllocator.Allocate()
 				callID, _ := tc["id"].(string)
 				if callID == "" {
 					callID = "call_" + randomString(12)
@@ -4026,6 +4081,11 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			totalUsage = usage
 		}
 		if finishReason == "stop" || finishReason == "length" || finishReason == "content_filter" {
+			if finishReason == "length" {
+				terminalStatus = "incomplete"
+				terminalEvent = "response.incomplete"
+				itemStatus = "incomplete"
+			}
 			emitReasoningDone()
 			if !messageStarted && len(toolCalls) == 0 {
 				idx := messageOutputIndex()
@@ -4060,12 +4120,12 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		emitToolCallDone(toolCalls[idx]["output_index"].(int), toolCalls[idx])
 	}
 
-	output := []any{}
+	output := make([]any, indexAllocator.Len())
 	if reasoningStarted {
-		output = append(output, reasoningItem("completed"))
+		output[reasoningOutputIndex] = reasoningItem(itemStatus)
 	}
 	if messageStarted {
-		output = append(output, messageItem("completed"))
+		output[messageIndex] = messageItem(itemStatus)
 	}
 	for _, idx := range toolOrder {
 		call := toolCalls[idx]
@@ -4073,26 +4133,32 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		if itemType == "" {
 			itemType = "function_call"
 		}
-		output = append(output, buildResponseToolCallItem(ToolCall{
+		item := buildResponseToolCallItem(ToolCall{
 			ID: call["call_id"].(string),
 			Function: FunctionCall{
 				Name:      call["name"].(string),
 				Arguments: call["arguments"].(string),
 			},
-		}, itemType))
+		}, itemType)
+		item["status"] = itemStatus
+		output[call["output_index"].(int)] = item
 	}
 
 	completedResponse := map[string]any{
 		"id":                 responseID,
 		"object":             "response",
 		"created_at":         createdAt,
-		"status":             "completed",
+		"status":             terminalStatus,
 		"background":         false,
 		"error":              nil,
 		"incomplete_details": nil,
 		"model":              model,
 		"output":             output,
 	}
+	if terminalStatus == "incomplete" {
+		completedResponse["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
+	applyResponsesRequestEcho(completedResponse, originalReq)
 	if len(tools) > 0 {
 		completedResponse["tools"] = tools
 	}
@@ -4138,8 +4204,8 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	}
 
 	seq++
-	emitSSEEvent(w, flusher, "response.completed", map[string]any{
-		"type":            "response.completed",
+	emitSSEEvent(w, flusher, terminalEvent, map[string]any{
+		"type":            terminalEvent,
 		"sequence_number": seq,
 		"response":        completedResponse,
 	})
@@ -4158,6 +4224,7 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 			FinishReason string `json:"finish_reason"`
 			Message      struct {
 				Content          any        `json:"content"`
+				Refusal          string     `json:"refusal"`
 				ReasoningContent string     `json:"reasoning_content"`
 				ToolCalls        []ToolCall `json:"tool_calls"`
 			} `json:"message"`
@@ -4175,6 +4242,9 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 	toolKinds := responsesToolKindMap(tools)
 	if len(chat.Choices) > 0 {
 		messageContent, _ = chatContentToResponsesContent(chat.Choices[0].Message.Content)
+		if refusal := chat.Choices[0].Message.Refusal; refusal != "" {
+			messageContent = []any{map[string]any{"type": "refusal", "refusal": refusal}}
+		}
 		if wantReasoning {
 			reasoning = chat.Choices[0].Message.ReasoningContent
 		}
@@ -4182,18 +4252,15 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		finishReason = chat.Choices[0].FinishReason
 	}
 
-	status := "completed"
-	if finishReason == "length" {
-		status = "incomplete"
-	}
-
+	outcome := responsesOutcome(finishReason)
+	status := outcome.Status
 	responses := map[string]any{
 		"id":                 chat.ID,
 		"object":             "response",
 		"status":             status,
 		"background":         false,
 		"error":              nil,
-		"incomplete_details": nil,
+		"incomplete_details": outcome.IncompleteDetails,
 		"model":              model,
 		"created_at":         chat.Created,
 	}
@@ -4217,13 +4284,15 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		output = append(output, map[string]any{
 			"id":      outputID,
 			"type":    "message",
-			"status":  "completed",
+			"status":  status,
 			"role":    "assistant",
 			"content": messageContent,
 		})
 	}
 	for _, tc := range toolCalls {
-		output = append(output, buildResponseToolCallItem(tc, toolCallOutputType(tc.Function.Name, toolKinds)))
+		item := buildResponseToolCallItem(tc, toolCallOutputType(tc.Function.Name, toolKinds))
+		item["status"] = status
+		output = append(output, item)
 	}
 	responses["output"] = output
 	if chat.Usage != nil {
