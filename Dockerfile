@@ -14,7 +14,7 @@ ARG DATE=unknown
 COPY go.mod ./
 RUN go mod download
 
-COPY main.go main_test.go ./
+COPY *.go ./
 
 RUN set -eux; \
     if [ "$TARGETARCH" = "arm" ]; then export GOARM="${TARGETVARIANT#v}"; fi; \
