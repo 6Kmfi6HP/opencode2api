@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1980,18 +1981,13 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// 追加别名模型
+	// 保存别名快照；目录权限仍按真实上游模型判断，最后再替换为客户端可见名称。
 	configMu.RLock()
-	aliases := make([]string, 0, len(modelAlias))
-	for k := range modelAlias {
-		aliases = append(aliases, k)
+	aliases := make(map[string]string, len(modelAlias))
+	for alias, upstream := range modelAlias {
+		aliases[alias] = upstream
 	}
 	configMu.RUnlock()
-	now := time.Now().Unix()
-	aliasModels := make([]ModelInfo, 0, len(aliases))
-	for _, alias := range aliases {
-		aliasModels = append(aliasModels, ModelInfo{ID: alias, Object: "model", Created: now, OwnedBy: "alias"})
-	}
 
 	auth := extractUpstreamAuth(r)
 	var combinedModels []ModelInfo
@@ -2024,24 +2020,50 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		combinedModels = models
 	}
-	allModels := append(combinedModels, aliasModels...)
-	if auth.Mode == AuthRoutePublic {
-		filtered := make([]ModelInfo, 0, len(allModels))
-		for _, m := range allModels {
-			if isFreeModel(m.ID) {
-				filtered = append(filtered, m)
-			}
-		}
-		if len(filtered) > 0 {
-			allModels = filtered
-		}
-	}
+	allModels := replaceModelIDsWithAliases(combinedModels, aliases)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
 		"data":   allModels,
 	})
+}
+
+func replaceModelIDsWithAliases(models []ModelInfo, aliases map[string]string) []ModelInfo {
+	aliasesByUpstream := make(map[string][]string, len(aliases))
+	for alias, upstream := range aliases {
+		alias = strings.TrimSpace(alias)
+		upstream = strings.TrimSpace(upstream)
+		if alias == "" || upstream == "" {
+			continue
+		}
+		aliasesByUpstream[upstream] = append(aliasesByUpstream[upstream], alias)
+	}
+	for upstream := range aliasesByUpstream {
+		sort.Strings(aliasesByUpstream[upstream])
+	}
+
+	result := make([]ModelInfo, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		visibleIDs := aliasesByUpstream[model.ID]
+		if len(visibleIDs) == 0 {
+			visibleIDs = []string{model.ID}
+		}
+		for _, visibleID := range visibleIDs {
+			if _, exists := seen[visibleID]; exists {
+				continue
+			}
+			visibleModel := model
+			visibleModel.ID = visibleID
+			if visibleID != model.ID {
+				visibleModel.OwnedBy = "alias"
+			}
+			result = append(result, visibleModel)
+			seen[visibleID] = struct{}{}
+		}
+	}
+	return result
 }
 
 // ======================== Claude Messages API ========================
