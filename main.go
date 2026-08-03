@@ -190,9 +190,10 @@ func socks5Dial(proxy Socks5Proxy) func(ctx context.Context, network, addr strin
 }
 
 var (
-	socks5Proxies []Socks5Proxy
-	activeSocks5  string // 启用的代理 Addr，空表示直连，__round_robin__ 表示轮询
-	socks5Mu      sync.RWMutex
+	socks5Proxies    []Socks5Proxy
+	activeSocks5     string // 启用的代理 Addr，空表示直连，__round_robin__ 表示轮询
+	socks5PaidDirect bool   // true=带 key/付费直连；false/缺省=全部走代理
+	socks5Mu         sync.RWMutex
 )
 
 const socks5RR = "__round_robin__"
@@ -258,13 +259,20 @@ func getHTTPClient() *http.Client {
 	return client
 }
 
-// getHTTPClientForTier 根据层级返回 HTTP 客户端
-// 付费层走直连，免费层（默认）走 SOCKS5 代理（如配置）
+// getHTTPClientForTier 按认证层级选择 HTTP 客户端。
+// 默认（socks5_paid_direct 未填或 false）：只要配置了 active_socks5，付费/带 key 与 public 都走代理。
+// socks5_paid_direct=true 时恢复旧行为：付费层直连，仅免费层走代理。
 func getHTTPClientForTier(tier TierType) *http.Client {
-	if tier == TierPaid {
+	if tier == TierPaid && getSocks5PaidDirect() {
 		return httpClient
 	}
 	return getHTTPClient()
+}
+
+func getSocks5PaidDirect() bool {
+	socks5Mu.RLock()
+	defer socks5Mu.RUnlock()
+	return socks5PaidDirect
 }
 
 // ======================== 随机 ID ========================
@@ -685,6 +693,10 @@ type AppConfig struct {
 	ForceDisableThinking bool              `json:"force_disable_thinking"`
 	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
 	ActiveSocks5         string            `json:"active_socks5,omitempty"`
+	// Socks5PaidDirect controls whether keyed/paid upstream calls bypass SOCKS5.
+	// Omitted or false (default): all traffic uses the active proxy.
+	// true: paid/keyed traffic goes direct; only public/free uses SOCKS5.
+	Socks5PaidDirect bool `json:"socks5_paid_direct,omitempty"`
 }
 
 // ======================== Claude Messages API 类型 ========================
@@ -838,6 +850,7 @@ func applyConfig(cfg AppConfig) {
 		socks5ClientAddr = ""
 		atomic.StoreUint32(&socks5RRIndex, 0)
 	}
+	socks5PaidDirect = cfg.Socks5PaidDirect
 	socks5Mu.Unlock()
 
 }
@@ -4971,6 +4984,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
 		cfg.ActiveSocks5 = activeSocks5
+		cfg.Socks5PaidDirect = socks5PaidDirect
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -4979,6 +4993,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			"force_disable_thinking": cfg.ForceDisableThinking,
 			"socks5_proxies":         cfg.Socks5Proxies,
 			"active_socks5":          cfg.ActiveSocks5,
+			"socks5_paid_direct":     cfg.Socks5PaidDirect,
 			"log_level":              getLogLevelString(),
 			"log_bodies":             getLogBodies(),
 		})
@@ -5328,6 +5343,8 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <option value="">直连（不使用代理）</option>
 </select>
 </div>
+<label class="check"><input type="checkbox" id="socks5_paid_direct"> 带 key / 付费请求直连（不走 SOCKS5）</label>
+<p style="margin:6px 0 12px;color:var(--muted);font-size:13px">默认关闭：只要启用了代理，public 与带 key 请求都走 SOCKS5。</p>
 <div class="actions">
 <button class="btn btn-primary" onclick="addSocks5Row()">添加代理</button>
 <button class="btn btn-success" onclick="saveConfig()">保存全部</button>
@@ -5341,7 +5358,7 @@ let aliasData={},effortData={},modelList=[],socks5Data=[];
 function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute('data-theme');const next=cur==='dark'?null:'dark';if(next)d.setAttribute('data-theme',next);else d.removeAttribute('data-theme');localStorage.setItem('theme',next||'light');document.querySelector('.theme-toggle').textContent=next==='dark'?'🌙':'☀'}
 (function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
 function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadStats();setTimeout(()=>window.scrollTo(0,sy),100)})}
-async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
+async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;document.getElementById('socks5_paid_direct').checked=!!cfg.socks5_paid_direct;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
 function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>').join('')}
 function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
 function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+modelSelectHtml('')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
@@ -5356,7 +5373,7 @@ function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,socks5_paid_direct:document.getElementById('socks5_paid_direct').checked};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}

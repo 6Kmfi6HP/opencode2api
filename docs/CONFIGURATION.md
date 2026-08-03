@@ -68,6 +68,20 @@ SOCKS5 代理列表。
 - 某个 `addr`：固定使用该代理
 - `__round_robin__`：在多个代理之间轮询
 
+### `socks5_paid_direct`
+
+控制**带 key / 付费**上游请求是否绕过 SOCKS5。
+
+- 不填或 `false`（默认）：只要配置了 `active_socks5`，public 与带 key 请求都走代理
+- `true`：带 key 请求直连；仅 public / 免费层走代理（旧行为）
+
+```json
+{
+  "active_socks5": "127.0.0.1:1080",
+  "socks5_paid_direct": false
+}
+```
+
 ## 管理面板
 
 打开 `http://127.0.0.1:8000/` 可进入管理面板。面板可以修改配置、刷新模型和查看 token 统计。

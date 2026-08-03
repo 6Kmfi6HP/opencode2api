@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.3.10
+
+- Add `socks5_paid_direct` (default `false`): when an `active_socks5` proxy is set, keyed/paid upstream traffic also uses SOCKS5 unless this flag is explicitly enabled for the old paid-direct bypass.
+
 ## v0.3.9
 
 - Stop cross-model upstream fallback for both public and keyed auth; retry transient 401/429/5xx and transport errors on the same requested model only.

@@ -21,5 +21,6 @@
       "password": ""
     }
   ],
-  "active_socks5": ""
+  "active_socks5": "",
+  "socks5_paid_direct": false
 }

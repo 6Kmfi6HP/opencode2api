@@ -93,6 +93,8 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	oldActiveSocks5 := activeSocks5
 	oldSocks5Client := socks5Client
 	oldSocks5ClientAddr := socks5ClientAddr
+	oldSocks5PaidDirect := socks5PaidDirect
+	oldSocks5Proxies := socks5Proxies
 
 	transport := &fakeRetryTransport{
 		t:         t,
@@ -109,6 +111,8 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	activeSocks5 = ""
 	socks5Client = nil
 	socks5ClientAddr = ""
+	socks5PaidDirect = false
+	socks5Proxies = nil
 	socks5Mu.Unlock()
 
 	ocOnce = sync.Once{}
@@ -127,6 +131,8 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 		activeSocks5 = oldActiveSocks5
 		socks5Client = oldSocks5Client
 		socks5ClientAddr = oldSocks5ClientAddr
+		socks5PaidDirect = oldSocks5PaidDirect
+		socks5Proxies = oldSocks5Proxies
 		socks5Mu.Unlock()
 		ocOnce = sync.Once{}
 		ocClientVer = oldOCClientVer
@@ -347,6 +353,56 @@ func TestIsNonRetryableUpstreamError(t *testing.T) {
 	plain := []byte(`{"error":"unauthorized"}`)
 	if isNonRetryableUpstreamError(http.StatusUnauthorized, plain) {
 		t.Fatal("plain 401 without credits payload should not be classified as non-retryable billing")
+	}
+}
+
+func TestGetHTTPClientForTierSocks5PaidDirectDefaultUsesProxy(t *testing.T) {
+	oldHTTPClient := httpClient
+	oldProxies := socks5Proxies
+	oldActive := activeSocks5
+	oldPaidDirect := socks5PaidDirect
+	oldClient := socks5Client
+	oldClientAddr := socks5ClientAddr
+	t.Cleanup(func() {
+		httpClient = oldHTTPClient
+		socks5Mu.Lock()
+		socks5Proxies = oldProxies
+		activeSocks5 = oldActive
+		socks5PaidDirect = oldPaidDirect
+		socks5Client = oldClient
+		socks5ClientAddr = oldClientAddr
+		socks5Mu.Unlock()
+	})
+
+	httpClient = &http.Client{Timeout: 1}
+	socks5Mu.Lock()
+	socks5Proxies = []Socks5Proxy{{Addr: "127.0.0.1:1080", Name: "test"}}
+	activeSocks5 = "127.0.0.1:1080"
+	socks5PaidDirect = false
+	socks5Client = nil
+	socks5ClientAddr = ""
+	socks5Mu.Unlock()
+
+	paid := getHTTPClientForTier(TierPaid)
+	free := getHTTPClientForTier(TierFree)
+	if paid == httpClient {
+		t.Fatal("default socks5_paid_direct=false should send paid traffic through SOCKS5")
+	}
+	if free == httpClient {
+		t.Fatal("free traffic should use SOCKS5 when active_socks5 is set")
+	}
+	if paid != free {
+		t.Fatal("paid and free should share the cached SOCKS5 client when paid_direct is false")
+	}
+
+	socks5Mu.Lock()
+	socks5PaidDirect = true
+	socks5Mu.Unlock()
+	if getHTTPClientForTier(TierPaid) != httpClient {
+		t.Fatal("socks5_paid_direct=true should keep paid traffic on the direct client")
+	}
+	if getHTTPClientForTier(TierFree) == httpClient {
+		t.Fatal("free traffic should still use SOCKS5 when paid_direct is true")
 	}
 }
 
