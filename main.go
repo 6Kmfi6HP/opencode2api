@@ -3084,6 +3084,8 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 	toolBlockIndices := map[int]int{}
 	toolCallOrder := []int{}
 	messageStartSent := false
+	finished := false
+	stopReason := "end_turn"
 	fullUsage := map[string]any{}
 	// Accumulates reasoning when keepReasoning so we can fall back to a text
 	// block if the stream never produces content/tool_use (#37635).
@@ -3138,6 +3140,26 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		textBlockOpen = false
 	}
 
+	ensureMessageStart := func() {
+		if messageStartSent {
+			return
+		}
+		messageStartSent = true
+		emitClaudeEvent("message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id":          msgID,
+				"type":        "message",
+				"role":        "assistant",
+				"content":     []any{},
+				"model":       model,
+				"stop_reason": nil,
+				"usage":       buildClaudeMessageUsage(fullUsage),
+			},
+		})
+		emitClaudeEvent("ping", map[string]any{"type": "ping"})
+	}
+
 	emitTextDelta := func(contentStr string) {
 		if contentStr == "" {
 			return
@@ -3178,6 +3200,25 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		emitTextDelta(fallback)
 	}
 
+	finalizeContentBlocks := func() {
+		emitEmptyTextFallback()
+		closeThinkingBlock()
+		closeTextBlock()
+		for _, idx := range toolCallOrder {
+			acc := toolCallAccumulator[idx]
+			emitClaudeEvent("content_block_stop", map[string]any{
+				"type":  "content_block_stop",
+				"index": toolBlockIndices[idx],
+				"content_block": map[string]any{
+					"type":  "tool_use",
+					"id":    acc["id"],
+					"name":  acc["name"],
+					"input": map[string]any{},
+				},
+			})
+		}
+	}
+
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -3207,6 +3248,7 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 
 		choices, ok := chunk["choices"].([]any)
 		if !ok || len(choices) == 0 {
+			// Usage-only trailing chunk (OpenAI stream_options.include_usage).
 			continue
 		}
 
@@ -3215,21 +3257,12 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		finishReason, _ := choice["finish_reason"].(string)
 		stats.noteChunk()
 
-		if !messageStartSent {
-			messageStartSent = true
-			emitClaudeEvent("message_start", map[string]any{
-				"type": "message_start",
-				"message": map[string]any{
-					"id":          msgID,
-					"type":        "message",
-					"role":        "assistant",
-					"content":     []any{},
-					"model":       model,
-					"stop_reason": nil,
-					"usage":       buildClaudeMessageUsage(fullUsage),
-				},
-			})
-			emitClaudeEvent("ping", map[string]any{"type": "ping"})
+		ensureMessageStart()
+
+		// After finish_reason, ignore further content deltas but keep reading
+		// so a later usage-only chunk can populate fullUsage.
+		if finished {
+			continue
 		}
 
 		if rc, ok := delta["reasoning_content"]; ok {
@@ -3331,25 +3364,10 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
 			stats.finishReason = finishReason
 			stats.sawFinish = true
-			emitEmptyTextFallback()
-			closeThinkingBlock()
-			closeTextBlock()
+			finished = true
+			finalizeContentBlocks()
 
-			for _, idx := range toolCallOrder {
-				acc := toolCallAccumulator[idx]
-				emitClaudeEvent("content_block_stop", map[string]any{
-					"type":  "content_block_stop",
-					"index": toolBlockIndices[idx],
-					"content_block": map[string]any{
-						"type":  "tool_use",
-						"id":    acc["id"],
-						"name":  acc["name"],
-						"input": map[string]any{},
-					},
-				})
-			}
-
-			stopReason := "end_turn"
+			stopReason = "end_turn"
 			switch finishReason {
 			case "length":
 				stopReason = "max_tokens"
@@ -3358,28 +3376,20 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 			case "content_filter":
 				stopReason = "refusal"
 			}
-
-			emitClaudeEvent("message_delta", map[string]any{
-				"type": "message_delta",
-				"delta": map[string]any{
-					"stop_reason": stopReason,
-				},
-				"usage": buildClaudeDeltaUsage(fullUsage),
-			})
-			emitClaudeEvent("message_stop", map[string]any{
-				"type": "message_stop",
-			})
-			return
+			// Do not emit message_delta/stop yet: OpenAI-compatible upstreams often
+			// send the usage-only chunk after finish_reason when include_usage=true.
+			continue
 		}
 	}
 
-	emitEmptyTextFallback()
-	closeThinkingBlock()
-	closeTextBlock()
+	ensureMessageStart()
+	if !finished {
+		finalizeContentBlocks()
+	}
 	emitClaudeEvent("message_delta", map[string]any{
 		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": "end_turn"},
-		"usage": buildClaudeDeltaUsage(nil),
+		"delta": map[string]any{"stop_reason": stopReason},
+		"usage": buildClaudeDeltaUsage(fullUsage),
 	})
 	emitClaudeEvent("message_stop", map[string]any{"type": "message_stop"})
 }

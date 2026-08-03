@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.3.8
+
+- Fix Claude Code `/v1/messages` streaming: wait for the OpenAI usage-only chunk after `finish_reason` before emitting `message_delta`, so token usage (and cache fields when present) is no longer dropped.
+
 ## v0.3.7
 
 - Fix Docker image build: copy `go.sum` so lumberjack dependency resolves during multi-arch image builds.
