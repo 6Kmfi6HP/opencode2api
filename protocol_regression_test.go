@@ -223,3 +223,84 @@ func TestChatResponsePreservesUsageDetailsAndSystemFingerprint(t *testing.T) {
 		t.Fatalf("usage details lost: %s", out)
 	}
 }
+
+func TestPromoteMisplacedReasoningWhenThinkingDisabled(t *testing.T) {
+	delta := map[string]any{"reasoning_content": "hello from go gateway"}
+	promoteMisplacedReasoning(delta, false)
+	if delta["content"] != "hello from go gateway" {
+		t.Fatalf("content = %#v, want promoted text", delta["content"])
+	}
+	if _, ok := delta["reasoning_content"]; ok {
+		t.Fatalf("reasoning_content should be removed: %#v", delta)
+	}
+}
+
+func TestPromoteMisplacedReasoningKeepsCoTWhenThinkingEnabled(t *testing.T) {
+	delta := map[string]any{"reasoning_content": "chain of thought"}
+	promoteMisplacedReasoning(delta, true)
+	if delta["reasoning_content"] != "chain of thought" {
+		t.Fatalf("reasoning lost: %#v", delta)
+	}
+	if _, ok := delta["content"]; ok {
+		t.Fatalf("should not promote while thinking enabled: %#v", delta)
+	}
+}
+
+func TestChatStreamPromotesReasoningToContentWhenThinkingDisabled(t *testing.T) {
+	line := `data: {"choices":[{"delta":{"reasoning_content":"2"},"finish_reason":null}]}`
+	got, _ := convertStreamChunkWithUsage(line, false)
+	if !strings.Contains(got, `"content":"2"`) {
+		t.Fatalf("expected promoted content:\n%s", got)
+	}
+	if strings.Contains(got, "reasoning_content") {
+		t.Fatalf("reasoning_content should be stripped:\n%s", got)
+	}
+}
+
+func TestClaudeStreamPromotesReasoningToTextWhenThinkingDisabled(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"reasoning_content":"The answer is "}}]}`,
+		`data: {"choices":[{"delta":{"reasoning_content":"2"},"finish_reason":"stop"}]}`,
+		`data: [DONE]`, "",
+	}, "\n")
+	rr := httptest.NewRecorder()
+	claudeStreamHandler(rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	out := rr.Body.String()
+	if !strings.Contains(out, `"type":"text_delta"`) {
+		t.Fatalf("missing text_delta:\n%s", out)
+	}
+	if strings.Contains(out, `"type":"thinking_delta"`) {
+		t.Fatalf("should not emit thinking when keepReasoning=false:\n%s", out)
+	}
+	if !strings.Contains(out, `"text":"The answer is "`) || !strings.Contains(out, `"text":"2"`) {
+		t.Fatalf("missing promoted text:\n%s", out)
+	}
+}
+
+func TestClaudeStreamFallbackEmitsTextWhenOnlyReasoningWithThinkingEnabled(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"reasoning_content":"only reasoning"}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`, "",
+	}, "\n")
+	rr := httptest.NewRecorder()
+	claudeStreamHandler(rr, io.NopCloser(strings.NewReader(upstream)), "m", true)
+	out := rr.Body.String()
+	if !strings.Contains(out, `"type":"thinking_delta"`) {
+		t.Fatalf("expected thinking while keepReasoning=true:\n%s", out)
+	}
+	if !strings.Contains(out, `"type":"text_delta"`) || !strings.Contains(out, `"text":"only reasoning"`) {
+		t.Fatalf("expected empty-content text fallback:\n%s", out)
+	}
+}
+
+func TestClaudeNonStreamPromotesEmptyContentFromReasoning(t *testing.T) {
+	body := openAIToClaudeResponse([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"2"},"finish_reason":"stop"}]}`), "m", false)
+	var got ClaudeResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Content) != 1 || got.Content[0].Type != "text" || got.Content[0].Text != "2" {
+		t.Fatalf("expected promoted text content, got %#v", got.Content)
+	}
+}

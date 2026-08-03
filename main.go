@@ -1375,7 +1375,34 @@ func cleanNulls(m map[string]any) {
 	}
 }
 
+// promoteMisplacedReasoning moves reasoning_content into content when upstream
+// put the visible answer in reasoning_content (opencode-go #37635). Only runs
+// when content is empty and the chunk has no tool_calls, so genuine CoT that
+// precedes tool calls is left alone when keepReasoning is true.
+func promoteMisplacedReasoning(fields map[string]any, keepReasoning bool) {
+	rc, _ := fields["reasoning_content"].(string)
+	if rc == "" {
+		return
+	}
+	if raw, ok := fields["tool_calls"]; ok && raw != nil {
+		if arr, ok := raw.([]any); ok && len(arr) > 0 {
+			return
+		}
+	}
+	content, _ := fields["content"].(string)
+	if content != "" {
+		return
+	}
+	if keepReasoning {
+		// Thinking explicitly requested: leave CoT in reasoning_content.
+		return
+	}
+	fields["content"] = rc
+	delete(fields, "reasoning_content")
+}
+
 func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
+	promoteMisplacedReasoning(delta, keepReasoning)
 	if v, ok := delta["content"]; ok && v == nil {
 		delete(delta, "content")
 	}
@@ -1440,6 +1467,7 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 		}
 		if msg, ok := choice["message"].(map[string]any); ok {
 			cleanNulls(msg)
+			promoteMisplacedReasoning(msg, keepReasoning)
 			if !keepReasoning {
 				delete(msg, "reasoning_content")
 			}
@@ -1479,6 +1507,7 @@ func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 			if choice, ok := c.(map[string]any); ok {
 				if msg, ok := choice["message"].(map[string]any); ok {
 					cleanNulls(msg)
+					promoteMisplacedReasoning(msg, keepReasoning)
 					if !keepReasoning {
 						delete(msg, "reasoning_content")
 					}
@@ -2317,10 +2346,17 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 				Thinking: msg.ReasoningContent,
 			})
 		}
-		if msg.Content != "" {
+		text := msg.Content
+		// #37635: Go gateway often puts the whole answer in reasoning_content.
+		// Promote to text when content is empty so Claude Code does not see an
+		// empty end_turn and exit the agent loop.
+		if text == "" && msg.ReasoningContent != "" && len(msg.ToolCalls) == 0 {
+			text = msg.ReasoningContent
+		}
+		if text != "" {
 			content = append(content, ClaudeContent{
 				Type: "text",
-				Text: msg.Content,
+				Text: text,
 			})
 		}
 		for _, tc := range msg.ToolCalls {
@@ -2517,11 +2553,9 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		chatReq.ExtraBody["stream_options"] = map[string]any{"include_usage": true}
 	}
 
-	wantReasoning := !getForceDisableThinking()
-	if claudeReq.Thinking != nil {
-		if isThinkingDisabled(claudeReq.Thinking) {
-			wantReasoning = false
-		}
+	wantReasoning := false
+	if !getForceDisableThinking() && claudeReq.Thinking != nil && isThinkingEnabled(claudeReq.Thinking) {
+		wantReasoning = true
 	}
 	keepReasoning := wantReasoning
 	chatReq.Messages = ensureReasoningContent(chatReq.Messages, keepReasoning)
@@ -2596,6 +2630,9 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 	toolCallOrder := []int{}
 	messageStartSent := false
 	fullUsage := map[string]any{}
+	// Accumulates reasoning when keepReasoning so we can fall back to a text
+	// block if the stream never produces content/tool_use (#37635).
+	reasoningFallback := strings.Builder{}
 	defer func() {
 		if len(fullUsage) > 0 {
 			pt, _ := fullUsage["prompt_tokens"].(float64)
@@ -2642,6 +2679,44 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 			"content_block": map[string]any{"type": "text"},
 		})
 		textBlockOpen = false
+	}
+
+	emitTextDelta := func(contentStr string) {
+		if contentStr == "" {
+			return
+		}
+		closeThinkingBlock()
+		if !textBlockOpen {
+			emitClaudeEvent("content_block_start", map[string]any{
+				"type":  "content_block_start",
+				"index": blockIndex,
+				"content_block": map[string]any{
+					"type": "text",
+					"text": "",
+				},
+			})
+			textBlockOpen = true
+			blockIndex++
+		}
+		emitClaudeEvent("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": blockIndex - 1,
+			"delta": map[string]any{
+				"type": "text_delta",
+				"text": contentStr,
+			},
+		})
+	}
+
+	emitEmptyTextFallback := func() {
+		if textBlockOpen || len(toolCallOrder) > 0 {
+			return
+		}
+		fallback := reasoningFallback.String()
+		if fallback == "" {
+			return
+		}
+		emitTextDelta(fallback)
 	}
 
 	for {
@@ -2699,57 +2774,43 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 			emitClaudeEvent("ping", map[string]any{"type": "ping"})
 		}
 
-		if rc, ok := delta["reasoning_content"]; ok && keepReasoning {
+		if rc, ok := delta["reasoning_content"]; ok {
 			rcStr, _ := rc.(string)
 			if rcStr != "" {
-				closeTextBlock()
-				if !thinkingBlockOpen {
-					emitClaudeEvent("content_block_start", map[string]any{
-						"type":  "content_block_start",
-						"index": blockIndex,
-						"content_block": map[string]any{
-							"type":     "thinking",
-							"thinking": "",
+				if keepReasoning {
+					reasoningFallback.WriteString(rcStr)
+					closeTextBlock()
+					if !thinkingBlockOpen {
+						emitClaudeEvent("content_block_start", map[string]any{
+							"type":  "content_block_start",
+							"index": blockIndex,
+							"content_block": map[string]any{
+								"type":     "thinking",
+								"thinking": "",
+							},
+						})
+						thinkingBlockOpen = true
+						blockIndex++
+					}
+					emitClaudeEvent("content_block_delta", map[string]any{
+						"type":  "content_block_delta",
+						"index": blockIndex - 1,
+						"delta": map[string]any{
+							"type":     "thinking_delta",
+							"thinking": rcStr,
 						},
 					})
-					thinkingBlockOpen = true
-					blockIndex++
+				} else {
+					// Thinking not requested: promote misplaced CoT to visible text (#37635).
+					emitTextDelta(rcStr)
 				}
-				emitClaudeEvent("content_block_delta", map[string]any{
-					"type":  "content_block_delta",
-					"index": blockIndex - 1,
-					"delta": map[string]any{
-						"type":     "thinking_delta",
-						"thinking": rcStr,
-					},
-				})
 			}
 		}
 
 		if c, ok := delta["content"]; ok && c != nil {
 			contentStr, _ := c.(string)
 			if contentStr != "" {
-				closeThinkingBlock()
-				if !textBlockOpen {
-					emitClaudeEvent("content_block_start", map[string]any{
-						"type":  "content_block_start",
-						"index": blockIndex,
-						"content_block": map[string]any{
-							"type": "text",
-							"text": "",
-						},
-					})
-					textBlockOpen = true
-					blockIndex++
-				}
-				emitClaudeEvent("content_block_delta", map[string]any{
-					"type":  "content_block_delta",
-					"index": blockIndex - 1,
-					"delta": map[string]any{
-						"type": "text_delta",
-						"text": contentStr,
-					},
-				})
+				emitTextDelta(contentStr)
 			}
 		}
 
@@ -2808,6 +2869,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		}
 
 		if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
+			emitEmptyTextFallback()
 			closeThinkingBlock()
 			closeTextBlock()
 
@@ -2849,6 +2911,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		}
 	}
 
+	emitEmptyTextFallback()
 	closeThinkingBlock()
 	closeTextBlock()
 	emitClaudeEvent("message_delta", map[string]any{
@@ -3976,6 +4039,12 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		if c, ok := delta["content"]; ok && c != nil {
 			contentStr, _ = c.(string)
 		}
+		// #37635: when thinking is not kept, promote misplaced reasoning to visible text.
+		if contentStr == "" && !wantReasoning {
+			if rc, ok := delta["reasoning_content"].(string); ok {
+				contentStr = rc
+			}
+		}
 		if contentStr != "" {
 			// The terminal finish reason determines the item's final status. Keep the
 			// reasoning item open until that reason is known so a truncation cannot
@@ -4245,11 +4314,15 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		if refusal := chat.Choices[0].Message.Refusal; refusal != "" {
 			messageContent = []any{map[string]any{"type": "refusal", "refusal": refusal}}
 		}
+		rc := chat.Choices[0].Message.ReasoningContent
 		if wantReasoning {
-			reasoning = chat.Choices[0].Message.ReasoningContent
+			reasoning = rc
 		}
 		toolCalls = chat.Choices[0].Message.ToolCalls
 		finishReason = chat.Choices[0].FinishReason
+		if len(messageContent) == 0 && rc != "" && len(toolCalls) == 0 {
+			messageContent, _ = chatContentToResponsesContent(rc)
+		}
 	}
 
 	outcome := responsesOutcome(finishReason)
