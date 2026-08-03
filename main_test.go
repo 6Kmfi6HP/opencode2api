@@ -137,7 +137,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	return transport
 }
 
-func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
+func TestCallOpenCodeAPIRetriesSameModelWithoutFallback(t *testing.T) {
 	tests := []struct {
 		name        string
 		stream      bool
@@ -147,9 +147,10 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 		wantModels  []string
 		wantCloses  int
 		requestBody string
+		auth        UpstreamAuth
 	}{
 		{
-			name:   "non-stream retries 401",
+			name:   "non-stream retries 401 on same model then succeeds",
 			stream: false,
 			responses: []fakeUpstreamResponse{
 				{status: http.StatusUnauthorized, body: `{"error":"unauthorized"}`},
@@ -157,12 +158,13 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			},
 			wantStatus:  http.StatusOK,
 			wantBody:    `{"id":"chatcmpl_test","choices":[]}`,
-			wantModels:  []string{"primary-model", "fallback-model-free"},
+			wantModels:  []string{"primary-model", "primary-model"},
 			wantCloses:  1,
 			requestBody: `{"model":"primary-model","messages":[]}`,
+			auth:        UpstreamAuth{Mode: AuthRoutePublic},
 		},
 		{
-			name:   "stream retries 429",
+			name:   "stream retries 429 on same model then succeeds",
 			stream: true,
 			responses: []fakeUpstreamResponse{
 				{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
@@ -170,15 +172,19 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			},
 			wantStatus:  http.StatusOK,
 			wantBody:    "data: ok\n\n",
-			wantModels:  []string{"primary-model", "fallback-model-free"},
+			wantModels:  []string{"primary-model", "primary-model"},
 			wantCloses:  1,
 			requestBody: `{"model":"primary-model","messages":[],"stream":true}`,
+			auth:        UpstreamAuth{Mode: AuthRoutePublic},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			transport := installFakeOpenCodeClient(t, tt.responses)
+			modelMu.Lock()
+			modelsCache = []ModelInfo{{ID: "primary-model"}, {ID: "fallback-model-free"}}
+			modelMu.Unlock()
 
 			var (
 				body   []byte
@@ -187,7 +193,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			)
 			if tt.stream {
 				var respBody io.ReadCloser
-				respBody, status, _, err = callOpenCodeAPIStream(context.Background(), []byte(tt.requestBody), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
+				respBody, status, _, err = callOpenCodeAPIStream(context.Background(), []byte(tt.requestBody), "primary-model", tt.auth)
 				if respBody != nil {
 					defer respBody.Close()
 				}
@@ -195,7 +201,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 					body, err = io.ReadAll(respBody)
 				}
 			} else {
-				body, status, _, err = callOpenCodeAPI(context.Background(), []byte(tt.requestBody), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
+				body, status, _, err = callOpenCodeAPI(context.Background(), []byte(tt.requestBody), "primary-model", tt.auth)
 			}
 			if err != nil {
 				t.Fatalf("upstream call error = %v", err)
@@ -216,7 +222,70 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 	}
 }
 
-func TestCallOpenCodeAPIFallbackKeepsOriginalGoEndpoint(t *testing.T) {
+func TestCallOpenCodeAPIKeyedAuthDoesNotCrossModelFallback(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non-stream", stream: false},
+		{name: "stream", stream: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			creditsBody := `{"type":"error","error":{"type":"CreditsError","message":"Insufficient balance. Manage your billing here: https://opencode.ai/workspace/billing"}}`
+			transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+				{status: http.StatusUnauthorized, body: creditsBody},
+			})
+			modelMu.Lock()
+			modelsCache = []ModelInfo{{ID: "claude-sonnet-4-5"}, {ID: "claude-opus-5"}, {ID: "fallback-model-free"}}
+			goModelsCache = []ModelInfo{{ID: "go-only-model"}, {ID: "shared-model"}}
+			modelMu.Unlock()
+
+			auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-validkey0123456789abcdef"}
+			body := []byte(`{"model":"claude-sonnet-4-5","messages":[]}`)
+			if tt.stream {
+				body = []byte(`{"model":"claude-sonnet-4-5","messages":[],"stream":true}`)
+				respBody, status, _, err := callOpenCodeAPIStream(context.Background(), body, "claude-sonnet-4-5", auth)
+				if respBody != nil {
+					defer respBody.Close()
+					got, _ := io.ReadAll(respBody)
+					if string(got) != creditsBody {
+						t.Fatalf("stream body = %s, want credits error", string(got))
+					}
+				}
+				if err != nil {
+					t.Fatalf("callOpenCodeAPIStream() error = %v", err)
+				}
+				if status != http.StatusUnauthorized {
+					t.Fatalf("callOpenCodeAPIStream() status = %d, want %d", status, http.StatusUnauthorized)
+				}
+			} else {
+				got, status, _, err := callOpenCodeAPI(context.Background(), body, "claude-sonnet-4-5", auth)
+				if err == nil {
+					t.Fatal("callOpenCodeAPI() error = nil, want upstream error")
+				}
+				if status != http.StatusUnauthorized {
+					t.Fatalf("callOpenCodeAPI() status = %d, want %d", status, http.StatusUnauthorized)
+				}
+				if string(got) != creditsBody {
+					t.Fatalf("callOpenCodeAPI() body = %s, want credits error", string(got))
+				}
+			}
+
+			wantModels := []string{"claude-sonnet-4-5"}
+			if !reflect.DeepEqual(transport.requestedModels, wantModels) {
+				t.Fatalf("requested models = %#v, want %#v (no cross-model fallback, no credits retry)", transport.requestedModels, wantModels)
+			}
+			wantURL := "https://opencode.ai/zen/v1/chat/completions"
+			if !reflect.DeepEqual(transport.requestedURLs, []string{wantURL}) {
+				t.Fatalf("requested URLs = %#v, want single %q", transport.requestedURLs, wantURL)
+			}
+		})
+	}
+}
+
+func TestCallOpenCodeAPIGoEndpointKeepsSurfaceWithoutFallback(t *testing.T) {
 	tests := []struct {
 		name   string
 		stream bool
@@ -228,7 +297,6 @@ func TestCallOpenCodeAPIFallbackKeepsOriginalGoEndpoint(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
-				{status: http.StatusUnauthorized, body: `{"error":"unauthorized"}`},
 				{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
 			})
 			modelMu.Lock()
@@ -261,46 +329,68 @@ func TestCallOpenCodeAPIFallbackKeepsOriginalGoEndpoint(t *testing.T) {
 			}
 
 			wantURL := "https://opencode.ai/zen/go/v1/chat/completions"
-			if !reflect.DeepEqual(transport.requestedURLs, []string{wantURL, wantURL}) {
-				t.Fatalf("requested URLs = %#v, want both requests to %q", transport.requestedURLs, wantURL)
+			if !reflect.DeepEqual(transport.requestedURLs, []string{wantURL}) {
+				t.Fatalf("requested URLs = %#v, want %q", transport.requestedURLs, wantURL)
+			}
+			if !reflect.DeepEqual(transport.requestedModels, []string{"go-only-model"}) {
+				t.Fatalf("requested models = %#v, want [go-only-model]", transport.requestedModels)
 			}
 		})
 	}
 }
 
-func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
+func TestIsNonRetryableUpstreamError(t *testing.T) {
+	credits := []byte(`{"type":"error","error":{"type":"CreditsError","message":"Insufficient balance"}}`)
+	if !isNonRetryableUpstreamError(http.StatusUnauthorized, credits) {
+		t.Fatal("CreditsError should be non-retryable")
+	}
+	plain := []byte(`{"error":"unauthorized"}`)
+	if isNonRetryableUpstreamError(http.StatusUnauthorized, plain) {
+		t.Fatal("plain 401 without credits payload should not be classified as non-retryable billing")
+	}
+}
+
+func TestCallOpenCodeAPIExhausted4xxReturnsRequestedModelError(t *testing.T) {
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
 		{
 			status: http.StatusUnauthorized,
-			body:   `{"error":"unauthorized"}`,
+			body:   `{"error":"unauthorized-1"}`,
 			header: http.Header{"X-Upstream-Error": []string{"first"}},
 		},
 		{
-			status: http.StatusForbidden,
-			body:   `{"error":"forbidden"}`,
+			status: http.StatusUnauthorized,
+			body:   `{"error":"unauthorized-2"}`,
+			header: http.Header{"X-Upstream-Error": []string{"second"}},
+		},
+		{
+			status: http.StatusUnauthorized,
+			body:   `{"error":"unauthorized-3"}`,
 			header: http.Header{"X-Upstream-Error": []string{"last"}},
 		},
 	})
+	modelMu.Lock()
+	modelsCache = []ModelInfo{{ID: "primary-model"}, {ID: "fallback-model-free"}}
+	modelMu.Unlock()
 
 	body, status, header, err := callOpenCodeAPI(context.Background(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 	if err == nil {
 		t.Fatal("callOpenCodeAPI() error = nil, want upstream error")
 	}
-	if status != http.StatusForbidden {
-		t.Fatalf("callOpenCodeAPI() status = %d, want %d", status, http.StatusForbidden)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("callOpenCodeAPI() status = %d, want %d", status, http.StatusUnauthorized)
 	}
-	if string(body) != `{"error":"forbidden"}` {
-		t.Fatalf("callOpenCodeAPI() body = %s, want final upstream body", string(body))
+	if string(body) != `{"error":"unauthorized-3"}` {
+		t.Fatalf("callOpenCodeAPI() body = %s, want final same-model retry body", string(body))
 	}
 	if header.Get("X-Upstream-Error") != "last" {
 		t.Fatalf("final header = %q, want last", header.Get("X-Upstream-Error"))
 	}
-	wantModels := []string{"primary-model", "fallback-model-free"}
+	wantModels := []string{"primary-model", "primary-model", "primary-model"}
 	if !reflect.DeepEqual(transport.requestedModels, wantModels) {
 		t.Fatalf("requested models = %#v, want %#v", transport.requestedModels, wantModels)
 	}
-	if transport.closeIdleCalls != 1 {
-		t.Fatalf("CloseIdleConnections calls = %d, want 1", transport.closeIdleCalls)
+	if transport.closeIdleCalls != 2 {
+		t.Fatalf("CloseIdleConnections calls = %d, want 2", transport.closeIdleCalls)
 	}
 }
 

@@ -446,26 +446,31 @@ func getGoModelIDs() []string {
 	return ids
 }
 
-func filterFreeModels(ids []string) []string {
-	free := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if isFreeModel(id) {
-			free = append(free, id)
-		}
+// isNonRetryableUpstreamError reports billing/credits failures that must not
+// trigger retries.
+func isNonRetryableUpstreamError(status int, body []byte) bool {
+	if status != http.StatusUnauthorized && status != http.StatusPaymentRequired && status != http.StatusForbidden {
+		return false
 	}
-	return free
-}
-
-// getCandidateModels 返回与当前认证权限一致的回退候选模型列表。
-// public 模式只回退到免费模型；带 key 的模式只回退到与目标模型走相同端点的模型，避免跨目录 401。
-func getCandidateModels(auth UpstreamAuth, modelID string) []string {
-	if auth.Mode == AuthRoutePublic {
-		return filterFreeModels(getModelIDs())
+	var payload struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	if auth.shouldUseGoEndpoint(modelID) {
-		return getGoModelIDs()
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
 	}
-	return getModelIDs()
+	errType := strings.ToLower(strings.TrimSpace(payload.Error.Type))
+	if errType == "" {
+		errType = strings.ToLower(strings.TrimSpace(payload.Type))
+	}
+	if errType == "creditserror" || errType == "insufficient_quota" || errType == "billing_error" {
+		return true
+	}
+	msg := strings.ToLower(payload.Error.Message)
+	return strings.Contains(msg, "insufficient balance") || strings.Contains(msg, "insufficient credits")
 }
 
 // startModelRefresh 定时刷新模型列表（每 10 分钟）
@@ -1695,7 +1700,7 @@ func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth Ups
 }
 
 func shouldRetryUpstreamStatus(status int) bool {
-	// 仅重试可恢复的临时性错误
+	// 仅重试可恢复的临时性错误（始终同模型重试，不换模型）
 	switch status {
 	case http.StatusUnauthorized, // 401 认证过期或 token 未同步
 		http.StatusTooManyRequests,    // 429 限流
@@ -1713,18 +1718,15 @@ const (
 	max401Retries      = 3
 )
 
+func maxAttemptsForUpstreamStatus(status int) int {
+	if status == http.StatusUnauthorized {
+		return max401Retries
+	}
+	return maxUpstreamRetries
+}
+
 func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {
 	initOCSession()
-	candidates := getCandidateModels(auth, modelID)
-	modelsToTry := []string{modelID}
-	for _, m := range candidates {
-		if m != modelID {
-			modelsToTry = append(modelsToTry, m)
-		}
-	}
-	if len(modelsToTry) == 0 {
-		modelsToTry = []string{modelID}
-	}
 
 	var bodyMap map[string]any
 	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
@@ -1739,34 +1741,46 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 
 	var lastErr error
 	var retryCount int
-	var retry401Count int
 	var lastBody []byte
 	var lastStatus int
 	var lastHeader http.Header
-	tried := make([]string, 0, len(modelsToTry))
-	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequestWithEndpoint(tryModel, bodyMap, auth, useGoEndpoint)
+	maxAttempts := maxUpstreamRetries
+	if max401Retries > maxAttempts {
+		maxAttempts = max401Retries
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		up, err := buildOCRequestWithEndpoint(modelID, bodyMap, auth, useGoEndpoint)
 		if err != nil {
-			lastErr = err
-			continue
+			return nil, 500, nil, err
 		}
 		client := getHTTPClientForTier(auth.tier())
 		attemptStart := time.Now()
 		resp, err := client.Do(up)
 		durationMs := time.Since(attemptStart).Milliseconds()
-		tried = append(tried, tryModel)
 		if err != nil {
 			lastErr = err
+			lastStatus = 0
+			retryReason := "transport_error"
+			canRetry := attempt+1 < maxUpstreamRetries
+			if !canRetry {
+				retryReason = ""
+			}
 			log.Info("upstream_attempt",
-				"try_model", tryModel,
+				"try_model", modelID,
 				"surface", surface,
 				"status", 0,
 				"duration_ms", durationMs,
-				"attempt_index", i,
-				"retry_reason", "transport_error",
+				"attempt_index", attempt,
+				"retry_reason", retryReason,
 				"error", err.Error(),
 			)
-			continue
+			if canRetry {
+				client.CloseIdleConnections()
+				retryCount++
+				continue
+			}
+			break
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			b, readErr := io.ReadAll(resp.Body)
@@ -1775,80 +1789,64 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 				return nil, 0, nil, readErr
 			}
 			if isAnthropicFormat(b) {
-				b = convertAnthropicToOpenAI(b, tryModel)
+				b = convertAnthropicToOpenAI(b, modelID)
 			}
 			log.Info("upstream_attempt",
-				"try_model", tryModel,
+				"try_model", modelID,
 				"surface", surface,
 				"status", resp.StatusCode,
 				"duration_ms", durationMs,
-				"attempt_index", i,
+				"attempt_index", attempt,
 			)
 			log.Info("upstream_result",
-				"models_tried", tried,
-				"retries", retryCount+retry401Count,
+				"models_tried", []string{modelID},
+				"retries", retryCount,
 				"final_status", resp.StatusCode,
-				"fallback_used", len(tried) > 1,
+				"fallback_used", false,
 			)
 			return b, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		logUpstreamError(ctx, tryModel, resp.StatusCode, errBody)
+		logUpstreamError(ctx, modelID, resp.StatusCode, errBody)
+		nonRetryable := isNonRetryableUpstreamError(resp.StatusCode, errBody)
+		canRetry := !nonRetryable && shouldRetryUpstreamStatus(resp.StatusCode) && attempt+1 < maxAttemptsForUpstreamStatus(resp.StatusCode)
 		retryReason := ""
-		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
+		if canRetry {
 			retryReason = fmt.Sprintf("status_%d", resp.StatusCode)
 		}
+		if nonRetryable {
+			retryReason = "non_retryable_upstream"
+		}
 		log.Info("upstream_attempt",
-			"try_model", tryModel,
+			"try_model", modelID,
 			"surface", surface,
 			"status", resp.StatusCode,
 			"duration_ms", durationMs,
-			"attempt_index", i,
+			"attempt_index", attempt,
 			"retry_reason", retryReason,
 		)
 		lastBody = errBody
 		lastStatus = resp.StatusCode
 		lastHeader = resp.Header
 		lastErr = fmt.Errorf("upstream error")
-		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
-			client.CloseIdleConnections()
-			if resp.StatusCode == http.StatusUnauthorized {
-				retry401Count++
-				if retry401Count >= max401Retries {
-					break
-				}
-			} else {
-				retryCount++
-				if retryCount >= maxUpstreamRetries {
-					break
-				}
-			}
-			continue
+		if !canRetry {
+			break
 		}
-		break
+		client.CloseIdleConnections()
+		retryCount++
 	}
 	log.Info("upstream_result",
-		"models_tried", tried,
-		"retries", retryCount+retry401Count,
+		"models_tried", []string{modelID},
+		"retries", retryCount,
 		"final_status", lastStatus,
-		"fallback_used", len(tried) > 1,
+		"fallback_used", false,
 	)
 	return lastBody, lastStatus, lastHeader, lastErr
 }
 
 func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
-	candidates := getCandidateModels(auth, modelID)
-	modelsToTry := []string{modelID}
-	for _, m := range candidates {
-		if m != modelID {
-			modelsToTry = append(modelsToTry, m)
-		}
-	}
-	if len(modelsToTry) == 0 {
-		modelsToTry = []string{modelID}
-	}
 
 	var bodyMap map[string]any
 	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
@@ -1865,98 +1863,97 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 	var lastStatus int
 	var lastHeader http.Header
 	var retryCount int
-	var retry401Count int
-	tried := make([]string, 0, len(modelsToTry))
-	for i, tryModel := range modelsToTry {
-		up, err := buildOCRequestWithEndpoint(tryModel, bodyMap, auth, useGoEndpoint)
+	maxAttempts := maxUpstreamRetries
+	if max401Retries > maxAttempts {
+		maxAttempts = max401Retries
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		up, err := buildOCRequestWithEndpoint(modelID, bodyMap, auth, useGoEndpoint)
 		if err != nil {
-			continue
+			return nil, 500, nil, err
 		}
 		client := getHTTPClientForTier(auth.tier())
 		attemptStart := time.Now()
 		resp, err := client.Do(up)
 		durationMs := time.Since(attemptStart).Milliseconds()
-		tried = append(tried, tryModel)
 		if err != nil {
+			retryReason := "transport_error"
+			canRetry := attempt+1 < maxUpstreamRetries
+			if !canRetry {
+				retryReason = ""
+			}
 			log.Info("upstream_attempt",
-				"try_model", tryModel,
+				"try_model", modelID,
 				"surface", surface,
 				"status", 0,
 				"duration_ms", durationMs,
-				"attempt_index", i,
-				"retry_reason", "transport_error",
+				"attempt_index", attempt,
+				"retry_reason", retryReason,
 				"error", err.Error(),
 			)
-			continue
+			if canRetry {
+				client.CloseIdleConnections()
+				retryCount++
+				continue
+			}
+			break
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			log.Info("upstream_attempt",
-				"try_model", tryModel,
+				"try_model", modelID,
 				"surface", surface,
 				"status", resp.StatusCode,
 				"duration_ms", durationMs,
-				"attempt_index", i,
+				"attempt_index", attempt,
 			)
 			log.Info("upstream_result",
-				"models_tried", tried,
-				"retries", retryCount+retry401Count,
+				"models_tried", []string{modelID},
+				"retries", retryCount,
 				"final_status", resp.StatusCode,
-				"fallback_used", len(tried) > 1,
+				"fallback_used", false,
 			)
 			return resp.Body, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		logUpstreamError(ctx, tryModel, resp.StatusCode, errBody)
+		logUpstreamError(ctx, modelID, resp.StatusCode, errBody)
+		nonRetryable := isNonRetryableUpstreamError(resp.StatusCode, errBody)
+		canRetry := !nonRetryable && shouldRetryUpstreamStatus(resp.StatusCode) && attempt+1 < maxAttemptsForUpstreamStatus(resp.StatusCode)
 		retryReason := ""
-		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
+		if canRetry {
 			retryReason = fmt.Sprintf("status_%d", resp.StatusCode)
 		}
+		if nonRetryable {
+			retryReason = "non_retryable_upstream"
+		}
 		log.Info("upstream_attempt",
-			"try_model", tryModel,
+			"try_model", modelID,
 			"surface", surface,
 			"status", resp.StatusCode,
 			"duration_ms", durationMs,
-			"attempt_index", i,
+			"attempt_index", attempt,
 			"retry_reason", retryReason,
 		)
 		lastBody = errBody
 		lastStatus = resp.StatusCode
 		lastHeader = resp.Header
-		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
-			client.CloseIdleConnections()
-			if resp.StatusCode == http.StatusUnauthorized {
-				retry401Count++
-				if retry401Count >= max401Retries {
-					break
-				}
-			} else {
-				retryCount++
-				if retryCount >= maxUpstreamRetries {
-					break
-				}
-			}
-			continue
+		if !canRetry {
+			break
 		}
-		log.Info("upstream_result",
-			"models_tried", tried,
-			"retries", retryCount+retry401Count,
-			"final_status", lastStatus,
-			"fallback_used", len(tried) > 1,
-		)
-		// 返回错误体供下游透传
-		return io.NopCloser(bytes.NewReader(lastBody)), lastStatus, lastHeader, nil
+		client.CloseIdleConnections()
+		retryCount++
 	}
 	log.Info("upstream_result",
-		"models_tried", tried,
-		"retries", retryCount+retry401Count,
+		"models_tried", []string{modelID},
+		"retries", retryCount,
 		"final_status", lastStatus,
-		"fallback_used", len(tried) > 1,
+		"fallback_used", false,
 	)
 	if lastStatus != 0 {
 		return io.NopCloser(bytes.NewReader(lastBody)), lastStatus, lastHeader, nil
 	}
-	return nil, 500, nil, fmt.Errorf("all models failed")
+	return nil, 500, nil, fmt.Errorf("upstream request failed")
 }
 
 // ======================== 安全响应头过滤 ========================
