@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.3.7
+
+- Fix Docker image build: copy `go.sum` so lumberjack dependency resolves during multi-arch image builds.
+
 ## v0.3.6
 
 - Claude Code `/v1/messages` → Chat upstream conversion: accept `x-api-key` (reject `sk-ant-`), merge mid-conversation `system` into one leading system message, convert `tool_result` images to follow-up `image_url`, map `tool_choice.disable_parallel_tool_use` → `parallel_tool_calls=false`, narrow `metadata.user_id` JSON to `session_id`, skip server tools without `input_schema`, and log intentional drops (`context_management`, `cache_control`, betas) in `request_plan`.

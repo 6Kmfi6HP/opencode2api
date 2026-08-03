@@ -11,7 +11,7 @@ ARG VERSION=dev
 ARG COMMIT=none
 ARG DATE=unknown
 
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY *.go ./
