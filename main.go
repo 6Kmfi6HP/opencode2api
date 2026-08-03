@@ -14,10 +14,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -31,7 +33,7 @@ var httpClient = &http.Client{
 }
 
 var (
-	version = "v0.3.0"
+	version = "v0.3.6"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -502,69 +504,6 @@ type contextKey string
 
 const reqIDKey contextKey = "request_id"
 
-var (
-	logLevel string
-	logFile  string
-)
-
-func initLogger() *slog.Logger {
-	var w io.Writer = os.Stdout
-	if logFile != "" {
-		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			slog.Warn("cannot open log file, falling back to stdout", "path", logFile, "error", err)
-		} else {
-			w = f
-		}
-	}
-
-	var lvl slog.Level
-	switch strings.ToLower(logLevel) {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "warn":
-		lvl = slog.LevelWarn
-	case "error":
-		lvl = slog.LevelError
-	default:
-		lvl = slog.LevelInfo
-	}
-
-	handler := slog.NewTextHandler(w, &slog.HandlerOptions{
-		Level: lvl,
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			if a.Key == slog.TimeKey {
-				return slog.String("time", a.Value.Time().Format("2006-01-02T15:04:05.000Z07:00"))
-			}
-			if a.Key == slog.SourceKey {
-				return slog.Attr{}
-			}
-			return a
-		},
-	})
-
-	logger := slog.New(handler)
-	slog.SetDefault(logger)
-	return logger
-}
-
-// loggingMiddleware 为每个请求注入 request_id 并记录请求信息
-func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		reqID := randomString(12)
-		ctx := context.WithValue(r.Context(), reqIDKey, reqID)
-		r = r.WithContext(ctx)
-
-		slog.DebugContext(ctx, "request started",
-			slog.String("method", r.Method),
-			slog.String("path", r.URL.Path),
-			slog.String("remote", r.RemoteAddr),
-		)
-
-		next(w, r)
-	}
-}
-
 func getReqID(ctx context.Context) string {
 	if id, ok := ctx.Value(reqIDKey).(string); ok {
 		return id
@@ -746,19 +685,21 @@ type AppConfig struct {
 // ======================== Claude Messages API 类型 ========================
 
 type ClaudeRequest struct {
-	Model         string          `json:"model"`
-	Messages      []ClaudeMessage `json:"messages"`
-	System        any             `json:"system,omitempty"`
-	MaxTokens     *int            `json:"max_tokens,omitempty"`
-	Temperature   *float64        `json:"temperature,omitempty"`
-	TopP          *float64        `json:"top_p,omitempty"`
-	TopK          *int            `json:"top_k,omitempty"`
-	Stream        bool            `json:"stream,omitempty"`
-	Tools         []ClaudeTool    `json:"tools,omitempty"`
-	ToolChoice    any             `json:"tool_choice,omitempty"`
-	StopSequences []string        `json:"stop_sequences,omitempty"`
-	Metadata      any             `json:"metadata,omitempty"`
-	Thinking      any             `json:"thinking,omitempty"`
+	Model             string          `json:"model"`
+	Messages          []ClaudeMessage `json:"messages"`
+	System            any             `json:"system,omitempty"`
+	MaxTokens         *int            `json:"max_tokens,omitempty"`
+	Temperature       *float64        `json:"temperature,omitempty"`
+	TopP              *float64        `json:"top_p,omitempty"`
+	TopK              *int            `json:"top_k,omitempty"`
+	Stream            bool            `json:"stream,omitempty"`
+	Tools             []ClaudeTool    `json:"tools,omitempty"`
+	ToolChoice        any             `json:"tool_choice,omitempty"`
+	StopSequences     []string        `json:"stop_sequences,omitempty"`
+	Metadata          any             `json:"metadata,omitempty"`
+	Thinking          any             `json:"thinking,omitempty"`
+	OutputConfig      any             `json:"output_config,omitempty"`
+	ContextManagement any             `json:"context_management,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -782,6 +723,7 @@ type ClaudeTool struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	InputSchema any    `json:"input_schema"`
+	Type        string `json:"type,omitempty"`
 }
 
 type ClaudeResponse struct {
@@ -903,6 +845,14 @@ func resolveModel(model string) string {
 	if ok {
 		return alias
 	}
+	// Clients see free models without the "-free" suffix from /v1/models.
+	// Map the display name back to the upstream free ID when that is the only match.
+	if m != "" && !isFreeModel(m) {
+		freeID := m + "-free"
+		if !modelExistsInCaches(m) && modelExistsInCaches(freeID) {
+			return freeID
+		}
+	}
 	return m
 }
 
@@ -973,12 +923,24 @@ func isThinkingEnabled(value any) bool {
 	switch v := value.(type) {
 	case map[string]any:
 		t, _ := v["type"].(string)
-		return t == "enabled"
+		// Claude Code sends adaptive thinking with --effort / CLAUDE_CODE_EFFORT_LEVEL.
+		return t == "enabled" || t == "adaptive"
 	case bool:
 		return v
 	default:
 		return false
 	}
+}
+
+// effortFromOutputConfig reads Claude Code's output_config.effort
+// (set by --effort / CLAUDE_CODE_EFFORT_LEVEL).
+func effortFromOutputConfig(value any) string {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	effort, _ := m["effort"].(string)
+	return strings.TrimSpace(effort)
 }
 
 func isThinkingDisabled(value any) bool {
@@ -990,6 +952,62 @@ func isThinkingDisabled(value any) bool {
 		return !v
 	default:
 		return false
+	}
+}
+
+// buildUpstreamThinking preserves budget_tokens / effort fields when present.
+func buildUpstreamThinking(value any) map[string]any {
+	out := map[string]any{"type": "enabled"}
+	m, ok := value.(map[string]any)
+	if !ok {
+		return out
+	}
+	for _, key := range []string{"budget_tokens", "effort"} {
+		if v, exists := m[key]; exists && v != nil {
+			out[key] = v
+		}
+	}
+	return out
+}
+
+// reasoningEffortFromThinking maps Anthropic-style budget_tokens onto an
+// OpenAI-compatible reasoning_effort when the client did not set one explicitly.
+func reasoningEffortFromThinking(value any) string {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if effort, ok := m["effort"].(string); ok && effort != "" {
+		return effort
+	}
+	var budget float64
+	switch v := m["budget_tokens"].(type) {
+	case float64:
+		budget = v
+	case int:
+		budget = float64(v)
+	case int64:
+		budget = float64(v)
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil {
+			return ""
+		}
+		budget = f
+	default:
+		return ""
+	}
+	switch {
+	case budget <= 0:
+		return ""
+	case budget < 2048:
+		return "low"
+	case budget < 8192:
+		return "medium"
+	case budget < 16384:
+		return "high"
+	default:
+		return "xhigh"
 	}
 }
 
@@ -1134,21 +1152,25 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	if getForceDisableThinking() || isThinkingDisabled(req.Thinking) {
 		converted["thinking"] = map[string]string{"type": "disabled"}
 	} else if req.Thinking != nil && isThinkingEnabled(req.Thinking) {
-		converted["thinking"] = map[string]string{"type": "enabled"}
+		converted["thinking"] = buildUpstreamThinking(req.Thinking)
 	} else if req.ExtraBody != nil {
 		if isThinkingDisabled(req.ExtraBody["thinking"]) {
 			converted["thinking"] = map[string]string{"type": "disabled"}
 		} else if isThinkingEnabled(req.ExtraBody["thinking"]) {
-			converted["thinking"] = map[string]string{"type": "enabled"}
+			converted["thinking"] = buildUpstreamThinking(req.ExtraBody["thinking"])
 		}
 	}
-	// 处理 reasoning_effort
-	if !getForceDisableThinking() && req.ReasoningEffort != "" {
+	// 处理 reasoning_effort（含从 thinking.budget_tokens 推导）
+	effort := req.ReasoningEffort
+	if effort == "" && !isThinkingDisabled(req.Thinking) {
+		effort = reasoningEffortFromThinking(req.Thinking)
+	}
+	if !getForceDisableThinking() && effort != "" {
 		effortMap := getReasoningEffortMap()
-		if mapped, ok := effortMap[req.ReasoningEffort]; ok {
+		if mapped, ok := effortMap[effort]; ok {
 			converted["reasoning_effort"] = mapped
 		} else {
-			converted["reasoning_effort"] = req.ReasoningEffort
+			converted["reasoning_effort"] = effort
 		}
 	}
 	// 合并 ExtraBody
@@ -1379,30 +1401,31 @@ func cleanNulls(m map[string]any) {
 // put the visible answer in reasoning_content (opencode-go #37635). Only runs
 // when content is empty and the chunk has no tool_calls, so genuine CoT that
 // precedes tool calls is left alone when keepReasoning is true.
-func promoteMisplacedReasoning(fields map[string]any, keepReasoning bool) {
+func promoteMisplacedReasoning(fields map[string]any, keepReasoning bool) bool {
 	rc, _ := fields["reasoning_content"].(string)
 	if rc == "" {
-		return
+		return false
 	}
 	if raw, ok := fields["tool_calls"]; ok && raw != nil {
 		if arr, ok := raw.([]any); ok && len(arr) > 0 {
-			return
+			return false
 		}
 	}
 	content, _ := fields["content"].(string)
 	if content != "" {
-		return
+		return false
 	}
 	if keepReasoning {
-		// Thinking explicitly requested: leave CoT in reasoning_content.
-		return
+		// Preserve CoT for thinking blocks / clients that read reasoning_content.
+		return false
 	}
 	fields["content"] = rc
 	delete(fields, "reasoning_content")
+	return true
 }
 
 func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
-	promoteMisplacedReasoning(delta, keepReasoning)
+	_ = promoteMisplacedReasoning(delta, keepReasoning)
 	if v, ok := delta["content"]; ok && v == nil {
 		delete(delta, "content")
 	}
@@ -1544,35 +1567,51 @@ const (
 )
 
 type UpstreamAuth struct {
-	Token string
-	Mode  AuthRouteMode
+	Token  string
+	Mode   AuthRouteMode
+	Source string // authorization | x-api-key | none
 }
 
 func extractUpstreamAuth(r *http.Request) UpstreamAuth {
+	token := ""
+	source := "none"
 	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		return UpstreamAuth{Mode: AuthRoutePublic}
+	if strings.HasPrefix(auth, "Bearer ") {
+		token = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		source = "authorization"
 	}
-	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	if token == "" {
+		if key := strings.TrimSpace(r.Header.Get("x-api-key")); key != "" {
+			token = key
+			source = "x-api-key"
+		}
+	}
 	if token == "" || token == "public" {
-		return UpstreamAuth{Mode: AuthRoutePublic}
+		src := source
+		if token == "" {
+			src = "none"
+		}
+		return UpstreamAuth{Mode: AuthRoutePublic, Source: src}
 	}
 	// go:/zen: 前缀路由：去掉前缀后剩余部分仍需是有效 key（sk- 开头）
 	if rest, ok := strings.CutPrefix(token, "go:"); ok && isValidOpenCodeKey(rest) {
-		return UpstreamAuth{Token: rest, Mode: AuthRouteGo}
+		return UpstreamAuth{Token: rest, Mode: AuthRouteGo, Source: source}
 	}
 	if rest, ok := strings.CutPrefix(token, "zen:"); ok && isValidOpenCodeKey(rest) {
-		return UpstreamAuth{Token: rest, Mode: AuthRouteZen}
+		return UpstreamAuth{Token: rest, Mode: AuthRouteZen, Source: source}
 	}
 	// 只有 sk- 开头的才是有效 key，其余（no-key-required 等占位符）一律走 public
 	if isValidOpenCodeKey(token) {
-		return UpstreamAuth{Token: token, Mode: AuthRouteAuto}
+		return UpstreamAuth{Token: token, Mode: AuthRouteAuto, Source: source}
 	}
-	return UpstreamAuth{Mode: AuthRoutePublic}
+	return UpstreamAuth{Mode: AuthRoutePublic, Source: source}
 }
 
-// 只认 sk- 开头的 key，避免客户端占位 key（如 no-key-required）被透传给上游导致 401
+// 只认 sk- 开头的 opencode key；Anthropic sk-ant-* 不能转发上游。
 func isValidOpenCodeKey(token string) bool {
+	if strings.HasPrefix(token, "sk-ant-") {
+		return false
+	}
 	return strings.HasPrefix(token, "sk-") && len(token) > 15
 }
 
@@ -1610,13 +1649,26 @@ func isFreeModel(modelID string) bool {
 	return strings.HasSuffix(modelID, "-free")
 }
 
+// publicFacingModelID strips the upstream "-free" suffix for client-visible catalogs.
+func publicFacingModelID(modelID string) string {
+	if isFreeModel(modelID) {
+		return strings.TrimSuffix(modelID, "-free")
+	}
+	return modelID
+}
+
+func modelExistsInCaches(modelID string) bool {
+	modelMu.RLock()
+	defer modelMu.RUnlock()
+	return containsModelWithID(modelsCache, modelID) || containsModelWithID(goModelsCache, modelID)
+}
+
 func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (*http.Request, error) {
 	return buildOCRequestWithEndpoint(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID))
 }
 
 func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool) (*http.Request, error) {
 	bodyMap["model"] = modelID
-	delete(bodyMap, "reasoning_effort")
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
 		return nil, err
@@ -1661,7 +1713,7 @@ const (
 	max401Retries      = 3
 )
 
-func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {
+func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {
 	initOCSession()
 	candidates := getCandidateModels(auth, modelID)
 	modelsToTry := []string{modelID}
@@ -1679,6 +1731,11 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 		return nil, 500, nil, fmt.Errorf("invalid request body")
 	}
 	useGoEndpoint := auth.shouldUseGoEndpoint(modelID)
+	surface := "zen"
+	if useGoEndpoint {
+		surface = "go"
+	}
+	log := reqLogger(ctx)
 
 	var lastErr error
 	var retryCount int
@@ -1686,6 +1743,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 	var lastBody []byte
 	var lastStatus int
 	var lastHeader http.Header
+	tried := make([]string, 0, len(modelsToTry))
 	for i, tryModel := range modelsToTry {
 		up, err := buildOCRequestWithEndpoint(tryModel, bodyMap, auth, useGoEndpoint)
 		if err != nil {
@@ -1693,9 +1751,21 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 			continue
 		}
 		client := getHTTPClientForTier(auth.tier())
+		attemptStart := time.Now()
 		resp, err := client.Do(up)
+		durationMs := time.Since(attemptStart).Milliseconds()
+		tried = append(tried, tryModel)
 		if err != nil {
 			lastErr = err
+			log.Info("upstream_attempt",
+				"try_model", tryModel,
+				"surface", surface,
+				"status", 0,
+				"duration_ms", durationMs,
+				"attempt_index", i,
+				"retry_reason", "transport_error",
+				"error", err.Error(),
+			)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -1707,11 +1777,36 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 			if isAnthropicFormat(b) {
 				b = convertAnthropicToOpenAI(b, tryModel)
 			}
+			log.Info("upstream_attempt",
+				"try_model", tryModel,
+				"surface", surface,
+				"status", resp.StatusCode,
+				"duration_ms", durationMs,
+				"attempt_index", i,
+			)
+			log.Info("upstream_result",
+				"models_tried", tried,
+				"retries", retryCount+retry401Count,
+				"final_status", resp.StatusCode,
+				"fallback_used", len(tried) > 1,
+			)
 			return b, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		slog.Error("upstream error", "model", tryModel, "status", resp.StatusCode, "body", string(errBody))
+		logUpstreamError(ctx, tryModel, resp.StatusCode, errBody)
+		retryReason := ""
+		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
+			retryReason = fmt.Sprintf("status_%d", resp.StatusCode)
+		}
+		log.Info("upstream_attempt",
+			"try_model", tryModel,
+			"surface", surface,
+			"status", resp.StatusCode,
+			"duration_ms", durationMs,
+			"attempt_index", i,
+			"retry_reason", retryReason,
+		)
 		lastBody = errBody
 		lastStatus = resp.StatusCode
 		lastHeader = resp.Header
@@ -1733,10 +1828,16 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, auth UpstreamAuth) ([]
 		}
 		break
 	}
+	log.Info("upstream_result",
+		"models_tried", tried,
+		"retries", retryCount+retry401Count,
+		"final_status", lastStatus,
+		"fallback_used", len(tried) > 1,
+	)
 	return lastBody, lastStatus, lastHeader, lastErr
 }
 
-func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
+func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
 	candidates := getCandidateModels(auth, modelID)
 	modelsToTry := []string{modelID}
@@ -1754,28 +1855,71 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAut
 		return nil, 500, nil, fmt.Errorf("invalid request body")
 	}
 	useGoEndpoint := auth.shouldUseGoEndpoint(modelID)
+	surface := "zen"
+	if useGoEndpoint {
+		surface = "go"
+	}
+	log := reqLogger(ctx)
 
 	var lastBody []byte
 	var lastStatus int
 	var lastHeader http.Header
 	var retryCount int
 	var retry401Count int
+	tried := make([]string, 0, len(modelsToTry))
 	for i, tryModel := range modelsToTry {
 		up, err := buildOCRequestWithEndpoint(tryModel, bodyMap, auth, useGoEndpoint)
 		if err != nil {
 			continue
 		}
 		client := getHTTPClientForTier(auth.tier())
+		attemptStart := time.Now()
 		resp, err := client.Do(up)
+		durationMs := time.Since(attemptStart).Milliseconds()
+		tried = append(tried, tryModel)
 		if err != nil {
+			log.Info("upstream_attempt",
+				"try_model", tryModel,
+				"surface", surface,
+				"status", 0,
+				"duration_ms", durationMs,
+				"attempt_index", i,
+				"retry_reason", "transport_error",
+				"error", err.Error(),
+			)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			log.Info("upstream_attempt",
+				"try_model", tryModel,
+				"surface", surface,
+				"status", resp.StatusCode,
+				"duration_ms", durationMs,
+				"attempt_index", i,
+			)
+			log.Info("upstream_result",
+				"models_tried", tried,
+				"retries", retryCount+retry401Count,
+				"final_status", resp.StatusCode,
+				"fallback_used", len(tried) > 1,
+			)
 			return resp.Body, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		slog.Error("upstream error", "model", tryModel, "status", resp.StatusCode, "body", string(errBody))
+		logUpstreamError(ctx, tryModel, resp.StatusCode, errBody)
+		retryReason := ""
+		if shouldRetryUpstreamStatus(resp.StatusCode) && i < len(modelsToTry)-1 {
+			retryReason = fmt.Sprintf("status_%d", resp.StatusCode)
+		}
+		log.Info("upstream_attempt",
+			"try_model", tryModel,
+			"surface", surface,
+			"status", resp.StatusCode,
+			"duration_ms", durationMs,
+			"attempt_index", i,
+			"retry_reason", retryReason,
+		)
 		lastBody = errBody
 		lastStatus = resp.StatusCode
 		lastHeader = resp.Header
@@ -1794,9 +1938,21 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, auth UpstreamAut
 			}
 			continue
 		}
+		log.Info("upstream_result",
+			"models_tried", tried,
+			"retries", retryCount+retry401Count,
+			"final_status", lastStatus,
+			"fallback_used", len(tried) > 1,
+		)
 		// 返回错误体供下游透传
 		return io.NopCloser(bytes.NewReader(lastBody)), lastStatus, lastHeader, nil
 	}
+	log.Info("upstream_result",
+		"models_tried", tried,
+		"retries", retryCount+retry401Count,
+		"final_status", lastStatus,
+		"fallback_used", len(tried) > 1,
+	)
 	if lastStatus != 0 {
 		return io.NopCloser(bytes.NewReader(lastBody)), lastStatus, lastHeader, nil
 	}
@@ -1838,13 +1994,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cnt := requestCount.Add(1)
-	slog.Debug("chat completion request body", "count", cnt, "body", string(body))
+	maybeLogBodySummary(r.Context(), "chat completion request body", body)
+	_ = cnt
 
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+	modelIn := req.Model
 	req.Model = resolveModel(req.Model)
 	if req.Model == "" {
 		modelIDs := getModelIDs()
@@ -1866,10 +2024,34 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		req.ExtraBody["stream_options"] = map[string]any{"include_usage": true}
 	}
+	effortIn := req.ReasoningEffort
+	if effortIn == "" && !isThinkingDisabled(req.Thinking) {
+		effortIn = reasoningEffortFromThinking(req.Thinking)
+	}
+	upstreamSurface := "zen"
+	if auth.shouldUseGoEndpoint(req.Model) {
+		upstreamSurface = "go"
+	}
+	logRequestPlan(r.Context(), map[string]any{
+		"protocol":             "chat",
+		"model_in":             modelIn,
+		"model_resolved":       req.Model,
+		"auth_mode":            authModeString(auth.Mode),
+		"auth_source":          auth.Source,
+		"has_key":              auth.Token != "",
+		"upstream_surface":     upstreamSurface,
+		"stream":               req.Stream,
+		"keep_reasoning":       keepReasoning,
+		"thinking":             thinkingState(req.Thinking),
+		"reasoning_effort_in":  effortIn,
+		"reasoning_effort_out": mappedReasoningEffort(effortIn),
+		"tools_count":          len(req.Tools),
+		"messages_count":       len(req.Messages),
+	})
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model, auth)
+		upResp, status, _, err := callOpenCodeAPIStream(r.Context(), upstreamBody, req.Model, auth)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -1889,6 +2071,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
 		reader := bufio.NewReader(upResp)
+		stats := &streamResultStats{start: time.Now()}
 		doneSeen := false
 		for {
 			line, err := reader.ReadString('\n')
@@ -1896,12 +2079,13 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				if err == io.EOF {
 					break
 				}
-				slog.Error("stream read error", "error", err)
+				reqLogger(r.Context()).Error("stream read error", "error", err)
 				// 发送错误事件通知客户端
 				w.Write([]byte("data: {\"error\":\"stream read error\"}\n\n"))
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
+				stats.log(r.Context(), "chat")
 				return
 			}
 			if doneSeen {
@@ -1910,11 +2094,29 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "data: [DONE]" {
 				doneSeen = true
+				stats.doneSeen = true
 				w.Write([]byte("data: [DONE]\n\n"))
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
 				continue
+			}
+
+			if strings.HasPrefix(line, "data: ") {
+				var raw map[string]any
+				if json.Unmarshal([]byte(line[6:]), &raw) == nil {
+					if choices, ok := raw["choices"].([]any); ok && len(choices) > 0 {
+						if choice, ok := choices[0].(map[string]any); ok {
+							if delta, ok := choice["delta"].(map[string]any); ok {
+								stats.observeDelta(delta, keepReasoning)
+							}
+							if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
+								stats.finishReason = fr
+								stats.sawFinish = true
+							}
+						}
+					}
+				}
 			}
 
 			out, usage := convertStreamChunkWithUsage(line, keepReasoning)
@@ -1947,10 +2149,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				f.Flush()
 			}
 		}
+		stats.log(r.Context(), "chat")
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model, auth)
+	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, req.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -1966,6 +2169,24 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		outBody = convertedResp
 	}
+	result := summarizeChatResult(outBody)
+	if !keepReasoning {
+		var before map[string]any
+		if json.Unmarshal(respBody, &before) == nil {
+			if choices, ok := before["choices"].([]any); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]any); ok {
+					if msg, ok := choice["message"].(map[string]any); ok {
+						content, _ := msg["content"].(string)
+						rc, _ := msg["reasoning_content"].(string)
+						if content == "" && rc != "" {
+							result["promoted_reasoning"] = true
+						}
+					}
+				}
+			}
+		}
+	}
+	logRequestResult(r.Context(), result)
 	// Record token usage
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
@@ -2078,7 +2299,7 @@ func replaceModelIDsWithAliases(models []ModelInfo, aliases map[string]string) [
 	for _, model := range models {
 		visibleIDs := aliasesByUpstream[model.ID]
 		if len(visibleIDs) == 0 {
-			visibleIDs = []string{model.ID}
+			visibleIDs = []string{publicFacingModelID(model.ID)}
 		}
 		for _, visibleID := range visibleIDs {
 			if _, exists := seen[visibleID]; exists {
@@ -2151,20 +2372,78 @@ func cleanJsonSchema(schema any) any {
 	return clean
 }
 
-func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
-	var messages []Message
-	if sysText := extractClaudeSystemText(system); sysText != "" {
-		messages = append(messages, Message{Role: "system", Content: sysText})
+func claudeImageBlockToOpenAI(block map[string]any) (map[string]any, bool) {
+	source, _ := block["source"].(map[string]any)
+	if source == nil {
+		return nil, false
 	}
+	srcType, _ := source["type"].(string)
+	mediaType, _ := source["media_type"].(string)
+	data, _ := source["data"].(string)
+	url, _ := source["url"].(string)
+	if srcType == "url" && url != "" {
+		return map[string]any{"type": "image_url", "image_url": map[string]string{"url": url}}, true
+	}
+	if srcType == "base64" && data != "" {
+		if mediaType == "" {
+			mediaType = "image/png"
+		}
+		return map[string]any{
+			"type": "image_url",
+			"image_url": map[string]string{
+				"url": "data:" + mediaType + ";base64," + data,
+			},
+		}, true
+	}
+	return nil, false
+}
+
+func extractClaudeContentText(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []any:
+		var parts []string
+		for _, item := range c {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if block["type"] == "text" {
+				if text, ok := block["text"].(string); ok && text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
+	var systemParts []string
+	if sysText := extractClaudeSystemText(system); sysText != "" {
+		systemParts = append(systemParts, sysText)
+	}
+
+	var body []Message
 	for _, msg := range claudeMsgs {
+		if msg.Role == "system" {
+			if text := extractClaudeContentText(msg.Content); text != "" {
+				systemParts = append(systemParts, text)
+			}
+			continue
+		}
 		switch content := msg.Content.(type) {
 		case string:
-			messages = append(messages, Message{Role: msg.Role, Content: content})
+			body = append(body, Message{Role: msg.Role, Content: content})
 		case []any:
 			var orderedContent []any
 			var reasoningParts []string
 			var toolCalls []ToolCall
 			var toolResults []Message
+			var followupImages []any
 			for _, item := range content {
 				block, ok := item.(map[string]any)
 				if !ok {
@@ -2177,26 +2456,8 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 						orderedContent = append(orderedContent, map[string]any{"type": "text", "text": text})
 					}
 				case "image":
-					source, _ := block["source"].(map[string]any)
-					if source != nil {
-						srcType, _ := source["type"].(string)
-						mediaType, _ := source["media_type"].(string)
-						data, _ := source["data"].(string)
-						url, _ := source["url"].(string)
-						if srcType == "url" && url != "" {
-							orderedContent = append(orderedContent, map[string]any{"type": "image_url", "image_url": map[string]string{"url": url}})
-						}
-						if srcType == "base64" && data != "" {
-							if mediaType == "" {
-								mediaType = "image/png"
-							}
-							orderedContent = append(orderedContent, map[string]any{
-								"type": "image_url",
-								"image_url": map[string]string{
-									"url": "data:" + mediaType + ";base64," + data,
-								},
-							})
-						}
+					if part, ok := claudeImageBlockToOpenAI(block); ok {
+						orderedContent = append(orderedContent, part)
 					}
 				case "thinking":
 					if thinking, ok := block["thinking"].(string); ok && thinking != "" {
@@ -2229,15 +2490,25 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 				case "tool_result":
 					toolUseID, _ := block["tool_use_id"].(string)
 					var resultText string
+					var imageParts []any
 					switch c := block["content"].(type) {
 					case string:
 						resultText = c
 					case []any:
 						var parts []string
 						for _, p := range c {
-							if pb, ok := p.(map[string]any); ok && pb["type"] == "text" {
+							pb, ok := p.(map[string]any)
+							if !ok {
+								continue
+							}
+							switch pb["type"] {
+							case "text":
 								if t, ok := pb["text"].(string); ok {
 									parts = append(parts, t)
+								}
+							case "image":
+								if part, ok := claudeImageBlockToOpenAI(pb); ok {
+									imageParts = append(imageParts, part)
 								}
 							}
 						}
@@ -2247,6 +2518,13 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 							b, _ := json.Marshal(c)
 							resultText = string(b)
 						}
+					}
+					if len(imageParts) > 0 {
+						if resultText != "" {
+							resultText += "\n"
+						}
+						resultText += "[image attached]"
+						followupImages = append(followupImages, imageParts...)
 					}
 					if isError, _ := block["is_error"].(bool); isError {
 						resultText = "Error: " + resultText
@@ -2275,25 +2553,44 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 			// content. Preserve that order when translating them to Chat
 			// Completions' separate tool messages.
 			if msg.Role == "user" {
-				messages = append(messages, toolResults...)
+				body = append(body, toolResults...)
+				if len(followupImages) > 0 {
+					body = append(body, Message{Role: "user", Content: followupImages})
+				}
 			}
 			if len(orderedContent) > 0 || len(reasoningParts) > 0 || len(toolCalls) > 0 || len(toolResults) == 0 {
-				messages = append(messages, om)
+				body = append(body, om)
 			}
 			if msg.Role != "user" {
-				messages = append(messages, toolResults...)
+				body = append(body, toolResults...)
+				if len(followupImages) > 0 {
+					body = append(body, Message{Role: "user", Content: followupImages})
+				}
 			}
 		default:
 			b, _ := json.Marshal(content)
-			messages = append(messages, Message{Role: msg.Role, Content: string(b)})
+			body = append(body, Message{Role: msg.Role, Content: string(b)})
 		}
 	}
+
+	var messages []Message
+	if len(systemParts) > 0 {
+		messages = append(messages, Message{Role: "system", Content: strings.Join(systemParts, "\n\n")})
+	}
+	messages = append(messages, body...)
 	return messages
 }
 
-func claudeToOpenAITools(claudeTools []ClaudeTool) []Tool {
+func claudeToOpenAITools(claudeTools []ClaudeTool) ([]Tool, []string) {
 	tools := make([]Tool, 0, len(claudeTools))
+	var skipped []string
 	for _, ct := range claudeTools {
+		// Server tools (web_search_*, etc.) carry a vendor type and no client schema.
+		// Emitting them as empty function tools would invite bogus model calls.
+		if ct.Type != "" && ct.InputSchema == nil {
+			skipped = append(skipped, ct.Name)
+			continue
+		}
 		params := ct.InputSchema
 		if params == nil {
 			params = map[string]any{"type": "object", "properties": map[string]any{}}
@@ -2312,7 +2609,105 @@ func claudeToOpenAITools(claudeTools []ClaudeTool) []Tool {
 			},
 		})
 	}
-	return tools
+	return tools, skipped
+}
+
+func countClaudeSystemParts(msgs []ClaudeMessage, system any) int {
+	n := 0
+	if extractClaudeSystemText(system) != "" {
+		n++
+	}
+	for _, msg := range msgs {
+		if msg.Role == "system" && extractClaudeContentText(msg.Content) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func countAnthropicBetas(header string) int {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0
+	}
+	n := 0
+	for _, part := range strings.Split(header, ",") {
+		if strings.TrimSpace(part) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func countCacheControlInValue(v any) int {
+	switch x := v.(type) {
+	case map[string]any:
+		n := 0
+		if _, ok := x["cache_control"]; ok {
+			n++
+		}
+		for _, child := range x {
+			n += countCacheControlInValue(child)
+		}
+		return n
+	case []any:
+		n := 0
+		for _, child := range x {
+			n += countCacheControlInValue(child)
+		}
+		return n
+	default:
+		return 0
+	}
+}
+
+func countClaudeCacheControlBlocks(req ClaudeRequest) int {
+	n := countCacheControlInValue(req.System)
+	for _, msg := range req.Messages {
+		n += countCacheControlInValue(msg.Content)
+	}
+	for _, tool := range req.Tools {
+		n += countCacheControlInValue(tool.InputSchema)
+	}
+	return n
+}
+
+var claudeUnsupportedBlockTypes = map[string]struct{}{
+	"redacted_thinking":      {},
+	"document":               {},
+	"search_result":          {},
+	"server_tool_use":        {},
+	"web_search_tool_result": {},
+	"container_upload":       {},
+}
+
+func scanClaudeUnsupportedBlocks(msgs []ClaudeMessage) map[string]int {
+	counts := map[string]int{}
+	var walk func(any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			if t, _ := x["type"].(string); t != "" {
+				if _, ok := claudeUnsupportedBlockTypes[t]; ok {
+					counts[t]++
+				}
+			}
+			for _, child := range x {
+				walk(child)
+			}
+		case []any:
+			for _, child := range x {
+				walk(child)
+			}
+		}
+	}
+	for _, msg := range msgs {
+		walk(msg.Content)
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	return counts
 }
 
 func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) []byte {
@@ -2533,18 +2928,20 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cnt := requestCount.Add(1)
-	slog.Debug("claude messages request body", "count", cnt, "body", string(body))
+	maybeLogBodySummary(r.Context(), "claude messages request body", body)
+	_ = cnt
 
 	var claudeReq ClaudeRequest
 	if err := json.Unmarshal(body, &claudeReq); err != nil {
 		http.Error(w, `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON"}}`, http.StatusBadRequest)
 		return
 	}
+	modelIn := claudeReq.Model
 	claudeReq.Model = resolveModel(claudeReq.Model)
 
 	// 多模态路由
 
-	chatReq := convertClaudeRequest(claudeReq)
+	chatReq, skippedServerTools := convertClaudeRequest(claudeReq)
 	chatReq.Messages = fixToolCallGaps(chatReq.Messages)
 	if claudeReq.Stream {
 		if chatReq.ExtraBody == nil {
@@ -2553,17 +2950,56 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		chatReq.ExtraBody["stream_options"] = map[string]any{"include_usage": true}
 	}
 
-	wantReasoning := false
-	if !getForceDisableThinking() && claudeReq.Thinking != nil && isThinkingEnabled(claudeReq.Thinking) {
-		wantReasoning = true
+	// Keep CoT by default so Claude Code still sees thinking blocks. Only drop
+	// reasoning when force-disabled or the client explicitly disables thinking.
+	// Empty-reply protection is handled by promoteMisplacedReasoning (!keep)
+	// and emitEmptyTextFallback (keep + no text/tool_use).
+	wantReasoning := !getForceDisableThinking()
+	if claudeReq.Thinking != nil && isThinkingDisabled(claudeReq.Thinking) {
+		wantReasoning = false
 	}
 	keepReasoning := wantReasoning
 	chatReq.Messages = ensureReasoningContent(chatReq.Messages, keepReasoning)
 
+	effortIn := chatReq.ReasoningEffort
+	if effortIn == "" && !isThinkingDisabled(claudeReq.Thinking) {
+		effortIn = reasoningEffortFromThinking(claudeReq.Thinking)
+	}
+	upstreamSurface := "zen"
+	if auth.shouldUseGoEndpoint(chatReq.Model) {
+		upstreamSurface = "go"
+	}
+	systemMerged := countClaudeSystemParts(claudeReq.Messages, claudeReq.System) > 1
+	plan := map[string]any{
+		"protocol":             "claude",
+		"model_in":             modelIn,
+		"model_resolved":       chatReq.Model,
+		"auth_mode":            authModeString(auth.Mode),
+		"auth_source":          auth.Source,
+		"has_key":              auth.Token != "",
+		"upstream_surface":     upstreamSurface,
+		"stream":               claudeReq.Stream,
+		"keep_reasoning":       keepReasoning,
+		"thinking":             thinkingState(claudeReq.Thinking),
+		"reasoning_effort_in":  effortIn,
+		"reasoning_effort_out": mappedReasoningEffort(effortIn),
+		"tools_count":          len(chatReq.Tools),
+		"messages_count":       len(chatReq.Messages),
+		"system_merged":        systemMerged,
+		"context_management":   claudeReq.ContextManagement != nil,
+		"cache_control_blocks": countClaudeCacheControlBlocks(claudeReq),
+		"client_beta_count":    countAnthropicBetas(r.Header.Get("anthropic-beta")),
+		"unsupported_blocks":   scanClaudeUnsupportedBlocks(claudeReq.Messages),
+	}
+	if len(skippedServerTools) > 0 {
+		plan["skipped_server_tools"] = skippedServerTools
+	}
+	logRequestPlan(r.Context(), plan)
+
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if claudeReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, auth)
+		upResp, status, _, err := callOpenCodeAPIStream(r.Context(), upstreamBody, chatReq.Model, auth)
 		if err != nil || status < 200 || status >= 300 {
 			errResp := map[string]any{
 				"type":  "error",
@@ -2575,11 +3011,11 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer upResp.Close()
-		claudeStreamHandler(w, upResp, claudeReq.Model, keepReasoning)
+		claudeStreamHandler(r.Context(), w, upResp, claudeReq.Model, keepReasoning)
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, auth)
+	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -2592,6 +3028,24 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	claudeRespBody := openAIToClaudeResponse(respBody, claudeReq.Model, wantReasoning)
+	result := summarizeClaudeResult(claudeRespBody)
+	if !wantReasoning {
+		var before map[string]any
+		if json.Unmarshal(respBody, &before) == nil {
+			if choices, ok := before["choices"].([]any); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]any); ok {
+					if msg, ok := choice["message"].(map[string]any); ok {
+						content, _ := msg["content"].(string)
+						rc, _ := msg["reasoning_content"].(string)
+						if content == "" && rc != "" {
+							result["promoted_reasoning"] = true
+						}
+					}
+				}
+			}
+		}
+	}
+	logRequestResult(r.Context(), result)
 
 	// Record token usage
 	var usageResp map[string]any
@@ -2608,11 +3062,11 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	slog.Debug("claude response body", "body", string(claudeRespBody))
+	maybeLogBodySummary(r.Context(), "claude response body", claudeRespBody)
 	w.Write(claudeRespBody)
 }
 
-func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model string, keepReasoning bool) {
+func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io.ReadCloser, model string, keepReasoning bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2620,6 +3074,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(respBody)
+	stats := &streamResultStats{start: time.Now()}
 
 	msgID := fmt.Sprintf("msg_%s", randomString(24))
 	blockIndex := 0
@@ -2642,12 +3097,14 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 				recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
 			}
 		}
+		stats.toolCallCount = len(toolCallOrder)
+		stats.log(ctx, "claude")
 	}()
 
 	emitClaudeEvent := func(event string, data any) {
 		jsonData, err := json.Marshal(data)
 		if err != nil {
-			slog.Error("marshal SSE event failed", "error", err)
+			reqLogger(ctx).Error("marshal SSE event failed", "error", err)
 			return
 		}
 		w.Write([]byte("event: " + event + "\n"))
@@ -2685,6 +3142,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		if contentStr == "" {
 			return
 		}
+		stats.textChars += len(contentStr)
 		closeThinkingBlock()
 		if !textBlockOpen {
 			emitClaudeEvent("content_block_start", map[string]any{
@@ -2716,6 +3174,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		if fallback == "" {
 			return
 		}
+		stats.promotedReasoning = true
 		emitTextDelta(fallback)
 	}
 
@@ -2725,15 +3184,13 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 			if err == io.EOF {
 				break
 			}
-			slog.Error("stream read error", "error", err)
+			reqLogger(ctx).Error("stream read error", "error", err)
 			break
-		}
-		if strings.HasPrefix(line, "data: ") {
-			slog.Debug("upstream raw chunk", "data", strings.TrimSpace(line[6:]))
 		}
 
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
+			stats.doneSeen = true
 			break
 		}
 		if !strings.HasPrefix(line, "data: ") {
@@ -2756,6 +3213,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		choice, _ := choices[0].(map[string]any)
 		delta, _ := choice["delta"].(map[string]any)
 		finishReason, _ := choice["finish_reason"].(string)
+		stats.noteChunk()
 
 		if !messageStartSent {
 			messageStartSent = true
@@ -2777,6 +3235,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		if rc, ok := delta["reasoning_content"]; ok {
 			rcStr, _ := rc.(string)
 			if rcStr != "" {
+				stats.reasoningChars += len(rcStr)
 				if keepReasoning {
 					reasoningFallback.WriteString(rcStr)
 					closeTextBlock()
@@ -2802,6 +3261,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 					})
 				} else {
 					// Thinking not requested: promote misplaced CoT to visible text (#37635).
+					stats.promotedReasoning = true
 					emitTextDelta(rcStr)
 				}
 			}
@@ -2869,6 +3329,8 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		}
 
 		if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
+			stats.finishReason = finishReason
+			stats.sawFinish = true
 			emitEmptyTextFallback()
 			closeThinkingBlock()
 			closeTextBlock()
@@ -3574,7 +4036,8 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cnt := requestCount.Add(1)
-	slog.Debug("responses request body", "count", cnt, "body", string(body))
+	maybeLogBodySummary(r.Context(), "responses request body", body)
+	_ = cnt
 
 	var respReq ResponsesAPIRequest
 	if err := json.Unmarshal(body, &respReq); err != nil {
@@ -3582,6 +4045,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	modelIn := respReq.Model
 	respReq.Model = resolveModel(respReq.Model)
 	previousState, hasPreviousState := StoredResponseState{}, false
 	if respReq.PreviousResponseID != "" {
@@ -3697,10 +4161,35 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	keepReasoning := wantsReasoning(&chatReq)
 	chatReq.Messages = ensureReasoningContent(chatReq.Messages, keepReasoning)
 
+	effortIn := chatReq.ReasoningEffort
+	if effortIn == "" {
+		effortIn = respReq.Reasoning.Effort
+	}
+	upstreamSurface := "zen"
+	if auth.shouldUseGoEndpoint(chatReq.Model) {
+		upstreamSurface = "go"
+	}
+	logRequestPlan(r.Context(), map[string]any{
+		"protocol":             "responses",
+		"model_in":             modelIn,
+		"model_resolved":       chatReq.Model,
+		"auth_mode":            authModeString(auth.Mode),
+		"auth_source":          auth.Source,
+		"has_key":              auth.Token != "",
+		"upstream_surface":     upstreamSurface,
+		"stream":               respReq.Stream,
+		"keep_reasoning":       keepReasoning,
+		"thinking":             thinkingState(nil),
+		"reasoning_effort_in":  effortIn,
+		"reasoning_effort_out": mappedReasoningEffort(effortIn),
+		"tools_count":          len(respReq.Tools),
+		"messages_count":       len(chatReq.Messages),
+	})
+
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if respReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, auth)
+		upResp, status, _, err := callOpenCodeAPIStream(r.Context(), upstreamBody, chatReq.Model, auth)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -3725,7 +4214,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, auth)
+	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -3747,6 +4236,9 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		storeResponseState(responseMap, respReq)
 	}
 
+	result := summarizeChatResult(respBody)
+	logRequestResult(r.Context(), result)
+
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
@@ -3760,13 +4252,17 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	slog.Debug("responses response body", "body", string(responsesBody))
+	maybeLogBodySummary(r.Context(), "responses response body", responsesBody)
 	w.Write(responsesBody)
 }
 
 // ======================== Responses Stream Handler ========================
 
-func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.Response, model string, _ string, wantReasoning bool, tools []ResponsesTool, toolChoice any, originalReq ResponsesAPIRequest) {
+func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.Response, model string, _ string, wantReasoning bool, tools []ResponsesTool, toolChoice any, originalReq ResponsesAPIRequest) {
+	ctx := context.Background()
+	if r != nil {
+		ctx = r.Context()
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -3774,6 +4270,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(resp.Body)
+	stats := &streamResultStats{start: time.Now()}
 
 	responseID := "resp_" + time.Now().Format("20060102150405") + "_" + randomString(8)
 	reasoningID := "rs_" + responseID
@@ -3798,6 +4295,13 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	indexAllocator := outputIndexAllocator{}
 	reasoningOutputIndex := -1
 	messageIndex := -1
+
+	defer func() {
+		stats.textChars = len(fullText)
+		stats.reasoningChars = len(fullReasoning)
+		stats.toolCallCount = len(toolOrder)
+		stats.log(ctx, "responses")
+	}()
 
 	messageOutputIndex := func() int {
 		if messageIndex < 0 {
@@ -3945,15 +4449,13 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 			if err == io.EOF {
 				break
 			}
-			slog.Error("stream read error", "error", err)
+			reqLogger(ctx).Error("stream read error", "error", err)
 			return
-		}
-		if strings.HasPrefix(line, "data: ") {
-			slog.Debug("upstream raw chunk", "data", strings.TrimSpace(line[6:]))
 		}
 
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
+			stats.doneSeen = true
 			break
 		}
 		if !strings.HasPrefix(line, "data: ") {
@@ -3964,6 +4466,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		if err := json.Unmarshal([]byte(line[6:]), &chunk); err != nil {
 			continue
 		}
+		stats.noteChunk()
 		if !createdSent {
 			if id, ok := chunk["id"].(string); ok && id != "" {
 				responseID = id
@@ -3998,6 +4501,10 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		choice, _ := choices[0].(map[string]any)
 		delta, _ := choice["delta"].(map[string]any)
 		finishReason, _ := choice["finish_reason"].(string)
+		if finishReason != "" {
+			stats.finishReason = finishReason
+			stats.sawFinish = true
+		}
 
 		if rc, ok := delta["reasoning_content"]; ok && wantReasoning {
 			rcStr, _ := rc.(string)
@@ -4042,6 +4549,9 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		// #37635: when thinking is not kept, promote misplaced reasoning to visible text.
 		if contentStr == "" && !wantReasoning {
 			if rc, ok := delta["reasoning_content"].(string); ok {
+				if rc != "" {
+					stats.promotedReasoning = true
+				}
 				contentStr = rc
 			}
 		}
@@ -4456,20 +4966,44 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		cfg.ActiveSocks5 = activeSocks5
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(cfg)
+		json.NewEncoder(w).Encode(map[string]any{
+			"model_alias":            cfg.ModelAlias,
+			"reasoning_effort_map":   cfg.ReasoningEffortMap,
+			"force_disable_thinking": cfg.ForceDisableThinking,
+			"socks5_proxies":         cfg.Socks5Proxies,
+			"active_socks5":          cfg.ActiveSocks5,
+			"log_level":              getLogLevelString(),
+			"log_bodies":             getLogBodies(),
+		})
 	case http.MethodPost:
-		var cfg AppConfig
-		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		var payload struct {
+			AppConfig
+			LogLevel  *string `json:"log_level,omitempty"`
+			LogBodies *bool   `json:"log_bodies,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, `{"error":"Invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
-		if err := saveConfig(configPath, cfg); err != nil {
+		if err := saveConfig(configPath, payload.AppConfig); err != nil {
 			http.Error(w, `{"error":"Failed to save config"}`, http.StatusInternalServerError)
 			return
 		}
-		applyConfig(cfg)
+		applyConfig(payload.AppConfig)
+		if payload.LogLevel != nil {
+			setLogLevelString(*payload.LogLevel)
+		}
+		if payload.LogBodies != nil {
+			setLogBodies(*payload.LogBodies)
+		}
 		if debugMode {
-			slog.Info("config updated", "aliases", len(cfg.ModelAlias), "effort_map", len(cfg.ReasoningEffortMap), "force_disable", cfg.ForceDisableThinking)
+			slog.Info("config updated",
+				"aliases", len(payload.ModelAlias),
+				"effort_map", len(payload.ReasoningEffortMap),
+				"force_disable", payload.ForceDisableThinking,
+				"log_level", getLogLevelString(),
+				"log_bodies", getLogBodies(),
+			)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -4834,11 +5368,18 @@ func main() {
 	flag.StringVar(&adminPassword, "password", "123456", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
 	flag.StringVar(&logLevel, "log-level", "info", "日志级别: debug/info/warn/error")
-	flag.StringVar(&logFile, "log-file", "", "日志文件路径（留空输出到 stdout）")
+	flag.StringVar(&logFile, "log-file", "opencode2api.log", "日志文件路径")
+	flag.BoolVar(&logStdout, "log-stdout", true, "是否同时写 stdout")
+	flag.IntVar(&logMaxSize, "log-max-size", 100, "单日志文件最大 MB，超过即轮换")
+	flag.IntVar(&logMaxBackups, "log-max-backups", 7, "保留的旧日志文件个数")
+	flag.IntVar(&logMaxAge, "log-max-age", 14, "旧日志保留天数")
+	flag.BoolVar(&logCompress, "log-compress", true, "轮换后 gzip 压缩")
+	flag.BoolVar(&logBodies, "log-bodies", false, "Debug 下记录截断的 body 摘要")
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	flag.Parse()
 
 	initLogger()
+	defer closeLogRotator()
 
 	if showVersion {
 		fmt.Println(versionString())
@@ -4877,7 +5418,7 @@ func main() {
 	startModelRefresh()
 	slog.Info("server starting",
 		"port", port,
-		"log_level", logLevel,
+		"log_level", getLogLevelString(),
 		"models", len(getModelIDs()),
 		"aliases", len(modelAlias),
 	)
@@ -4886,30 +5427,47 @@ func main() {
 	} else {
 		slog.Info("admin panel disabled (no password)")
 	}
-	http.HandleFunc("/v1/chat/completions", loggingMiddleware(chatCompletionsHandler))
-	http.HandleFunc("/v1/responses", loggingMiddleware(responsesHandler))
-	http.HandleFunc("/v1/messages", loggingMiddleware(claudeMessagesHandler))
-	http.HandleFunc("/v1/models", loggingMiddleware(listModelsHandler))
-	http.HandleFunc("/login", loggingMiddleware(loginHandler))
-	http.HandleFunc("/logout", loggingMiddleware(logoutHandler))
-	http.HandleFunc("/api/config", loggingMiddleware(requireAuth(adminConfigHandler)))
-	http.HandleFunc("/api/stats", loggingMiddleware(requireAuth(adminStatsHandler)))
-	http.HandleFunc("/api/reload", loggingMiddleware(requireAuth(reloadHandler)))
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", loggingMiddleware(chatCompletionsHandler))
+	mux.HandleFunc("/v1/responses", loggingMiddleware(responsesHandler))
+	mux.HandleFunc("/v1/messages", loggingMiddleware(claudeMessagesHandler))
+	mux.HandleFunc("/v1/models", loggingMiddleware(listModelsHandler))
+	mux.HandleFunc("/login", loggingMiddleware(loginHandler))
+	mux.HandleFunc("/logout", loggingMiddleware(logoutHandler))
+	mux.HandleFunc("/api/config", loggingMiddleware(requireAuth(adminConfigHandler)))
+	mux.HandleFunc("/api/stats", loggingMiddleware(requireAuth(adminStatsHandler)))
+	mux.HandleFunc("/api/reload", loggingMiddleware(requireAuth(reloadHandler)))
+	mux.HandleFunc("/health", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
-	})
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			requireAuth(adminPageHandler)(w, r)
 			return
 		}
 		http.NotFound(w, r)
-	})
+	}))
+
 	addr := ":" + port
-	slog.Info("listening", "addr", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		slog.Error("server terminated", "error", err)
-		os.Exit(1)
+	server := &http.Server{Addr: addr, Handler: mux}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		slog.Info("listening", "addr", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server terminated", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Info("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Error("graceful shutdown failed", "error", err)
 	}
 }

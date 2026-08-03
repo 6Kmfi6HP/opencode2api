@@ -49,6 +49,9 @@ if [ "$(id -u)" = "0" ]; then
     -port "$OPENCODE2API_PORT" \
     -config "$OPENCODE2API_CONFIG" \
     -password "$OPENCODE2API_PASSWORD" \
+    -log-file "${OPENCODE2API_LOG_FILE:-/data/opencode2api.log}" \
+    -log-level "${OPENCODE2API_LOG_LEVEL:-info}" \
+    -log-stdout="${OPENCODE2API_LOG_STDOUT:-true}" \
     "$@"
 fi
 
@@ -56,4 +59,7 @@ exec /usr/local/bin/opencode2api \
   -port "$OPENCODE2API_PORT" \
   -config "$OPENCODE2API_CONFIG" \
   -password "$OPENCODE2API_PASSWORD" \
+  -log-file "${OPENCODE2API_LOG_FILE:-/data/opencode2api.log}" \
+  -log-level "${OPENCODE2API_LOG_LEVEL:-info}" \
+  -log-stdout="${OPENCODE2API_LOG_STDOUT:-true}" \
   "$@"

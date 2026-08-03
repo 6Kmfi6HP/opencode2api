@@ -77,3 +77,23 @@ SOCKS5 代理列表。
 ```bash
 ./opencode2api -password "your-strong-password"
 ```
+
+`GET/POST /api/config` 额外返回/接受运行时日志字段（不写入 `config.json`）：
+
+- `log_level`：`debug` / `info` / `warn` / `error`
+- `log_bodies`：是否在 Debug 下记录 body 形状摘要
+
+## 日志与排障
+
+默认写入 `opencode2api.log` 并由 lumberjack 按大小轮换；同时写 stdout。
+
+关键字段：
+
+| 事件 | 用途 |
+|------|------|
+| `request_plan` | 协议决策：模型、auth_mode、thinking、reasoning_effort、stream |
+| `upstream_attempt` / `upstream_result` | 上游重试与回退链 |
+| `stream_result` | 流式结果摘要；`empty_reply=true` 时为 Warn |
+| `request_result` | 非流式结果摘要 |
+
+密钥字段（`authorization` / `token` / `sk-…`）会被脱敏，永不落完整密钥。

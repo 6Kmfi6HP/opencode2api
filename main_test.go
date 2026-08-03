@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -186,7 +187,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 			)
 			if tt.stream {
 				var respBody io.ReadCloser
-				respBody, status, _, err = callOpenCodeAPIStream([]byte(tt.requestBody), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
+				respBody, status, _, err = callOpenCodeAPIStream(context.Background(), []byte(tt.requestBody), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 				if respBody != nil {
 					defer respBody.Close()
 				}
@@ -194,7 +195,7 @@ func TestCallOpenCodeAPIRetries4xxAndClosesConnectionBeforeRetry(t *testing.T) {
 					body, err = io.ReadAll(respBody)
 				}
 			} else {
-				body, status, _, err = callOpenCodeAPI([]byte(tt.requestBody), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
+				body, status, _, err = callOpenCodeAPI(context.Background(), []byte(tt.requestBody), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 			}
 			if err != nil {
 				t.Fatalf("upstream call error = %v", err)
@@ -239,7 +240,7 @@ func TestCallOpenCodeAPIFallbackKeepsOriginalGoEndpoint(t *testing.T) {
 			body := []byte(`{"model":"go-only-model","messages":[]}`)
 			if tt.stream {
 				body = []byte(`{"model":"go-only-model","messages":[],"stream":true}`)
-				respBody, status, _, err := callOpenCodeAPIStream(body, "go-only-model", auth)
+				respBody, status, _, err := callOpenCodeAPIStream(context.Background(), body, "go-only-model", auth)
 				if respBody != nil {
 					defer respBody.Close()
 				}
@@ -250,7 +251,7 @@ func TestCallOpenCodeAPIFallbackKeepsOriginalGoEndpoint(t *testing.T) {
 					t.Fatalf("callOpenCodeAPIStream() status = %d, want %d", status, http.StatusOK)
 				}
 			} else {
-				_, status, _, err := callOpenCodeAPI(body, "go-only-model", auth)
+				_, status, _, err := callOpenCodeAPI(context.Background(), body, "go-only-model", auth)
 				if err != nil {
 					t.Fatalf("callOpenCodeAPI() error = %v", err)
 				}
@@ -281,7 +282,7 @@ func TestCallOpenCodeAPIExhausted4xxReturnsLastUpstreamResponse(t *testing.T) {
 		},
 	})
 
-	body, status, header, err := callOpenCodeAPI([]byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
+	body, status, header, err := callOpenCodeAPI(context.Background(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 	if err == nil {
 		t.Fatal("callOpenCodeAPI() error = nil, want upstream error")
 	}
@@ -419,17 +420,17 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 	}{
 		{
 			name:    "public only sees free zen models",
-			wantIDs: []string{"deepseek-v4-flash-free"},
+			wantIDs: []string{"deepseek-v4-flash"},
 		},
 		{
 			name:       "bare zen key sees zen catalog only",
 			authHeader: "Bearer sk-auto0123456789abcdef",
-			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "gpt-5.5"},
+			wantIDs:    []string{"deepseek-v4-flash", "glm-5.2", "gpt-5.5"},
 		},
 		{
 			name:       "go prefix sees free and go catalog",
 			authHeader: "Bearer go:sk-go0123456789abcdef",
-			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "kimi-k2.7-code"},
+			wantIDs:    []string{"deepseek-v4-flash", "glm-5.2", "kimi-k2.7-code"},
 		},
 	}
 
@@ -536,23 +537,103 @@ func TestListModelsHandlerReplacesMappedModelIDsWithAliases(t *testing.T) {
 	}
 }
 
+func TestListModelsHandlerStripsFreeSuffixWithoutAlias(t *testing.T) {
+	oldModelsCache := modelsCache
+	oldGoModelsCache := goModelsCache
+	oldModelsLoaded := modelsLoaded
+	oldModelAlias := modelAlias
+	modelMu.Lock()
+	modelsCache = []ModelInfo{
+		{ID: "mimo-v2.5-free", Object: "model", OwnedBy: "opencode"},
+	}
+	goModelsCache = nil
+	modelsLoaded = true
+	modelMu.Unlock()
+	configMu.Lock()
+	modelAlias = map[string]string{}
+	configMu.Unlock()
+	t.Cleanup(func() {
+		modelMu.Lock()
+		modelsCache = oldModelsCache
+		goModelsCache = oldGoModelsCache
+		modelsLoaded = oldModelsLoaded
+		modelMu.Unlock()
+		configMu.Lock()
+		modelAlias = oldModelAlias
+		configMu.Unlock()
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	listModelsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var payload struct {
+		Data []ModelInfo `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data) != 1 || payload.Data[0].ID != "mimo-v2.5" {
+		t.Fatalf("ids = %#v, want [mimo-v2.5]", payload.Data)
+	}
+}
+
+func TestResolveModelMapsStrippedFreeNameBackToUpstream(t *testing.T) {
+	oldModelsCache := modelsCache
+	oldGoModelsCache := goModelsCache
+	oldModelAlias := modelAlias
+	modelMu.Lock()
+	modelsCache = []ModelInfo{{ID: "mimo-v2.5-free"}}
+	goModelsCache = nil
+	modelMu.Unlock()
+	configMu.Lock()
+	modelAlias = map[string]string{}
+	configMu.Unlock()
+	t.Cleanup(func() {
+		modelMu.Lock()
+		modelsCache = oldModelsCache
+		goModelsCache = oldGoModelsCache
+		modelMu.Unlock()
+		configMu.Lock()
+		modelAlias = oldModelAlias
+		configMu.Unlock()
+	})
+
+	if got := resolveModel("mimo-v2.5"); got != "mimo-v2.5-free" {
+		t.Fatalf("resolveModel(mimo-v2.5) = %q, want mimo-v2.5-free", got)
+	}
+	if got := resolveModel("mimo-v2.5-free"); got != "mimo-v2.5-free" {
+		t.Fatalf("resolveModel(mimo-v2.5-free) = %q, want unchanged", got)
+	}
+}
+
 func TestExtractUpstreamAuthKeyValidation(t *testing.T) {
 	tests := []struct {
 		name       string
 		authHeader string
+		apiKey     string
 		wantMode   AuthRouteMode
 		wantToken  string
+		wantSource string
 	}{
-		{"no header", "", AuthRoutePublic, ""},
-		{"bearer empty", "Bearer ", AuthRoutePublic, ""},
-		{"bearer public", "Bearer public", AuthRoutePublic, ""},
-		{"bearer no-key-required placeholder", "Bearer no-key-required", AuthRoutePublic, ""},
-		{"bearer random non-key", "Bearer abc123xyz", AuthRoutePublic, ""},
-		{"valid sk key", "Bearer sk-validkey0123456789abcdef", AuthRouteAuto, "sk-validkey0123456789abcdef"},
-		{"go prefix with sk key", "Bearer go:sk-gokey0123456789abcdef", AuthRouteGo, "sk-gokey0123456789abcdef"},
-		{"zen prefix with sk key", "Bearer zen:sk-zenkey0123456789abcdef", AuthRouteZen, "sk-zenkey0123456789abcdef"},
-		{"go prefix with placeholder falls to public", "Bearer go:no-key-required", AuthRoutePublic, ""},
-		{"bare sk- with no suffix is invalid", "Bearer sk-", AuthRoutePublic, ""},
+		{"no header", "", "", AuthRoutePublic, "", "none"},
+		{"bearer empty", "Bearer ", "", AuthRoutePublic, "", "none"},
+		{"bearer public", "Bearer public", "", AuthRoutePublic, "", "authorization"},
+		{"bearer no-key-required placeholder", "Bearer no-key-required", "", AuthRoutePublic, "", "authorization"},
+		{"bearer random non-key", "Bearer abc123xyz", "", AuthRoutePublic, "", "authorization"},
+		{"valid sk key", "Bearer sk-validkey0123456789abcdef", "", AuthRouteAuto, "sk-validkey0123456789abcdef", "authorization"},
+		{"go prefix with sk key", "Bearer go:sk-gokey0123456789abcdef", "", AuthRouteGo, "sk-gokey0123456789abcdef", "authorization"},
+		{"zen prefix with sk key", "Bearer zen:sk-zenkey0123456789abcdef", "", AuthRouteZen, "sk-zenkey0123456789abcdef", "authorization"},
+		{"go prefix with placeholder falls to public", "Bearer go:no-key-required", "", AuthRoutePublic, "", "authorization"},
+		{"bare sk- with no suffix is invalid", "Bearer sk-", "", AuthRoutePublic, "", "authorization"},
+		{"x-api-key valid", "", "sk-validkey0123456789abcdef", AuthRouteAuto, "sk-validkey0123456789abcdef", "x-api-key"},
+		{"x-api-key sk-local short", "", "sk-local", AuthRoutePublic, "", "x-api-key"},
+		{"x-api-key sk-ant rejected", "", "sk-ant-api03-abcdefghijklmnopqrstuvwxyz", AuthRoutePublic, "", "x-api-key"},
+		{"x-api-key go prefix", "", "go:sk-gokey0123456789abcdef", AuthRouteGo, "sk-gokey0123456789abcdef", "x-api-key"},
+		{"x-api-key zen prefix", "", "zen:sk-zenkey0123456789abcdef", AuthRouteZen, "sk-zenkey0123456789abcdef", "x-api-key"},
+		{"bearer wins over x-api-key", "Bearer sk-validkey0123456789abcdef", "sk-otherkey0123456789abcdef", AuthRouteAuto, "sk-validkey0123456789abcdef", "authorization"},
 	}
 
 	for _, tt := range tests {
@@ -561,12 +642,18 @@ func TestExtractUpstreamAuthKeyValidation(t *testing.T) {
 			if tt.authHeader != "" {
 				req.Header.Set("Authorization", tt.authHeader)
 			}
+			if tt.apiKey != "" {
+				req.Header.Set("x-api-key", tt.apiKey)
+			}
 			auth := extractUpstreamAuth(req)
 			if auth.Mode != tt.wantMode {
 				t.Fatalf("mode = %v, want %v", auth.Mode, tt.wantMode)
 			}
 			if auth.Token != tt.wantToken {
 				t.Fatalf("token = %q, want %q", auth.Token, tt.wantToken)
+			}
+			if auth.Source != tt.wantSource {
+				t.Fatalf("source = %q, want %q", auth.Source, tt.wantSource)
 			}
 		})
 	}

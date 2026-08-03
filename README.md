@@ -80,12 +80,48 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 -password string
     管理面板密码，默认 123456；留空表示不启用登录验证
 -debug
-    输出调试日志
+    输出调试日志（等价于将 -log-level 提升到 debug）
+-log-level string
+    日志级别: debug/info/warn/error，默认 info
+-log-file string
+    日志文件路径，默认 opencode2api.log；配合自动轮换
+-log-stdout
+    是否同时写 stdout，默认 true
+-log-max-size int
+    单日志文件最大 MB，默认 100
+-log-max-backups int
+    保留旧日志个数，默认 7
+-log-max-age int
+    旧日志保留天数，默认 14
+-log-compress
+    轮换后 gzip 压缩，默认 true
+-log-bodies
+    Debug 下记录截断的 body 形状摘要，默认 false
 -version
     显示构建版本
 ```
 
 第一次部署请务必修改 `-password`。如果把服务暴露到公网，建议只通过反向代理、访问控制或 VPN 暴露管理面板。
+
+### 排障日志
+
+默认同时写文件与 stdout。每个请求带 `request_id`（响应头 `X-Request-Id`），可串联：
+
+`request_started → request_plan → upstream_attempt* → upstream_result → stream_result|request_result → request_done`
+
+常见排查：
+
+```bash
+rg 'empty_reply=true' opencode2api.log
+rg 'request_id=XXXX' opencode2api.log
+rg 'promoted_reasoning=true' opencode2api.log
+```
+
+容器内默认日志路径是 `/data/opencode2api.log`（挂载卷持久化），可用环境变量覆盖：
+
+- `OPENCODE2API_LOG_FILE`
+- `OPENCODE2API_LOG_LEVEL`
+- `OPENCODE2API_LOG_STDOUT`
 
 ## 本地构建
 

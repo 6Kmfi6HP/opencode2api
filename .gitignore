@@ -2,6 +2,7 @@
 config.json
 stats.json
 *.log
+*.log.gz
 
 # Build output
 dist/

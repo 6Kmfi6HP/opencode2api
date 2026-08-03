@@ -6,7 +6,7 @@
 
 - 无 `Authorization`，或 `Bearer public`
   - 走 public Zen 免费模型。
-  - `/v1/models` 只返回 `-free` 模型和免费别名。
+  - `/v1/models` 只返回免费模型，且 ID 会去掉上游 `-free` 后缀（请求时会自动映射回 `-free`）。
 - `Bearer <opencode-api-key>`
   - 默认走 Zen。
   - 如果请求的是仅存在于 Go 目录中的模型，代理会自动切到 Go。
@@ -20,7 +20,7 @@
 
 | 路由 | 方法 | 说明 |
 | --- | --- | --- |
-| `/v1/models` | `GET` | 返回权限范围内的模型；已配置别名会替换对应上游模型 ID |
+| `/v1/models` | `GET` | 返回权限范围内的模型；`-free` 后缀会隐藏，已配置别名会替换对应上游模型 ID |
 | `/v1/chat/completions` | `POST` | OpenAI Chat Completions 兼容入口 |
 | `/v1/responses` | `POST` | OpenAI Responses 兼容入口 |
 | `/v1/messages` | `POST` | Anthropic Messages 兼容入口 |
@@ -99,28 +99,42 @@ curl http://127.0.0.1:8000/v1/responses \
 
 ## Anthropic Messages
 
+### 鉴权
+
+- `Authorization: Bearer <key>` 与 `x-api-key: <key>` 同权；Bearer 优先。
+- 有效 opencode key：`sk-` 前缀且长度 > 15；`go:` / `zen:` 前缀路由同样适用于两种头。
+- Anthropic 真 key（`sk-ant-`）不会转发上游，回落 public。
+- 占位短 key（如 Claude Code 默认 `sk-local`）因长度不足走 public。
+
 ### 准确支持
 
-- `system`、`stop_sequences`、`temperature` / `top_p` / `top_k`（包括显式零值）和 `metadata.user_id`
+- `system`（顶层）与消息内 `role=system` 合并为上游**唯一首条** system（`\n\n` 拼接，顶层在前）
+- `stop_sequences`、`temperature` / `top_p` / `top_k`（包括显式零值）
+- `metadata.user_id`：若为 JSON 串则只转发 `session_id`（避免 `device_id` 外泄）；否则原样转发
 - 文本、base64/URL image、`tool_use`、`tool_result`（包括 `is_error`）；合法的 tool result 在普通用户内容之前的顺序会被保留
-- `tool_choice` 的 `auto`、`any`、`tool`、`none`
+- `tool_result` 中的 image 转为紧随其后的 `role=user` + `image_url`，tool 文本保留字符串并标注 `[image attached]`
+- `tool_choice` 的 `auto`、`any`、`tool`、`none`；`disable_parallel_tool_use:true` 映射为上游 `parallel_tool_calls=false`
+- `output_config.effort` → 上游 `reasoning_effort`；`thinking.type=adaptive` 视为 enabled
 - JSON Schema 约束字段（包括 `additionalProperties`、`format`）
 - stop reason、usage 以及流式 content block 配对
 
-### Best-effort
+### Best-effort / 显式丢弃（可观测）
 
 - thinking 会在没有 signature 时继续输出，以提高客户端兼容性。代理不会伪造 signature 或发送假的 `signature_delta`。
 - `redacted_thinking.data` 是不可解释的加密数据，无法无损转成 reasoning；代理忽略该内容且不记录其数据。
+- 无 Chat Completions 等价物的字段不进上游 body，但会绑定并记入 `request_plan` / body summary：`context_management`、`cache_control`、`anthropic-beta`、带 `type` 且无 `input_schema` 的 server tools（如 `web_search_*`）。
 
-### 不支持
+### 不支持（不实现语义）
 
-- Anthropic beta、server tools、fallback 等本项目未承诺的扩展。
+- prompt caching、context management、server tools 的真实能力
+- 转发 `anthropic-beta` 到上游
 
 示例：
 
 ```bash
 curl http://127.0.0.1:8000/v1/messages \
   -H "Content-Type: application/json" \
+  -H "x-api-key: sk-your-opencode-key" \
   -d '{
     "model": "gpt-4o-mini",
     "max_tokens": 256,

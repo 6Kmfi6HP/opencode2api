@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,7 +31,7 @@ func TestAnthropicRequestConversionPreservesProtocolSemantics(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req := ClaudeRequest{Model: "m", MaxTokens: ptr(0), Temperature: &zero, TopP: &zero, TopK: &topK, ToolChoice: tt.in,
 				StopSequences: []string{"END"}, Metadata: map[string]any{"user_id": "u-1"}}
-			got := convertClaudeRequest(req)
+			got, _ := convertClaudeRequest(req)
 			if !reflect.DeepEqual(got.ToolChoice, tt.want) {
 				t.Fatalf("tool choice = %#v, want %#v", got.ToolChoice, tt.want)
 			}
@@ -103,7 +105,7 @@ func TestAnthropicStreamKeepsParallelToolArgumentDeltasOnTheirOwnBlocks(t *testi
 		`data: [DONE]`, "",
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
 
 	var starts, deltas []sseEvent
 	for _, event := range parseSSEEvents(t, rr.Body.String()) {
@@ -264,7 +266,7 @@ func TestClaudeStreamPromotesReasoningToTextWhenThinkingDisabled(t *testing.T) {
 		`data: [DONE]`, "",
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
 	out := rr.Body.String()
 	if !strings.Contains(out, `"type":"text_delta"`) {
 		t.Fatalf("missing text_delta:\n%s", out)
@@ -284,7 +286,7 @@ func TestClaudeStreamFallbackEmitsTextWhenOnlyReasoningWithThinkingEnabled(t *te
 		`data: [DONE]`, "",
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(rr, io.NopCloser(strings.NewReader(upstream)), "m", true)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", true)
 	out := rr.Body.String()
 	if !strings.Contains(out, `"type":"thinking_delta"`) {
 		t.Fatalf("expected thinking while keepReasoning=true:\n%s", out)
@@ -302,5 +304,354 @@ func TestClaudeNonStreamPromotesEmptyContentFromReasoning(t *testing.T) {
 	}
 	if len(got.Content) != 1 || got.Content[0].Type != "text" || got.Content[0].Text != "2" {
 		t.Fatalf("expected promoted text content, got %#v", got.Content)
+	}
+}
+
+func TestClaudeNonStreamKeepsThinkingAndTextFallbackWhenReasoningEnabled(t *testing.T) {
+	body := openAIToClaudeResponse([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"step by step"},"finish_reason":"stop"}]}`), "m", true)
+	var got ClaudeResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Content) != 2 || got.Content[0].Type != "thinking" || got.Content[0].Thinking != "step by step" {
+		t.Fatalf("expected thinking block, got %#v", got.Content)
+	}
+	if got.Content[1].Type != "text" || got.Content[1].Text != "step by step" {
+		t.Fatalf("expected text fallback for agents, got %#v", got.Content)
+	}
+}
+
+func TestConvertRequestForwardsReasoningEffortAndThinkingBudget(t *testing.T) {
+	body := convertRequest(&OpenAIRequest{
+		Model:           "m",
+		Messages:        []Message{{Role: "user", Content: "hi"}},
+		ReasoningEffort: "high",
+		Thinking:        map[string]any{"type": "enabled", "budget_tokens": 12000},
+	})
+	if body["reasoning_effort"] != "high" {
+		t.Fatalf("effort = %#v, want high", body["reasoning_effort"])
+	}
+	thinking, _ := body["thinking"].(map[string]any)
+	if thinking["type"] != "enabled" || thinking["budget_tokens"] != 12000 {
+		t.Fatalf("thinking = %#v", thinking)
+	}
+}
+
+func TestConvertRequestDerivesEffortFromBudgetTokens(t *testing.T) {
+	body := convertRequest(&OpenAIRequest{
+		Model:    "m",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+		Thinking: map[string]any{"type": "enabled", "budget_tokens": 1000},
+	})
+	if body["reasoning_effort"] != "low" {
+		t.Fatalf("derived effort = %#v, want low", body["reasoning_effort"])
+	}
+}
+
+func TestBuildOCRequestKeepsReasoningEffort(t *testing.T) {
+	body := convertRequest(&OpenAIRequest{
+		Model:           "m",
+		Messages:        []Message{{Role: "user", Content: "hi"}},
+		ReasoningEffort: "medium",
+		Thinking:        map[string]any{"type": "enabled"},
+	})
+	req, err := buildOCRequestWithEndpoint("deepseek-v4-flash-free", body, UpstreamAuth{Mode: AuthRoutePublic}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent map[string]any
+	if err := json.NewDecoder(req.Body).Decode(&sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent["reasoning_effort"] != "medium" {
+		t.Fatalf("upstream body dropped effort: %#v", sent)
+	}
+}
+
+func TestConvertClaudeRequestMapsOutputConfigEffort(t *testing.T) {
+	out, _ := convertClaudeRequest(ClaudeRequest{
+		Model:        "m",
+		Thinking:     map[string]any{"type": "adaptive"},
+		OutputConfig: map[string]any{"effort": "max"},
+	})
+	if out.ReasoningEffort != "max" {
+		t.Fatalf("ReasoningEffort = %q, want max", out.ReasoningEffort)
+	}
+	thinking, _ := out.Thinking.(map[string]any)
+	if thinking["type"] != "enabled" {
+		t.Fatalf("adaptive should normalize to enabled, got %#v", out.Thinking)
+	}
+	if thinking["effort"] != "max" {
+		t.Fatalf("thinking.effort = %#v, want max", thinking["effort"])
+	}
+
+	body := convertRequest(&out)
+	if body["reasoning_effort"] != "max" {
+		t.Fatalf("upstream reasoning_effort = %#v, want max", body["reasoning_effort"])
+	}
+	upThinking, _ := body["thinking"].(map[string]any)
+	if upThinking["type"] != "enabled" {
+		t.Fatalf("upstream thinking = %#v", upThinking)
+	}
+}
+
+func TestEffortFromOutputConfig(t *testing.T) {
+	if got := effortFromOutputConfig(map[string]any{"effort": "max"}); got != "max" {
+		t.Fatalf("got %q", got)
+	}
+	if got := effortFromOutputConfig(nil); got != "" {
+		t.Fatalf("nil = %q", got)
+	}
+}
+
+func TestConvertClaudeRequestForwardsThinking(t *testing.T) {
+	thinking := map[string]any{"type": "enabled", "budget_tokens": 8000}
+	out, _ := convertClaudeRequest(ClaudeRequest{Model: "m", Thinking: thinking})
+	got, _ := out.Thinking.(map[string]any)
+	if got["type"] != "enabled" || got["budget_tokens"] != 8000 {
+		t.Fatalf("thinking not forwarded: %#v", out.Thinking)
+	}
+}
+
+func TestReasoningEffortMapAppliesAndSurvivesUpstreamBody(t *testing.T) {
+	old := reasoningEffortMap
+	reasoningEffortMap = map[string]string{"xhigh": "max", "minimal": "low"}
+	t.Cleanup(func() { reasoningEffortMap = old })
+
+	body := convertRequest(&OpenAIRequest{
+		Model: "m", Messages: []Message{{Role: "user", Content: "hi"}},
+		ReasoningEffort: "xhigh", Thinking: map[string]any{"type": "enabled"},
+	})
+	if body["reasoning_effort"] != "max" {
+		t.Fatalf("mapped effort = %#v, want max", body["reasoning_effort"])
+	}
+	req, err := buildOCRequestWithEndpoint("m", body, UpstreamAuth{Mode: AuthRoutePublic}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent map[string]any
+	if err := json.NewDecoder(req.Body).Decode(&sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent["reasoning_effort"] != "max" {
+		t.Fatalf("upstream effort = %#v, want max", sent["reasoning_effort"])
+	}
+}
+
+func TestClaudeSystemMessagesMergedToLeadingSystem(t *testing.T) {
+	msgs := claudeToOpenAIMessages([]ClaudeMessage{
+		{Role: "user", Content: "hi"},
+		{Role: "system", Content: []any{
+			map[string]any{"type": "text", "text": "tail system"},
+		}},
+	}, []any{
+		map[string]any{"type": "text", "text": "top system"},
+	})
+	if len(msgs) != 2 {
+		t.Fatalf("len = %d, want 2: %#v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "system" {
+		t.Fatalf("first role = %q", msgs[0].Role)
+	}
+	got, _ := msgs[0].Content.(string)
+	if got != "top system\n\ntail system" {
+		t.Fatalf("system content = %q", got)
+	}
+	if msgs[1].Role != "user" {
+		t.Fatalf("second role = %q", msgs[1].Role)
+	}
+	for _, m := range msgs[1:] {
+		if m.Role == "system" {
+			t.Fatalf("trailing system remains: %#v", msgs)
+		}
+	}
+}
+
+func TestClaudeToolResultImageBecomesFollowupUser(t *testing.T) {
+	msgs := claudeToOpenAIMessages([]ClaudeMessage{{
+		Role: "user",
+		Content: []any{
+			map[string]any{
+				"type":        "tool_result",
+				"tool_use_id": "toolu_1",
+				"content": []any{
+					map[string]any{"type": "text", "text": "screenshot"},
+					map[string]any{
+						"type": "image",
+						"source": map[string]any{
+							"type":       "base64",
+							"media_type": "image/png",
+							"data":       "abc",
+						},
+					},
+				},
+			},
+		},
+	}}, nil)
+	if len(msgs) < 2 {
+		t.Fatalf("want tool + followup user, got %#v", msgs)
+	}
+	tool := msgs[0]
+	if tool.Role != "tool" {
+		t.Fatalf("first = %#v", tool)
+	}
+	text, _ := tool.Content.(string)
+	if !strings.Contains(text, "screenshot") || !strings.Contains(text, "[image attached]") {
+		t.Fatalf("tool text = %q", text)
+	}
+	follow := msgs[1]
+	if follow.Role != "user" {
+		t.Fatalf("followup role = %q", follow.Role)
+	}
+	parts, ok := follow.Content.([]any)
+	if !ok || len(parts) != 1 {
+		t.Fatalf("followup content = %#v", follow.Content)
+	}
+	part, _ := parts[0].(map[string]any)
+	if part["type"] != "image_url" {
+		t.Fatalf("part = %#v", part)
+	}
+	iu, _ := part["image_url"].(map[string]string)
+	if !strings.HasPrefix(iu["url"], "data:image/png;base64,abc") {
+		t.Fatalf("url = %#v", iu)
+	}
+}
+
+func TestClaudeToolChoiceDisableParallelMapsExtraBody(t *testing.T) {
+	out, _ := convertClaudeRequest(ClaudeRequest{
+		Model: "m",
+		ToolChoice: map[string]any{
+			"type":                      "auto",
+			"disable_parallel_tool_use": true,
+		},
+	})
+	if out.ToolChoice != "auto" {
+		t.Fatalf("ToolChoice = %#v", out.ToolChoice)
+	}
+	if out.ExtraBody["parallel_tool_calls"] != false {
+		t.Fatalf("ExtraBody = %#v", out.ExtraBody)
+	}
+	body := convertRequest(&out)
+	if body["parallel_tool_calls"] != false {
+		t.Fatalf("upstream body = %#v", body["parallel_tool_calls"])
+	}
+}
+
+func TestNarrowClaudeMetadataUserKeepsSessionID(t *testing.T) {
+	meta := map[string]any{
+		"user_id": `{"device_id":"dev-1","session_id":"sess-42"}`,
+	}
+	out, _ := convertClaudeRequest(ClaudeRequest{Model: "m", Metadata: meta})
+	if out.ExtraBody["user"] != "sess-42" {
+		t.Fatalf("user = %#v, want sess-42", out.ExtraBody["user"])
+	}
+	body := convertRequest(&out)
+	user, _ := body["user"].(string)
+	if user != "sess-42" {
+		t.Fatalf("upstream user = %q", user)
+	}
+	if strings.Contains(user, "device_id") || strings.Contains(fmt.Sprintf("%v", body), "device_id") {
+		t.Fatalf("device_id leaked into upstream: %#v", body)
+	}
+}
+
+func TestClaudeServerToolsSkipped(t *testing.T) {
+	tools, skipped := claudeToOpenAITools([]ClaudeTool{
+		{Name: "Read", InputSchema: map[string]any{"type": "object"}},
+		{Name: "web_search", Type: "web_search_20250305"},
+	})
+	if len(tools) != 1 || tools[0].Function.Name != "Read" {
+		t.Fatalf("tools = %#v", tools)
+	}
+	if len(skipped) != 1 || skipped[0] != "web_search" {
+		t.Fatalf("skipped = %#v", skipped)
+	}
+	_, skipped2 := convertClaudeRequest(ClaudeRequest{
+		Model: "m",
+		Tools: []ClaudeTool{{Name: "web_search", Type: "web_search_20250305"}},
+	})
+	if len(skipped2) != 1 || skipped2[0] != "web_search" {
+		t.Fatalf("convert skipped = %#v", skipped2)
+	}
+}
+
+func TestClaudeCodePayloadDropsContextManagementAndCacheControl(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"max_tokens":32000,
+		"stream":true,
+		"system":[{"type":"text","text":"You are Claude Code","cache_control":{"type":"ephemeral"}}],
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"system","content":[{"type":"text","text":"mid system","cache_control":{"type":"ephemeral"}}]}
+		],
+		"tools":[{"name":"web_search","type":"web_search_20250305"}],
+		"metadata":{"user_id":"{\"device_id\":\"d1\",\"session_id\":\"s1\"}"},
+		"thinking":{"type":"adaptive"},
+		"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},
+		"output_config":{"effort":"high"},
+		"tool_choice":{"type":"auto","disable_parallel_tool_use":true}
+	}`)
+	var req ClaudeRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.ContextManagement == nil {
+		t.Fatal("context_management should bind")
+	}
+	out, skipped := convertClaudeRequest(req)
+	body := convertRequest(&out)
+	for _, key := range []string{"context_management", "cache_control", "anthropic-beta"} {
+		if _, ok := body[key]; ok {
+			t.Fatalf("upstream still has %s: %#v", key, body[key])
+		}
+	}
+	msgsRaw := body["messages"]
+	var msgs []map[string]any
+	switch m := msgsRaw.(type) {
+	case []map[string]any:
+		msgs = m
+	case []any:
+		for _, item := range m {
+			mm, _ := item.(map[string]any)
+			msgs = append(msgs, mm)
+		}
+	default:
+		t.Fatalf("messages type = %T %#v", msgsRaw, msgsRaw)
+	}
+	if len(msgs) < 2 {
+		t.Fatalf("messages = %#v", msgs)
+	}
+	first := msgs[0]
+	if first["role"] != "system" {
+		t.Fatalf("first message = %#v", first)
+	}
+	sys, _ := first["content"].(string)
+	if !strings.Contains(sys, "You are Claude Code") || !strings.Contains(sys, "mid system") {
+		t.Fatalf("merged system = %q", sys)
+	}
+	for i, mm := range msgs[1:] {
+		if mm["role"] == "system" {
+			t.Fatalf("trailing system at %d: %#v", i+1, mm)
+		}
+	}
+	if body["user"] != "s1" {
+		t.Fatalf("user = %#v", body["user"])
+	}
+	if body["parallel_tool_calls"] != false {
+		t.Fatalf("parallel_tool_calls = %#v", body["parallel_tool_calls"])
+	}
+	if len(skipped) != 1 || skipped[0] != "web_search" {
+		t.Fatalf("skipped = %#v", skipped)
+	}
+	if n := countClaudeCacheControlBlocks(req); n < 2 {
+		t.Fatalf("cache_control_blocks = %d", n)
+	}
+	summary := summarizeJSONBody(raw, 0)
+	if summary["context_management"] != true {
+		t.Fatalf("summary missing context_management: %#v", summary)
+	}
+	if summary["cache_control_blocks"] == nil {
+		t.Fatalf("summary missing cache_control_blocks: %#v", summary)
 	}
 }
