@@ -532,17 +532,17 @@ func getReqID(ctx context.Context) string {
 // ======================== 配置 ========================
 
 var (
-	port                  string
-	configPath            = "config.json"
-	modelAlias            = map[string]string{}
-	reasoningEffortMap    = map[string]string{}
-	forceDisableThinking  bool
-	maxTokensCap          int
-	maxTokensCapPerModel  = map[string]int{}
-	debugMode             bool
-	configMu              sync.RWMutex
-	storedResponses       = map[string]StoredResponseState{}
-	storedResponsesMu     sync.RWMutex
+	port                 string
+	configPath           = "config.json"
+	modelAlias           = map[string]string{}
+	reasoningEffortMap   = map[string]string{}
+	forceDisableThinking bool
+	maxTokensCap         int
+	maxTokensCapPerModel = map[string]int{}
+	debugMode            bool
+	configMu             sync.RWMutex
+	storedResponses      = map[string]StoredResponseState{}
+	storedResponsesMu    sync.RWMutex
 )
 
 // ======================== 管理面板认证 ========================
@@ -6380,16 +6380,16 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"model_alias":               cfg.ModelAlias,
-			"reasoning_effort_map":      cfg.ReasoningEffortMap,
-			"force_disable_thinking":    cfg.ForceDisableThinking,
-			"max_tokens_cap":            cfg.MaxTokensCap,
-			"max_tokens_cap_per_model":  cfg.MaxTokensCapPerModel,
-			"socks5_proxies":            cfg.Socks5Proxies,
-			"active_socks5":             cfg.ActiveSocks5,
-			"socks5_paid_direct":        cfg.Socks5PaidDirect,
-			"log_level":                 getLogLevelString(),
-			"log_bodies":                getLogBodies(),
+			"model_alias":              cfg.ModelAlias,
+			"reasoning_effort_map":     cfg.ReasoningEffortMap,
+			"force_disable_thinking":   cfg.ForceDisableThinking,
+			"max_tokens_cap":           cfg.MaxTokensCap,
+			"max_tokens_cap_per_model": cfg.MaxTokensCapPerModel,
+			"socks5_proxies":           cfg.Socks5Proxies,
+			"active_socks5":            cfg.ActiveSocks5,
+			"socks5_paid_direct":       cfg.Socks5PaidDirect,
+			"log_level":                getLogLevelString(),
+			"log_bodies":               getLogBodies(),
 		})
 	case http.MethodPost:
 		var payload struct {
