@@ -2041,3 +2041,131 @@ func TestResponsesValidator_MalformedInputFileInToolResultNotRejected(t *testing
 		t.Fatalf("upstream should be called, payloads = %d", len(transport.requestPayloads))
 	}
 }
+
+func TestResponsesEcho_MissingFieldsAreEchoed(t *testing.T) {
+	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{{
+		status: http.StatusOK,
+		body:   okChatBody(),
+	}})
+	reqBody := `{
+		"model":"primary-model",
+		"input":"hello",
+		"instructions":"You are a helpful assistant.",
+		"user":"user-123",
+		"previous_response_id":"resp_abc",
+		"stop":["stop1","stop2"],
+		"frequency_penalty":0.5,
+		"presence_penalty":0.3,
+		"text":{"format":{"type":"json_object"}},
+		"truncation":"auto",
+		"service_tier":"default",
+		"prompt_cache_key":"cache-key-1",
+		"reasoning":{"effort":"high","summary":"auto"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+
+	responsesHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if len(transport.requestPayloads) != 1 {
+		t.Fatalf("upstream payload count = %d, want 1", len(transport.requestPayloads))
+	}
+
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	checks := []struct {
+		key  string
+		want any
+	}{
+		{"instructions", "You are a helpful assistant."},
+		{"user", "user-123"},
+		{"previous_response_id", "resp_abc"},
+		{"truncation", "auto"},
+		{"service_tier", "default"},
+		{"prompt_cache_key", "cache-key-1"},
+	}
+	for _, c := range checks {
+		if got := response[c.key]; got != c.want {
+			t.Errorf("response[%q] = %#v, want %#v", c.key, got, c.want)
+		}
+	}
+
+	// stop is an array
+	stop, ok := response["stop"].([]any)
+	if !ok || len(stop) != 2 {
+		t.Errorf("response[\"stop\"] = %#v, want 2-element array", response["stop"])
+	} else {
+		if stop[0] != "stop1" || stop[1] != "stop2" {
+			t.Errorf("response[\"stop\"] = %#v, want [stop1,stop2]", stop)
+		}
+	}
+
+	// frequency_penalty
+	if fp, ok := response["frequency_penalty"].(float64); !ok || fp != 0.5 {
+		t.Errorf("response[\"frequency_penalty\"] = %#v, want 0.5", response["frequency_penalty"])
+	}
+
+	// presence_penalty
+	if pp, ok := response["presence_penalty"].(float64); !ok || pp != 0.3 {
+		t.Errorf("response[\"presence_penalty\"] = %#v, want 0.3", response["presence_penalty"])
+	}
+
+	// text (echoed as-is)
+	text, ok := response["text"].(map[string]any)
+	if !ok {
+		t.Errorf("response[\"text\"] = %#v, want object", response["text"])
+	} else {
+		format, ok := text["format"].(map[string]any)
+		if !ok {
+			t.Errorf("response[\"text\"][\"format\"] = %#v, want object", text["format"])
+		} else if format["type"] != "json_object" {
+			t.Errorf("response[\"text\"][\"format\"][\"type\"] = %#v, want json_object", format["type"])
+		}
+	}
+
+	// reasoning echo includes both effort and summary
+	reasoning, ok := response["reasoning"].(map[string]any)
+	if !ok {
+		t.Errorf("response[\"reasoning\"] = %#v, want object", response["reasoning"])
+	} else {
+		if reasoning["effort"] != "high" {
+			t.Errorf("response[\"reasoning\"][\"effort\"] = %#v, want high", reasoning["effort"])
+		}
+		if reasoning["summary"] != "auto" {
+			t.Errorf("response[\"reasoning\"][\"summary\"] = %#v, want auto", reasoning["summary"])
+		}
+	}
+}
+
+func TestResponsesInclude_EncryptedContentOnlyWhenRequested(t *testing.T) {
+	// Without include: no encrypted_content field
+	body := convertChatToResponses([]byte(`{"id":"r","created":1,"choices":[{"finish_reason":"stop","message":{"reasoning_content":"thinking...","content":"answer"}}]}`), "m", true, nil, nil, nil)
+	var resp map[string]any
+	json.Unmarshal(body, &resp)
+	for _, item := range resp["output"].([]any) {
+		m := item.(map[string]any)
+		if m["type"] == "reasoning" {
+			if _, ok := m["encrypted_content"]; ok {
+				t.Fatal("encrypted_content should be absent when include is nil")
+			}
+		}
+	}
+
+	// With include: encrypted_content present
+	body = convertChatToResponses([]byte(`{"id":"r","created":1,"choices":[{"finish_reason":"stop","message":{"reasoning_content":"thinking...","content":"answer"}}]}`), "m", true, nil, nil, []string{"reasoning.encrypted_content"})
+	json.Unmarshal(body, &resp)
+	for _, item := range resp["output"].([]any) {
+		m := item.(map[string]any)
+		if m["type"] == "reasoning" {
+			if _, ok := m["encrypted_content"]; !ok {
+				t.Fatal("encrypted_content should be present when include has reasoning.encrypted_content")
+			}
+		}
+	}
+}

@@ -46,7 +46,7 @@ func TestAnthropicRequestConversionPreservesProtocolSemantics(t *testing.T) {
 }
 
 func TestResponsesNonStreamLengthUsesIncompleteOutcomeEverywhere(t *testing.T) {
-	body := convertChatToResponses([]byte(`{"id":"r","created":1,"choices":[{"finish_reason":"length","message":{"content":"partial","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}`), "m", false, nil, nil)
+	body := convertChatToResponses([]byte(`{"id":"r","created":1,"choices":[{"finish_reason":"length","message":{"content":"partial","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}`), "m", false, nil, nil, nil)
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
