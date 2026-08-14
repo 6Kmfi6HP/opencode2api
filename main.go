@@ -795,12 +795,12 @@ type ResponsesAPIRequest struct {
 	User               string          `json:"user,omitempty"`
 	StreamOptions      any             `json:"stream_options,omitempty"`
 	Metadata           any             `json:"metadata,omitempty"`
-	Text              any             `json:"text,omitempty"`
-	Truncation        string          `json:"truncation,omitempty"`
-	ServiceTier       string          `json:"service_tier,omitempty"`
-	PromptCacheKey    string          `json:"prompt_cache_key,omitempty"`
-	SafetyIdentifier  any             `json:"safety_identifier,omitempty"`
-	TopLogprobs       *int            `json:"top_logprobs,omitempty"`
+	Text               any             `json:"text,omitempty"`
+	Truncation         string          `json:"truncation,omitempty"`
+	ServiceTier        string          `json:"service_tier,omitempty"`
+	PromptCacheKey     string          `json:"prompt_cache_key,omitempty"`
+	SafetyIdentifier   any             `json:"safety_identifier,omitempty"`
+	TopLogprobs        *int            `json:"top_logprobs,omitempty"`
 }
 
 type ResponsesTool struct {

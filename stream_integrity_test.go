@@ -686,8 +686,6 @@ func TestResponsesStream_FinishThenReaderError(t *testing.T) {
 	}
 }
 
-
-
 func TestResponsesStream_RefusalDelta(t *testing.T) {
 	// Given: upstream sends a refusal delta then a normal stop
 	installFakeOpenCodeClient(t, []fakeUpstreamResponse{{
