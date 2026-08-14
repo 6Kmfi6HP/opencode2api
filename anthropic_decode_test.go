@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -359,7 +360,7 @@ func TestCallOpenCodeAPI_AnthropicErrorReturns502(t *testing.T) {
 		status: http.StatusOK,
 		body:   `{"type":"error","error":{"type":"overloaded_error","message":"Server overloaded"}}`,
 	}})
-	body, status, _, err := callOpenCodeAPI(t.Context(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
+	body, status, _, err := callOpenCodeAPI(context.Background(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 	if err == nil {
 		t.Fatal("callOpenCodeAPI should return error for native Anthropic error body")
 	}
@@ -376,7 +377,7 @@ func TestCallOpenCodeAPI_AnthropicTruncatedReturns502(t *testing.T) {
 		status: http.StatusOK,
 		body:   `{"type":"message_start","message":{"id":"msg_t","type":"message","role":"assistant","model":"m","stop_reason":null,"usage":{}}}`,
 	}})
-	body, status, _, err := callOpenCodeAPI(t.Context(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
+	body, status, _, err := callOpenCodeAPI(context.Background(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 	if err == nil {
 		t.Fatal("callOpenCodeAPI should return error for truncated Anthropic SSE")
 	}
@@ -1163,7 +1164,7 @@ func TestCallOpenCodeAPI_AnthropicMalformedReturns502(t *testing.T) {
 		status: http.StatusOK,
 		body:   strings.Join([]string{`{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m","stop_reason":null,"usage":{}}}`, `{bad json}`}, "\n"),
 	}})
-	body, status, _, err := callOpenCodeAPI(t.Context(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
+	body, status, _, err := callOpenCodeAPI(context.Background(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 	if err == nil {
 		t.Fatal("should return error for malformed Anthropic SSE")
 	}
@@ -1191,7 +1192,7 @@ func TestClaudeStream_UsageMergeMultipleChunks(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(t.Context(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
 	events := parseSSEEvents(t, rr.Body.String())
 	var usage map[string]any
 	for _, event := range events {
@@ -1611,7 +1612,7 @@ func TestCallOpenCodeAPI_AnthropicError502_ClaudeShape(t *testing.T) {
 		body:   `{"type":"error","error":{"type":"overloaded_error","message":"Server overloaded"}}`,
 	}})
 	// Test the error shape from callOpenCodeAPI directly
-	_, status, _, err := callOpenCodeAPI(t.Context(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
+	_, status, _, err := callOpenCodeAPI(context.Background(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
 	if err == nil {
 		t.Fatal("expected error")
 	}
