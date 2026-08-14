@@ -13,6 +13,14 @@
     "high": "high"
   },
   "force_disable_thinking": false,
+  "max_tokens_cap": 131072,
+  "max_tokens_cap_per_model": {
+    "deepseek-v4-flash-free": 131072,
+    "laguna-s-2.1-free": 262144,
+    "mimo-v2.5-free": 1048576,
+    "nemotron-3-ultra-free": 1000000,
+    "nemotron-3.5-lightning-free": 1000000
+  },
   "socks5_proxies": [
     {
       "name": "local",

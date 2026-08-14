@@ -532,15 +532,17 @@ func getReqID(ctx context.Context) string {
 // ======================== 配置 ========================
 
 var (
-	port                 string
-	configPath           = "config.json"
-	modelAlias           = map[string]string{}
-	reasoningEffortMap   = map[string]string{}
-	forceDisableThinking bool
-	debugMode            bool
-	configMu             sync.RWMutex
-	storedResponses      = map[string]StoredResponseState{}
-	storedResponsesMu    sync.RWMutex
+	port                  string
+	configPath            = "config.json"
+	modelAlias            = map[string]string{}
+	reasoningEffortMap    = map[string]string{}
+	forceDisableThinking  bool
+	maxTokensCap          int
+	maxTokensCapPerModel  = map[string]int{}
+	debugMode             bool
+	configMu              sync.RWMutex
+	storedResponses       = map[string]StoredResponseState{}
+	storedResponsesMu     sync.RWMutex
 )
 
 // ======================== 管理面板认证 ========================
@@ -696,8 +698,15 @@ type AppConfig struct {
 	ModelAlias           map[string]string `json:"model_alias"`
 	ReasoningEffortMap   map[string]string `json:"reasoning_effort_map"`
 	ForceDisableThinking bool              `json:"force_disable_thinking"`
-	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
-	ActiveSocks5         string            `json:"active_socks5,omitempty"`
+	// MaxTokensCap is the global default upper bound for max_tokens sent
+	// upstream. 0 (default) means no global cap. Per-model values in
+	// MaxTokensCapPerModel take precedence.
+	MaxTokensCap int `json:"max_tokens_cap,omitempty"`
+	// MaxTokensCapPerModel overrides the global cap for specific models.
+	// A value of 0 for a model disables the cap for that model.
+	MaxTokensCapPerModel map[string]int `json:"max_tokens_cap_per_model,omitempty"`
+	Socks5Proxies        []Socks5Proxy  `json:"socks5_proxies,omitempty"`
+	ActiveSocks5         string         `json:"active_socks5,omitempty"`
 	// Socks5PaidDirect controls whether keyed/paid upstream calls bypass SOCKS5.
 	// Omitted or false (default): all traffic uses the active proxy.
 	// true: paid/keyed traffic goes direct; only public/free uses SOCKS5.
@@ -846,6 +855,10 @@ func applyConfig(cfg AppConfig) {
 		reasoningEffortMap = cfg.ReasoningEffortMap
 	}
 	forceDisableThinking = cfg.ForceDisableThinking
+	maxTokensCap = cfg.MaxTokensCap
+	if cfg.MaxTokensCapPerModel != nil {
+		maxTokensCapPerModel = cfg.MaxTokensCapPerModel
+	}
 
 	socks5Mu.Lock()
 	if cfg.Socks5Proxies != nil {
@@ -895,6 +908,18 @@ func getReasoningEffortMap() map[string]string {
 		cp[k] = v
 	}
 	return cp
+}
+
+// getMaxTokensCapForModel returns the effective max_tokens cap for the given
+// model: the per-model value if set, otherwise the global default. A return
+// value of 0 means no cap (max_tokens is forwarded as-is).
+func getMaxTokensCapForModel(model string) int {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	if cap, ok := maxTokensCapPerModel[model]; ok {
+		return cap
+	}
+	return maxTokensCap
 }
 
 // ======================== Token 统计 ========================
@@ -1162,7 +1187,11 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 		converted["temperature"] = *req.Temperature
 	}
 	if req.MaxTokens != nil {
-		converted["max_tokens"] = *req.MaxTokens
+		v := *req.MaxTokens
+		if cap := getMaxTokensCapForModel(req.Model); cap > 0 && v > cap {
+			v = cap
+		}
+		converted["max_tokens"] = v
 	}
 	if req.TopP != nil {
 		converted["top_p"] = *req.TopP
@@ -2695,6 +2724,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		"reasoning_effort_out": mappedReasoningEffort(effortIn),
 		"tools_count":          len(req.Tools),
 		"messages_count":       len(req.Messages),
+		"max_tokens":           req.MaxTokens,
+		"max_tokens_cap":       getMaxTokensCapForModel(req.Model),
 	})
 	upstreamBody := buildUpstreamBody(&req)
 
@@ -3837,6 +3868,8 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		"history_signature_count": countClaudeThinkingSignatures(claudeReq.Messages),
 		"client_beta_count":       countAnthropicBetas(r.Header.Get("anthropic-beta")),
 		"unsupported_blocks":      scanClaudeUnsupportedBlocks(claudeReq.Messages),
+		"max_tokens":              chatReq.MaxTokens,
+		"max_tokens_cap":          getMaxTokensCapForModel(chatReq.Model),
 	}
 	if len(skippedServerTools) > 0 {
 		plan["skipped_server_tools"] = skippedServerTools
@@ -5442,6 +5475,8 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		"reasoning_effort_out": mappedReasoningEffort(effortIn),
 		"tools_count":          len(respReq.Tools),
 		"messages_count":       len(chatReq.Messages),
+		"max_tokens":           chatReq.MaxTokens,
+		"max_tokens_cap":       getMaxTokensCapForModel(chatReq.Model),
 	})
 
 	upstreamBody := buildUpstreamBody(&chatReq)
@@ -6336,7 +6371,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		configMu.RLock()
-		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking}
+		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking, MaxTokensCap: maxTokensCap, MaxTokensCapPerModel: maxTokensCapPerModel}
 		configMu.RUnlock()
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
@@ -6345,14 +6380,16 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"model_alias":            cfg.ModelAlias,
-			"reasoning_effort_map":   cfg.ReasoningEffortMap,
-			"force_disable_thinking": cfg.ForceDisableThinking,
-			"socks5_proxies":         cfg.Socks5Proxies,
-			"active_socks5":          cfg.ActiveSocks5,
-			"socks5_paid_direct":     cfg.Socks5PaidDirect,
-			"log_level":              getLogLevelString(),
-			"log_bodies":             getLogBodies(),
+			"model_alias":               cfg.ModelAlias,
+			"reasoning_effort_map":      cfg.ReasoningEffortMap,
+			"force_disable_thinking":    cfg.ForceDisableThinking,
+			"max_tokens_cap":            cfg.MaxTokensCap,
+			"max_tokens_cap_per_model":  cfg.MaxTokensCapPerModel,
+			"socks5_proxies":            cfg.Socks5Proxies,
+			"active_socks5":             cfg.ActiveSocks5,
+			"socks5_paid_direct":        cfg.Socks5PaidDirect,
+			"log_level":                 getLogLevelString(),
+			"log_bodies":                getLogBodies(),
 		})
 	case http.MethodPost:
 		var payload struct {
@@ -6380,6 +6417,8 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 				"aliases", len(payload.ModelAlias),
 				"effort_map", len(payload.ReasoningEffortMap),
 				"force_disable", payload.ForceDisableThinking,
+				"max_tokens_cap", payload.MaxTokensCap,
+				"max_tokens_cap_per_model", len(payload.MaxTokensCapPerModel),
 				"log_level", getLogLevelString(),
 				"log_bodies", getLogBodies(),
 			)
@@ -6673,6 +6712,25 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 
 <div class="card">
+<h2><span class="dot" style="background:#e85d75"></span>max_tokens 上限</h2>
+<div class="form-group">
+<label>全局默认上限</label>
+<input type="number" id="maxTokensCap" class="m-input" min="0" placeholder="0 = 不限制" style="width:140px">
+<span class="hint">超过此值的 max_tokens 会被截断到此值（0 = 不限制）</span>
+</div>
+<div style="margin-bottom:12px">
+<table class="tbl" id="capTable">
+<thead><tr><th style="width:55%">模型</th><th style="width:30%">上限</th><th style="width:15%"></th></tr></thead>
+<tbody></tbody>
+</table>
+</div>
+<div class="actions">
+<button class="btn btn-primary" onclick="addCapRow()">添加模型上限</button>
+<button class="btn btn-success" onclick="saveConfig()">保存全部</button>
+</div>
+</div>
+
+<div class="card">
 <h2><span class="dot" style="background:var(--accent)"></span>模型映射</h2>
 <div style="margin-bottom:12px">
 <table class="tbl" id="aliasTable">
@@ -6711,11 +6769,11 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 <div id="toast"></div>
 <script>
-let aliasData={},effortData={},modelList=[],socks5Data=[];
+let aliasData={},effortData={},modelList=[],socks5Data=[],capData={};
 function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute('data-theme');const next=cur==='dark'?null:'dark';if(next)d.setAttribute('data-theme',next);else d.removeAttribute('data-theme');localStorage.setItem('theme',next||'light');document.querySelector('.theme-toggle').textContent=next==='dark'?'🌙':'☀'}
 (function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
 function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadStats();setTimeout(()=>window.scrollTo(0,sy),100)})}
-async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;document.getElementById('socks5_paid_direct').checked=!!cfg.socks5_paid_direct;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
+async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;document.getElementById('socks5_paid_direct').checked=!!cfg.socks5_paid_direct;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];capData=cfg.max_tokens_cap_per_model||{};document.getElementById('maxTokensCap').value=cfg.max_tokens_cap||'';const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();renderCapTable();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
 function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>').join('')}
 function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
 function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+modelSelectHtml('')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
@@ -6730,7 +6788,11 @@ function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,socks5_paid_direct:document.getElementById('socks5_paid_direct').checked};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+async function saveConfig(){collectAliases();collectEfforts();collectSocks5();collectCaps();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,max_tokens_cap:parseInt(document.getElementById('maxTokensCap').value)||0,max_tokens_cap_per_model:capData,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,socks5_paid_direct:document.getElementById('socks5_paid_direct').checked};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+function renderCapTable(){const tb=document.querySelector('#capTable tbody');const ks=Object.keys(capData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无模型上限配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td>'+modelSelectHtml(k)+'</td><td><input type="number" value="'+capData[k]+'" data-field="cap" min="0" style="width:100px"></td><td><button class="btn btn-danger" onclick="delCap(this)">删除</button></td></tr>').join('')}
+function addCapRow(){const tb=document.querySelector('#capTable tbody');const tr=document.createElement('tr');tr.innerHTML='<td>'+modelSelectHtml('')+'</td><td><input type="number" value="0" data-field="cap" min="0" style="width:100px"></td><td><button class="btn btn-danger" onclick="delCap(this)">删除</button></td>';tb.appendChild(tr);if(tb.querySelector('.empty-hint'))tb.innerHTML=''}
+function collectCaps(){capData={};document.querySelectorAll('#capTable tbody tr').forEach(tr=>{const sel=tr.querySelector('[data-field=key]');const inp=tr.querySelector('[data-field=cap]');if(sel&&inp){const k=sel.value;if(k){const v=parseInt(inp.value)||0;capData[k]=v}}})}
+function delCap(btn){btn.closest('tr').remove();if(!document.querySelector('#capTable tbody tr'))renderCapTable()}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
