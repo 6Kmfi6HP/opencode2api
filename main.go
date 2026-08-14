@@ -760,13 +760,15 @@ type ClaudeTool struct {
 }
 
 type ClaudeResponse struct {
-	ID         string          `json:"id"`
-	Type       string          `json:"type"`
-	Role       string          `json:"role"`
-	Content    []ClaudeContent `json:"content"`
-	Model      string          `json:"model"`
-	StopReason string          `json:"stop_reason"`
-	Usage      ClaudeUsage     `json:"usage,omitempty"`
+	ID           string          `json:"id"`
+	Type         string          `json:"type"`
+	Role         string          `json:"role"`
+	Content      []ClaudeContent `json:"content"`
+	Model        string          `json:"model"`
+	StopReason   string          `json:"stop_reason"`
+	StopSequence *string         `json:"stop_sequence"`
+	StopDetails  any             `json:"stop_details,omitempty"`
+	Usage        ClaudeUsage     `json:"usage,omitempty"`
 }
 
 type ClaudeUsage map[string]any
@@ -3475,11 +3477,18 @@ func countClaudeThinkingSignatures(msgs []ClaudeMessage) int {
 // as a best-effort file part (see claudeDocumentBlockToOpenAI) and is not
 // listed here so it is not counted as unsupported.
 var claudeUnsupportedBlockTypes = map[string]struct{}{
-	"redacted_thinking":      {},
-	"search_result":          {},
-	"server_tool_use":        {},
-	"web_search_tool_result": {},
-	"container_upload":       {},
+	"redacted_thinking":               {},
+	"search_result":                   {},
+	"server_tool_use":                 {},
+	"web_search_tool_result":          {},
+	"container_upload":                {},
+	"code_execution_tool_use":         {},
+	"code_execution_tool_result":      {},
+	"mcp_tool_use":                    {},
+	"mcp_tool_result":                 {},
+	"bash_code_execution_tool_result": {},
+	"web_fetch_tool_result":           {},
+	"tool_reference":                  {},
 }
 
 func scanClaudeUnsupportedBlocks(msgs []ClaudeMessage) map[string]int {
@@ -3661,12 +3670,13 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 	respID := normalizeClaudeMessageID(chat.ID)
 
 	resp := ClaudeResponse{
-		ID:         respID,
-		Type:       "message",
-		Role:       "assistant",
-		Content:    content,
-		Model:      model,
-		StopReason: stopReason,
+		ID:           respID,
+		Type:         "message",
+		Role:         "assistant",
+		Content:      content,
+		Model:        model,
+		StopReason:   stopReason,
+		StopSequence: nil,
 	}
 	if chat.Usage != nil {
 		resp.Usage = buildClaudeMessageUsage(chat.Usage)
@@ -4092,13 +4102,14 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		emitClaudeEvent("message_start", map[string]any{
 			"type": "message_start",
 			"message": map[string]any{
-				"id":          msgID,
-				"type":        "message",
-				"role":        "assistant",
-				"content":     []any{},
-				"model":       model,
-				"stop_reason": nil,
-				"usage":       buildClaudeMessageUsage(fullUsage),
+				"id":            msgID,
+				"type":          "message",
+				"role":          "assistant",
+				"content":       []any{},
+				"model":         model,
+				"stop_reason":   nil,
+				"stop_sequence": nil,
+				"usage":         buildClaudeMessageUsage(fullUsage),
 			},
 		})
 		emitClaudeEvent("ping", map[string]any{"type": "ping"})
@@ -4370,7 +4381,7 @@ loop:
 	ensureMessageStart()
 	emitClaudeEvent("message_delta", map[string]any{
 		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": stopReason},
+		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
 		"usage": buildClaudeDeltaUsage(fullUsage),
 	})
 	emitClaudeEvent("message_stop", map[string]any{"type": "message_stop"})
