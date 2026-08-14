@@ -4319,7 +4319,7 @@ loop:
 					break loop
 				}
 				reqLogger(ctx).Error("stream read error", "error", pendingErr)
-				emitClaudeError("stream read error: " + pendingErr.Error())
+				emitClaudeError("stream read error")
 				return
 			}
 		}
@@ -6042,7 +6042,7 @@ loop:
 					break loop
 				}
 				reqLogger(ctx).Error("stream read error", "error", pendingErr)
-				emitResponseFailed("stream read error: " + pendingErr.Error())
+				emitResponseFailed("stream read error")
 				return
 			}
 		}

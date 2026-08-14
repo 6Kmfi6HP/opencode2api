@@ -612,6 +612,16 @@ func TestClaudeStream_FinishThenReaderError(t *testing.T) {
 	if hasEvent(events, "message_stop") || hasEvent(events, "message_delta") {
 		t.Fatalf("must not emit message_stop/delta after trailing reader error: %s", rr.Body.String())
 	}
+	// Must not leak the raw Go transport error string.
+	for _, e := range events {
+		if e.Name == "error" {
+			errObj, _ := e.Data["error"].(map[string]any)
+			msg, _ := errObj["message"].(string)
+			if msg == "" || strings.Contains(msg, "io: read/write on closed pipe") {
+				t.Fatalf("error message must be fixed string, got %q: %s", msg, rr.Body.String())
+			}
+		}
+	}
 }
 
 func TestResponsesStream_FinishThenInBandError(t *testing.T) {
@@ -662,5 +672,16 @@ func TestResponsesStream_FinishThenReaderError(t *testing.T) {
 	}
 	if hasEvent(events, "response.output_item.done") {
 		t.Fatalf("must not emit output_item.done before response.failed: %s", rr.Body.String())
+	}
+	// Must not leak the raw Go transport error string.
+	for _, e := range events {
+		if e.Name == "response.failed" {
+			resp, _ := e.Data["response"].(map[string]any)
+			errObj, _ := resp["error"].(map[string]any)
+			msg, _ := errObj["message"].(string)
+			if msg == "" || strings.Contains(msg, "io: read/write on closed pipe") {
+				t.Fatalf("error message must be fixed string, got %q: %s", msg, rr.Body.String())
+			}
+		}
 	}
 }
