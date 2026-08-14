@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.4.1
+
+- Add `stop_sequence` field to non-streaming Claude responses, streaming `message_start`, and streaming `message_delta` so Claude Code sees `"stop_sequence": null` consistently, matching the Anthropic Messages API contract.
+- Add `stop_details` field (omitempty) to `ClaudeResponse` for forward compatibility with `refusal` stop reason.
+- Extend `claudeUnsupportedBlockTypes` with 7 new server-tool/MCP block types (`code_execution_tool_use`, `code_execution_tool_result`, `mcp_tool_use`, `mcp_tool_result`, `bash_code_execution_tool_result`, `web_fetch_tool_result`, `tool_reference`) for observability; requests with these blocks are still accepted (no 400).
+
 ## v0.4.0
 
 - Fix 19 audited protocol compatibility issues across stream integrity, native Anthropic decoding, and request compatibility adapters.
