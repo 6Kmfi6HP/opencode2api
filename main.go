@@ -795,6 +795,12 @@ type ResponsesAPIRequest struct {
 	User               string          `json:"user,omitempty"`
 	StreamOptions      any             `json:"stream_options,omitempty"`
 	Metadata           any             `json:"metadata,omitempty"`
+	Text               any             `json:"text,omitempty"`
+	Truncation         string          `json:"truncation,omitempty"`
+	ServiceTier        string          `json:"service_tier,omitempty"`
+	PromptCacheKey     string          `json:"prompt_cache_key,omitempty"`
+	SafetyIdentifier   any             `json:"safety_identifier,omitempty"`
+	TopLogprobs        *int            `json:"top_logprobs,omitempty"`
 }
 
 type ResponsesTool struct {
@@ -812,7 +818,9 @@ type ResponsesTool struct {
 }
 
 type ReasonEffort struct {
-	Effort string `json:"effort,omitempty"`
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
+	Mode    string `json:"mode,omitempty"`
 }
 
 type StoredResponseState struct {
@@ -4683,6 +4691,16 @@ func responsesToolKindMap(tools []ResponsesTool) map[string]string {
 	return kinds
 }
 
+// includeHas reports whether the include array contains the given key.
+func includeHas(include []string, key string) bool {
+	for _, v := range include {
+		if v == key {
+			return true
+		}
+	}
+	return false
+}
+
 func toolCallOutputType(name string, kinds map[string]string) string {
 	switch kinds[name] {
 	case "apply_patch":
@@ -5427,6 +5445,42 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		chatReq.ExtraBody["user"] = respReq.User
 	}
+	if respReq.Text != nil {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["response_format"] = respReq.Text
+	}
+	if respReq.Truncation != "" {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["truncation"] = respReq.Truncation
+	}
+	if respReq.ServiceTier != "" {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["service_tier"] = respReq.ServiceTier
+	}
+	if respReq.PromptCacheKey != "" {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["prompt_cache_key"] = respReq.PromptCacheKey
+	}
+	if respReq.SafetyIdentifier != nil {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["safety_identifier"] = respReq.SafetyIdentifier
+	}
+	if respReq.TopLogprobs != nil {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["top_logprobs"] = *respReq.TopLogprobs
+	}
 	if respReq.StreamOptions != nil {
 		if chatReq.ExtraBody == nil {
 			chatReq.ExtraBody = map[string]any{}
@@ -5523,7 +5577,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responsesBody := convertChatToResponses(respBody, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice)
+	responsesBody := convertChatToResponses(respBody, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice, respReq.Include)
 	var responseMap map[string]any
 	if json.Unmarshal(responsesBody, &responseMap) == nil {
 		applyResponsesRequestEcho(responseMap, respReq)
@@ -5581,6 +5635,8 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 	messageDone := false
 	fullReasoning := ""
 	fullText := ""
+	fullRefusal := ""
+	refusalStarted := false
 	totalUsage := map[string]any{}
 	createdSent := false
 	terminalStatus := "completed"
@@ -5649,7 +5705,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		if status != "" {
 			item["status"] = status
 		}
-		if status == "completed" {
+		if status == "completed" && includeHas(originalReq.Include, "reasoning.encrypted_content") {
 			item["encrypted_content"] = ""
 		}
 		if fullReasoning != "" {
@@ -5659,12 +5715,19 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 	}
 
 	messageItem := func(status string) map[string]any {
-		content := []any{map[string]any{
+		content := []any{}
+		if fullRefusal != "" {
+			content = append(content, map[string]any{
+				"type":    "refusal",
+				"refusal": fullRefusal,
+			})
+		}
+		content = append(content, map[string]any{
 			"type":        "output_text",
 			"annotations": []any{},
 			"logprobs":    []any{},
 			"text":        fullText,
-		}}
+		})
 		return map[string]any{
 			"id":      msgID,
 			"type":    "message",
@@ -5738,6 +5801,22 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			"item":            messageItem(itemStatus),
 		})
 		messageDone = true
+	}
+
+	emitRefusalDone := func() {
+		if !refusalStarted {
+			return
+		}
+		idx := messageOutputIndex()
+		seq++
+		emitSSEEvent(w, flusher, "response.refusal.done", map[string]any{
+			"type":            "response.refusal.done",
+			"sequence_number": seq,
+			"item_id":         msgID,
+			"output_index":    idx,
+			"content_index":   0,
+			"refusal":         fullRefusal,
+		})
 	}
 
 	emitToolCallDone := func(idx int, call map[string]any) {
@@ -5976,6 +6055,22 @@ loop:
 										})
 									}
 
+									if refusalStr, ok := delta["refusal"].(string); ok && refusalStr != "" {
+										if !refusalStarted {
+											refusalStarted = true
+										}
+										fullRefusal += refusalStr
+										seq++
+										emitSSEEvent(w, flusher, "response.refusal.delta", map[string]any{
+											"type":            "response.refusal.delta",
+											"sequence_number": seq,
+											"item_id":         msgID,
+											"output_index":    messageOutputIndex(),
+											"content_index":   0,
+											"delta":           refusalStr,
+										})
+									}
+
 									rawToolCalls, _ := delta["tool_calls"].([]any)
 									for _, rawToolCall := range rawToolCalls {
 										tc, ok := rawToolCall.(map[string]any)
@@ -6085,6 +6180,7 @@ loop:
 
 	// Reached only when finished is true.
 	emitReasoningDone()
+	emitRefusalDone()
 	if !messageStarted && len(toolCalls) == 0 {
 		idx := messageOutputIndex()
 		seq++
@@ -6206,7 +6302,7 @@ loop:
 	storeResponseState(completedResponse, originalReq)
 }
 
-func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, tools []ResponsesTool, toolChoice any) []byte {
+func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, tools []ResponsesTool, toolChoice any, include []string) []byte {
 	var chat struct {
 		ID      string `json:"id"`
 		Created int64  `json:"created"`
@@ -6268,12 +6364,15 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 	outputID := "msg_" + normalizedID + "_0"
 	output := []any{}
 	if reasoning != "" {
-		output = append(output, map[string]any{
-			"id":                "rs_" + normalizedID,
-			"type":              "reasoning",
-			"encrypted_content": "",
-			"summary":           []any{map[string]any{"type": "summary_text", "text": reasoning}},
-		})
+		reasoningItem := map[string]any{
+			"id":      "rs_" + normalizedID,
+			"type":    "reasoning",
+			"summary": []any{map[string]any{"type": "summary_text", "text": reasoning}},
+		}
+		if includeHas(include, "reasoning.encrypted_content") {
+			reasoningItem["encrypted_content"] = ""
+		}
+		output = append(output, reasoningItem)
 	}
 	if len(messageContent) > 0 {
 		output = append(output, map[string]any{

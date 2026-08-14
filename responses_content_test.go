@@ -143,7 +143,7 @@ func Test_ConvertChatToResponses_preserves_array_message_content_when_upstream_r
 	}`)
 
 	// When
-	body := convertChatToResponses(chatBody, "primary-model", false, nil, nil)
+	body := convertChatToResponses(chatBody, "primary-model", false, nil, nil, nil)
 
 	// Then
 	var response map[string]any

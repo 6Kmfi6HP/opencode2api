@@ -567,7 +567,7 @@ func TestConvertResponse_StripsPrivateFieldKeepReasoning(t *testing.T) {
 // Test: convertChatToResponses does not leak private field
 func TestConvertChatToResponses_NoPrivateFieldLeak(t *testing.T) {
 	chatBody := `{"id":"chatcmpl_x","created":1234,"choices":[{"index":0,"message":{"role":"assistant","content":"Hi","_opencode2api_anthropic_content":[{"type":"text","text":"Hi"}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`
-	out := convertChatToResponses([]byte(chatBody), "m", false, nil, nil)
+	out := convertChatToResponses([]byte(chatBody), "m", false, nil, nil, nil)
 	var resp map[string]any
 	json.Unmarshal(out, &resp)
 	outStr := string(out)
@@ -1562,7 +1562,7 @@ func TestConvertResponse_PreservesValidChatID(t *testing.T) {
 
 func TestConvertChatToResponses_NormalizesResponsesID(t *testing.T) {
 	chatBody := `{"id":"chatcmpl_xyz","created":1234,"choices":[{"index":0,"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`
-	out := convertChatToResponses([]byte(chatBody), "m", false, nil, nil)
+	out := convertChatToResponses([]byte(chatBody), "m", false, nil, nil, nil)
 	var resp map[string]any
 	json.Unmarshal(out, &resp)
 	id, _ := resp["id"].(string)
@@ -1577,7 +1577,7 @@ func TestConvertChatToResponses_NormalizesResponsesID(t *testing.T) {
 
 func TestConvertChatToResponses_PreservesValidResponsesID(t *testing.T) {
 	chatBody := `{"id":"resp_abc","created":1234,"choices":[{"index":0,"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`
-	out := convertChatToResponses([]byte(chatBody), "m", false, nil, nil)
+	out := convertChatToResponses([]byte(chatBody), "m", false, nil, nil, nil)
 	var resp map[string]any
 	json.Unmarshal(out, &resp)
 	id, _ := resp["id"].(string)
@@ -1797,7 +1797,7 @@ func TestConvertStreamChunkWithUsage_DeterministicID(t *testing.T) {
 // Test: Responses top-level ID and derived msg_/rs_ IDs are consistent
 func TestConvertChatToResponses_DerivedIDsConsistent(t *testing.T) {
 	chatBody := `{"id":"msg_test123","created":1234,"choices":[{"index":0,"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`
-	out := convertChatToResponses([]byte(chatBody), "m", false, nil, nil)
+	out := convertChatToResponses([]byte(chatBody), "m", false, nil, nil, nil)
 	var resp map[string]any
 	json.Unmarshal(out, &resp)
 
@@ -2189,7 +2189,7 @@ func TestClaudeHandler_MalformedAnthropicReturns502(t *testing.T) {
 
 func TestConvertChatToResponses_EmptyIDConsistent(t *testing.T) {
 	chatBody := `{"id":"","created":1234,"choices":[{"index":0,"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`
-	out := convertChatToResponses([]byte(chatBody), "m", false, nil, nil)
+	out := convertChatToResponses([]byte(chatBody), "m", false, nil, nil, nil)
 	var resp map[string]any
 	json.Unmarshal(out, &resp)
 	topID, _ := resp["id"].(string)

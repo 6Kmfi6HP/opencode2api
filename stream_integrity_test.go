@@ -685,3 +685,101 @@ func TestResponsesStream_FinishThenReaderError(t *testing.T) {
 		}
 	}
 }
+
+func TestResponsesStream_RefusalDelta(t *testing.T) {
+	// Given: upstream sends a refusal delta then a normal stop
+	installFakeOpenCodeClient(t, []fakeUpstreamResponse{{
+		status: http.StatusOK,
+		body: strings.Join([]string{
+			`data: {"choices":[{"delta":{"refusal":"I cannot help."},"finish_reason":null}]}`,
+			``,
+			`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			``,
+			`data: [DONE]`,
+			``,
+		}, "\n"),
+	}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"primary-model","input":"hi","stream":true}`))
+	rec := httptest.NewRecorder()
+
+	// When
+	responsesHandler(rec, req)
+
+	// Then
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	events := parseSSEEvents(t, rec.Body.String())
+	if !hasEvent(events, "response.refusal.delta") {
+		t.Fatalf("expected response.refusal.delta event:\n%s", rec.Body.String())
+	}
+	if !hasEvent(events, "response.refusal.done") {
+		t.Fatalf("expected response.refusal.done event:\n%s", rec.Body.String())
+	}
+
+	// Verify refusal delta content
+	for _, e := range events {
+		if e.Name == "response.refusal.delta" {
+			delta, _ := e.Data["delta"].(string)
+			if delta != "I cannot help." {
+				t.Fatalf("refusal delta = %q, want %q", delta, "I cannot help.")
+			}
+		}
+		if e.Name == "response.refusal.done" {
+			refusal, _ := e.Data["refusal"].(string)
+			if refusal != "I cannot help." {
+				t.Fatalf("refusal done = %q, want %q", refusal, "I cannot help.")
+			}
+		}
+	}
+
+	// Verify response.completed includes refusal content in the message item
+	var completedEvent *sseEvent
+	for i := range events {
+		if events[i].Name == "response.completed" {
+			completedEvent = &events[i]
+			break
+		}
+	}
+	if completedEvent == nil {
+		t.Fatalf("expected response.completed event:\n%s", rec.Body.String())
+	}
+	resp, ok := completedEvent.Data["response"].(map[string]any)
+	if !ok {
+		t.Fatalf("response.completed missing response object: %#v", completedEvent.Data)
+	}
+	output, ok := resp["output"].([]any)
+	if !ok {
+		t.Fatalf("response.completed missing output array: %#v", resp["output"])
+	}
+	var foundRefusal bool
+	for _, item := range output {
+		itemMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if itemMap["type"] != "message" {
+			continue
+		}
+		content, ok := itemMap["content"].([]any)
+		if !ok {
+			t.Fatalf("message item missing content array: %#v", itemMap)
+		}
+		for _, c := range content {
+			cMap, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			if cMap["type"] == "refusal" {
+				foundRefusal = true
+				if r, _ := cMap["refusal"].(string); r != "I cannot help." {
+					t.Fatalf("refusal content = %q, want %q", r, "I cannot help.")
+				}
+			}
+		}
+	}
+	if !foundRefusal {
+		t.Fatalf("response.completed message item does not include refusal content:\n%s", rec.Body.String())
+	}
+}
