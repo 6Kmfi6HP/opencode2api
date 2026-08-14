@@ -43,6 +43,40 @@ cp config.example.json config.json
 
 设为 `true` 时，服务会尽量禁用 thinking/reasoning，并从返回中移除 reasoning 内容。
 
+### `max_tokens_cap`
+
+全局默认 `max_tokens` 上限。客户端传入的 `max_tokens` 超过此值时，会被截断到此值。设为 `0` 或不填则不限制。
+
+```json
+{
+  "max_tokens_cap": 131072
+}
+```
+
+### `max_tokens_cap_per_model`
+
+按模型覆盖全局上限。键是上游模型名，值是该模型的上限。值为 `0` 表示对该模型不限制。
+
+```json
+{
+  "max_tokens_cap_per_model": {
+    "deepseek-v4-flash-free": 131072,
+    "laguna-s-2.1-free": 262144,
+    "mimo-v2.5-free": 1048576
+  }
+}
+```
+
+上游对不同模型的 `max_tokens` 限制不同，实测值如下：
+
+| 模型 | 限制类型 | 上限 |
+|------|---------|------|
+| `deepseek-v4-flash-free` | completion tokens | 131,072 |
+| `laguna-s-2.1-free` | context length | 262,144 |
+| `mimo-v2.5-free` | context length | 1,048,576 |
+| `nemotron-3-ultra-free` | context length | 1,000,000 |
+| `nemotron-3.5-lightning-free` | context length | 1,000,000 |
+
 ### `socks5_proxies`
 
 SOCKS5 代理列表。

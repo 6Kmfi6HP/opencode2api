@@ -755,6 +755,42 @@ func TestResolveModelMapsStrippedFreeNameBackToUpstream(t *testing.T) {
 	}
 }
 
+func TestMapPublicToFreeModel(t *testing.T) {
+	oldModelsCache := modelsCache
+	oldGoModelsCache := goModelsCache
+	modelMu.Lock()
+	modelsCache = []ModelInfo{{ID: "deepseek-v4-flash"}, {ID: "deepseek-v4-flash-free"}, {ID: "mimo-v2.5-free"}}
+	goModelsCache = nil
+	modelMu.Unlock()
+	t.Cleanup(func() {
+		modelMu.Lock()
+		modelsCache = oldModelsCache
+		goModelsCache = oldGoModelsCache
+		modelMu.Unlock()
+	})
+
+	public := UpstreamAuth{Mode: AuthRoutePublic}
+	keyed := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-validkey0123456789abcdef"}
+
+	tests := []struct {
+		name  string
+		auth  UpstreamAuth
+		model string
+		want  string
+	}{
+		{"public paid with free variant maps to free", public, "deepseek-v4-flash", "deepseek-v4-flash-free"},
+		{"public free model stays", public, "deepseek-v4-flash-free", "deepseek-v4-flash-free"},
+		{"public model without free variant stays", public, "laguna-s-2.1", "laguna-s-2.1"},
+		{"keyed paid model stays", keyed, "deepseek-v4-flash", "deepseek-v4-flash"},
+		{"empty model stays", public, "", ""},
+	}
+	for _, tt := range tests {
+		if got := mapPublicToFreeModel(tt.auth, tt.model); got != tt.want {
+			t.Errorf("%s: mapPublicToFreeModel(%v, %q) = %q, want %q", tt.name, tt.auth.Mode, tt.model, got, tt.want)
+		}
+	}
+}
+
 func TestExtractUpstreamAuthKeyValidation(t *testing.T) {
 	tests := []struct {
 		name       string

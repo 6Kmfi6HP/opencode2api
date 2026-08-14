@@ -5,17 +5,22 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -532,6 +537,8 @@ var (
 	modelAlias           = map[string]string{}
 	reasoningEffortMap   = map[string]string{}
 	forceDisableThinking bool
+	maxTokensCap         int
+	maxTokensCapPerModel = map[string]int{}
 	debugMode            bool
 	configMu             sync.RWMutex
 	storedResponses      = map[string]StoredResponseState{}
@@ -691,8 +698,15 @@ type AppConfig struct {
 	ModelAlias           map[string]string `json:"model_alias"`
 	ReasoningEffortMap   map[string]string `json:"reasoning_effort_map"`
 	ForceDisableThinking bool              `json:"force_disable_thinking"`
-	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
-	ActiveSocks5         string            `json:"active_socks5,omitempty"`
+	// MaxTokensCap is the global default upper bound for max_tokens sent
+	// upstream. 0 (default) means no global cap. Per-model values in
+	// MaxTokensCapPerModel take precedence.
+	MaxTokensCap int `json:"max_tokens_cap,omitempty"`
+	// MaxTokensCapPerModel overrides the global cap for specific models.
+	// A value of 0 for a model disables the cap for that model.
+	MaxTokensCapPerModel map[string]int `json:"max_tokens_cap_per_model,omitempty"`
+	Socks5Proxies        []Socks5Proxy  `json:"socks5_proxies,omitempty"`
+	ActiveSocks5         string         `json:"active_socks5,omitempty"`
 	// Socks5PaidDirect controls whether keyed/paid upstream calls bypass SOCKS5.
 	// Omitted or false (default): all traffic uses the active proxy.
 	// true: paid/keyed traffic goes direct; only public/free uses SOCKS5.
@@ -729,6 +743,7 @@ type ClaudeContent struct {
 	Text      string `json:"text,omitempty"`
 	Thinking  string `json:"thinking,omitempty"`
 	Signature string `json:"signature,omitempty"`
+	Data      string `json:"data,omitempty"`
 	ID        string `json:"id,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Input     any    `json:"input,omitempty"`
@@ -737,10 +752,11 @@ type ClaudeContent struct {
 }
 
 type ClaudeTool struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	InputSchema any    `json:"input_schema"`
-	Type        string `json:"type,omitempty"`
+	Name         string `json:"name"`
+	Description  string `json:"description,omitempty"`
+	InputSchema  any    `json:"input_schema"`
+	Type         string `json:"type,omitempty"`
+	CacheControl any    `json:"cache_control,omitempty"`
 }
 
 type ClaudeResponse struct {
@@ -839,6 +855,10 @@ func applyConfig(cfg AppConfig) {
 		reasoningEffortMap = cfg.ReasoningEffortMap
 	}
 	forceDisableThinking = cfg.ForceDisableThinking
+	maxTokensCap = cfg.MaxTokensCap
+	if cfg.MaxTokensCapPerModel != nil {
+		maxTokensCapPerModel = cfg.MaxTokensCapPerModel
+	}
 
 	socks5Mu.Lock()
 	if cfg.Socks5Proxies != nil {
@@ -888,6 +908,18 @@ func getReasoningEffortMap() map[string]string {
 		cp[k] = v
 	}
 	return cp
+}
+
+// getMaxTokensCapForModel returns the effective max_tokens cap for the given
+// model: the per-model value if set, otherwise the global default. A return
+// value of 0 means no cap (max_tokens is forwarded as-is).
+func getMaxTokensCapForModel(model string) int {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	if cap, ok := maxTokensCapPerModel[model]; ok {
+		return cap
+	}
+	return maxTokensCap
 }
 
 // ======================== Token 统计 ========================
@@ -1155,7 +1187,11 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 		converted["temperature"] = *req.Temperature
 	}
 	if req.MaxTokens != nil {
-		converted["max_tokens"] = *req.MaxTokens
+		v := *req.MaxTokens
+		if cap := getMaxTokensCapForModel(req.Model); cap > 0 && v > cap {
+			v = cap
+		}
+		converted["max_tokens"] = v
 	}
 	if req.TopP != nil {
 		converted["top_p"] = *req.TopP
@@ -1226,29 +1262,12 @@ func isAnthropicFormat(body []byte) bool {
 		if len(line) == 0 {
 			continue
 		}
-		var event map[string]any
-		if err := json.Unmarshal(line, &event); err != nil {
-			continue
+		// Support "data: " prefixed SSE lines.
+		if bytes.HasPrefix(line, []byte("data: ")) {
+			line = bytes.TrimSpace(line[6:])
+		} else if bytes.HasPrefix(line, []byte("data:")) {
+			line = bytes.TrimSpace(line[5:])
 		}
-		typ, _ := event["type"].(string)
-		switch typ {
-		case "message_start", "content_block_start", "content_block_delta",
-			"content_block_stop", "message_delta", "message_stop", "ping":
-			return true
-		}
-		return false
-	}
-	return false
-}
-
-func parseAnthropicSSE(body []byte) (map[string]any, string, []map[string]any) {
-	lines := bytes.Split(body, []byte("\n"))
-	var anthropicMsg map[string]any
-	var textBuilder, currentToolInputBuilder strings.Builder
-	var currentToolUse map[string]any
-	var toolUseBlocks []map[string]any
-	for _, line := range lines {
-		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
@@ -1258,63 +1277,479 @@ func parseAnthropicSSE(body []byte) (map[string]any, string, []map[string]any) {
 		}
 		typ, _ := event["type"].(string)
 		switch typ {
+		case "message_start", "content_block_start", "content_block_delta",
+			"content_block_stop", "message_delta", "message_stop", "ping",
+			"error":
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+// anthropicBlockState tracks per-index content block reconstruction.
+type anthropicBlockState struct {
+	blockType     string
+	id            string
+	name          string
+	signature     string
+	data          string
+	textBuilder   strings.Builder
+	thinkBuilder  strings.Builder
+	jsonBuilder   strings.Builder
+	initialInput  any
+	sawInputDelta bool
+	started       bool
+	stopped       bool
+}
+
+// mergeUsageMaps merges src into dst. Anthropic usage values are snapshots /
+// cumulative: a field present in src always replaces the value in dst (including
+// 0). Nested maps are recursively merged. Fields absent from src are retained.
+func mergeUsageMaps(dst any, src map[string]any) map[string]any {
+	if src == nil {
+		if dm, ok := dst.(map[string]any); ok {
+			return dm
+		}
+		return nil
+	}
+	var result map[string]any
+	if dm, ok := dst.(map[string]any); ok {
+		result = make(map[string]any, len(dm))
+		for k, v := range dm {
+			result[k] = v
+		}
+	} else {
+		result = map[string]any{}
+	}
+	for k, v := range src {
+		if existing, ok := result[k]; ok {
+			if srcMap, ok := v.(map[string]any); ok {
+				if existing != nil {
+					result[k] = mergeUsageMaps(existing, srcMap)
+					continue
+				}
+			}
+		}
+		result[k] = v
+	}
+	return result
+}
+
+// parseAnthropicSSE reconstructs content blocks from Anthropic SSE events.
+// It manages parallel blocks by index, handles text_delta, thinking_delta,
+// signature_delta, and input_json_delta. Returns the reconstructed message,
+// ordered content blocks (sorted by numeric index ascending), and an error
+// if the stream is malformed/truncated.
+//
+// Supported line formats:
+//   - raw JSON per line (one event per line)
+//   - standard SSE: "data: <json>", "event: <name>", comment lines starting
+//     with ":" (ignored as metadata)
+//
+// Malformed/truncated conditions that return an error:
+//   - missing message_stop
+//   - error event from upstream
+//   - malformed event JSON
+//   - delta for an unknown/un-started index
+//   - content_block_stop for an unknown/un-started index
+//   - duplicate content_block_start for the same index
+//   - message_stop with unclosed (not-yet-stopped) blocks
+//   - malformed tool_use input JSON
+func parseAnthropicSSE(body []byte) (map[string]any, []map[string]any, error) {
+	lines := bytes.Split(body, []byte("\n"))
+	var anthropicMsg map[string]any
+	blocks := map[int]*anthropicBlockState{}
+	sawMessageStop := false
+	messageStartCount := 0
+
+	for _, rawLine := range lines {
+		line := bytes.TrimSpace(rawLine)
+		if len(line) == 0 {
+			continue
+		}
+		// Standard SSE metadata lines: "event: ...", "id: ...", comment ": ..."
+		if bytes.HasPrefix(line, []byte("event:")) ||
+			bytes.HasPrefix(line, []byte("id:")) ||
+			bytes.HasPrefix(line, []byte(":")) {
+			continue
+		}
+		// Support "data: " prefixed SSE lines.
+		if bytes.HasPrefix(line, []byte("data: ")) {
+			line = bytes.TrimSpace(line[6:])
+		} else if bytes.HasPrefix(line, []byte("data:")) {
+			line = bytes.TrimSpace(line[5:])
+		}
+		if len(line) == 0 {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal(line, &event); err != nil {
+			return nil, nil, fmt.Errorf("malformed SSE event JSON: %w", err)
+		}
+		typ, _ := event["type"].(string)
+
+		// After message_stop, only ping events and comment/metadata lines
+		// are allowed. Comment/metadata lines are already filtered above.
+		// Any other event is an error.
+		if sawMessageStop && typ != "ping" {
+			return nil, nil, fmt.Errorf("unexpected event %q after message_stop", typ)
+		}
+
+		switch typ {
 		case "message_start":
-			if m, ok := event["message"].(map[string]any); ok {
-				anthropicMsg = m
+			messageStartCount++
+			if messageStartCount > 1 {
+				return nil, nil, fmt.Errorf("multiple message_start events in SSE stream")
 			}
+			m, ok := event["message"].(map[string]any)
+			if !ok || m == nil {
+				return nil, nil, fmt.Errorf("message_start missing non-nil message object")
+			}
+			anthropicMsg = m
 		case "content_block_start":
-			if cb, ok := event["content_block"].(map[string]any); ok {
-				if cbType, _ := cb["type"].(string); cbType == "tool_use" {
-					currentToolUse = cb
-					currentToolInputBuilder.Reset()
-				}
+			if messageStartCount == 0 {
+				return nil, nil, fmt.Errorf("content_block_start before message_start")
 			}
-		case "content_block_delta":
-			if delta, ok := event["delta"].(map[string]any); ok {
-				if t, ok := delta["text"].(string); ok {
-					textBuilder.WriteString(t)
+			idx, ok := extractBlockIndex(event)
+			if !ok {
+				return nil, nil, fmt.Errorf("content_block_start missing valid non-negative integer index")
+			}
+			if existing, ok := blocks[idx]; ok && existing.started {
+				return nil, nil, fmt.Errorf("duplicate content_block_start for index %d", idx)
+			}
+			cb, _ := event["content_block"].(map[string]any)
+			cbType, _ := cb["type"].(string)
+			if cbType == "" {
+				return nil, nil, fmt.Errorf("content_block_start missing content_block type")
+			}
+			if cbType != "text" && cbType != "thinking" && cbType != "redacted_thinking" && cbType != "tool_use" {
+				return nil, nil, fmt.Errorf("content_block_start unsupported type %q", cbType)
+			}
+			st := &anthropicBlockState{blockType: cbType, started: true}
+			if cb != nil {
+				if id, ok := cb["id"].(string); ok {
+					st.id = id
 				}
-				if dt, _ := delta["type"].(string); dt == "input_json_delta" {
-					if partial, ok := delta["partial_json"].(string); ok {
-						currentToolInputBuilder.WriteString(partial)
+				if name, ok := cb["name"].(string); ok {
+					st.name = name
+				}
+				// tool_use must have a non-empty name.
+				if cbType == "tool_use" && st.name == "" {
+					return nil, nil, fmt.Errorf("tool_use content_block_start missing non-empty name")
+				}
+				if sig, ok := cb["signature"].(string); ok {
+					st.signature = sig
+				}
+				if d, ok := cb["data"].(string); ok {
+					st.data = d
+				}
+				// Preserve initial text if provided.
+				if t, ok := cb["text"].(string); ok && t != "" {
+					st.textBuilder.WriteString(t)
+				}
+				if t, ok := cb["thinking"].(string); ok && t != "" {
+					st.thinkBuilder.WriteString(t)
+				}
+				// Preserve initial input if provided as a non-empty value.
+				// In Anthropic SSE, content_block_start.input is typically {}
+				// and the actual input arrives via input_json_delta partials.
+				// Store separately so initial input and partial deltas are not
+				// concatenated into invalid JSON.
+				if input, ok := cb["input"]; ok && input != nil {
+					if inputStr, ok := input.(string); ok && inputStr != "" {
+						st.initialInput = inputStr
+					} else if m, ok := input.(map[string]any); ok && len(m) > 0 {
+						st.initialInput = input
 					}
 				}
 			}
-		case "content_block_stop":
-			if currentToolUse != nil {
-				inputStr := currentToolInputBuilder.String()
-				var input any = inputStr
-				var parsed any
-				if json.Unmarshal([]byte(inputStr), &parsed) == nil {
-					input = parsed
-				}
-				currentToolUse["input"] = input
-				toolUseBlocks = append(toolUseBlocks, currentToolUse)
-				currentToolUse = nil
+			blocks[idx] = st
+		case "content_block_delta":
+			if messageStartCount == 0 {
+				return nil, nil, fmt.Errorf("content_block_delta before message_start")
 			}
-		case "message_delta":
-			if delta, ok := event["delta"].(map[string]any); ok {
-				if anthropicMsg == nil {
-					anthropicMsg = map[string]any{}
+			idx, ok := extractBlockIndex(event)
+			if !ok {
+				return nil, nil, fmt.Errorf("content_block_delta missing valid non-negative integer index")
+			}
+			st, ok := blocks[idx]
+			if !ok || !st.started {
+				return nil, nil, fmt.Errorf("content_block_delta for unknown index %d", idx)
+			}
+			if st.stopped {
+				return nil, nil, fmt.Errorf("content_block_delta for already-stopped index %d", idx)
+			}
+			delta, ok := event["delta"].(map[string]any)
+			if !ok || delta == nil {
+				return nil, nil, fmt.Errorf("content_block_delta for index %d missing delta object", idx)
+			}
+			dt, _ := delta["type"].(string)
+			if dt == "" {
+				return nil, nil, fmt.Errorf("content_block_delta for index %d missing delta type", idx)
+			}
+			switch dt {
+			case "text_delta":
+				if t, ok := delta["text"].(string); ok {
+					st.textBuilder.WriteString(t)
 				}
+			case "thinking_delta":
+				if t, ok := delta["thinking"].(string); ok {
+					st.thinkBuilder.WriteString(t)
+				}
+			case "signature_delta":
+				if sig, ok := delta["signature"].(string); ok {
+					st.signature += sig
+				}
+			case "input_json_delta":
+				if partial, ok := delta["partial_json"].(string); ok {
+					st.jsonBuilder.WriteString(partial)
+					st.sawInputDelta = true
+				}
+			default:
+				// Unknown delta type: ignore.
+			}
+		case "content_block_stop":
+			if messageStartCount == 0 {
+				return nil, nil, fmt.Errorf("content_block_stop before message_start")
+			}
+			idx, ok := extractBlockIndex(event)
+			if !ok {
+				return nil, nil, fmt.Errorf("content_block_stop missing valid non-negative integer index")
+			}
+			st, ok := blocks[idx]
+			if !ok || !st.started {
+				return nil, nil, fmt.Errorf("content_block_stop for unknown index %d", idx)
+			}
+			if st.stopped {
+				return nil, nil, fmt.Errorf("duplicate content_block_stop for index %d", idx)
+			}
+			st.stopped = true
+		case "message_delta":
+			if messageStartCount == 0 {
+				return nil, nil, fmt.Errorf("message_delta before message_start")
+			}
+			if anthropicMsg == nil {
+				anthropicMsg = map[string]any{}
+			}
+			if delta, ok := event["delta"].(map[string]any); ok {
 				if stop, ok := delta["stop_reason"].(string); ok {
 					anthropicMsg["stop_reason"] = stop
 				}
+			}
+			// message_delta usage is at the event top level (Anthropic spec).
+			if usage, ok := event["usage"].(map[string]any); ok {
+				anthropicMsg["usage"] = mergeUsageMaps(anthropicMsg["usage"], usage)
+			} else if delta, ok := event["delta"].(map[string]any); ok {
 				if usage, ok := delta["usage"].(map[string]any); ok {
-					anthropicMsg["usage"] = usage
+					anthropicMsg["usage"] = mergeUsageMaps(anthropicMsg["usage"], usage)
 				}
 			}
 		case "message_stop":
+			// Validate at message_stop time: must have message_start,
+			// all blocks stopped, and non-empty stop_reason.
+			if messageStartCount == 0 {
+				return nil, nil, fmt.Errorf("message_stop before message_start")
+			}
+			for idx, st := range blocks {
+				if st != nil && st.started && !st.stopped {
+					return nil, nil, fmt.Errorf("message_stop with unclosed block at index %d", idx)
+				}
+			}
+			stopReason, _ := anthropicMsg["stop_reason"].(string)
+			if stopReason == "" {
+				return nil, nil, fmt.Errorf("message_stop without stop_reason")
+			}
+			sawMessageStop = true
 		case "error":
-			return nil, "", nil
+			errType := "api_error"
+			errMsg := "upstream Anthropic error"
+			if errMap, ok := event["error"].(map[string]any); ok {
+				if t, ok := errMap["type"].(string); ok && t != "" {
+					errType = t
+				}
+				if m, ok := errMap["message"].(string); ok && m != "" {
+					errMsg = m
+				}
+			}
+			return nil, nil, &anthropicProtocolError{errType: errType, message: errMsg}
+		default:
+			// Unknown event type: ignore.
 		}
 	}
-	return anthropicMsg, textBuilder.String(), toolUseBlocks
+
+	if messageStartCount == 0 {
+		return nil, nil, fmt.Errorf("anthropic SSE stream missing message_start")
+	}
+	if !sawMessageStop {
+		return nil, nil, fmt.Errorf("anthropic SSE stream ended without message_stop")
+	}
+
+	// Build ordered content blocks sorted by numeric index ascending.
+	indices := make([]int, 0, len(blocks))
+	for idx := range blocks {
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+
+	var contentBlocks []map[string]any
+	for _, idx := range indices {
+		st := blocks[idx]
+		if st == nil {
+			continue
+		}
+		switch st.blockType {
+		case "text":
+			contentBlocks = append(contentBlocks, map[string]any{
+				"type": "text",
+				"text": st.textBuilder.String(),
+			})
+		case "thinking":
+			blk := map[string]any{
+				"type":     "thinking",
+				"thinking": st.thinkBuilder.String(),
+			}
+			if st.signature != "" {
+				blk["signature"] = st.signature
+			}
+			contentBlocks = append(contentBlocks, blk)
+		case "redacted_thinking":
+			blk := map[string]any{
+				"type": "redacted_thinking",
+			}
+			if st.data != "" {
+				blk["data"] = st.data
+			}
+			contentBlocks = append(contentBlocks, blk)
+		case "tool_use":
+			var input any
+			if st.sawInputDelta {
+				// Parse accumulated partial JSON deltas.
+				inputStr := st.jsonBuilder.String()
+				if inputStr != "" {
+					var parsed any
+					if err := json.Unmarshal([]byte(inputStr), &parsed); err != nil {
+						return nil, nil, fmt.Errorf("malformed tool_use input JSON for index %d: %w", idx, err)
+					}
+					input = parsed
+				} else {
+					input = map[string]any{}
+				}
+			} else if st.initialInput != nil {
+				// Use initial input from content_block_start.
+				if inputStr, ok := st.initialInput.(string); ok {
+					var parsed any
+					if err := json.Unmarshal([]byte(inputStr), &parsed); err != nil {
+						return nil, nil, fmt.Errorf("malformed tool_use initial input for index %d: %w", idx, err)
+					}
+					input = parsed
+				} else {
+					input = st.initialInput
+				}
+			} else {
+				input = map[string]any{}
+			}
+			blk := map[string]any{
+				"type":  "tool_use",
+				"input": input,
+			}
+			if st.id != "" {
+				blk["id"] = st.id
+			}
+			if st.name != "" {
+				blk["name"] = st.name
+			}
+			contentBlocks = append(contentBlocks, blk)
+		default:
+			// Unknown block type: skip.
+		}
+	}
+
+	if anthropicMsg == nil {
+		anthropicMsg = map[string]any{}
+	}
+	return anthropicMsg, contentBlocks, nil
 }
 
-func buildOpenAIResponse(anthropicMsg map[string]any, text string, toolUseBlocks []map[string]any, modelID string) []byte {
+// extractBlockIndex extracts a non-negative integer index from an SSE event.
+// Returns false if the index is missing, not a JSON number, is a float with
+// a fractional part, is negative, NaN, Inf, or exceeds the platform's int range.
+// The platform maxInt is checked BEFORE the int(f) conversion to avoid
+// undefined/saturating behavior on overflow.
+func extractBlockIndex(event map[string]any) (int, bool) {
+	rawIdx, ok := event["index"]
+	if !ok || rawIdx == nil {
+		return 0, false
+	}
+	f, ok := rawIdx.(float64)
+	if !ok {
+		return 0, false
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	if math.Trunc(f) != f || f < 0 {
+		return 0, false
+	}
+	// Check platform int range BEFORE converting, to avoid overflow.
+	// On 64-bit: maxInt = 2^63-1; on 32-bit: maxInt = 2^31-1.
+	// float64 can't represent all int64 values, so also cap at 2^53
+	// (where all integers are exactly representable as float64).
+	maxInt := float64(1<<(strconv.IntSize-1) - 1)
+	if f > maxInt {
+		return 0, false
+	}
+	// Also reject values above the float64 exact-integer upper bound.
+	if f > float64(1<<53) {
+		return 0, false
+	}
+	idx := int(f)
+	if float64(idx) != f {
+		return 0, false
+	}
+	return idx, true
+}
+
+// deterministicResponseID returns a deterministic response ID for the given
+// prefix and upstream ID. If id already has the prefix (with a non-empty
+// suffix), it is kept as-is. Otherwise, a stable hex digest derived from
+// sha256(id) is appended to the prefix so the same input always produces the
+// same output. An empty id gets a random suffix (callers should cache).
+func deterministicResponseID(prefix, id string) string {
+	if strings.HasPrefix(id, prefix) && len(id) > len(prefix) {
+		return id
+	}
+	if id == "" {
+		return prefix + randomString(24)
+	}
+	h := sha256.Sum256([]byte(id))
+	return prefix + hex.EncodeToString(h[:16])
+}
+
+// normalizeChatResponseID ensures a Chat response ID has the chatcmpl- prefix.
+func normalizeChatResponseID(id string) string {
+	return deterministicResponseID("chatcmpl-", id)
+}
+
+// normalizeResponsesID ensures a Responses response ID has the resp_ prefix.
+func normalizeResponsesID(id string) string {
+	return deterministicResponseID("resp_", id)
+}
+
+// normalizeClaudeMessageID ensures a Claude message ID has the msg_ prefix.
+func normalizeClaudeMessageID(id string) string {
+	return deterministicResponseID("msg_", id)
+}
+
+// buildOpenAIResponse constructs a Chat Completions response from an Anthropic
+// message and ordered content blocks. Text blocks are concatenated into a
+// content string (preserving original order), thinking goes to
+// reasoning_content, tool_use blocks populate tool_calls. A private field
+// _opencode2api_anthropic_content preserves the original ordered blocks for
+// Claude roundtrip; convertResponse strips it before responding to clients.
+func buildOpenAIResponse(anthropicMsg map[string]any, contentBlocks []map[string]any, modelID string) ([]byte, error) {
 	if anthropicMsg == nil {
-		return nil
+		return nil, fmt.Errorf("no Anthropic message to convert")
 	}
 	now := time.Now().Unix()
 	role, _ := anthropicMsg["role"].(string)
@@ -1323,32 +1758,100 @@ func buildOpenAIResponse(anthropicMsg map[string]any, text string, toolUseBlocks
 	}
 	finishReason, _ := anthropicMsg["stop_reason"].(string)
 	finishReason = normalizeFinishReason(finishReason)
-	choice := map[string]any{
-		"index":         0,
-		"message":       map[string]any{"role": role, "content": text},
-		"finish_reason": finishReason,
-	}
-	if len(toolUseBlocks) > 0 {
-		var toolCalls []map[string]any
-		for _, tb := range toolUseBlocks {
-			toolInput := tb["input"]
-			argsJSON, _ := json.Marshal(toolInput)
+
+	var textBuilder strings.Builder
+	var reasoningContent string
+	var toolCalls []map[string]any
+	hasNonText := false
+
+	for _, blk := range contentBlocks {
+		bt, _ := blk["type"].(string)
+		switch bt {
+		case "text":
+			if t, ok := blk["text"].(string); ok {
+				textBuilder.WriteString(t)
+			}
+		case "thinking":
+			hasNonText = true
+			if t, ok := blk["thinking"].(string); ok {
+				if reasoningContent != "" {
+					reasoningContent += "\n"
+				}
+				reasoningContent += t
+			}
+		case "redacted_thinking":
+			hasNonText = true
+		case "tool_use":
+			hasNonText = true
+			input := blk["input"]
+			if input == nil {
+				input = map[string]any{}
+			}
+			argsJSON, _ := json.Marshal(input)
+			toolID, _ := blk["id"].(string)
+			if toolID == "" {
+				toolID = "toolu_" + randomString(12)
+				blk["id"] = toolID
+			}
+			toolName, _ := blk["name"].(string)
 			toolCalls = append(toolCalls, map[string]any{
-				"id":   tb["id"],
+				"id":   toolID,
 				"type": "function",
 				"function": map[string]any{
-					"name":      tb["name"],
+					"name":      toolName,
 					"arguments": string(argsJSON),
 				},
 			})
-		}
-		choice["message"].(map[string]any)["tool_calls"] = toolCalls
-		if text == "" {
-			choice["message"].(map[string]any)["content"] = nil
+		default:
+			// Unknown non-empty block type: preserve for private roundtrip.
+			if bt != "" {
+				hasNonText = true
+			}
 		}
 	}
+
+	msg := map[string]any{"role": role}
+
+	// Determine content: if only text blocks, use a string for compatibility.
+	textStr := textBuilder.String()
+	if !hasNonText {
+		msg["content"] = textStr
+	} else {
+		if textStr != "" {
+			msg["content"] = textStr
+		} else {
+			msg["content"] = nil
+		}
+	}
+
+	if reasoningContent != "" {
+		msg["reasoning_content"] = reasoningContent
+	}
+
+	if len(toolCalls) > 0 {
+		msg["tool_calls"] = toolCalls
+	}
+
+	// Private field for Claude roundtrip: preserves original ordered blocks
+	// whenever any non-text native block exists (thinking, redacted_thinking,
+	// tool_use). Generated tool IDs are written back to the blocks so that
+	// Claude roundtrip associations are consistent.
+	if hasNonText {
+		privateBlocks := make([]map[string]any, 0, len(contentBlocks))
+		for _, blk := range contentBlocks {
+			privateBlocks = append(privateBlocks, blk)
+		}
+		msg["_opencode2api_anthropic_content"] = privateBlocks
+	}
+
+	choice := map[string]any{
+		"index":         0,
+		"message":       msg,
+		"finish_reason": finishReason,
+	}
+
 	resp := map[string]any{
-		"id":      anthropicMsg["id"],
+		"id":      normalizeChatResponseID(toString(anthropicMsg["id"])),
 		"object":  "chat.completion",
 		"created": now,
 		"model":   modelID,
@@ -1357,48 +1860,98 @@ func buildOpenAIResponse(anthropicMsg map[string]any, text string, toolUseBlocks
 	if usage, ok := anthropicMsg["usage"].(map[string]any); ok {
 		resp["usage"] = anthropicUsageToChat(usage)
 	}
-	result, _ := json.Marshal(resp)
-	return result
+	result, err := json.Marshal(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal Chat response: %w", err)
+	}
+	return result, nil
 }
 
-func convertAnthropicMessageToOpenAI(msg map[string]any, modelID string) []byte {
+// convertAnthropicMessageToOpenAI converts a native Anthropic message JSON
+// (non-streaming) to Chat Completions format. Returns an error on malformed input.
+func convertAnthropicMessageToOpenAI(msg map[string]any, modelID string) ([]byte, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("no Anthropic message to convert")
+	}
 	if msg["model"] == nil {
 		msg["model"] = modelID
 	}
-	var textBuilder strings.Builder
-	var toolUses []map[string]any
-	if content, ok := msg["content"].([]any); ok {
-		for _, c := range content {
-			if block, ok := c.(map[string]any); ok {
-				switch block["type"] {
-				case "text":
-					if t, ok := block["text"].(string); ok {
-						textBuilder.WriteString(t)
-					}
-				case "tool_use":
-					toolUses = append(toolUses, block)
+	// Direct non-stream message requires a content array.
+	content, ok := msg["content"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("anthropic message missing content array")
+	}
+	var contentBlocks []map[string]any
+	for _, c := range content {
+		block, ok := c.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("anthropic message content contains non-object block")
+		}
+		bt, _ := block["type"].(string)
+		switch bt {
+		case "text", "thinking", "redacted_thinking":
+			// Supported types.
+		case "tool_use":
+			// tool_use must have a non-empty name.
+			name, _ := block["name"].(string)
+			if name == "" {
+				return nil, fmt.Errorf("tool_use block missing non-empty name")
+			}
+			// tool_use input must be JSON-marshalable.
+			if input, exists := block["input"]; exists && input != nil {
+				if _, err := json.Marshal(input); err != nil {
+					return nil, fmt.Errorf("tool_use input not JSON-marshalable: %w", err)
 				}
 			}
+		default:
+			if bt == "" {
+				return nil, fmt.Errorf("anthropic message content block missing type")
+			}
+			// Unknown non-empty block type: keep in private blocks for
+			// potential roundtrip; public Chat ignores it.
 		}
+		contentBlocks = append(contentBlocks, block)
 	}
-	return buildOpenAIResponse(msg, textBuilder.String(), toolUses, modelID)
+	// Direct non-stream message requires a non-empty stop_reason.
+	stopReason, _ := msg["stop_reason"].(string)
+	if stopReason == "" {
+		return nil, fmt.Errorf("anthropic message missing stop_reason")
+	}
+	return buildOpenAIResponse(msg, contentBlocks, modelID)
 }
 
-func convertAnthropicToOpenAI(body []byte, modelID string) []byte {
+// convertAnthropicToOpenAI detects whether the upstream body is a native
+// Anthropic message (JSON) or SSE stream, and converts it to Chat Completions.
+// Returns an error if the body is malformed, truncated, or contains an error event.
+func convertAnthropicToOpenAI(body []byte, modelID string) ([]byte, error) {
 	var singleMsg map[string]any
 	if json.Unmarshal(body, &singleMsg) == nil {
 		if typ, _ := singleMsg["type"].(string); typ == "message" {
 			return convertAnthropicMessageToOpenAI(singleMsg, modelID)
 		}
+		// Could be a single error object.
+		if typ, _ := singleMsg["type"].(string); typ == "error" {
+			errType := "api_error"
+			errMsg := "upstream Anthropic error"
+			if errMap, ok := singleMsg["error"].(map[string]any); ok {
+				if t, ok := errMap["type"].(string); ok && t != "" {
+					errType = t
+				}
+				if m, ok := errMap["message"].(string); ok && m != "" {
+					errMsg = m
+				}
+			}
+			return nil, &anthropicProtocolError{errType: errType, message: errMsg}
+		}
 	}
-	msg, text, toolUses := parseAnthropicSSE(body)
-	if msg == nil {
-		return body
+	msg, contentBlocks, err := parseAnthropicSSE(body)
+	if err != nil {
+		return nil, err
 	}
 	if msg["model"] == nil {
 		msg["model"] = modelID
 	}
-	return buildOpenAIResponse(msg, text, toolUses, modelID)
+	return buildOpenAIResponse(msg, contentBlocks, modelID)
 }
 
 // ======================== 响应清理 ========================
@@ -1490,6 +2043,9 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 	if !ok || len(choices) == 0 {
 		// Chat Completions deliberately uses an empty choices array for the
 		// terminal usage chunk. It is part of the client-visible stream.
+		if id, ok := raw["id"].(string); ok && id != "" {
+			raw["id"] = normalizeChatResponseID(id)
+		}
 		delete(raw, "cost")
 		converted, err := json.Marshal(raw)
 		if err != nil {
@@ -1512,6 +2068,7 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 			if !keepReasoning {
 				delete(msg, "reasoning_content")
 			}
+			delete(msg, "_opencode2api_anthropic_content")
 			choice["message"] = msg
 		}
 		if v, ok := choice["logprobs"]; ok && v == nil {
@@ -1529,6 +2086,9 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 	if v, ok := raw["usage"]; ok && v == nil {
 		delete(raw, "usage")
 	}
+	if id, ok := raw["id"].(string); ok && id != "" {
+		raw["id"] = normalizeChatResponseID(id)
+	}
 	delete(raw, "cost")
 	converted, err := json.Marshal(raw)
 	if err != nil {
@@ -1543,6 +2103,9 @@ func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 		slog.Warn("convertResponse unmarshal failed", "error", err)
 		return data, nil
 	}
+	if id, ok := raw["id"].(string); ok && id != "" {
+		raw["id"] = normalizeChatResponseID(id)
+	}
 	if choices, ok := raw["choices"].([]any); ok {
 		for i, c := range choices {
 			if choice, ok := c.(map[string]any); ok {
@@ -1552,6 +2115,9 @@ func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 					if !keepReasoning {
 						delete(msg, "reasoning_content")
 					}
+					// Strip private Anthropic roundtrip field so it never
+					// leaks to Chat Completions consumers.
+					delete(msg, "_opencode2api_anthropic_content")
 					choice["message"] = msg
 				}
 				if v, ok := choice["logprobs"]; ok && v == nil {
@@ -1671,6 +2237,21 @@ func isFreeModel(modelID string) bool {
 func publicFacingModelID(modelID string) string {
 	if isFreeModel(modelID) {
 		return strings.TrimSuffix(modelID, "-free")
+	}
+	return modelID
+}
+
+// mapPublicToFreeModel downgrades paid model IDs to their "-free" variants for
+// keyless (public tier) requests, so deepseek-v4-flash reaches the free tier as
+// deepseek-v4-flash-free instead of failing upstream with a missing key. Keyed
+// tiers keep the exact requested model; models without a known free variant are
+// left untouched.
+func mapPublicToFreeModel(auth UpstreamAuth, modelID string) string {
+	if auth.Mode != AuthRoutePublic || isFreeModel(modelID) {
+		return modelID
+	}
+	if freeID := modelID + "-free"; modelExistsInCaches(freeID) {
+		return freeID
 	}
 	return modelID
 }
@@ -1802,7 +2383,21 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 				return nil, 0, nil, readErr
 			}
 			if isAnthropicFormat(b) {
-				b = convertAnthropicToOpenAI(b, modelID)
+				converted, convErr := convertAnthropicToOpenAI(b, modelID)
+				if convErr != nil {
+					log.Info("upstream_attempt",
+						"try_model", modelID,
+						"surface", surface,
+						"status", resp.StatusCode,
+						"duration_ms", durationMs,
+						"attempt_index", attempt,
+					)
+					// Only anthropicProtocolError errors carry type/message;
+					// non-typed conversion errors stay generic so
+					// writeUpstreamError emits a safe default.
+					return nil, http.StatusBadGateway, nil, convErr
+				}
+				b = converted
 			}
 			log.Info("upstream_attempt",
 				"try_model", modelID,
@@ -1856,6 +2451,74 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		"fallback_used", false,
 	)
 	return lastBody, lastStatus, lastHeader, lastErr
+}
+
+// anthropicProtocolError is a typed error that carries Anthropic error
+// type/message through a local protocol conversion failure. Use errors.As
+// to extract it; do not parse error strings.
+type anthropicProtocolError struct {
+	errType string
+	message string
+}
+
+func (e *anthropicProtocolError) Error() string {
+	if e.errType != "" {
+		return e.errType + ": " + e.message
+	}
+	return e.message
+}
+
+// writeUpstreamError writes a protocol-shaped error response for each
+// downstream protocol (chat, claude, responses). Only local Anthropic
+// protocol conversion errors (anthropicProtocolError via errors.As) expose
+// the upstream type/message; all other errors (transport, build, etc.) get
+// a generic "upstream_error" type with a stable safe message. The error's
+// Error() string is never exposed. Invalid HTTP status (0, etc.) is
+// normalized to 502.
+func writeUpstreamError(w http.ResponseWriter, status int, err error, protocol string) {
+	if status < 100 || status >= 600 {
+		status = http.StatusBadGateway
+	}
+
+	errType := "upstream_error"
+	message := "upstream error"
+
+	var ape *anthropicProtocolError
+	if errors.As(err, &ape) {
+		if ape.errType != "" {
+			errType = ape.errType
+		}
+		if ape.message != "" {
+			message = ape.message
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	switch protocol {
+	case "claude":
+		json.NewEncoder(w).Encode(map[string]any{
+			"type": "error",
+			"error": map[string]string{
+				"type":    errType,
+				"message": message,
+			},
+		})
+	case "responses":
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"type":    errType,
+				"message": message,
+			},
+		})
+	default: // "chat"
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"type":    errType,
+				"message": message,
+			},
+		})
+	}
 }
 
 func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
@@ -2022,6 +2685,10 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			req.Model = "deepseek-v4-flash-free"
 		}
 	}
+	req.Model = mapPublicToFreeModel(auth, req.Model)
+	if !validateRequestTemperature(w, req.Temperature, "chat", 0, 2) {
+		return
+	}
 
 	// 多模态路由：检测到图片时转发到配置的上游
 
@@ -2057,6 +2724,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		"reasoning_effort_out": mappedReasoningEffort(effortIn),
 		"tools_count":          len(req.Tools),
 		"messages_count":       len(req.Messages),
+		"max_tokens":           req.MaxTokens,
+		"max_tokens_cap":       getMaxTokensCapForModel(req.Model),
 	})
 	upstreamBody := buildUpstreamBody(&req)
 
@@ -2165,12 +2834,16 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, req.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		if len(respBody) > 0 {
-			w.Write(respBody)
+		if err != nil {
+			writeUpstreamError(w, status, err, "chat")
 		} else {
-			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error", "type": "upstream_error"}})
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			if len(respBody) > 0 {
+				w.Write(respBody)
+			} else {
+				json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error", "type": "upstream_error"}})
+			}
 		}
 		return
 	}
@@ -2408,6 +3081,49 @@ func claudeImageBlockToOpenAI(block map[string]any) (map[string]any, bool) {
 	return nil, false
 }
 
+// claudeDocumentBlockToOpenAI maps an Anthropic document content block to a
+// Chat Completions file content part. It supports source.type=base64
+// (media_type, default application/pdf) and source.type=url. A filename is
+// preserved from the block/title when available; no protocol ID is generated.
+// Returns (nil, false) when the document lacks a usable payload so the caller
+// can surface a structured 400 instead of serializing the wrapper as text.
+func claudeDocumentBlockToOpenAI(block map[string]any) (map[string]any, bool) {
+	source, _ := block["source"].(map[string]any)
+	if source == nil {
+		return nil, false
+	}
+	srcType, _ := source["type"].(string)
+	mediaType, _ := source["media_type"].(string)
+	if mediaType == "" {
+		mediaType = "application/pdf"
+	}
+	data, _ := source["data"].(string)
+	url, _ := source["url"].(string)
+
+	file := map[string]any{}
+	if filename, ok := block["filename"].(string); ok && filename != "" {
+		file["filename"] = filename
+	} else if title, ok := block["title"].(string); ok && title != "" {
+		file["filename"] = title
+	}
+
+	switch srcType {
+	case "base64":
+		if data == "" {
+			return nil, false
+		}
+		file["file_data"] = "data:" + mediaType + ";base64," + data
+		return map[string]any{"type": "file", "file": file}, true
+	case "url":
+		if url == "" {
+			return nil, false
+		}
+		file["file_data"] = url
+		return map[string]any{"type": "file", "file": file}, true
+	}
+	return nil, false
+}
+
 func extractClaudeContentText(content any) string {
 	switch c := content.(type) {
 	case string:
@@ -2453,7 +3169,7 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 			var reasoningParts []string
 			var toolCalls []ToolCall
 			var toolResults []Message
-			var followupImages []any
+			var followupAttachments []any
 			for _, item := range content {
 				block, ok := item.(map[string]any)
 				if !ok {
@@ -2467,6 +3183,10 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 					}
 				case "image":
 					if part, ok := claudeImageBlockToOpenAI(block); ok {
+						orderedContent = append(orderedContent, part)
+					}
+				case "document":
+					if part, ok := claudeDocumentBlockToOpenAI(block); ok {
 						orderedContent = append(orderedContent, part)
 					}
 				case "thinking":
@@ -2500,7 +3220,7 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 				case "tool_result":
 					toolUseID, _ := block["tool_use_id"].(string)
 					var resultText string
-					var imageParts []any
+					var attachmentParts []any // local per-block image/document parts in original order
 					switch c := block["content"].(type) {
 					case string:
 						resultText = c
@@ -2518,7 +3238,11 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 								}
 							case "image":
 								if part, ok := claudeImageBlockToOpenAI(pb); ok {
-									imageParts = append(imageParts, part)
+									attachmentParts = append(attachmentParts, part)
+								}
+							case "document":
+								if part, ok := claudeDocumentBlockToOpenAI(pb); ok {
+									attachmentParts = append(attachmentParts, part)
 								}
 							}
 						}
@@ -2529,15 +3253,28 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 							resultText = string(b)
 						}
 					}
-					if len(imageParts) > 0 {
+					// Annotate based on this block's own attachments, not a
+					// global accumulator, so parallel tool_results are labeled
+					// independently.
+					if len(attachmentParts) > 0 {
 						if resultText != "" {
 							resultText += "\n"
 						}
-						resultText += "[image attached]"
-						followupImages = append(followupImages, imageParts...)
+						var labels []string
+						for _, ap := range attachmentParts {
+							if m, ok := ap.(map[string]any); ok {
+								if m["type"] == "image_url" {
+									labels = append(labels, "[image attached]")
+								} else if m["type"] == "file" {
+									labels = append(labels, "[document attached]")
+								}
+							}
+						}
+						resultText += strings.Join(labels, "\n")
+						followupAttachments = append(followupAttachments, attachmentParts...)
 					}
 					if isError, _ := block["is_error"].(bool); isError {
-						resultText = "Error: " + resultText
+						resultText = applyErrorPrefix(resultText)
 					}
 					toolResults = append(toolResults, Message{
 						Role:       "tool",
@@ -2564,8 +3301,8 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 			// Completions' separate tool messages.
 			if msg.Role == "user" {
 				body = append(body, toolResults...)
-				if len(followupImages) > 0 {
-					body = append(body, Message{Role: "user", Content: followupImages})
+				if len(followupAttachments) > 0 {
+					body = append(body, Message{Role: "user", Content: followupAttachments})
 				}
 			}
 			if len(orderedContent) > 0 || len(reasoningParts) > 0 || len(toolCalls) > 0 || len(toolResults) == 0 {
@@ -2573,8 +3310,8 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 			}
 			if msg.Role != "user" {
 				body = append(body, toolResults...)
-				if len(followupImages) > 0 {
-					body = append(body, Message{Role: "user", Content: followupImages})
+				if len(followupAttachments) > 0 {
+					body = append(body, Message{Role: "user", Content: followupAttachments})
 				}
 			}
 		default:
@@ -2649,6 +3386,11 @@ func countAnthropicBetas(header string) int {
 	return n
 }
 
+// countCacheControlInValue counts cache_control breakpoints on content
+// blocks within system, message content, and tool_result content arrays. It
+// recurses into all values except input_schema and tool_use input, so a
+// property named cache_control inside a schema or input object is not
+// falsely counted as a breakpoint.
 func countCacheControlInValue(v any) int {
 	switch x := v.(type) {
 	case map[string]any:
@@ -2656,7 +3398,12 @@ func countCacheControlInValue(v any) int {
 		if _, ok := x["cache_control"]; ok {
 			n++
 		}
-		for _, child := range x {
+		for key, child := range x {
+			// Skip input_schema and input — cache_control inside these is a
+			// schema/input property, not a content-block breakpoint.
+			if key == "input_schema" || key == "input" {
+				continue
+			}
 			n += countCacheControlInValue(child)
 		}
 		return n
@@ -2676,15 +3423,51 @@ func countClaudeCacheControlBlocks(req ClaudeRequest) int {
 	for _, msg := range req.Messages {
 		n += countCacheControlInValue(msg.Content)
 	}
+	// Count actual tool-level cache_control breakpoints on tool definitions,
+	// not properties named cache_control inside input_schema.
 	for _, tool := range req.Tools {
-		n += countCacheControlInValue(tool.InputSchema)
+		if tool.CacheControl != nil {
+			n++
+		}
 	}
 	return n
 }
 
+// countClaudeThinkingSignatures counts non-empty signature fields on
+// thinking content blocks at the top level of each message's content array.
+// Only actual message content blocks are counted — not nested values inside
+// tool_use input or other objects that happen to have type:"thinking" and a
+// signature key. The signature content itself is never recorded; only the
+// count is exposed in request_plan for observability. These signatures have
+// no Chat Completions equivalent and are dropped upstream.
+func countClaudeThinkingSignatures(msgs []ClaudeMessage) int {
+	var n int
+	for _, msg := range msgs {
+		blocks, ok := msg.Content.([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range blocks {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := block["type"].(string); t == "thinking" {
+				if sig, ok := block["signature"].(string); ok && sig != "" {
+					n++
+				}
+			}
+		}
+	}
+	return n
+}
+
+// claudeUnsupportedBlockTypes lists Anthropic content block types that are
+// dropped without a structured upstream representation. document is handled
+// as a best-effort file part (see claudeDocumentBlockToOpenAI) and is not
+// listed here so it is not counted as unsupported.
 var claudeUnsupportedBlockTypes = map[string]struct{}{
 	"redacted_thinking":      {},
-	"document":               {},
 	"search_result":          {},
 	"server_tool_use":        {},
 	"web_search_tool_result": {},
@@ -2745,38 +3528,110 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 	if len(chat.Choices) > 0 {
 		msg := chat.Choices[0].Message
 		fr := chat.Choices[0].FinishReason
-		if wantReasoning && msg.ReasoningContent != "" {
-			content = append(content, ClaudeContent{
-				Type:     "thinking",
-				Thinking: msg.ReasoningContent,
-			})
-		}
-		text := msg.Content
-		// #37635: Go gateway often puts the whole answer in reasoning_content.
-		// Promote to text when content is empty so Claude Code does not see an
-		// empty end_turn and exit the agent loop.
-		if text == "" && msg.ReasoningContent != "" && len(msg.ToolCalls) == 0 {
-			text = msg.ReasoningContent
-		}
-		if text != "" {
-			content = append(content, ClaudeContent{
-				Type: "text",
-				Text: text,
-			})
-		}
-		for _, tc := range msg.ToolCalls {
-			var input any
-			json.Unmarshal([]byte(tc.Function.Arguments), &input)
-			if input == nil {
-				input = map[string]any{}
+
+		// Try to read private ordered Anthropic content blocks first.
+		var rawMsg map[string]any
+		privateBlocks := []map[string]any(nil)
+		if json.Unmarshal(chatBody, &rawMsg) == nil {
+			if choices, ok := rawMsg["choices"].([]any); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]any); ok {
+					if m, ok := choice["message"].(map[string]any); ok {
+						if pb, ok := m["_opencode2api_anthropic_content"].([]any); ok {
+							for _, item := range pb {
+								if blk, ok := item.(map[string]any); ok {
+									privateBlocks = append(privateBlocks, blk)
+								}
+							}
+						}
+					}
+				}
 			}
-			content = append(content, ClaudeContent{
-				Type:  "tool_use",
-				ID:    tc.ID,
-				Name:  tc.Function.Name,
-				Input: input,
-			})
 		}
+
+		if len(privateBlocks) > 0 {
+			// Consume private ordered blocks in array order.
+			for _, blk := range privateBlocks {
+				bt, _ := blk["type"].(string)
+				switch bt {
+				case "text":
+					text, _ := blk["text"].(string)
+					content = append(content, ClaudeContent{
+						Type: "text",
+						Text: text,
+					})
+				case "thinking":
+					if wantReasoning {
+						thinking, _ := blk["thinking"].(string)
+						cc := ClaudeContent{
+							Type:     "thinking",
+							Thinking: thinking,
+						}
+						if sig, ok := blk["signature"].(string); ok && sig != "" {
+							cc.Signature = sig
+						}
+						content = append(content, cc)
+					}
+				case "redacted_thinking":
+					if wantReasoning {
+						cc := ClaudeContent{
+							Type: "redacted_thinking",
+						}
+						if d, ok := blk["data"].(string); ok && d != "" {
+							cc.Data = d
+						}
+						content = append(content, cc)
+					}
+				case "tool_use":
+					id, _ := blk["id"].(string)
+					name, _ := blk["name"].(string)
+					input := blk["input"]
+					if input == nil {
+						input = map[string]any{}
+					}
+					content = append(content, ClaudeContent{
+						Type:  "tool_use",
+						ID:    id,
+						Name:  name,
+						Input: input,
+					})
+				}
+			}
+		} else {
+			// Fallback: string content + reasoning_content + tool_calls.
+			if wantReasoning && msg.ReasoningContent != "" {
+				content = append(content, ClaudeContent{
+					Type:     "thinking",
+					Thinking: msg.ReasoningContent,
+				})
+			}
+			text := msg.Content
+			// #37635: Go gateway often puts the whole answer in reasoning_content.
+			// Promote to text when content is empty so Claude Code does not see an
+			// empty end_turn and exit the agent loop.
+			if text == "" && msg.ReasoningContent != "" && len(msg.ToolCalls) == 0 {
+				text = msg.ReasoningContent
+			}
+			if text != "" {
+				content = append(content, ClaudeContent{
+					Type: "text",
+					Text: text,
+				})
+			}
+			for _, tc := range msg.ToolCalls {
+				var input any
+				json.Unmarshal([]byte(tc.Function.Arguments), &input)
+				if input == nil {
+					input = map[string]any{}
+				}
+				content = append(content, ClaudeContent{
+					Type:  "tool_use",
+					ID:    tc.ID,
+					Name:  tc.Function.Name,
+					Input: input,
+				})
+			}
+		}
+
 		switch fr {
 		case "stop":
 			stopReason = "end_turn"
@@ -2793,8 +3648,12 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 		content = append(content, ClaudeContent{Type: "text", Text: ""})
 	}
 
+	// Response ID: keep upstream ID only if it is a valid msg_ ID;
+	// otherwise generate a new msg_ ID. Never leak chatcmpl/resp IDs.
+	respID := normalizeClaudeMessageID(chat.ID)
+
 	resp := ClaudeResponse{
-		ID:         fmt.Sprintf("msg_%s", randomString(24)),
+		ID:         respID,
 		Type:       "message",
 		Role:       "assistant",
 		Content:    content,
@@ -2948,6 +3807,14 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	modelIn := claudeReq.Model
 	claudeReq.Model = resolveModel(claudeReq.Model)
+	claudeReq.Model = mapPublicToFreeModel(auth, claudeReq.Model)
+	if !validateRequestTemperature(w, claudeReq.Temperature, "claude", 0, 1) {
+		return
+	}
+	if msg := validateClaudeDocumentBlocks(claudeReq.Messages); msg != "" {
+		writeProtocolValidation400(w, "claude", "", msg)
+		return
+	}
 
 	// 多模态路由
 
@@ -2981,25 +3848,28 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	systemMerged := countClaudeSystemParts(claudeReq.Messages, claudeReq.System) > 1
 	plan := map[string]any{
-		"protocol":             "claude",
-		"model_in":             modelIn,
-		"model_resolved":       chatReq.Model,
-		"auth_mode":            authModeString(auth.Mode),
-		"auth_source":          auth.Source,
-		"has_key":              auth.Token != "",
-		"upstream_surface":     upstreamSurface,
-		"stream":               claudeReq.Stream,
-		"keep_reasoning":       keepReasoning,
-		"thinking":             thinkingState(claudeReq.Thinking),
-		"reasoning_effort_in":  effortIn,
-		"reasoning_effort_out": mappedReasoningEffort(effortIn),
-		"tools_count":          len(chatReq.Tools),
-		"messages_count":       len(chatReq.Messages),
-		"system_merged":        systemMerged,
-		"context_management":   claudeReq.ContextManagement != nil,
-		"cache_control_blocks": countClaudeCacheControlBlocks(claudeReq),
-		"client_beta_count":    countAnthropicBetas(r.Header.Get("anthropic-beta")),
-		"unsupported_blocks":   scanClaudeUnsupportedBlocks(claudeReq.Messages),
+		"protocol":                "claude",
+		"model_in":                modelIn,
+		"model_resolved":          chatReq.Model,
+		"auth_mode":               authModeString(auth.Mode),
+		"auth_source":             auth.Source,
+		"has_key":                 auth.Token != "",
+		"upstream_surface":        upstreamSurface,
+		"stream":                  claudeReq.Stream,
+		"keep_reasoning":          keepReasoning,
+		"thinking":                thinkingState(claudeReq.Thinking),
+		"reasoning_effort_in":     effortIn,
+		"reasoning_effort_out":    mappedReasoningEffort(effortIn),
+		"tools_count":             len(chatReq.Tools),
+		"messages_count":          len(chatReq.Messages),
+		"system_merged":           systemMerged,
+		"context_management":      claudeReq.ContextManagement != nil,
+		"cache_control_blocks":    countClaudeCacheControlBlocks(claudeReq),
+		"history_signature_count": countClaudeThinkingSignatures(claudeReq.Messages),
+		"client_beta_count":       countAnthropicBetas(r.Header.Get("anthropic-beta")),
+		"unsupported_blocks":      scanClaudeUnsupportedBlocks(claudeReq.Messages),
+		"max_tokens":              chatReq.MaxTokens,
+		"max_tokens_cap":          getMaxTokensCapForModel(chatReq.Model),
 	}
 	if len(skippedServerTools) > 0 {
 		plan["skipped_server_tools"] = skippedServerTools
@@ -3027,12 +3897,16 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		if len(respBody) > 0 {
-			w.Write(respBody)
+		if err != nil {
+			writeUpstreamError(w, status, err, "claude")
 		} else {
-			json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "api_error", "message": "upstream error"}})
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			if len(respBody) > 0 {
+				w.Write(respBody)
+			} else {
+				json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "api_error", "message": "upstream error"}})
+			}
 		}
 		return
 	}
@@ -3076,6 +3950,8 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(claudeRespBody)
 }
 
+var claudeKeepaliveInterval = 15 * time.Second
+
 func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io.ReadCloser, model string, keepReasoning bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -3100,6 +3976,40 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 	// Accumulates reasoning when keepReasoning so we can fall back to a text
 	// block if the stream never produces content/tool_use (#37635).
 	reasoningFallback := strings.Builder{}
+
+	// --- Reader goroutine -> channel so the main loop can select on
+	// ticker/read/context without blocking, and so context cancellation
+	// unblocks the reader via Close. ---
+	type readResult struct {
+		line string
+		err  error
+	}
+	readCh := make(chan readResult)
+	readerDone := make(chan struct{})
+	readerExited := make(chan struct{})
+
+	go func() {
+		defer close(readerExited)
+		for {
+			line, err := reader.ReadString('\n')
+			select {
+			case readCh <- readResult{line: line, err: err}:
+			case <-readerDone:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	keepaliveInterval := claudeKeepaliveInterval
+	if keepaliveInterval <= 0 {
+		keepaliveInterval = 15 * time.Second
+	}
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+
 	defer func() {
 		if len(fullUsage) > 0 {
 			pt, _ := fullUsage["prompt_tokens"].(float64)
@@ -3111,6 +4021,12 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		}
 		stats.toolCallCount = len(toolCallOrder)
 		stats.log(ctx, "claude")
+	}()
+	// Reader cleanup: signal goroutine, unblock any pending read, wait for exit.
+	defer func() {
+		close(readerDone)
+		respBody.Close()
+		<-readerExited
 	}()
 
 	emitClaudeEvent := func(event string, data any) {
@@ -3124,6 +4040,16 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		if flusher != nil {
 			flusher.Flush()
 		}
+	}
+
+	emitClaudeError := func(msg string) {
+		emitClaudeEvent("error", map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "api_error",
+				"message": msg,
+			},
+		})
 	}
 
 	closeThinkingBlock := func() {
@@ -3229,173 +4155,211 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		}
 	}
 
+loop:
 	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
+		select {
+		case <-ctx.Done():
+			// Client cancelled: quiet exit, no error writes.
+			return
+		case <-ticker.C:
+			// Keepalive ping — before the first upstream token this is the
+			// only thing the client receives; do NOT fake message_start.
+			emitClaudeEvent("ping", map[string]any{"type": "ping"})
+		case result := <-readCh:
+			// bufio.ReadString may return both a non-empty line and an error
+			// (e.g. the last line without a trailing newline + io.EOF). Process
+			// the line first, then handle the accompanying error via pendingErr.
+			pendingErr := result.err
+
+			line := result.line
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
+				stats.doneSeen = true
+				if !finished {
+					emitClaudeError("stream ended with [DONE] but no finish_reason")
+					return
+				}
+				break loop
 			}
-			reqLogger(ctx).Error("stream read error", "error", err)
-			break
-		}
+			if strings.HasPrefix(line, "data: ") {
+				payload := line[6:]
+				if strings.TrimSpace(payload) != "" {
+					var chunk map[string]any
+					if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+						emitClaudeError("stream received malformed JSON data")
+						return
+					} else {
+						// In-band error from upstream.
+						if errVal, ok := chunk["error"]; ok && errVal != nil {
+							errMsg := "upstream stream error"
+							if errMap, ok := errVal.(map[string]any); ok {
+								if m, ok := errMap["message"].(string); ok && m != "" {
+									errMsg = m
+								}
+							} else if errStr, ok := errVal.(string); ok && errStr != "" {
+								errMsg = errStr
+							}
+							emitClaudeError(errMsg)
+							return
+						} else {
 
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
-			stats.doneSeen = true
-			break
-		}
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
+							if usage, ok := chunk["usage"].(map[string]any); ok {
+								fullUsage = mergeUsageMaps(fullUsage, usage)
+							}
 
-		var chunk map[string]any
-		if err := json.Unmarshal([]byte(line[6:]), &chunk); err != nil {
-			continue
-		}
-		if usage, ok := chunk["usage"].(map[string]any); ok {
-			fullUsage = usage
-		}
+							choices, ok := chunk["choices"].([]any)
+							if !ok || len(choices) == 0 {
+								// Usage-only trailing chunk (OpenAI stream_options.include_usage).
+							} else {
+								choice, _ := choices[0].(map[string]any)
+								delta, _ := choice["delta"].(map[string]any)
+								finishReason, _ := choice["finish_reason"].(string)
+								stats.noteChunk()
 
-		choices, ok := chunk["choices"].([]any)
-		if !ok || len(choices) == 0 {
-			// Usage-only trailing chunk (OpenAI stream_options.include_usage).
-			continue
-		}
+								ensureMessageStart()
 
-		choice, _ := choices[0].(map[string]any)
-		delta, _ := choice["delta"].(map[string]any)
-		finishReason, _ := choice["finish_reason"].(string)
-		stats.noteChunk()
+								// After finish_reason, ignore further content deltas but keep reading
+								// so a later usage-only chunk can populate fullUsage.
+								if !finished {
+									if rc, ok := delta["reasoning_content"]; ok {
+										rcStr, _ := rc.(string)
+										if rcStr != "" {
+											stats.reasoningChars += len(rcStr)
+											if keepReasoning {
+												reasoningFallback.WriteString(rcStr)
+												closeTextBlock()
+												if !thinkingBlockOpen {
+													emitClaudeEvent("content_block_start", map[string]any{
+														"type":  "content_block_start",
+														"index": blockIndex,
+														"content_block": map[string]any{
+															"type":     "thinking",
+															"thinking": "",
+														},
+													})
+													thinkingBlockOpen = true
+													blockIndex++
+												}
+												emitClaudeEvent("content_block_delta", map[string]any{
+													"type":  "content_block_delta",
+													"index": blockIndex - 1,
+													"delta": map[string]any{
+														"type":     "thinking_delta",
+														"thinking": rcStr,
+													},
+												})
+											} else {
+												// Thinking not requested: promote misplaced CoT to visible text (#37635).
+												stats.promotedReasoning = true
+												emitTextDelta(rcStr)
+											}
+										}
+									}
 
-		ensureMessageStart()
+									if c, ok := delta["content"]; ok && c != nil {
+										contentStr, _ := c.(string)
+										if contentStr != "" {
+											emitTextDelta(contentStr)
+										}
+									}
 
-		// After finish_reason, ignore further content deltas but keep reading
-		// so a later usage-only chunk can populate fullUsage.
-		if finished {
-			continue
-		}
+									if rawToolCalls, ok := delta["tool_calls"].([]any); ok {
+										for _, rawTC := range rawToolCalls {
+											tc, ok := rawTC.(map[string]any)
+											if !ok {
+												continue
+											}
+											idxFloat, _ := tc["index"].(float64)
+											upstreamIndex := int(idxFloat)
 
-		if rc, ok := delta["reasoning_content"]; ok {
-			rcStr, _ := rc.(string)
-			if rcStr != "" {
-				stats.reasoningChars += len(rcStr)
-				if keepReasoning {
-					reasoningFallback.WriteString(rcStr)
-					closeTextBlock()
-					if !thinkingBlockOpen {
-						emitClaudeEvent("content_block_start", map[string]any{
-							"type":  "content_block_start",
-							"index": blockIndex,
-							"content_block": map[string]any{
-								"type":     "thinking",
-								"thinking": "",
-							},
-						})
-						thinkingBlockOpen = true
-						blockIndex++
+											closeThinkingBlock()
+											closeTextBlock()
+
+											if _, exists := toolCallAccumulator[upstreamIndex]; !exists {
+												callID, _ := tc["id"].(string)
+												if callID == "" {
+													callID = "toolu_" + randomString(12)
+												}
+												fn, _ := tc["function"].(map[string]any)
+												name, _ := fn["name"].(string)
+												toolCallAccumulator[upstreamIndex] = map[string]string{
+													"id":   callID,
+													"name": name,
+													"args": "",
+												}
+												toolCallOrder = append(toolCallOrder, upstreamIndex)
+												toolBlockIndices[upstreamIndex] = blockIndex
+												emitClaudeEvent("content_block_start", map[string]any{
+													"type":  "content_block_start",
+													"index": blockIndex,
+													"content_block": map[string]any{
+														"type":  "tool_use",
+														"id":    callID,
+														"name":  name,
+														"input": map[string]any{},
+													},
+												})
+												blockIndex++
+											}
+
+											fn, _ := tc["function"].(map[string]any)
+											if argDelta, ok := fn["arguments"].(string); ok && argDelta != "" {
+												toolCallAccumulator[upstreamIndex]["args"] += argDelta
+												emitClaudeEvent("content_block_delta", map[string]any{
+													"type":  "content_block_delta",
+													"index": toolBlockIndices[upstreamIndex],
+													"delta": map[string]any{
+														"type":         "input_json_delta",
+														"partial_json": argDelta,
+													},
+												})
+											}
+										}
+									}
+
+									if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
+										stats.finishReason = finishReason
+										stats.sawFinish = true
+										finished = true
+										finalizeContentBlocks()
+
+										stopReason = "end_turn"
+										switch finishReason {
+										case "length":
+											stopReason = "max_tokens"
+										case "tool_calls", "function_call":
+											stopReason = "tool_use"
+										case "content_filter":
+											stopReason = "refusal"
+										}
+										// Do not emit message_delta/stop yet: OpenAI-compatible upstreams often
+										// send the usage-only chunk after finish_reason when include_usage=true.
+									}
+								}
+							}
+						}
 					}
-					emitClaudeEvent("content_block_delta", map[string]any{
-						"type":  "content_block_delta",
-						"index": blockIndex - 1,
-						"delta": map[string]any{
-							"type":     "thinking_delta",
-							"thinking": rcStr,
-						},
-					})
-				} else {
-					// Thinking not requested: promote misplaced CoT to visible text (#37635).
-					stats.promotedReasoning = true
-					emitTextDelta(rcStr)
 				}
 			}
-		}
 
-		if c, ok := delta["content"]; ok && c != nil {
-			contentStr, _ := c.(string)
-			if contentStr != "" {
-				emitTextDelta(contentStr)
-			}
-		}
-
-		if rawToolCalls, ok := delta["tool_calls"].([]any); ok {
-			for _, rawTC := range rawToolCalls {
-				tc, ok := rawTC.(map[string]any)
-				if !ok {
-					continue
-				}
-				idxFloat, _ := tc["index"].(float64)
-				upstreamIndex := int(idxFloat)
-
-				closeThinkingBlock()
-				closeTextBlock()
-
-				if _, exists := toolCallAccumulator[upstreamIndex]; !exists {
-					callID, _ := tc["id"].(string)
-					if callID == "" {
-						callID = "toolu_" + randomString(12)
+			// Now handle a pending error from the read.
+			if pendingErr != nil {
+				if pendingErr == io.EOF {
+					if !finished {
+						emitClaudeError("stream ended without finish_reason")
+						return
 					}
-					fn, _ := tc["function"].(map[string]any)
-					name, _ := fn["name"].(string)
-					toolCallAccumulator[upstreamIndex] = map[string]string{
-						"id":   callID,
-						"name": name,
-						"args": "",
-					}
-					toolCallOrder = append(toolCallOrder, upstreamIndex)
-					toolBlockIndices[upstreamIndex] = blockIndex
-					emitClaudeEvent("content_block_start", map[string]any{
-						"type":  "content_block_start",
-						"index": blockIndex,
-						"content_block": map[string]any{
-							"type":  "tool_use",
-							"id":    callID,
-							"name":  name,
-							"input": map[string]any{},
-						},
-					})
-					blockIndex++
+					break loop
 				}
-
-				fn, _ := tc["function"].(map[string]any)
-				if argDelta, ok := fn["arguments"].(string); ok && argDelta != "" {
-					toolCallAccumulator[upstreamIndex]["args"] += argDelta
-					emitClaudeEvent("content_block_delta", map[string]any{
-						"type":  "content_block_delta",
-						"index": toolBlockIndices[upstreamIndex],
-						"delta": map[string]any{
-							"type":         "input_json_delta",
-							"partial_json": argDelta,
-						},
-					})
-				}
+				reqLogger(ctx).Error("stream read error", "error", pendingErr)
+				emitClaudeError("stream read error")
+				return
 			}
-		}
-
-		if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
-			stats.finishReason = finishReason
-			stats.sawFinish = true
-			finished = true
-			finalizeContentBlocks()
-
-			stopReason = "end_turn"
-			switch finishReason {
-			case "length":
-				stopReason = "max_tokens"
-			case "tool_calls", "function_call":
-				stopReason = "tool_use"
-			case "content_filter":
-				stopReason = "refusal"
-			}
-			// Do not emit message_delta/stop yet: OpenAI-compatible upstreams often
-			// send the usage-only chunk after finish_reason when include_usage=true.
-			continue
 		}
 	}
 
+	// Reached only when finished is true (valid finish_reason seen).
 	ensureMessageStart()
-	if !finished {
-		finalizeContentBlocks()
-	}
 	emitClaudeEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReason},
@@ -3425,6 +4389,34 @@ func responsesInputToMessages(input any, instructions string) []Message {
 		messages = append(messages, Message{Role: "user", Content: v})
 	case []any:
 		functionOutputs := collectFunctionOutputs(v)
+		// Pre-collect call IDs present in this input array so output items
+		// whose matching call is also present are not independently appended
+		// (the call branch emits the paired tool message). Standalone outputs
+		// (e.g. previous-response-id replay) have no matching call and still
+		// append independently. Uses the same call-ID extraction rule as the
+		// call branch: call_id → id → nested tool_use.id.
+		callIDsPresent := map[string]bool{}
+		for _, item := range v {
+			elem, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch elem["type"] {
+			case "function_call", "tool_call", "apply_patch_call", "shell_call":
+				cid, _ := elem["call_id"].(string)
+				if cid == "" {
+					cid, _ = elem["id"].(string)
+				}
+				if cid == "" {
+					if tu, ok := elem["tool_use"].(map[string]any); ok {
+						cid, _ = tu["id"].(string)
+					}
+				}
+				if cid != "" {
+					callIDsPresent[cid] = true
+				}
+			}
+		}
 		for _, item := range v {
 			switch elem := item.(type) {
 			case string:
@@ -3478,8 +4470,10 @@ func responsesInputToMessages(input any, instructions string) []Message {
 						}},
 					})
 					if callID != "" {
-						output := functionOutputs[callID]
-						if output == "" {
+						// Map presence (not value=="") decides whether a payload
+						// was provided: an empty string is a legitimate output.
+						output, hasOutput := functionOutputs[callID]
+						if !hasOutput {
 							output = "[tool output missing]"
 						}
 						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
@@ -3490,25 +4484,32 @@ func responsesInputToMessages(input any, instructions string) []Message {
 						callID, _ = elem["tool_use_id"].(string)
 					}
 					if callID != "" {
-						output := functionOutputs[callID]
-						if output == "" {
-							switch o := elem["output"].(type) {
-							case string:
-								output = o
-							default:
-								if o != nil {
-									b, _ := json.Marshal(o)
-									output = string(b)
-								}
+						// If the matching call item is also present in this
+						// input array, skip independent emission — the call
+						// branch will emit the paired assistant+tool messages,
+						// preventing a leading duplicate tool message when
+						// output precedes call. Standalone outputs (no matching
+						// call, e.g. previous-response-id replay) still append
+						// independently.
+						if callIDsPresent[callID] {
+							continue
+						}
+						// Map presence (not value=="") decides whether a payload
+						// was provided: an empty string is a legitimate output.
+						output, hasOutput := functionOutputs[callID]
+						if !hasOutput {
+							// Fallback for items not collected (e.g. output
+							// field absent on a standard *_call_output). Use
+							// the single normalizer so Anthropic-style content
+							// is honored and the raw tool_result wrapper JSON
+							// is never emitted.
+							text, present := normalizeToolResultOutput(elem)
+							if present {
+								output = text
+								hasOutput = true
 							}
 						}
-						if output == "" {
-							b, err := json.Marshal(elem)
-							if err == nil {
-								output = string(b)
-							}
-						}
-						if output == "" {
+						if !hasOutput {
 							output = "[tool output missing]"
 						}
 						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
@@ -3529,6 +4530,18 @@ func responsesInputToMessages(input any, instructions string) []Message {
 					}
 					content := responsesContentToMessageContent(elem["content"])
 					messages = append(messages, Message{Role: role, Content: content})
+				case "input_file":
+					// Top-level input_file item (file upload). Map to a user
+					// message carrying a structured file part. Malformed items
+					// (no payload) are rejected earlier by the handler, so a
+					// failure here is dropped rather than serialized as text.
+					if file, ok := responsesInputFileToFile(elem); ok {
+						messages = append(messages, Message{
+							Role:    "user",
+							Content: []any{map[string]any{"type": "file", "file": file}},
+						})
+					}
+					continue
 				default:
 					role := "user"
 					if r, ok := elem["role"].(string); ok && r != "" {
@@ -3709,6 +4722,16 @@ func convertResponsesToolChoice(choice any) any {
 	return choice
 }
 
+// toolResultOutputKind marks the output item types that carry a tool/function
+// output payload. tool_result is the Anthropic-style alias accepted by the
+// Responses entrypoint in addition to the standard *_call_output types.
+var toolResultOutputKind = map[string]struct{}{
+	"function_call_output":    {},
+	"apply_patch_call_output": {},
+	"shell_call_output":       {},
+	"tool_result":             {},
+}
+
 func collectFunctionOutputs(items []any) map[string]string {
 	outputs := map[string]string{}
 	for _, item := range items {
@@ -3717,24 +4740,95 @@ func collectFunctionOutputs(items []any) map[string]string {
 			continue
 		}
 		itemType, _ := elem["type"].(string)
-		switch itemType {
-		case "function_call_output", "apply_patch_call_output", "shell_call_output":
-		default:
+		if _, ok := toolResultOutputKind[itemType]; !ok {
 			continue
 		}
+		// Standard Responses items use call_id; Anthropic-style tool_result
+		// uses tool_use_id when call_id is absent.
 		callID, _ := elem["call_id"].(string)
+		if callID == "" {
+			callID, _ = elem["tool_use_id"].(string)
+		}
 		if callID == "" {
 			continue
 		}
-		switch v := elem["output"].(type) {
-		case string:
-			outputs[callID] = v
-		default:
-			b, _ := json.Marshal(v)
-			outputs[callID] = string(b)
+		text, present := normalizeToolResultOutput(elem)
+		if present {
+			outputs[callID] = text
 		}
+		// When no payload is present, the key is left absent so the caller
+		// surfaces "[tool output missing]" — the raw wrapper JSON is never
+		// stored as the output.
 	}
 	return outputs
+}
+
+// normalizeToolResultOutput is the single helper that extracts a textual
+// output from a tool/function output item. It prefers the standard `output`
+// field; for Anthropic-style tool_result it reads `content` when `output` is
+// absent. content supports a string, a string array, or an array of
+// {type:"text"|"input_text"|"output_text", text:"..."} blocks joined by
+// newlines in original order. The boolean reports whether a payload was
+// present (an empty string is a legitimate provided output).
+func normalizeToolResultOutput(elem map[string]any) (string, bool) {
+	var text string
+	present := false
+	// Standard `output` field takes priority.
+	if v, ok := elem["output"]; ok && v != nil {
+		switch s := v.(type) {
+		case string:
+			text = s
+		default:
+			b, _ := json.Marshal(v)
+			text = string(b)
+		}
+		present = true
+	} else if c, ok := elem["content"]; ok && c != nil {
+		// Anthropic-style tool_result uses `content`.
+		text = joinToolResultContent(c)
+		present = true
+	}
+	if !present {
+		return "", false
+	}
+	// Apply is_error prefix here so the collected map already carries error
+	// semantics, independent of call/output ordering in the array.
+	if isError, _ := elem["is_error"].(bool); isError {
+		text = applyErrorPrefix(text)
+	}
+	return text, true
+}
+
+// joinToolResultContent renders an Anthropic tool_result content value to text.
+func joinToolResultContent(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []any:
+		var parts []string
+		for _, p := range c {
+			pb, ok := p.(map[string]any)
+			if !ok {
+				if s, ok := p.(string); ok {
+					parts = append(parts, s)
+				}
+				continue
+			}
+			switch pb["type"] {
+			case "text", "input_text", "output_text":
+				if t, ok := pb["text"].(string); ok {
+					parts = append(parts, t)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		if c != nil {
+			b, _ := json.Marshal(c)
+			return string(b)
+		}
+		return ""
+	}
 }
 
 func parseJSONString(input string) any {
@@ -3913,9 +5007,174 @@ func convertResponsesContentPart(part map[string]any) (map[string]any, bool) {
 			"type":      "image_url",
 			"image_url": imageURLValue,
 		}, true
+	case "input_file":
+		file, ok := responsesInputFileToFile(part)
+		if !ok {
+			return nil, false
+		}
+		return map[string]any{"type": "file", "file": file}, true
 	default:
 		return nil, false
 	}
+}
+
+// validateClaudeDocumentBlocks scans Anthropic Messages content for document
+// blocks that lack a usable source payload. It inspects top-level message
+// content blocks and nested tool_result.content blocks, but never descends
+// into tool_use input, document source, schemas, or arbitrary domain data.
+func validateClaudeDocumentBlocks(msgs []ClaudeMessage) string {
+	for _, msg := range msgs {
+		if m := validateClaudeDocumentBlocksContent(msg.Content); m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+// validateClaudeDocumentBlocksContent inspects a content array's top-level
+// blocks. For tool_result blocks, it recurses into the tool_result's own
+// content array (which may contain document blocks). It never recurses into
+// tool_use input or other arbitrary map values.
+func validateClaudeDocumentBlocksContent(content any) string {
+	blocks, ok := content.([]any)
+	if !ok {
+		return ""
+	}
+	for _, item := range blocks {
+		block, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		bt, _ := block["type"].(string)
+		if bt == "document" {
+			if _, ok := claudeDocumentBlockToOpenAI(block); !ok {
+				return "document is missing a usable source payload"
+			}
+		}
+		if bt == "tool_result" {
+			// tool_result content is itself a content array that may contain
+			// document blocks. Recurse into it, but not into any other fields.
+			if m := validateClaudeDocumentBlocksContent(block["content"]); m != "" {
+				return m
+			}
+		}
+	}
+	return ""
+}
+
+// validateResponsesFileItems scans Responses input for input_file content
+// parts that are recognized as file inputs but lack any usable payload. It
+// inspects top-level items and message content arrays only — it
+// never descends into function/tool arguments, nested tool_use.input, file
+// payload objects, metadata, or arbitrary maps. Returns a non-empty message
+// when a malformed file item is found.
+func validateResponsesFileItems(input any) string {
+	switch v := input.(type) {
+	case []any:
+		for _, item := range v {
+			if msg := validateResponsesFileItem(item); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
+// validateResponsesFileItem validates a single top-level input item or a
+// content part within a message content array. File validation applies only
+// to official input paths: top-level input_file items and message content
+// arrays. Output/tool_result content arrays are not validated for file
+// inputs — they use text shapes only (normalizeToolResultOutput supports
+// strings and text/input_text/output_text blocks).
+func validateResponsesFileItem(item any) string {
+	elem, ok := item.(map[string]any)
+	if !ok {
+		return ""
+	}
+	itemType, _ := elem["type"].(string)
+	// Top-level input_file item or input_file content part.
+	if itemType == "input_file" {
+		if _, ok := responsesInputFileToFile(elem); !ok {
+			return "input_file is missing file_data, file_id, and file_url"
+		}
+		return ""
+	}
+	// For message items, recurse into the content array (content parts).
+	if itemType == "message" || itemType == "" {
+		if content, ok := elem["content"].([]any); ok {
+			for _, part := range content {
+				if msg := validateResponsesFileItem(part); msg != "" {
+					return msg
+				}
+			}
+		}
+		return ""
+	}
+	// All other item types (function_call, tool_call, tool_result,
+	// apply_patch_call, shell_call, reasoning, *_call_output, etc.) are not
+	// inspected — their arguments/input/content fields are not file inputs.
+	return ""
+}
+
+// responsesInputFileToFile extracts a Chat Completions file object from a
+// Responses input_file content part. It accepts the official common flat
+// fields (file_data, file_id, file_url, filename) as well as a nested
+// input_file object. Only known fields are selected — unknown/extension
+// fields are never copied. file_url (nested or flat) maps to Chat
+// file.file_data on a best-effort basis. Empty strings are not valid
+// payloads. The official Chat file object has only file_data/file_id/filename.
+// Returns (file, true) when a usable payload exists; (nil, false) otherwise.
+func responsesInputFileToFile(part map[string]any) (map[string]any, bool) {
+	file := map[string]any{}
+
+	// Helper: read a non-empty string from a map by key.
+	nonEmptyStr := func(m map[string]any, key string) (string, bool) {
+		if v, ok := m[key].(string); ok && v != "" {
+			return v, true
+		}
+		return "", false
+	}
+
+	// Nested input_file object: {"type":"input_file","input_file":{...}}.
+	// Only select known fields; do not wholesale-copy.
+	if nested, ok := part["input_file"].(map[string]any); ok {
+		if v, ok := nonEmptyStr(nested, "file_data"); ok {
+			file["file_data"] = v
+		}
+		if v, ok := nonEmptyStr(nested, "file_id"); ok {
+			file["file_id"] = v
+		}
+		// nested file_url maps to file.file_data (best-effort).
+		if v, ok := nonEmptyStr(nested, "file_url"); ok {
+			file["file_data"] = v
+		}
+		if v, ok := nonEmptyStr(nested, "filename"); ok {
+			file["filename"] = v
+		}
+	}
+
+	// Flat fields take priority over nested values.
+	if v, ok := nonEmptyStr(part, "file_data"); ok {
+		file["file_data"] = v
+	}
+	if v, ok := nonEmptyStr(part, "file_id"); ok {
+		file["file_id"] = v
+	}
+	// Flat file_url maps to file.file_data (best-effort).
+	if v, ok := nonEmptyStr(part, "file_url"); ok {
+		file["file_data"] = v
+	}
+	if v, ok := nonEmptyStr(part, "filename"); ok {
+		file["filename"] = v
+	}
+
+	// A usable payload requires at least one of file_data / file_id.
+	if _, hasData := file["file_data"]; !hasData {
+		if _, hasID := file["file_id"]; !hasID {
+			return nil, false
+		}
+	}
+	return file, true
 }
 
 func responsesContentToMessageContent(content any) any {
@@ -4067,6 +5326,17 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 	modelIn := respReq.Model
 	respReq.Model = resolveModel(respReq.Model)
+	if !validateRequestTemperature(w, respReq.Temperature, "responses", 0, 2) {
+		return
+	}
+	if msg := validateResponsesFileItems(respReq.Input); msg != "" {
+		writeProtocolValidation400(w, "responses", "input_file", msg)
+		return
+	}
+	// Note: respReq.Messages (nonstandard compatibility field) is forwarded
+	// as-is using Chat content shapes; Responses-style input_file parts are
+	// not validated or converted there. Use the official `input` field for
+	// input_file support.
 	previousState, hasPreviousState := StoredResponseState{}, false
 	if respReq.PreviousResponseID != "" {
 		previousState, hasPreviousState = loadResponseState(respReq.PreviousResponseID)
@@ -4088,6 +5358,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			respReq.Model = "deepseek-v4-flash-free"
 		}
 	}
+	respReq.Model = mapPublicToFreeModel(auth, respReq.Model)
 
 	// 多模态路由
 
@@ -4204,6 +5475,8 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		"reasoning_effort_out": mappedReasoningEffort(effortIn),
 		"tools_count":          len(respReq.Tools),
 		"messages_count":       len(chatReq.Messages),
+		"max_tokens":           chatReq.MaxTokens,
+		"max_tokens_cap":       getMaxTokensCapForModel(chatReq.Model),
 	})
 
 	upstreamBody := buildUpstreamBody(&chatReq)
@@ -4236,12 +5509,16 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		if len(respBody) > 0 {
-			w.Write(respBody)
+		if err != nil {
+			writeUpstreamError(w, status, err, "responses")
 		} else {
-			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error"}})
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			if len(respBody) > 0 {
+				w.Write(respBody)
+			} else {
+				json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error"}})
+			}
 		}
 		return
 	}
@@ -4309,6 +5586,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 	terminalStatus := "completed"
 	terminalEvent := "response.completed"
 	itemStatus := "completed"
+	finished := false
 	toolCalls := map[int]map[string]any{}
 	toolOrder := []int{}
 	toolKinds := responsesToolKindMap(tools)
@@ -4316,11 +5594,43 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 	reasoningOutputIndex := -1
 	messageIndex := -1
 
+	// --- Reader goroutine -> channel so the main loop can select on
+	// read/context without blocking, and context cancellation unblocks the
+	// reader via Close. ---
+	type readResult struct {
+		line string
+		err  error
+	}
+	readCh := make(chan readResult)
+	readerDone := make(chan struct{})
+	readerExited := make(chan struct{})
+
+	go func() {
+		defer close(readerExited)
+		for {
+			line, err := reader.ReadString('\n')
+			select {
+			case readCh <- readResult{line: line, err: err}:
+			case <-readerDone:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
 	defer func() {
 		stats.textChars = len(fullText)
 		stats.reasoningChars = len(fullReasoning)
 		stats.toolCallCount = len(toolOrder)
 		stats.log(ctx, "responses")
+	}()
+	// Reader cleanup: signal goroutine, unblock any pending read, wait for exit.
+	defer func() {
+		close(readerDone)
+		resp.Body.Close()
+		<-readerExited
 	}()
 
 	messageOutputIndex := func() int {
@@ -4463,257 +5773,338 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		})
 	}
 
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			reqLogger(ctx).Error("stream read error", "error", err)
+	ensureCreated := func(chunk map[string]any) {
+		if createdSent {
 			return
 		}
-
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
-			stats.doneSeen = true
-			break
-		}
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		var chunk map[string]any
-		if err := json.Unmarshal([]byte(line[6:]), &chunk); err != nil {
-			continue
-		}
-		stats.noteChunk()
-		if !createdSent {
+		if chunk != nil {
 			if id, ok := chunk["id"].(string); ok && id != "" {
-				responseID = id
+				responseID = normalizeResponsesID(id)
 				reasoningID = "rs_" + responseID + "_0"
 				msgID = "msg_" + responseID + "_0"
 			}
 			if created, ok := chunk["created"].(float64); ok {
 				createdAt = int64(created)
 			}
-			seq++
-			emitSSEEvent(w, flusher, "response.created", map[string]any{
-				"type":            "response.created",
-				"sequence_number": seq,
-				"response":        map[string]any{"id": responseID, "object": "response", "created_at": createdAt, "status": "in_progress", "background": false, "error": nil, "output": []any{}},
-			})
-			seq++
-			emitSSEEvent(w, flusher, "response.in_progress", map[string]any{
-				"type":            "response.in_progress",
-				"sequence_number": seq,
-				"response":        map[string]any{"id": responseID, "object": "response", "created_at": createdAt, "status": "in_progress"},
-			})
-			createdSent = true
 		}
-		choices, ok := chunk["choices"].([]any)
-		if !ok || len(choices) == 0 {
-			if usage, ok := chunk["usage"].(map[string]any); ok {
-				totalUsage = usage
-			}
-			continue
-		}
+		seq++
+		emitSSEEvent(w, flusher, "response.created", map[string]any{
+			"type":            "response.created",
+			"sequence_number": seq,
+			"response":        map[string]any{"id": responseID, "object": "response", "created_at": createdAt, "status": "in_progress", "background": false, "error": nil, "output": []any{}},
+		})
+		seq++
+		emitSSEEvent(w, flusher, "response.in_progress", map[string]any{
+			"type":            "response.in_progress",
+			"sequence_number": seq,
+			"response":        map[string]any{"id": responseID, "object": "response", "created_at": createdAt, "status": "in_progress"},
+		})
+		createdSent = true
+	}
 
-		choice, _ := choices[0].(map[string]any)
-		delta, _ := choice["delta"].(map[string]any)
-		finishReason, _ := choice["finish_reason"].(string)
-		if finishReason != "" {
-			stats.finishReason = finishReason
-			stats.sawFinish = true
+	emitResponseFailed := func(msg string) {
+		ensureCreated(nil)
+		failedResponse := map[string]any{
+			"id":         responseID,
+			"object":     "response",
+			"created_at": createdAt,
+			"status":     "failed",
+			"background": false,
+			"error": map[string]any{
+				"code":    "server_error",
+				"message": msg,
+			},
+			"incomplete_details": nil,
+			"model":              model,
+			"output":             []any{},
 		}
+		applyResponsesRequestEcho(failedResponse, originalReq)
+		seq++
+		emitSSEEvent(w, flusher, "response.failed", map[string]any{
+			"type":            "response.failed",
+			"sequence_number": seq,
+			"response":        failedResponse,
+		})
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 
-		if rc, ok := delta["reasoning_content"]; ok && wantReasoning {
-			rcStr, _ := rc.(string)
-			if rcStr != "" {
-				if !reasoningStarted {
-					reasoningOutputIndex = indexAllocator.Allocate()
-					seq++
-					emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
-						"type":            "response.output_item.added",
-						"sequence_number": seq,
-						"output_index":    reasoningOutputIndex,
-						"item":            reasoningItem("in_progress"),
-					})
-					seq++
-					emitSSEEvent(w, flusher, "response.reasoning_summary_part.added", map[string]any{
-						"type":            "response.reasoning_summary_part.added",
-						"sequence_number": seq,
-						"item_id":         reasoningID,
-						"output_index":    reasoningOutputIndex,
-						"summary_index":   0,
-						"part":            map[string]any{"type": "summary_text", "text": ""},
-					})
-					reasoningStarted = true
-				}
-				fullReasoning += rcStr
-				seq++
-				emitSSEEvent(w, flusher, "response.reasoning_summary_text.delta", map[string]any{
-					"type":            "response.reasoning_summary_text.delta",
-					"sequence_number": seq,
-					"item_id":         reasoningID,
-					"output_index":    reasoningOutputIndex,
-					"summary_index":   0,
-					"delta":           rcStr,
-				})
-			}
-		}
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			// Client cancelled: quiet exit, no error writes.
+			return
+		case result := <-readCh:
+			// bufio.ReadString may return both a non-empty line and an error
+			// (e.g. the last line without a trailing newline + io.EOF). Process
+			// the line first, then handle the accompanying error via pendingErr.
+			pendingErr := result.err
 
-		contentStr := ""
-		if c, ok := delta["content"]; ok && c != nil {
-			contentStr, _ = c.(string)
-		}
-		// #37635: when thinking is not kept, promote misplaced reasoning to visible text.
-		if contentStr == "" && !wantReasoning {
-			if rc, ok := delta["reasoning_content"].(string); ok {
-				if rc != "" {
-					stats.promotedReasoning = true
+			line := result.line
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
+				stats.doneSeen = true
+				if !finished {
+					emitResponseFailed("stream ended with [DONE] but no finish_reason")
+					return
 				}
-				contentStr = rc
+				break loop
 			}
-		}
-		if contentStr != "" {
-			// The terminal finish reason determines the item's final status. Keep the
-			// reasoning item open until that reason is known so a truncation cannot
-			// first announce it as completed.
-			if !messageStarted {
-				idx := messageOutputIndex()
-				seq++
-				emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
-					"type":            "response.output_item.added",
-					"sequence_number": seq,
-					"output_index":    idx,
-					"item":            map[string]any{"id": msgID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
-				})
-				seq++
-				emitSSEEvent(w, flusher, "response.content_part.added", map[string]any{
-					"type":            "response.content_part.added",
-					"sequence_number": seq,
-					"item_id":         msgID,
-					"output_index":    idx,
-					"content_index":   0,
-					"part":            map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": ""},
-				})
-				messageStarted = true
-			}
-			fullText += contentStr
-			seq++
-			emitSSEEvent(w, flusher, "response.output_text.delta", map[string]any{
-				"type":            "response.output_text.delta",
-				"sequence_number": seq,
-				"item_id":         msgID,
-				"output_index":    messageOutputIndex(),
-				"content_index":   0,
-				"delta":           contentStr,
-				"logprobs":        []any{},
-			})
-		}
+			if strings.HasPrefix(line, "data: ") {
+				payload := line[6:]
+				if strings.TrimSpace(payload) != "" {
+					var chunk map[string]any
+					if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+						emitResponseFailed("stream received malformed JSON data")
+						return
+					} else {
+						// In-band error from upstream.
+						if errVal, ok := chunk["error"]; ok && errVal != nil {
+							errMsg := "upstream stream error"
+							if errMap, ok := errVal.(map[string]any); ok {
+								if m, ok := errMap["message"].(string); ok && m != "" {
+									errMsg = m
+								}
+							} else if errStr, ok := errVal.(string); ok && errStr != "" {
+								errMsg = errStr
+							}
+							emitResponseFailed(errMsg)
+							return
+						} else {
+							stats.noteChunk()
+							ensureCreated(chunk)
+							choices, ok := chunk["choices"].([]any)
+							if !ok || len(choices) == 0 {
+								if usage, ok := chunk["usage"].(map[string]any); ok {
+									totalUsage = usage
+								}
+							} else {
+								choice, _ := choices[0].(map[string]any)
+								delta, _ := choice["delta"].(map[string]any)
+								finishReason, _ := choice["finish_reason"].(string)
+								if finishReason != "" {
+									stats.finishReason = finishReason
+									stats.sawFinish = true
+								}
 
-		rawToolCalls, _ := delta["tool_calls"].([]any)
-		for _, rawToolCall := range rawToolCalls {
-			tc, ok := rawToolCall.(map[string]any)
-			if !ok {
-				continue
-			}
-			idxFloat, _ := tc["index"].(float64)
-			upstreamIndex := int(idxFloat)
-			call, exists := toolCalls[upstreamIndex]
-			if !exists {
-				outputIndex := indexAllocator.Allocate()
-				callID, _ := tc["id"].(string)
-				if callID == "" {
-					callID = "call_" + randomString(12)
-				}
-				fn, _ := tc["function"].(map[string]any)
-				name, _ := fn["name"].(string)
-				itemType := toolCallOutputType(name, toolKinds)
-				call = map[string]any{
-					"output_index": outputIndex,
-					"item_id":      "fc_" + callID,
-					"call_id":      callID,
-					"name":         name,
-					"arguments":    "",
-					"done":         false,
-					"item_type":    itemType,
-				}
-				toolCalls[upstreamIndex] = call
-				toolOrder = append(toolOrder, upstreamIndex)
-				seq++
-				emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
-					"type":            "response.output_item.added",
-					"sequence_number": seq,
-					"output_index":    outputIndex,
-					"item": map[string]any{
-						"id":        call["item_id"],
-						"type":      itemType,
-						"status":    "in_progress",
-						"arguments": "",
-						"call_id":   callID,
-						"name":      name,
-					},
-				})
-			}
-			fn, _ := tc["function"].(map[string]any)
-			if name, _ := fn["name"].(string); name != "" {
-				call["name"] = name
-				if call["item_type"] == "function_call" {
-					call["item_type"] = toolCallOutputType(name, toolKinds)
-				}
-			}
-			if argDelta, _ := fn["arguments"].(string); argDelta != "" {
-				call["arguments"] = call["arguments"].(string) + argDelta
-				seq++
-				emitSSEEvent(w, flusher, "response.function_call_arguments.delta", map[string]any{
-					"type":            "response.function_call_arguments.delta",
-					"sequence_number": seq,
-					"item_id":         call["item_id"],
-					"output_index":    call["output_index"],
-					"delta":           argDelta,
-				})
-			}
-		}
+								if !finished {
+									if rc, ok := delta["reasoning_content"]; ok && wantReasoning {
+										rcStr, _ := rc.(string)
+										if rcStr != "" {
+											if !reasoningStarted {
+												reasoningOutputIndex = indexAllocator.Allocate()
+												seq++
+												emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+													"type":            "response.output_item.added",
+													"sequence_number": seq,
+													"output_index":    reasoningOutputIndex,
+													"item":            reasoningItem("in_progress"),
+												})
+												seq++
+												emitSSEEvent(w, flusher, "response.reasoning_summary_part.added", map[string]any{
+													"type":            "response.reasoning_summary_part.added",
+													"sequence_number": seq,
+													"item_id":         reasoningID,
+													"output_index":    reasoningOutputIndex,
+													"summary_index":   0,
+													"part":            map[string]any{"type": "summary_text", "text": ""},
+												})
+												reasoningStarted = true
+											}
+											fullReasoning += rcStr
+											seq++
+											emitSSEEvent(w, flusher, "response.reasoning_summary_text.delta", map[string]any{
+												"type":            "response.reasoning_summary_text.delta",
+												"sequence_number": seq,
+												"item_id":         reasoningID,
+												"output_index":    reasoningOutputIndex,
+												"summary_index":   0,
+												"delta":           rcStr,
+											})
+										}
+									}
 
-		if usage, ok := chunk["usage"].(map[string]any); ok {
-			totalUsage = usage
-		}
-		if finishReason == "stop" || finishReason == "length" || finishReason == "content_filter" {
-			if finishReason == "length" {
-				terminalStatus = "incomplete"
-				terminalEvent = "response.incomplete"
-				itemStatus = "incomplete"
+									contentStr := ""
+									if c, ok := delta["content"]; ok && c != nil {
+										contentStr, _ = c.(string)
+									}
+									// #37635: when thinking is not kept, promote misplaced reasoning to visible text.
+									if contentStr == "" && !wantReasoning {
+										if rc, ok := delta["reasoning_content"].(string); ok {
+											if rc != "" {
+												stats.promotedReasoning = true
+											}
+											contentStr = rc
+										}
+									}
+									if contentStr != "" {
+										// The terminal finish reason determines the item's final status. Keep the
+										// reasoning item open until that reason is known so a truncation cannot
+										// first announce it as completed.
+										if !messageStarted {
+											idx := messageOutputIndex()
+											seq++
+											emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+												"type":            "response.output_item.added",
+												"sequence_number": seq,
+												"output_index":    idx,
+												"item":            map[string]any{"id": msgID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
+											})
+											seq++
+											emitSSEEvent(w, flusher, "response.content_part.added", map[string]any{
+												"type":            "response.content_part.added",
+												"sequence_number": seq,
+												"item_id":         msgID,
+												"output_index":    idx,
+												"content_index":   0,
+												"part":            map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": ""},
+											})
+											messageStarted = true
+										}
+										fullText += contentStr
+										seq++
+										emitSSEEvent(w, flusher, "response.output_text.delta", map[string]any{
+											"type":            "response.output_text.delta",
+											"sequence_number": seq,
+											"item_id":         msgID,
+											"output_index":    messageOutputIndex(),
+											"content_index":   0,
+											"delta":           contentStr,
+											"logprobs":        []any{},
+										})
+									}
+
+									rawToolCalls, _ := delta["tool_calls"].([]any)
+									for _, rawToolCall := range rawToolCalls {
+										tc, ok := rawToolCall.(map[string]any)
+										if !ok {
+											continue
+										}
+										idxFloat, _ := tc["index"].(float64)
+										upstreamIndex := int(idxFloat)
+										call, exists := toolCalls[upstreamIndex]
+										if !exists {
+											outputIndex := indexAllocator.Allocate()
+											callID, _ := tc["id"].(string)
+											if callID == "" {
+												callID = "call_" + randomString(12)
+											}
+											fn, _ := tc["function"].(map[string]any)
+											name, _ := fn["name"].(string)
+											itemType := toolCallOutputType(name, toolKinds)
+											call = map[string]any{
+												"output_index": outputIndex,
+												"item_id":      "fc_" + callID,
+												"call_id":      callID,
+												"name":         name,
+												"arguments":    "",
+												"done":         false,
+												"item_type":    itemType,
+											}
+											toolCalls[upstreamIndex] = call
+											toolOrder = append(toolOrder, upstreamIndex)
+											seq++
+											emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+												"type":            "response.output_item.added",
+												"sequence_number": seq,
+												"output_index":    outputIndex,
+												"item": map[string]any{
+													"id":        call["item_id"],
+													"type":      itemType,
+													"status":    "in_progress",
+													"arguments": "",
+													"call_id":   callID,
+													"name":      name,
+												},
+											})
+										}
+										fn, _ := tc["function"].(map[string]any)
+										if name, _ := fn["name"].(string); name != "" {
+											call["name"] = name
+											if call["item_type"] == "function_call" {
+												call["item_type"] = toolCallOutputType(name, toolKinds)
+											}
+										}
+										if argDelta, _ := fn["arguments"].(string); argDelta != "" {
+											call["arguments"] = call["arguments"].(string) + argDelta
+											seq++
+											emitSSEEvent(w, flusher, "response.function_call_arguments.delta", map[string]any{
+												"type":            "response.function_call_arguments.delta",
+												"sequence_number": seq,
+												"item_id":         call["item_id"],
+												"output_index":    call["output_index"],
+												"delta":           argDelta,
+											})
+										}
+									}
+
+									if usage, ok := chunk["usage"].(map[string]any); ok {
+										totalUsage = usage
+									}
+									if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
+										finished = true
+										if finishReason == "length" {
+											terminalStatus = "incomplete"
+											terminalEvent = "response.incomplete"
+											itemStatus = "incomplete"
+										}
+										// Do not emit done events yet: a trailing error
+										// must still produce response.failed without any
+										// status=completed item.done. Done events are
+										// emitted only after the loop exits cleanly.
+									}
+								} else {
+									// After finish_reason, only look for usage-only trailing chunks.
+									if usage, ok := chunk["usage"].(map[string]any); ok {
+										totalUsage = usage
+									}
+								}
+							}
+						}
+					}
+				}
 			}
-			emitReasoningDone()
-			if !messageStarted && len(toolCalls) == 0 {
-				idx := messageOutputIndex()
-				seq++
-				emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
-					"type":            "response.output_item.added",
-					"sequence_number": seq,
-					"output_index":    idx,
-					"item":            map[string]any{"id": msgID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
-				})
-				seq++
-				emitSSEEvent(w, flusher, "response.content_part.added", map[string]any{
-					"type":            "response.content_part.added",
-					"sequence_number": seq,
-					"item_id":         msgID,
-					"output_index":    idx,
-					"content_index":   0,
-					"part":            map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": ""},
-				})
-				messageStarted = true
-			}
-			emitMessageDone()
-			for _, idx := range toolOrder {
-				emitToolCallDone(toolCalls[idx]["output_index"].(int), toolCalls[idx])
+
+			// Now handle a pending error from the read.
+			if pendingErr != nil {
+				if pendingErr == io.EOF {
+					if !finished {
+						emitResponseFailed("stream ended without finish_reason")
+						return
+					}
+					break loop
+				}
+				reqLogger(ctx).Error("stream read error", "error", pendingErr)
+				emitResponseFailed("stream read error")
+				return
 			}
 		}
 	}
 
+	// Reached only when finished is true.
 	emitReasoningDone()
+	if !messageStarted && len(toolCalls) == 0 {
+		idx := messageOutputIndex()
+		seq++
+		emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+			"type":            "response.output_item.added",
+			"sequence_number": seq,
+			"output_index":    idx,
+			"item":            map[string]any{"id": msgID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
+		})
+		seq++
+		emitSSEEvent(w, flusher, "response.content_part.added", map[string]any{
+			"type":            "response.content_part.added",
+			"sequence_number": seq,
+			"item_id":         msgID,
+			"output_index":    idx,
+			"content_index":   0,
+			"part":            map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": ""},
+		})
+		messageStarted = true
+	}
 	emitMessageDone()
 	for _, idx := range toolOrder {
 		emitToolCallDone(toolCalls[idx]["output_index"].(int), toolCalls[idx])
@@ -4857,8 +6248,9 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 
 	outcome := responsesOutcome(finishReason)
 	status := outcome.Status
+	normalizedID := normalizeResponsesID(chat.ID)
 	responses := map[string]any{
-		"id":                 chat.ID,
+		"id":                 normalizedID,
 		"object":             "response",
 		"status":             status,
 		"background":         false,
@@ -4873,11 +6265,11 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 	if toolChoice != nil {
 		responses["tool_choice"] = toolChoice
 	}
-	outputID := "msg_" + chat.ID + "_0"
+	outputID := "msg_" + normalizedID + "_0"
 	output := []any{}
 	if reasoning != "" {
 		output = append(output, map[string]any{
-			"id":                "rs_" + chat.ID,
+			"id":                "rs_" + normalizedID,
 			"type":              "reasoning",
 			"encrypted_content": "",
 			"summary":           []any{map[string]any{"type": "summary_text", "text": reasoning}},
@@ -4979,7 +6371,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		configMu.RLock()
-		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking}
+		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking, MaxTokensCap: maxTokensCap, MaxTokensCapPerModel: maxTokensCapPerModel}
 		configMu.RUnlock()
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
@@ -4988,14 +6380,16 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"model_alias":            cfg.ModelAlias,
-			"reasoning_effort_map":   cfg.ReasoningEffortMap,
-			"force_disable_thinking": cfg.ForceDisableThinking,
-			"socks5_proxies":         cfg.Socks5Proxies,
-			"active_socks5":          cfg.ActiveSocks5,
-			"socks5_paid_direct":     cfg.Socks5PaidDirect,
-			"log_level":              getLogLevelString(),
-			"log_bodies":             getLogBodies(),
+			"model_alias":              cfg.ModelAlias,
+			"reasoning_effort_map":     cfg.ReasoningEffortMap,
+			"force_disable_thinking":   cfg.ForceDisableThinking,
+			"max_tokens_cap":           cfg.MaxTokensCap,
+			"max_tokens_cap_per_model": cfg.MaxTokensCapPerModel,
+			"socks5_proxies":           cfg.Socks5Proxies,
+			"active_socks5":            cfg.ActiveSocks5,
+			"socks5_paid_direct":       cfg.Socks5PaidDirect,
+			"log_level":                getLogLevelString(),
+			"log_bodies":               getLogBodies(),
 		})
 	case http.MethodPost:
 		var payload struct {
@@ -5023,6 +6417,8 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 				"aliases", len(payload.ModelAlias),
 				"effort_map", len(payload.ReasoningEffortMap),
 				"force_disable", payload.ForceDisableThinking,
+				"max_tokens_cap", payload.MaxTokensCap,
+				"max_tokens_cap_per_model", len(payload.MaxTokensCapPerModel),
 				"log_level", getLogLevelString(),
 				"log_bodies", getLogBodies(),
 			)
@@ -5316,6 +6712,25 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 
 <div class="card">
+<h2><span class="dot" style="background:#e85d75"></span>max_tokens 上限</h2>
+<div class="form-group">
+<label>全局默认上限</label>
+<input type="number" id="maxTokensCap" class="m-input" min="0" placeholder="0 = 不限制" style="width:140px">
+<span class="hint">超过此值的 max_tokens 会被截断到此值（0 = 不限制）</span>
+</div>
+<div style="margin-bottom:12px">
+<table class="tbl" id="capTable">
+<thead><tr><th style="width:55%">模型</th><th style="width:30%">上限</th><th style="width:15%"></th></tr></thead>
+<tbody></tbody>
+</table>
+</div>
+<div class="actions">
+<button class="btn btn-primary" onclick="addCapRow()">添加模型上限</button>
+<button class="btn btn-success" onclick="saveConfig()">保存全部</button>
+</div>
+</div>
+
+<div class="card">
 <h2><span class="dot" style="background:var(--accent)"></span>模型映射</h2>
 <div style="margin-bottom:12px">
 <table class="tbl" id="aliasTable">
@@ -5354,11 +6769,11 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 <div id="toast"></div>
 <script>
-let aliasData={},effortData={},modelList=[],socks5Data=[];
+let aliasData={},effortData={},modelList=[],socks5Data=[],capData={};
 function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute('data-theme');const next=cur==='dark'?null:'dark';if(next)d.setAttribute('data-theme',next);else d.removeAttribute('data-theme');localStorage.setItem('theme',next||'light');document.querySelector('.theme-toggle').textContent=next==='dark'?'🌙':'☀'}
 (function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
 function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadStats();setTimeout(()=>window.scrollTo(0,sy),100)})}
-async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;document.getElementById('socks5_paid_direct').checked=!!cfg.socks5_paid_direct;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
+async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;document.getElementById('socks5_paid_direct').checked=!!cfg.socks5_paid_direct;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];capData=cfg.max_tokens_cap_per_model||{};document.getElementById('maxTokensCap').value=cfg.max_tokens_cap||'';const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();renderCapTable();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
 function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>').join('')}
 function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
 function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+modelSelectHtml('')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
@@ -5373,7 +6788,11 @@ function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,socks5_paid_direct:document.getElementById('socks5_paid_direct').checked};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+async function saveConfig(){collectAliases();collectEfforts();collectSocks5();collectCaps();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,max_tokens_cap:parseInt(document.getElementById('maxTokensCap').value)||0,max_tokens_cap_per_model:capData,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,socks5_paid_direct:document.getElementById('socks5_paid_direct').checked};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+function renderCapTable(){const tb=document.querySelector('#capTable tbody');const ks=Object.keys(capData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无模型上限配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td>'+modelSelectHtml(k)+'</td><td><input type="number" value="'+capData[k]+'" data-field="cap" min="0" style="width:100px"></td><td><button class="btn btn-danger" onclick="delCap(this)">删除</button></td></tr>').join('')}
+function addCapRow(){const tb=document.querySelector('#capTable tbody');const tr=document.createElement('tr');tr.innerHTML='<td>'+modelSelectHtml('')+'</td><td><input type="number" value="0" data-field="cap" min="0" style="width:100px"></td><td><button class="btn btn-danger" onclick="delCap(this)">删除</button></td>';tb.appendChild(tr);if(tb.querySelector('.empty-hint'))tb.innerHTML=''}
+function collectCaps(){capData={};document.querySelectorAll('#capTable tbody tr').forEach(tr=>{const sel=tr.querySelector('[data-field=key]');const inp=tr.querySelector('[data-field=cap]');if(sel&&inp){const k=sel.value;if(k){const v=parseInt(inp.value)||0;capData[k]=v}}})}
+function delCap(btn){btn.closest('tr').remove();if(!document.querySelector('#capTable tbody tr'))renderCapTable()}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
