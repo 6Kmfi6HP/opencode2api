@@ -2,8 +2,6 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/ids"
 )
 
 // Claude roundtrip; convertResponse strips it before responding to clients.
@@ -1022,14 +1022,7 @@ func buildUpstreamBody(req *OpenAIRequest) []byte {
 
 // same output. An empty id gets a random suffix (callers should cache).
 func deterministicResponseID(prefix, id string) string {
-	if strings.HasPrefix(id, prefix) && len(id) > len(prefix) {
-		return id
-	}
-	if id == "" {
-		return prefix + randomString(24)
-	}
-	h := sha256.Sum256([]byte(id))
-	return prefix + hex.EncodeToString(h[:16])
+	return ids.Deterministic(prefix, id)
 }
 
 // normalizeChatResponseID ensures a Chat response ID has the chatcmpl- prefix.

@@ -22,13 +22,6 @@ var httpClient = &http.Client{
 
 // ======================== SOCKS5 代理 ========================
 
-type Socks5Proxy struct {
-	Addr     string `json:"addr"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
-	Name     string `json:"name,omitempty"`
-}
-
 func socks5Dial(proxy Socks5Proxy) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, target string) (net.Conn, error) {
 		conn, err := net.DialTimeout("tcp", proxy.Addr, 10*time.Second)

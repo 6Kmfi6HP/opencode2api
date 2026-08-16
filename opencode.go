@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,28 +13,18 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/random"
 )
 
 // ======================== 随机 ID ========================
 
 func randomString(n int) string {
-	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, n)
-	rand.Read(b)
-	for i := range b {
-		b[i] = letters[b[i]%byte(len(letters))]
-	}
-	return string(b)
+	return random.String(n)
 }
 
 func randomHex(n int) string {
-	const hex = "0123456789abcdef"
-	b := make([]byte, n)
-	rand.Read(b)
-	for i := range b {
-		b[i] = hex[b[i]%byte(len(hex))]
-	}
-	return string(b)
+	return random.Hex(n)
 }
 
 // ======================== OpenCode 会话 ========================
