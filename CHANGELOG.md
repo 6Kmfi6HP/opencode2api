@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.4.3
+
+- Fix `cache_control` counting so signature fields are not treated as cacheable message content, and ensure Responses `cached_tokens` remains present in Claude usage translation.
+
 ## v0.4.2
 
 - Refactor project layout: split the root `main.go` monolith into `internal/app` packages, add `cmd/opencode2api` as the executable entrypoint, extract protocol DTOs into `internal/domain`, random helpers into `internal/random`, response ID normalization into `internal/ids`, and sync Makefile/Dockerfile/release script/CI paths and ldflags. HTTP behavior and CLI flags are unchanged.
