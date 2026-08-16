@@ -7,7 +7,8 @@
 ## 一、数据来源
 
 - 官方规范: `openai-openapi/openapi.yaml` (v3.1.0, ~2.9MB)
-- 代码实现: `internal/app/main.go`, `internal/app/responses_protocol.go`, `internal/app/chat_protocol.go`, `internal/app/anthropic_protocol.go`
+- 代码实现: `internal/app/responses.go`, `internal/app/chat.go`, `internal/app/claude.go`, `internal/app/responses_protocol.go`, `internal/app/chat_protocol.go`, `internal/app/anthropic_protocol.go`
+- 说明: 本文涉及的函数原位于单文件 `internal/app/main.go`；重构后已按协议拆到上述文件。
 - 测试覆盖: `request_compatibility_test.go`, `responses_content_test.go`, `responses_builtins_test.go`, `responses_previous_state_test.go`, `responses_store_test.go`, `stream_integrity_test.go`, `protocol_regression_test.go`
 
 ## 二、转换架构
@@ -297,7 +298,7 @@
 
 | 涉及文件 | 说明 |
 |---------|------|
-| `internal/app/main.go` | `responsesToolFunction` 已有行为：不支持的工具类型返回 false，`convertResponsesTools` 跳过 |
+| `internal/app/responses.go` | `responsesToolFunction` 已有行为：不支持的工具类型返回 false，`convertResponsesTools` 跳过 |
 
 ### 9.2 流式 refusal 处理
 
@@ -312,7 +313,7 @@
 
 | 涉及文件 | 修改 |
 |---------|------|
-| `internal/app/main.go` | `responsesStreamHandler`：新增 refusal 状态、delta 处理、`emitRefusalDone`、`messageItem` 修改 |
+| `internal/app/responses.go` | `responsesStreamHandler`：新增 refusal 状态、delta 处理、`emitRefusalDone`、`messageItem` 修改 |
 | `stream_integrity_test.go` | 新增 `TestResponsesStream_RefusalDelta` |
 
 ### 9.3 include 字段功能化
@@ -328,7 +329,7 @@
 
 | 涉及文件 | 修改 |
 |---------|------|
-| `internal/app/main.go` | `includeHas` 函数、`convertChatToResponses` 签名及逻辑、`responsesHandler` 调用点、`responsesStreamHandler` reasoningItem |
+| `internal/app/responses.go` | `includeHas` 函数、`convertChatToResponses` 签名及逻辑、`responsesHandler` 调用点、`responsesStreamHandler` reasoningItem |
 | `request_compatibility_test.go` | 新增 `TestResponsesInclude_EncryptedContentOnlyWhenRequested` |
 | `responses_content_test.go` | 更新 1 处 `convertChatToResponses` 调用 |
 | `protocol_regression_test.go` | 更新 1 处调用 |
@@ -359,7 +360,7 @@
 
 | 涉及文件 | 修改 |
 |---------|------|
-| `internal/app/main.go` | `ResponsesAPIRequest` 结构体、`ReasonEffort` 结构体、`responsesHandler` extra_body 接线 |
+| `internal/app/responses.go` | `ResponsesAPIRequest` 结构体、`ReasonEffort` 结构体、`responsesHandler` extra_body 接线 |
 | `internal/app/responses_protocol.go` | `applyResponsesRequestEcho` 重写 |
 | `request_compatibility_test.go` | 新增 `TestResponsesEcho_MissingFieldsAreEchoed` |
 

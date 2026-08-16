@@ -51,7 +51,7 @@ Claude Code 客户端
 
 | 来源 | 类型 | 覆盖内容 |
 |------|------|----------|
-| 代码分析 | 直接 | `internal/app/anthropic_protocol.go`, `internal/app/chat_protocol.go`, `internal/app/main.go` (~7000行) |
+| 代码分析 | 直接 | `internal/app/claude.go`, `internal/app/chat.go`, `internal/app/anthropic_protocol.go`, `internal/app/chat_protocol.go` |
 | Anthropic 官方文档 | wigolo fetch | Messages API 参考(62K)、stop_reasons(8K)、extended-thinking(13K)、prompt-caching(33K)、versioning(2K) |
 | Claude Code 行为研究 | 子代理 | `docs/research-claude-code-behavior.md` (36K, 913行) |
 | 开源代理项目研究 | 子代理 | `docs/research-proxy-projects.md` (32K, 678行) |
@@ -484,7 +484,7 @@ event: message_stop      → {type:"message_stop"}
 |------|------|---------|
 | `internal/app/anthropic_protocol.go` | 120 | `convertClaudeRequest()`, `convertClaudeToolChoice()` |
 | `internal/app/chat_protocol.go` | 130 | `normalizeFinishReason()`, `writeProtocolValidation400()` |
-| `internal/app/main.go` | ~7000 | `claudeMessagesHandler()`, `claudeToOpenAIMessages()`, `claudeStreamHandler()`, `openAIToClaudeResponse()` |
+| `internal/app/claude.go` | 拆分后 | `claudeMessagesHandler()`, `claudeToOpenAIMessages()`, `claudeStreamHandler()`, `openAIToClaudeResponse()` |
 
 ### C. Anthropic stop_reason 完整枚举
 
