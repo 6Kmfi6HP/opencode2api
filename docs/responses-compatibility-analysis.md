@@ -344,7 +344,7 @@
 
 | 字段 | 类型 | JSON tag | 上游映射 |
 |------|------|----------|---------|
-| `Text` | `any` | `text` | `extra_body.response_format` |
+| `Text` | `any` | `text` | `extra_body.response_format`（经 `convertResponsesTextToResponseFormat` 从 Responses `text.format` 翻译为 Chat `response_format`） |
 | `Truncation` | `string` | `truncation` | `extra_body.truncation` |
 | `ServiceTier` | `string` | `service_tier` | `extra_body.service_tier` |
 | `PromptCacheKey` | `string` | `prompt_cache_key` | `extra_body.prompt_cache_key` |
@@ -373,10 +373,40 @@
 | 请求字段缺失 (6个) | ✅ 已修复 | 结构体补全并接入上游 |
 | 响应回显不完整 (14个) | ✅ 已修复 | applyResponsesRequestEcho 补全 |
 | reasoning 只支持 effort | ✅ 部分修复 | 新增 summary/mode 解析和回显；context/generate_summary 仍缺失 |
-| Structured Outputs (text.format) | ⚠️ 架构性限制 | 字段已解析并透传 extra_body，但上游 Chat Completions 对 response_format 的支持取决于模型 |
+| Structured Outputs (text.format) | ✅ 已修复 | `text.format` 翻译为合法 `response_format`（`type` 顶层必填），无法翻译时静默丢弃，不再触发上游 400 |
 | 服务器端工具执行 | ⚠️ 架构性限制 | 返回 400 告知不支持；Chat Completions 无 server-side tools 对应物 |
 | response.queued 事件 | ⚠️ 低优先级 | 大部分客户端不依赖 |
 | response.output_text.annotation.added | ⚠️ 低优先级 | 注释功能极少使用 |
+
+### 9.6 text.format 翻译为合法 response_format（修复上游 400）
+
+**问题**：`responsesHandler` 把 Responses API 的 `text` 参数**原样透传**为上游 `response_format`。
+但 Responses API 的 `text` 是 `{format:{type:...}, verbosity:...}` 结构，`type` 位于 `format` 内部；
+而上游 Console provider（Chat Completions 兼容）要求 `response_format` **顶层必须有 `type`** 字段（判别联合体）。
+于是上游收到 `{"response_format":{"format":{"type":"json_object"}}}`，serde 反序列化失败，返回：
+
+```
+Error from provider (Console): Upstream request failed: [invalid_request_error] Failed to deserialize the JSON body into the target type: response_format: missing field `type`
+```
+
+**修复**：新增 `convertResponsesTextToResponseFormat`，把 `text.format` 翻译为合法 Chat `response_format`：
+
+| Responses `text.format` | 翻译后的 `response_format` |
+|------|------|
+| `{"type":"text"}` | `{"type":"text"}` |
+| `{"type":"json_object"}` | `{"type":"json_object"}` |
+| `{"type":"json_schema", name, description, schema, strict}` | `{"type":"json_schema","json_schema":{name, description, schema, strict}}` |
+
+无法表达的情况（未知类型、`json_schema` 缺 `name`/`schema`、`text` 非对象、只有 `verbosity`）→ 返回 `nil`，
+**静默丢弃 `response_format`**，绝不发送畸形对象，遵循"不返回 400 / 不兼容就忽略"原则。
+`text.verbosity` 在 Chat 无对应物，不转发。
+
+**验证**：对真实上游 `https://opencode.ai/zen/v1/chat/completions`（经 SOCKS5）实测：
+- 修复前形态（透传 `text`）→ 400 `response_format: missing field type`（复现用户报告错误）
+- 修复后形态 `{"type":"json_object"}` / `{"type":"json_schema",...}` / `{"type":"text"}` → 全部 200
+- 端到端通过修复后的代理二进制请求 `/v1/responses`（json_object / json_schema / 无 text）→ 全部 200 并返回合法 JSON
+
+**新增测试**：`response_format_translation_test.go`（7 个用例：json_object、text、json_schema、verbosity 不泄漏、不可翻译时丢弃、无 text 不变、响应回显保持原样）。
 
 **新增测试**：4 个（`TestResponsesUnsupportedToolType_Returns400`、`TestResponsesStream_RefusalDelta`、`TestResponsesInclude_EncryptedContentOnlyWhenRequested`、`TestResponsesEcho_MissingFieldsAreEchoed`）。
 

@@ -4609,6 +4609,56 @@ func convertResponsesTools(tools []ResponsesTool) []Tool {
 	return converted
 }
 
+// convertResponsesTextToResponseFormat translates the Responses API `text`
+// parameter ({format:{type:...}, verbosity:...}) into the Chat Completions
+// `response_format` shape ({type:...}) that upstream providers require.
+//
+// Returns nil when no representable format can be built (unknown type,
+// missing required json_schema fields, or a non-object text value) so the
+// caller can omit response_format instead of sending a malformed object that
+// upstream would reject with a 400.
+func convertResponsesTextToResponseFormat(text any) any {
+	obj, ok := text.(map[string]any)
+	if !ok {
+		return nil
+	}
+	format, ok := obj["format"].(map[string]any)
+	if !ok {
+		// Only verbosity was provided (no format) — nothing to map.
+		return nil
+	}
+	typ, _ := format["type"].(string)
+	switch typ {
+	case "text", "json_object":
+		return map[string]any{"type": typ}
+	case "json_schema":
+		jsonSchema := map[string]any{}
+		if name, ok := format["name"].(string); ok && name != "" {
+			jsonSchema["name"] = name
+		}
+		if desc, ok := format["description"].(string); ok {
+			jsonSchema["description"] = desc
+		}
+		if schema, ok := format["schema"]; ok {
+			jsonSchema["schema"] = schema
+		}
+		if strict, ok := format["strict"]; ok {
+			jsonSchema["strict"] = strict
+		}
+		// name and schema are required by both APIs; without them upstream
+		// would reject the object, so drop the format entirely.
+		if _, hasName := jsonSchema["name"]; !hasName {
+			return nil
+		}
+		if _, hasSchema := jsonSchema["schema"]; !hasSchema {
+			return nil
+		}
+		return map[string]any{"type": "json_schema", "json_schema": jsonSchema}
+	default:
+		return nil
+	}
+}
+
 func responsesToolFunction(tool ResponsesTool) (ToolFunction, bool) {
 	switch tool.Type {
 	case "function":
@@ -5457,10 +5507,17 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		chatReq.ExtraBody["user"] = respReq.User
 	}
 	if respReq.Text != nil {
-		if chatReq.ExtraBody == nil {
-			chatReq.ExtraBody = map[string]any{}
+		// OpenAI Responses API `text` is {format:{type:...}, verbosity:...};
+		// upstream expects Chat Completions `response_format` with a top-level
+		// `type`. Translate, and drop the field entirely when it cannot be
+		// represented (never send a malformed response_format upstream, which
+		// would surface as a 400).
+		if rf := convertResponsesTextToResponseFormat(respReq.Text); rf != nil {
+			if chatReq.ExtraBody == nil {
+				chatReq.ExtraBody = map[string]any{}
+			}
+			chatReq.ExtraBody["response_format"] = rf
 		}
-		chatReq.ExtraBody["response_format"] = respReq.Text
 	}
 	if respReq.Truncation != "" {
 		if chatReq.ExtraBody == nil {
