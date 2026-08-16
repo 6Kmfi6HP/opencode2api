@@ -655,3 +655,96 @@ func TestClaudeCodePayloadDropsContextManagementAndCacheControl(t *testing.T) {
 		t.Fatalf("summary missing cache_control_blocks: %#v", summary)
 	}
 }
+
+func TestResponsesStreamUsageAddsCachedTokensWhenPromptDetailsLackIt(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		details    string
+		wantCached float64
+		wantText   float64
+	}{
+		{"details with cached tokens", `{"cached_tokens":7,"text_tokens":10}`, 7, 10},
+		{"no cached tokens", `{"text_tokens":10}`, 0, 10},
+		{"without prompt details", "", 0, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			usageLine := `"prompt_tokens_details":` + tt.details
+			if tt.details == "" {
+				usageLine = ""
+			}
+			chunk := `data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5`
+			if usageLine != "" {
+				usageLine = "," + usageLine
+			}
+			chunk += usageLine + `}}`
+			upstream := strings.Join([]string{
+				`data: {"id":"r","created":1,"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}`,
+				``,
+				chunk,
+				``,
+				`data: [DONE]`,
+				``,
+			}, "\n")
+			rr := httptest.NewRecorder()
+			responsesStreamHandler(rr, nil, &http.Response{Body: io.NopCloser(strings.NewReader(upstream))}, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+			for _, event := range parseSSEEvents(t, rr.Body.String()) {
+				if event.Name != "response.completed" {
+					continue
+				}
+				response, _ := event.Data["response"].(map[string]any)
+				usage, _ := response["usage"].(map[string]any)
+				details, _ := usage["input_tokens_details"].(map[string]any)
+				if int(details["cached_tokens"].(float64)) != int(tt.wantCached) {
+					t.Fatalf("cached_tokens = %v, want %v:\n%s", details["cached_tokens"], tt.wantCached, rr.Body.String())
+				}
+				if tt.wantText == 0 {
+					if _, ok := details["text_tokens"]; ok {
+						t.Fatalf("unexpected text_tokens = %v", details["text_tokens"])
+					}
+				} else if int(details["text_tokens"].(float64)) != int(tt.wantText) {
+					t.Fatalf("text_tokens = %v, want %v", details["text_tokens"], tt.wantText)
+				}
+				return
+			}
+			t.Fatalf("response.completed not found:\n%s", rr.Body.String())
+		})
+	}
+}
+
+func TestResponsesConvertChatUsageAddsCachedTokensWhenPromptDetailsLackIt(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		details    string
+		wantCached float64
+		wantText   float64
+	}{
+		{"details with cached tokens", `{"cached_tokens":7,"text_tokens":10}`, 7, 10},
+		{"no cached tokens", `{"text_tokens":10}`, 0, 10},
+		{"without prompt details", "", 0, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			usage := `"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5`
+			if tt.details != "" {
+				usage += `,"prompt_tokens_details":` + tt.details
+			}
+			usage += `}`
+			in := `{"id":"r","created":1,"choices":[{"finish_reason":"stop","message":{"content":"ok"}}],` + usage + `}`
+			var got map[string]any
+			if err := json.Unmarshal(convertChatToResponses([]byte(in), "m", false, nil, nil, nil), &got); err != nil {
+				t.Fatal(err)
+			}
+			respUsage, _ := got["usage"].(map[string]any)
+			details, _ := respUsage["input_tokens_details"].(map[string]any)
+			if int(details["cached_tokens"].(float64)) != int(tt.wantCached) {
+				t.Fatalf("cached_tokens = %v, want %v", details["cached_tokens"], tt.wantCached)
+			}
+			if tt.wantText == 0 {
+				if _, ok := details["text_tokens"]; ok {
+					t.Fatalf("unexpected text_tokens = %v", details["text_tokens"])
+				}
+			} else if int(details["text_tokens"].(float64)) != int(tt.wantText) {
+				t.Fatalf("text_tokens = %v, want %v", details["text_tokens"], tt.wantText)
+			}
+		})
+	}
+}
