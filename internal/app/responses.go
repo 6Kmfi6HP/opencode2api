@@ -1254,6 +1254,17 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 // ======================== Responses Stream Handler ========================
 
+func responsesInputTokensDetails(details any) map[string]any {
+	if m, ok := details.(map[string]any); ok {
+		if cached, ok := m["cached_tokens"]; ok && cached != nil {
+			return m
+		}
+		m["cached_tokens"] = 0
+		return m
+	}
+	return map[string]any{"cached_tokens": 0}
+}
+
 func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.Response, model string, _ string, wantReasoning bool, tools []ResponsesTool, toolChoice any, originalReq ResponsesAPIRequest) {
 	ctx := context.Background()
 	if r != nil {
@@ -1902,11 +1913,7 @@ loop:
 		if v, ok := totalUsage["prompt_tokens"]; ok {
 			usage["input_tokens"] = v
 		}
-		if v, ok := totalUsage["prompt_tokens_details"]; ok {
-			usage["input_tokens_details"] = v
-		} else {
-			usage["input_tokens_details"] = map[string]any{"cached_tokens": 0}
-		}
+		usage["input_tokens_details"] = responsesInputTokensDetails(totalUsage["prompt_tokens_details"])
 		if v, ok := totalUsage["completion_tokens"]; ok {
 			usage["output_tokens"] = v
 		}
@@ -2039,11 +2046,7 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		if v, ok := chat.Usage["prompt_tokens"]; ok {
 			usage["input_tokens"] = v
 		}
-		if v, ok := chat.Usage["prompt_tokens_details"]; ok {
-			usage["input_tokens_details"] = v
-		} else {
-			usage["input_tokens_details"] = map[string]any{"cached_tokens": 0}
-		}
+		usage["input_tokens_details"] = responsesInputTokensDetails(chat.Usage["prompt_tokens_details"])
 		if v, ok := chat.Usage["completion_tokens"]; ok {
 			usage["output_tokens"] = v
 		}
