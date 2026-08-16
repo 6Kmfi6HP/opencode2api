@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Refactor project layout: split the root `main.go` monolith into `internal/app` packages, add `cmd/opencode2api` as the executable entrypoint, extract protocol DTOs into `internal/domain`, random helpers into `internal/random`, response ID normalization into `internal/ids`, and sync Makefile/Dockerfile/release script/CI paths and ldflags. HTTP behavior and CLI flags are unchanged.
+
 - Fix `/v1/responses` `text` parameter being forwarded verbatim as upstream `response_format`. The Responses API `text` nests `type` inside `format` (`{format:{type:...}, verbosity:...}`), but upstream providers require a top-level `type` in `response_format`, causing `400 response_format: missing field type`. Added `convertResponsesTextToResponseFormat` to translate `text.format` into a valid Chat Completions `response_format` (`text` / `json_object` / `json_schema`), and drop the field entirely when it cannot be represented (unknown type, missing required `json_schema` fields, non-object `text`, or verbosity-only) so the proxy never forwards a malformed `response_format` and never surfaces a 400 for this case. Verified against the real upstream and end-to-end through the proxy.
 
 ## v0.4.1

@@ -53,8 +53,8 @@ for target in "${targets[@]}"; do
     cd "$ROOT_DIR"
     env "${env_vars[@]}" go build \
       -trimpath \
-      -ldflags "-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.date=$DATE" \
-      -o "$work_dir/$binary" .
+      -ldflags "-s -w -X github.com/6Kmfi6HP/opencode2api/internal/app.version=$VERSION -X github.com/6Kmfi6HP/opencode2api/internal/app.commit=$COMMIT -X github.com/6Kmfi6HP/opencode2api/internal/app.date=$DATE" \
+      -o "$work_dir/$binary" ./cmd/opencode2api
   )
 
   cp "$ROOT_DIR/README.md" "$ROOT_DIR/config.example.json" "$work_dir/"

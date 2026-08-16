@@ -1,4 +1,4 @@
-package main
+package app
 
 // responseOutcome is shared by streaming and non-streaming builders so their
 // top-level and item statuses cannot drift apart.
