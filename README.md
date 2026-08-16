@@ -16,6 +16,23 @@
 - GitHub Actions 自动构建 Linux、macOS、Windows、FreeBSD 多平台 release
 - GitHub Actions 自动发布 Docker 镜像到 GHCR
 
+
+## 开发结构
+
+```text
+cmd/opencode2api/         # 可执行入口
+internal/app/             # 代理核心：handler、协议转换、上游调用、管理面板
+internal/domain/          # 协议 DTO
+internal/ids/             # 响应 ID 规范化
+internal/random/          # 随机 ID 工具
+```
+
+本地构建：
+
+```bash
+go build ./cmd/opencode2api
+```
+
 ## 快速开始
 
 ```bash

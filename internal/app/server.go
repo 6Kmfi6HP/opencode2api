@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 
 // ======================== Main ========================
 
-func main() {
+func Run() {
 	var showVersion bool
 	flag.StringVar(&port, "port", "8000", "服务端口")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")

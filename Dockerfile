@@ -14,14 +14,15 @@ ARG DATE=unknown
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY *.go ./
+COPY cmd ./cmd
+COPY internal ./internal
 
 RUN set -eux; \
     if [ "$TARGETARCH" = "arm" ]; then export GOARM="${TARGETVARIANT#v}"; fi; \
     CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
       go build -trimpath \
-      -ldflags "-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.date=$DATE" \
-      -o /out/opencode2api .
+      -ldflags "-s -w -X github.com/6Kmfi6HP/opencode2api/internal/app.version=$VERSION -X github.com/6Kmfi6HP/opencode2api/internal/app.commit=$COMMIT -X github.com/6Kmfi6HP/opencode2api/internal/app.date=$DATE" \
+      -o /out/opencode2api ./cmd/opencode2api
 
 FROM alpine:3.20
 
