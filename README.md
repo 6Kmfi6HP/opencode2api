@@ -39,7 +39,7 @@ go build ./cmd/opencode2api
 git clone https://github.com/6Kmfi6HP/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
-go run . -port 8000 -config config.json -password "change-me"
+go run ./cmd/opencode2api -port 8000 -config config.json -password "change-me"
 ```
 
 健康检查：
