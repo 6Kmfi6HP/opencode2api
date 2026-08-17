@@ -380,6 +380,7 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 				}
 				b = converted
 			}
+			b = convertRawToolCallsInBody(b)
 			log.Info("upstream_attempt",
 				"try_model", modelID,
 				"surface", surface,
@@ -562,7 +563,7 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 				"final_status", resp.StatusCode,
 				"fallback_used", false,
 			)
-			return resp.Body, resp.StatusCode, resp.Header, nil
+			return wrapRawSSE(resp.Body), resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
