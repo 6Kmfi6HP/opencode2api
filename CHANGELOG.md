@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix DeepSeek/Qwen models that emit raw DSML/XML tool-call markup (for example `<｜DSML｜tool_calls>`, `<|DSML|tool_calls>`, `<tool_calls>`, and `<tool_call>`) by converting it to standard OpenAI `tool_calls` before it reaches Chat/Claude/Responses clients. Non-streaming responses are normalized in `callOpenCodeAPI`; streaming responses are wrapped by `callOpenCodeAPIStream` so all three downstream protocols share one conversion layer. Native `tool_calls`, `usage`, `reasoning_content`, `finish_reason`, and `[DONE]` semantics are preserved.
+
 ## v0.4.3
 
 - Fix `cache_control` counting so signature fields are not treated as cacheable message content, and ensure Responses `cached_tokens` remains present in Claude usage translation.
