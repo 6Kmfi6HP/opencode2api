@@ -1,39 +1,42 @@
 # opencode2api
 
-`opencode2api` 是一个本地 HTTP 代理，把 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages 风格的请求转发到 OpenCode 上游接口，并提供模型别名、reasoning/thinking 兼容、SOCKS5 代理和一个轻量管理面板。
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-> 这个项目不是 OpenAI、Anthropic 或 OpenCode 的官方项目。请遵守上游服务条款，并只在你有权限的环境中使用。
+`opencode2api` is a local-first HTTP proxy that forwards OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages–style requests to the OpenCode upstream. It adds model aliases, reasoning/thinking compatibility, SOCKS5 proxying, token usage accounting, and a lightweight admin panel — so any OpenAI/Anthropic-compatible client can talk to OpenCode without changes.
 
-## 功能
+> This project is not affiliated with OpenAI, Anthropic, or OpenCode. Respect the upstream terms of service and only run it in environments you are authorized to use.
 
-- OpenAI 兼容接口：`/v1/chat/completions`、`/v1/models`
-- OpenAI Responses 兼容接口：`/v1/responses`
-- Anthropic Messages 兼容接口：`/v1/messages`
-- 流式 SSE 转换和 token 用量统计
-- 模型别名、reasoning effort 映射、强制禁用 thinking
-- SOCKS5 直连、指定代理和轮询代理
-- Web 管理面板：配置、统计、刷新上游会话
-- GitHub Actions 自动构建 Linux、macOS、Windows、FreeBSD 多平台 release
-- GitHub Actions 自动发布 Docker 镜像到 GHCR
+## Features
 
+- **OpenAI-compatible** endpoints: `/v1/chat/completions`, `/v1/models`
+- **OpenAI Responses** compatible endpoint: `/v1/responses`
+- **Anthropic Messages** compatible endpoint: `/v1/messages`
+- Streaming SSE conversion with token usage accounting
+- Model aliases, reasoning-effort mapping, and force-disable-thinking
+- Multi-tier auth routing: public / auto / `zen:` / `go:` prefixes
+- SOCKS5 support: direct, fixed proxy, or round-robin
+- Web admin panel: edit config, view stats, reload upstream sessions
+- GitHub Actions: multi-platform release binaries (Linux / macOS / Windows / FreeBSD)
+- GitHub Actions: multi-arch Docker image published to GHCR (`linux/amd64`, `linux/arm64`)
+- Single Go dependency (`lumberjack`); ships as one static binary
 
-## 开发结构
+## Project layout
 
 ```text
-cmd/opencode2api/         # 可执行入口
-internal/app/             # 代理核心：handler、协议转换、上游调用、管理面板
-internal/domain/          # 协议 DTO
-internal/ids/             # 响应 ID 规范化
-internal/random/          # 随机 ID 工具
+cmd/opencode2api/         # executable entrypoint
+internal/app/             # proxy core: handlers, protocol conversion, upstream calls, admin panel
+internal/domain/          # protocol DTOs
+internal/ids/             # response ID normalization
+internal/random/          # random ID helpers
 ```
 
-本地构建：
+Build locally:
 
 ```bash
 go build ./cmd/opencode2api
 ```
 
-## 快速开始
+## Quick start
 
 ```bash
 git clone https://github.com/6Kmfi6HP/opencode2api.git
@@ -42,27 +45,27 @@ cp config.example.json config.json
 go run ./cmd/opencode2api -port 8000 -config config.json -password "change-me"
 ```
 
-健康检查：
+Health check:
 
 ```bash
 curl http://127.0.0.1:8000/health
 ```
 
-查看模型：
+List models:
 
 ```bash
 curl http://127.0.0.1:8000/v1/models
 ```
 
-认证模式：
+### Authentication modes
 
-- 不带 `Authorization`，或使用 `Bearer public`：走 OpenCode public，只可稳定访问 `-free` 结尾的免费 Zen 模型。
-- 使用 `Bearer <api-key>`：默认走 Zen；如果请求的是仅存在于 Go 目录中的模型，会自动切到 Go。
-- 使用 `Bearer zen:<api-key>`：强制走 Zen，适合你明确要用 Zen 按量计费目录时。
-- 使用 `Bearer go:<api-key>`：优先走 Go 订阅目录；共享模型也会按 Go 路径请求。
-- 无效或占位 key（如 `no-key-required`）会自动回退到 public 模式。
+- No `Authorization`, or `Bearer public` → OpenCode public tier; only the `-free` Zen models are reachable.
+- `Bearer <api-key>` → defaults to Zen; auto-switches to Go if the requested model only exists in the Go catalog.
+- `Bearer zen:<api-key>` → forces the Zen metered catalog.
+- `Bearer go:<api-key>` → prefers the Go subscription catalog; shared models are also requested via the Go path.
+- Invalid or placeholder keys (e.g. `no-key-required`, Anthropic `sk-ant-*`) fall back to public.
 
-Chat Completions 示例：
+Chat Completions example:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -74,7 +77,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Go 订阅示例：
+Go subscription example:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -87,46 +90,46 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-## 命令行参数
+## CLI flags
 
 ```text
 -port string
-    服务端口，默认 8000
+    Service port, default 8000
 -config string
-    配置文件路径，默认 config.json
+    Config file path, default config.json
 -password string
-    管理面板密码，默认 123456；留空表示不启用登录验证
+    Admin panel password, default 123456; empty disables login auth
 -debug
-    输出调试日志（等价于将 -log-level 提升到 debug）
+    Emit debug logs (raises -log-level to debug when it is at the default info)
 -log-level string
-    日志级别: debug/info/warn/error，默认 info
+    Log level: debug/info/warn/error, default info
 -log-file string
-    日志文件路径，默认 opencode2api.log；配合自动轮换
+    Log file path, default opencode2api.log; auto-rotated
 -log-stdout
-    是否同时写 stdout，默认 true
+    Also write to stdout, default true
 -log-max-size int
-    单日志文件最大 MB，默认 100
+    Max MB per log file, default 100
 -log-max-backups int
-    保留旧日志个数，默认 7
+    Number of old logs to keep, default 7
 -log-max-age int
-    旧日志保留天数，默认 14
+    Days to retain old logs, default 14
 -log-compress
-    轮换后 gzip 压缩，默认 true
+    gzip rotated logs, default true
 -log-bodies
-    Debug 下记录截断的 body 形状摘要，默认 false
+    Under debug, log truncated body-shape summaries, default false
 -version
-    显示构建版本
+    Print build version
 ```
 
-第一次部署请务必修改 `-password`。如果把服务暴露到公网，建议只通过反向代理、访问控制或 VPN 暴露管理面板。
+Change `-password` on first deploy. If you expose the service publicly, put the admin panel behind a reverse proxy, access control, or VPN.
 
-### 排障日志
+### Logs and troubleshooting
 
-默认同时写文件与 stdout。每个请求带 `request_id`（响应头 `X-Request-Id`），可串联：
+By default logs go to both file and stdout. Every request carries a `request_id` (response header `X-Request-Id`) you can chain:
 
 `request_started → request_plan → upstream_attempt* → upstream_result → stream_result|request_result → request_done`
 
-常见排查：
+Common queries:
 
 ```bash
 rg 'empty_reply=true' opencode2api.log
@@ -134,13 +137,20 @@ rg 'request_id=XXXX' opencode2api.log
 rg 'promoted_reasoning=true' opencode2api.log
 ```
 
-容器内默认日志路径是 `/data/opencode2api.log`（挂载卷持久化），可用环境变量覆盖：
+In the container, the default log path is `/data/opencode2api.log` (persisted on the mounted volume). The entrypoint reads the following environment variables (all optional — CLI flags still win when passed explicitly):
 
-- `OPENCODE2API_LOG_FILE`
-- `OPENCODE2API_LOG_LEVEL`
-- `OPENCODE2API_LOG_STDOUT`
+| Env var | Default | Maps to flag |
+| --- | --- | --- |
+| `OPENCODE2API_PORT` | `8000` | `-port` |
+| `OPENCODE2API_CONFIG` | `/data/config.json` | `-config` |
+| `OPENCODE2API_PASSWORD` | `123456` | `-password` |
+| `OPENCODE2API_LOG_FILE` | `/data/opencode2api.log` | `-log-file` |
+| `OPENCODE2API_LOG_LEVEL` | `info` | `-log-level` |
+| `OPENCODE2API_LOG_STDOUT` | `true` | `-log-stdout` |
+| `OPENCODE2API_SOCKS5_ADDR` | *(unset)* | bootstraps a SOCKS5 entry in `config.json` when set |
+| `OPENCODE2API_SOCKS5_NAME` | `proxy` | name of the bootstrapped SOCKS5 entry |
 
-## 本地构建
+## Local build
 
 ```bash
 make test
@@ -149,16 +159,16 @@ make build
 ./bin/opencode2api -version
 ```
 
-生成本地多平台 release 包：
+Generate local multi-platform release archives:
 
 ```bash
 make release-snapshot VERSION=v0.1.0
 ls dist/
 ```
 
-## 自动 Release
+## Releases
 
-推送 `v*` tag 后，GitHub Actions 会先运行一次格式、测试和 vet 检查，然后用 matrix 并发构建以下目标：
+Pushing a `v*` tag triggers GitHub Actions, which first runs formatting, tests, and vet, then builds the following targets in a matrix:
 
 - `linux/amd64`
 - `linux/arm64`
@@ -170,36 +180,84 @@ ls dist/
 - `freebsd/amd64`
 - `freebsd/arm64`
 
-发布命令：
+Publish a release:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Release 会包含每个平台的 `.tar.gz` 包和统一生成的 `checksums.txt`。
+Each release includes a per-platform `.tar.gz` and a generated `checksums.txt`.
 
-## Docker Compose 部署
+## Docker
 
-项目提供单独运行、Tor 代理、WARP 代理三套 compose 模版：
+The Dockerfile is multi-arch and publishes to GHCR. Pull the image:
+
+```bash
+docker pull ghcr.io/6kmfi6hp/opencode2api:latest
+```
+
+Run directly:
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -v "$PWD/data:/data" \
+  -e OPENCODE2API_PASSWORD="change-me" \
+  ghcr.io/6kmfi6hp/opencode2api:latest
+```
+
+### Docker Compose
+
+Three compose templates are provided (standalone, Tor, WARP):
 
 ```bash
 export OPENCODE2API_PASSWORD="change-me"
 docker compose -f deploy/compose/compose.yml up -d
 ```
 
-代理部署见 [Docker Compose 部署模版](deploy/compose/README.md)。
+See [Docker Compose templates](deploy/compose/README.md) for Tor and WARP variants.
 
-## 文档
+## Configuration
 
-- [API 兼容说明](docs/API.md)
-- [配置说明](docs/CONFIGURATION.md)
-- [部署说明](docs/DEPLOYMENT.md)
-- [发布流程](docs/RELEASE.md)
-- [Docker Compose 部署模版](deploy/compose/README.md)
-- [贡献指南](CONTRIBUTING.md)
-- [安全说明](SECURITY.md)
+Config lives in `config.json` (copy from `config.example.json`). Key fields:
 
-## 许可证
+| Field | Description |
+| --- | --- |
+| `model_alias` | Client model name → upstream model name. Explicit `go:`/`zen:` routing wins over a same-name `-free` alias. |
+| `reasoning_effort_map` | Maps client `reasoning_effort` to upstream-accepted values. |
+| `force_disable_thinking` | When `true`, disables thinking/reasoning and strips it from responses. |
+| `max_tokens_cap` | Global `max_tokens` ceiling; `0` = unlimited. |
+| `max_tokens_cap_per_model` | Per-model override; `0` = unlimited for that model. |
+| `socks5_proxies` | SOCKS5 proxy list. |
+| `active_socks5` | `""` direct, an `addr` for a fixed proxy, or `__round_robin__`. |
+| `socks5_paid_direct` | `true` makes keyed/paid requests bypass SOCKS5; only public/free goes through proxy. |
 
-当前仓库默认保留全部权利，避免在未确认授权策略前自动开源。需要公开开源时，可将 `LICENSE` 替换为 MIT、Apache-2.0 或其他许可证。
+Full details: [Configuration](docs/CONFIGURATION.md).
+
+## Documentation
+
+- [API compatibility](docs/API.md)
+- [Configuration](docs/CONFIGURATION.md)
+- [Deployment](docs/DEPLOYMENT.md)
+- [Release process](docs/RELEASE.md)
+- [Docker Compose templates](deploy/compose/README.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security](SECURITY.md)
+
+## Contributing
+
+Before submitting, run:
+
+```bash
+make fmt
+make test
+make vet
+make build
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for principles and commit message conventions.
+
+## License
+
+All rights reserved by default until an open-source license is chosen. To open-source, replace `LICENSE` with MIT, Apache-2.0, or another license.
