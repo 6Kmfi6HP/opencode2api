@@ -812,7 +812,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelIn := claudeReq.Model
-	claudeReq.Model = resolveModel(claudeReq.Model)
+	claudeReq.Model = resolveModelForAuth(auth, claudeReq.Model)
 	claudeReq.Model = mapPublicToFreeModel(auth, claudeReq.Model)
 	if !validateRequestTemperature(w, claudeReq.Temperature, "claude", 0, 1) {
 		return

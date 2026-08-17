@@ -419,7 +419,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelIn := req.Model
-	req.Model = resolveModel(req.Model)
+	req.Model = resolveModelForAuth(auth, req.Model)
 	if req.Model == "" {
 		modelIDs := getModelIDs()
 		if len(modelIDs) > 0 {

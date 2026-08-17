@@ -755,6 +755,108 @@ func TestResolveModelMapsStrippedFreeNameBackToUpstream(t *testing.T) {
 	}
 }
 
+func TestResolveModelForAuthPrefersGoModelOverMatchingFreeAlias(t *testing.T) {
+	oldModelsCache := modelsCache
+	oldGoModelsCache := goModelsCache
+	oldModelAlias := modelAlias
+	modelMu.Lock()
+	modelsCache = []ModelInfo{
+		{ID: "deepseek-v4-flash"},
+		{ID: "deepseek-v4-flash-free"},
+		{ID: "free-only-free"},
+		{ID: "zen-target"},
+	}
+	goModelsCache = []ModelInfo{{ID: "deepseek-v4-flash"}, {ID: "go-target"}}
+	modelMu.Unlock()
+	configMu.Lock()
+	modelAlias = map[string]string{
+		"deepseek-v4-flash": "deepseek-v4-flash-free",
+		"free-only":         "free-only-free",
+		"custom-alias":      "go-target",
+		"zen-alias":         "zen-target",
+	}
+	configMu.Unlock()
+	t.Cleanup(func() {
+		modelMu.Lock()
+		modelsCache = oldModelsCache
+		goModelsCache = oldGoModelsCache
+		modelMu.Unlock()
+		configMu.Lock()
+		modelAlias = oldModelAlias
+		configMu.Unlock()
+	})
+
+	tests := []struct {
+		name   string
+		auth   UpstreamAuth
+		model  string
+		want   string
+		wantGo bool
+	}{
+		{
+			name:   "go mode keeps exact go model instead of matching free alias",
+			auth:   UpstreamAuth{Mode: AuthRouteGo},
+			model:  "deepseek-v4-flash",
+			want:   "deepseek-v4-flash",
+			wantGo: true,
+		},
+		{
+			name:   "auto mode keeps existing free alias behavior",
+			auth:   UpstreamAuth{Mode: AuthRouteAuto},
+			model:  "deepseek-v4-flash",
+			want:   "deepseek-v4-flash-free",
+			wantGo: false,
+		},
+		{
+			name:   "zen mode keeps exact zen model instead of matching free alias",
+			auth:   UpstreamAuth{Mode: AuthRouteZen},
+			model:  "deepseek-v4-flash",
+			want:   "deepseek-v4-flash",
+			wantGo: false,
+		},
+		{
+			name:   "go mode uses free alias when exact model is absent from go catalog",
+			auth:   UpstreamAuth{Mode: AuthRouteGo},
+			model:  "free-only",
+			want:   "free-only-free",
+			wantGo: false,
+		},
+		{
+			name:   "zen mode uses free alias when exact model is absent from zen catalog",
+			auth:   UpstreamAuth{Mode: AuthRouteZen},
+			model:  "free-only",
+			want:   "free-only-free",
+			wantGo: false,
+		},
+		{
+			name:   "go mode preserves ordinary aliases",
+			auth:   UpstreamAuth{Mode: AuthRouteGo},
+			model:  "custom-alias",
+			want:   "go-target",
+			wantGo: true,
+		},
+		{
+			name:   "zen mode preserves ordinary aliases",
+			auth:   UpstreamAuth{Mode: AuthRouteZen},
+			model:  "zen-alias",
+			want:   "zen-target",
+			wantGo: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveModelForAuth(tt.auth, tt.model)
+			if got != tt.want {
+				t.Fatalf("resolveModelForAuth(%v, %q) = %q, want %q", tt.auth.Mode, tt.model, got, tt.want)
+			}
+			if gotGo := tt.auth.shouldUseGoEndpoint(got); gotGo != tt.wantGo {
+				t.Fatalf("shouldUseGoEndpoint(%q) = %v, want %v", got, gotGo, tt.wantGo)
+			}
+		})
+	}
+}
+
 func TestMapPublicToFreeModel(t *testing.T) {
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
