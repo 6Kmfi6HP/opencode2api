@@ -83,7 +83,7 @@
 
 - 本项目未声明支持的 Chat Completions beta 字段不会被合成或伪造。
 
-`model` 会先经过 `model_alias` 解析。`reasoning_effort` 会按 `reasoning_effort_map` 转换。
+`model` 通常会先经过 `model_alias` 解析；显式使用 `go:` 或 `zen:` 且原模型存在于对应目录时，同名的 `模型 -> 模型-free` 兼容别名会让位于对应目录中的原模型。`reasoning_effort` 会按 `reasoning_effort_map` 转换。
 
 ## Responses API
 

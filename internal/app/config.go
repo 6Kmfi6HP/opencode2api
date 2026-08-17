@@ -96,6 +96,27 @@ func resolveModel(model string) string {
 	return m
 }
 
+// Explicit catalog routing wins over a legacy same-name alias to the free variant.
+func resolveModelForAuth(auth UpstreamAuth, model string) string {
+	m := strings.TrimSpace(model)
+	exactModelAvailable := false
+	switch auth.Mode {
+	case AuthRouteGo:
+		exactModelAvailable = isModelInGoCatalog(m)
+	case AuthRouteZen:
+		exactModelAvailable = isModelInZenCatalog(m)
+	}
+	if m != "" && exactModelAvailable {
+		configMu.RLock()
+		alias, ok := modelAlias[m]
+		configMu.RUnlock()
+		if ok && strings.TrimSpace(alias) == m+"-free" {
+			return m
+		}
+	}
+	return resolveModel(m)
+}
+
 func getForceDisableThinking() bool {
 	configMu.RLock()
 	defer configMu.RUnlock()

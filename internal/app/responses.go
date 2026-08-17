@@ -981,7 +981,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	modelIn := respReq.Model
-	respReq.Model = resolveModel(respReq.Model)
+	respReq.Model = resolveModelForAuth(auth, respReq.Model)
 	if !validateRequestTemperature(w, respReq.Temperature, "responses", 0, 2) {
 		return
 	}

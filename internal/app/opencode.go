@@ -158,6 +158,12 @@ func isModelInGoCatalog(modelID string) bool {
 	return containsModelWithID(goModelsCache, modelID)
 }
 
+func isModelInZenCatalog(modelID string) bool {
+	modelMu.RLock()
+	defer modelMu.RUnlock()
+	return containsModelWithID(modelsCache, modelID)
+}
+
 func isGoCatalogOnlyModel(modelID string) bool {
 	modelMu.RLock()
 	defer modelMu.RUnlock()
