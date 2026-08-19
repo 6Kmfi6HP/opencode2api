@@ -23,6 +23,7 @@
   },
   "prompt_cache_retention": "24h",
   "cache_control_breakpoints": true,
+  "text_only_models": ["deepseek"],
   "socks5_sticky": true,
   "socks5_proxies": [
     {

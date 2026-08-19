@@ -467,6 +467,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		"reasoning_effort_out": mappedReasoningEffort(effortIn),
 		"tools_count":          len(req.Tools),
 		"messages_count":       len(req.Messages),
+		"multimodal_parts":     countMultimodalParts(req.Messages),
+		"text_only_model":      isTextOnlyModel(req.Model),
 		"max_tokens":           req.MaxTokens,
 		"max_tokens_cap":       getMaxTokensCapForModel(req.Model),
 	})
@@ -922,7 +924,74 @@ func ensureReasoningContent(messages []Message, thinking bool) []Message {
 	return messages
 }
 
-func convertMessagesForUpstream(messages []Message) []map[string]any {
+// multimodalAttachedLabel is the text annotation that replaces multimodal
+// image/document parts when the resolved upstream model only accepts text.
+// It matches the label the Claude converter already uses for tool_result
+// attachments, so tool images and message images degrade identically.
+const (
+	multimodalAttachedLabel = "[image attached]"
+	multimodalDocumentLabel = "[document attached]"
+)
+
+// countMultimodalParts returns the number of image/document content parts in
+// a request, for observability (request_plan).
+func countMultimodalParts(messages []Message) int {
+	n := 0
+	for _, msg := range messages {
+		arr, ok := msg.Content.([]any)
+		if !ok {
+			continue
+		}
+		for _, part := range arr {
+			pm, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch pm["type"] {
+			case "image_url", "file":
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// downgradeMultimodalContent replaces image_url ("[image attached]") and file
+// ("[document attached]") content parts with text annotations so requests to
+// text-only upstream models (e.g. DeepSeek) keep working instead of failing
+// with "image not supported". Text and all other parts are preserved, as is
+// the relative order. Returns the original slice unchanged when model is not
+// text-only or there is nothing to downgrade.
+func downgradeMultimodalContent(content []any, textOnly bool) any {
+	if !textOnly {
+		return content
+	}
+	out := make([]any, 0, len(content))
+	downgraded := false
+	for _, part := range content {
+		pm, ok := part.(map[string]any)
+		if !ok {
+			out = append(out, part)
+			continue
+		}
+		switch pm["type"] {
+		case "image_url":
+			downgraded = true
+			out = append(out, map[string]any{"type": "text", "text": multimodalAttachedLabel})
+		case "file":
+			downgraded = true
+			out = append(out, map[string]any{"type": "text", "text": multimodalDocumentLabel})
+		default:
+			out = append(out, part)
+		}
+	}
+	if !downgraded {
+		return content
+	}
+	return out
+}
+
+func convertMessagesForUpstream(messages []Message, textOnly bool) []map[string]any {
 	converted := make([]map[string]any, 0, len(messages))
 	for _, msg := range messages {
 		clean := map[string]any{}
@@ -930,6 +999,9 @@ func convertMessagesForUpstream(messages []Message) []map[string]any {
 			clean["role"] = msg.Role
 		}
 		content := normalizeContent(msg.Content)
+		if arr, ok := content.([]any); ok {
+			content = downgradeMultimodalContent(arr, textOnly)
+		}
 		reasoningContent := msg.ReasoningContent
 		if content != nil {
 			clean["content"] = content
@@ -956,7 +1028,7 @@ func convertMessagesForUpstream(messages []Message) []map[string]any {
 func convertRequest(req *OpenAIRequest) map[string]any {
 	converted := map[string]any{
 		"model":    req.Model,
-		"messages": convertMessagesForUpstream(req.Messages),
+		"messages": convertMessagesForUpstream(req.Messages, isTextOnlyModel(req.Model)),
 		"stream":   req.Stream,
 	}
 	if req.Temperature != nil {

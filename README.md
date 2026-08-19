@@ -235,6 +235,7 @@ Config lives in `config.json` (copy from `config.example.json`). Key fields:
 | `socks5_proxies` | SOCKS5 proxy list. |
 | `active_socks5` | `""` direct, an `addr` for a fixed proxy, or `__round_robin__`. |
 | `socks5_paid_direct` | `true` makes keyed/paid requests bypass SOCKS5; only public/free goes through proxy. |
+| `text_only_models` | Model prefixes accepting text only (default `deepseek`); images are silently downgraded to an `[image attached]` text annotation. |
 
 Full details: [Configuration](docs/CONFIGURATION.md).
 

@@ -79,6 +79,20 @@ cp config.example.json config.json
 | `nemotron-3-ultra-free` | context length | 1,000,000 |
 | `nemotron-3.5-lightning-free` | context length | 1,000,000 |
 
+### `text_only_models`
+
+只接受文本输入的上游模型前缀列表。请求解析到这些模型时，消息里的图片/文档内容会被**静默降级**为文本标注（`[image attached]` / `[document attached]`）后继续转发，而不是把无法处理的多模态内容交给上游报错。
+
+匹配是**大小写不敏感的前缀匹配**：一个前缀覆盖该模型的所有变体。例如 `"deepseek"` 同时匹配 `deepseek-v4-flash` 和 `deepseek-v4-flash-free`。
+
+不填时默认 `["deepseek"]`；显式设置（即使是空数组）会替换默认值。此字段同样作用于 Chat、Responses、Claude 三条协议面。
+
+```json
+{
+  "text_only_models": ["deepseek"]
+}
+```
+
 ### `socks5_proxies`
 
 SOCKS5 代理列表。

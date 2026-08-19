@@ -1174,6 +1174,8 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		"reasoning_effort_out": mappedReasoningEffort(effortIn),
 		"tools_count":          len(respReq.Tools),
 		"messages_count":       len(chatReq.Messages),
+		"multimodal_parts":     countMultimodalParts(chatReq.Messages),
+		"text_only_model":      isTextOnlyModel(chatReq.Model),
 		"max_tokens":           chatReq.MaxTokens,
 		"max_tokens_cap":       getMaxTokensCapForModel(chatReq.Model),
 	})

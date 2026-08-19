@@ -21,6 +21,7 @@ var (
 	maxTokensCapPerModel = map[string]int{}
 	promptCacheRetention string // "" -> runtime default "24h"; "off" disables injection
 	cacheBreakpoints     = true
+	textOnlyModels       = []string{"deepseek"} // default: text-only upstreams
 	debugMode            bool
 	configMu             sync.RWMutex
 	storedResponses      = map[string]StoredResponseState{}
@@ -91,6 +92,9 @@ func applyConfig(cfg AppConfig) {
 	}
 	if cfg.CacheControlBreakpoints != nil {
 		cacheBreakpoints = *cfg.CacheControlBreakpoints
+	}
+	if cfg.TextOnlyModels != nil {
+		textOnlyModels = cfg.TextOnlyModels
 	}
 
 }
@@ -180,6 +184,27 @@ func getCacheBreakpoints() bool {
 	configMu.RLock()
 	defer configMu.RUnlock()
 	return cacheBreakpoints
+}
+
+// isTextOnlyModel reports whether the resolved upstream model ID only accepts
+// text input. Matching is case-insensitive prefix matching, so one configured
+// prefix covers every variant (e.g. "deepseek" matches both
+// "deepseek-v4-flash" and "deepseek-v4-flash-free"). When a request resolves
+// to a text-only model, multimodal image/document parts are downgraded to text
+// annotations instead of being forwarded upstream.
+func isTextOnlyModel(modelID string) bool {
+	name := strings.ToLower(strings.TrimSpace(modelID))
+	if name == "" {
+		return false
+	}
+	configMu.RLock()
+	defer configMu.RUnlock()
+	for _, prefix := range textOnlyModels {
+		if strings.HasPrefix(name, strings.ToLower(strings.TrimSpace(prefix))) {
+			return true
+		}
+	}
+	return false
 }
 
 // rejectsCacheControl reports whether a resolved upstream model is known to

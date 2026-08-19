@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.9
+
+- Silence multi-modal downgrade for text-only upstream models: models matching the new configurable `text_only_models` prefixes (default `["deepseek"]`, prefix-matched case-insensitively) have image and document parts replaced with `[image attached]` / `[document attached]` text annotations before the request leaves the proxy, so DeepSeek requests with screenshots or pasted images keep working instead of failing upstream with an image-unsupported error. Applied uniformly across the Chat, Responses, and Claude protocol surfaces (single choke point at `buildUpstreamBody`); text content and part order are preserved.
+
 ## v0.4.8
 
 - Align Messages-API `input_tokens` with Anthropic semantics: when `cache_read_input_tokens` is derived from DeepSeek/OpenAI-style counters (`prompt_cache_hit_tokens` or `prompt_tokens_details.cached_tokens`), the hit portion is subtracted from `input_tokens`, since `prompt_tokens` includes it. Clients that price input and cache reads separately no longer bill hit tokens twice (289 prompt + 256 hit now reports `input_tokens: 33`, `cache_read_input_tokens: 256`). Anthropic-style `cache_read_input_tokens` sources are left untouched.

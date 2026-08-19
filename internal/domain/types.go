@@ -70,6 +70,13 @@ type AppConfig struct {
 	// building up instead of being reset on every rotation. Set to false to
 	// restore pure round-robin rotation.
 	Socks5Sticky *bool `json:"socks5_sticky,omitempty"`
+	// TextOnlyModels lists model ID prefixes that only accept text input
+	// (e.g. DeepSeek). When a request resolves to one of these models,
+	// multimodal image/document parts are silently downgraded to a text
+	// annotation ("[image attached]") instead of being forwarded to an
+	// upstream that rejects them. Defaults to ["deepseek"] when unset;
+	// an explicit value (even empty) replaces the default.
+	TextOnlyModels []string `json:"text_only_models,omitempty"`
 }
 
 type Socks5Proxy struct {
