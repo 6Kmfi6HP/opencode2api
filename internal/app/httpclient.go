@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -174,7 +175,156 @@ var socks5RRIndex uint32
 var (
 	socks5Client     *http.Client // 缓存的 SOCKS5 客户端
 	socks5ClientAddr string       // 缓存对应的代理地址
+	socks5Sticky     bool         // 轮询模式下按会话固定出口（默认 true）
 )
+
+// ======================== 会话粘性代理（sticky egress） ========================
+//
+// 上游免费层（opencode.ai/zen -free 模型）的 prompt 缓存按出口 IP 隔离：
+// 同一请求经不同出口会各自冷启动，缓存几乎无法命中。轮询模式下若每次请求
+// 随机换出口，命中率会归零（实测 0% vs 固定出口 99.8%）。
+//
+// sticky 模式为同一会话（账号 token 或客户端会话 user）固定一个出口代理，
+// 让缓存持续累积；不同会话之间仍轮询分散，保留多出口的意义。绑定 TTL
+// 过期或代理连接失败时自动解除，重新分配出口。
+
+type stickyProxyEntry struct {
+	proxyIdx int
+	client   *http.Client
+	lastUsed time.Time
+}
+
+var (
+	stickyMu      sync.Mutex
+	stickyEntries = map[string]*stickyProxyEntry{}
+)
+
+const (
+	stickyEntryTTL       = 15 * time.Minute
+	stickyMaxEntries     = 256
+	stickyPublicFallback = "cli://public-shared" // 无会话标识的 public 请求共用同一出口
+)
+
+// stickyRebindSeq 每次重新绑定递增,参与哈希,保证同一会话在绑定被切断
+// (上游 429/5xx/连接错误)后重新分配时换到不同出口,而不是永远钉死
+// 在同一个确定性哈希结果上。
+var stickyRebindSeq uint32
+
+// stickyKeyForRequest 生成会话粘性键。优先级：账号 token > 会话 user
+// （来自 Claude metadata 的 session_id 等）> 公共兜底。
+func stickyKeyForRequest(auth UpstreamAuth, bodyMap map[string]any) string {
+	if auth.Token != "" {
+		return "tok:" + auth.Token
+	}
+	if u, ok := bodyMap["user"].(string); ok && u != "" {
+		return "usr:" + u
+	}
+	return stickyPublicFallback
+}
+
+// buildProxyClient 为指定代理构建带 SOCKS5 dial 的 HTTP 客户端。
+func buildProxyClient(proxy Socks5Proxy) *http.Client {
+	return &http.Client{
+		Timeout: 300 * time.Second,
+		Transport: &http.Transport{
+			DialContext:         socks5Dial(proxy),
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 20,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+}
+
+// getHTTPClientSticky 在轮询代理模式下选择客户端：
+// sticky 开启且能识别会话时固定出口，否则退化为普通轮询。
+func getHTTPClientSticky(auth UpstreamAuth, bodyMap map[string]any) *http.Client {
+	// 带 key 直连配置优先，不参与粘性。
+	if auth.tier() == TierPaid && getSocks5PaidDirect() {
+		return httpClient
+	}
+	if !getSocks5Sticky() {
+		return getHTTPClientForTier(auth.tier())
+	}
+	socks5Mu.RLock()
+	rr := activeSocks5 == socks5RR
+	proxies := socks5Proxies
+	socks5Mu.RUnlock()
+	if !rr || len(proxies) == 0 {
+		return getHTTPClientForTier(auth.tier())
+	}
+
+	key := stickyKeyForRequest(auth, bodyMap)
+
+	stickyMu.Lock()
+	now := time.Now()
+	// 懒清理：先清过期条目，超出上限时再清最旧的。
+	if len(stickyEntries) > stickyMaxEntries || len(stickyEntries) > 0 {
+		for k, e := range stickyEntries {
+			if now.Sub(e.lastUsed) > stickyEntryTTL {
+				delete(stickyEntries, k)
+			}
+		}
+	}
+	if len(stickyEntries) > stickyMaxEntries {
+		var oldestKey string
+		var oldest time.Time
+		for k, e := range stickyEntries {
+			if oldestKey == "" || e.lastUsed.Before(oldest) {
+				oldestKey, oldest = k, e.lastUsed
+			}
+		}
+		delete(stickyEntries, oldestKey)
+	}
+	if e, ok := stickyEntries[key]; ok {
+		e.lastUsed = now
+		client := e.client
+		stickyMu.Unlock()
+		slog.Debug("sticky proxy reuse", "key", key, "idx", e.proxyIdx)
+		return client
+	}
+
+	// 哈希 + 递增序号:同一 key 的连续绑定会落在不同出口,使代理切换真正生效。
+	seq := atomic.AddUint32(&stickyRebindSeq, 1)
+	idx := int((fnv32a(key) + seq) % uint32(len(proxies)))
+	entry := &stickyProxyEntry{proxyIdx: idx, client: buildProxyClient(proxies[idx]), lastUsed: now}
+	stickyEntries[key] = entry
+	stickyMu.Unlock()
+	slog.Debug("sticky proxy bind", "key", key, "idx", idx, "addr", proxies[idx].Addr)
+	return entry.client
+}
+
+// invalidateStickyProxy 在代理连接失败时解除会话的 sticky 绑定，
+// 让下一次请求重新分配出口，避免持续使用故障代理。
+func invalidateStickyProxy(auth UpstreamAuth, bodyMap map[string]any) {
+	if !getSocks5Sticky() {
+		return
+	}
+	socks5Mu.RLock()
+	rr := activeSocks5 == socks5RR
+	socks5Mu.RUnlock()
+	if !rr {
+		return
+	}
+	key := stickyKeyForRequest(auth, bodyMap)
+	stickyMu.Lock()
+	delete(stickyEntries, key)
+	stickyMu.Unlock()
+}
+
+func fnv32a(s string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}
+
+func getSocks5Sticky() bool {
+	socks5Mu.RLock()
+	defer socks5Mu.RUnlock()
+	return socks5Sticky
+}
 
 func getHTTPClient() *http.Client {
 	socks5Mu.RLock()
@@ -212,16 +362,7 @@ func getHTTPClient() *http.Client {
 		}
 	}
 
-	dial := socks5Dial(proxy)
-	client := &http.Client{
-		Timeout: 300 * time.Second,
-		Transport: &http.Transport{
-			DialContext:         dial,
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
+	client := buildProxyClient(proxy)
 
 	if !useRR {
 		socks5Client = client

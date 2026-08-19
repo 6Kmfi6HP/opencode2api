@@ -64,6 +64,12 @@ type AppConfig struct {
 	// body for models that accept it (GLM/Zhipu reject the field and are
 	// always skipped). Defaults to true.
 	CacheControlBreakpoints *bool `json:"cache_control_breakpoints,omitempty"`
+	// Socks5Sticky, when true (default), keeps the round-robin proxy mode
+	// session-sticky: requests from the same account/session always use the
+	// same egress proxy, so upstream prompt caches (which are per-egress) keep
+	// building up instead of being reset on every rotation. Set to false to
+	// restore pure round-robin rotation.
+	Socks5Sticky *bool `json:"socks5_sticky,omitempty"`
 }
 
 type Socks5Proxy struct {

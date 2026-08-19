@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.6
+
+- Add session-sticky egress (`socks5_sticky`, default `true`) for round-robin proxy mode. Each session/account (paid by API token, public by Claude metadata `session_id`, otherwise a shared fallback) pins one egress proxy, so upstream per-egress prompt caches keep building up: measured 99.8% cache hit on a pinned egress vs ~0% when rotation randomly switches egress between requests. Different sessions still rotate, keeping the multi-egress distribution.
+- Release sticky bindings before retrying upstream errors: free-tier 429s are rate-limited per egress IP, so the retry rotates to the next proxy (verified live: 429 on egress A → automatic rebind to egress B → retry succeeds). Transport errors and 5xx release the binding too.
+- Fix rebind-after-invalidate using a deterministic hash, which always landed the same session back on the same proxy (i.e. "switch IP on error" never actually happened). Rebinding now rotates egress via an incrementing sequence mixed into the hash.
+- Clear all sticky bindings when the proxy configuration changes (`active_socks5` or the proxy list), so stale bindings never point at removed egresses.
+
 ## v0.4.5
 
 - Improve prompt-cache hit rate on the OpenCode zen upstream. Requests now inject `prompt_cache_retention: "24h"` (upstream default is ~5 min) and an Anthropic-style `cache_control: {"type":"ephemeral","ttl":"1h"}` breakpoint for models that accept it. GLM/Zhipu models, which reject unknown fields, are always skipped, and client-supplied `extra_body` values win over the injected defaults. Both behaviors are configurable via `prompt_cache_retention` (`"24h"` default, `"in_memory"`, or `"off"`) and `cache_control_breakpoints` (default `true`).

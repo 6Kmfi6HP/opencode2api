@@ -23,6 +23,7 @@
   },
   "prompt_cache_retention": "24h",
   "cache_control_breakpoints": true,
+  "socks5_sticky": true,
   "socks5_proxies": [
     {
       "addr": "127.0.0.1:1080",

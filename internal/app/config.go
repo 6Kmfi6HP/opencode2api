@@ -73,9 +73,18 @@ func applyConfig(cfg AppConfig) {
 		socks5Client = nil
 		socks5ClientAddr = ""
 		atomic.StoreUint32(&socks5RRIndex, 0)
+		// 代理配置变化后旧 sticky 绑定可能指向已不存在的出口,全部清空重建。
+		stickyMu.Lock()
+		stickyEntries = map[string]*stickyProxyEntry{}
+		stickyMu.Unlock()
 	}
 	socks5PaidDirect = cfg.Socks5PaidDirect
 	socks5Mu.Unlock()
+
+	socks5Sticky = true
+	if cfg.Socks5Sticky != nil {
+		socks5Sticky = *cfg.Socks5Sticky
+	}
 
 	if cfg.PromptCacheRetention != "" {
 		promptCacheRetention = cfg.PromptCacheRetention

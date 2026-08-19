@@ -335,7 +335,7 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		if err != nil {
 			return nil, 500, nil, err
 		}
-		client := getHTTPClientForTier(auth.tier())
+		client := getHTTPClientSticky(auth, bodyMap)
 		attemptStart := time.Now()
 		resp, err := client.Do(up)
 		durationMs := time.Since(attemptStart).Milliseconds()
@@ -358,6 +358,7 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 			)
 			if canRetry {
 				client.CloseIdleConnections()
+				invalidateStickyProxy(auth, bodyMap)
 				retryCount++
 				continue
 			}
@@ -429,6 +430,9 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		if !canRetry {
 			break
 		}
+		// 免费层 429 按出口 IP 限流,5xx 也可能是出口问题:
+		// 重试前切断 sticky,让同一会话换到下一个出口。
+		invalidateStickyProxy(auth, bodyMap)
 		client.CloseIdleConnections()
 		retryCount++
 	}
@@ -529,7 +533,7 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 		if err != nil {
 			return nil, 500, nil, err
 		}
-		client := getHTTPClientForTier(auth.tier())
+		client := getHTTPClientSticky(auth, bodyMap)
 		attemptStart := time.Now()
 		resp, err := client.Do(up)
 		durationMs := time.Since(attemptStart).Milliseconds()
@@ -550,6 +554,7 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 			)
 			if canRetry {
 				client.CloseIdleConnections()
+				invalidateStickyProxy(auth, bodyMap)
 				retryCount++
 				continue
 			}
@@ -597,6 +602,9 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 		if !canRetry {
 			break
 		}
+		// 免费层 429 按出口 IP 限流,5xx 也可能是出口问题:
+		// 重试前切断 sticky,让同一会话换到下一个出口。
+		invalidateStickyProxy(auth, bodyMap)
 		client.CloseIdleConnections()
 		retryCount++
 	}

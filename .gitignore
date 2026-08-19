@@ -16,3 +16,6 @@ bin/
 .vscode/
 *.swp
 .env
+
+# Local deployment helpers (not for upstream)
+/scripts/update-remote.sh

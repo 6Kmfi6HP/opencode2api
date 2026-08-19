@@ -231,6 +231,7 @@ Config lives in `config.json` (copy from `config.example.json`). Key fields:
 | `max_tokens_cap_per_model` | Per-model override; `0` = unlimited for that model. |
 | `prompt_cache_retention` | Asks the upstream zen gateway to keep prompt-prefix caches for `"24h"` (default) or `"in_memory"` (~5 min); `"off"` disables injection. |
 | `cache_control_breakpoints` | When `true` (default), adds an Anthropic-style `cache_control` breakpoint (`ttl: 1h`) to upstream requests for models that accept it. GLM/Zhipu models are always skipped. |
+| `socks5_sticky` | When `true` (default) and `active_socks5` is `__round_robin__`, each session/account sticks to one egress proxy so upstream per-egress prompt caches keep hitting (measured 99.8% on a pinned egress vs ~0% on random rotation). |
 | `socks5_proxies` | SOCKS5 proxy list. |
 | `active_socks5` | `""` direct, an `addr` for a fixed proxy, or `__round_robin__`. |
 | `socks5_paid_direct` | `true` makes keyed/paid requests bypass SOCKS5; only public/free goes through proxy. |

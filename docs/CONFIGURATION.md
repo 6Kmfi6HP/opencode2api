@@ -118,6 +118,27 @@ SOCKS5 代理列表。
 }
 ```
 
+### `socks5_sticky`
+
+轮询模式（`active_socks5: "__round_robin__"`）下的会话粘性出口。
+
+实测（Claude Code 真实会话）：上游免费层 prompt 缓存按出口 IP 隔离，随机轮换出口时相同请求两次都全 miss；固定出口时相同请求命中 99.8%。`socks5_sticky` 让同一会话（付费按账号 token，public 按 Claude metadata 的 session_id，缺省按公共兜底）固定走同一出口代理，缓存持续累积；不同会话之间仍然轮询分散。
+
+- 缺省或 `true`：轮询时按会话固定出口（推荐）
+- `false`：恢复纯轮询（每次请求随机换出口）
+
+以下情况会自动切断当前会话的 sticky 绑定，重试/下次请求换到下一个出口：
+
+- 传输层连接错误（代理不可达）
+- 上游 HTTP 429（免费层按出口 IP 限流，换出口可绕过）与 5xx
+
+```json
+{
+  "active_socks5": "__round_robin__",
+  "socks5_sticky": true
+}
+```
+
 ### `prompt_cache_retention`
 
 向上游 zen 网关显式声明 prompt 前缀缓存的保留时长。上游默认约 5 分钟（`in_memory`），agent 任务间歇过长时缓存容易过期导致命中率低。
