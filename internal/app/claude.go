@@ -741,16 +741,12 @@ func buildClaudeUsageCore(upstreamUsage map[string]any) ClaudeUsage {
 			usage["cache_read_input_tokens"] = value
 		}
 	}
-	// DeepSeek-style counters: hit≈read, miss≈write. Only fill when the
-	// canonical fields above were absent so shapes never double-report.
+	// DeepSeek-style counters split the prompt into hit (read) and miss
+	// (ordinary input). Miss is not a cache write, so it is intentionally
+	// left out of the Claude cache fields.
 	if _, exists := usage["cache_read_input_tokens"]; !exists {
 		if value, ok := usageIntField(upstreamUsage, "prompt_cache_hit_tokens"); ok {
 			usage["cache_read_input_tokens"] = value
-		}
-	}
-	if _, exists := usage["cache_creation_input_tokens"]; !exists {
-		if value, ok := usageIntField(upstreamUsage, "prompt_cache_miss_tokens"); ok {
-			usage["cache_creation_input_tokens"] = value
 		}
 	}
 	if outputDetails, ok := usageMapField(upstreamUsage, "output_tokens_details"); ok {

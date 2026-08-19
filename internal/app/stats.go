@@ -108,24 +108,20 @@ func recordCacheUsage(model string, usage map[string]any) {
 // Returns (read, created).
 func parseCacheUsage(usage map[string]any) (int64, int64) {
 	var read, created int64
+	// Prefer the canonical Anthropic cache field. The fallbacks use the same
+	// semantic category (already-cached prompt tokens), so any combination is
+	// read once instead of double-counted.
 	if v, ok := usageIntField(usage, "cache_read_input_tokens"); ok {
 		read += int64(v)
-	}
-	if v, ok := usageIntField(usage, "cache_creation_input_tokens"); ok {
-		created += int64(v)
-	}
-	// DeepSeek-style counters (mutually exclusive with the above in practice,
-	// but sum defensively).
-	if v, ok := usageIntField(usage, "prompt_cache_hit_tokens"); ok {
+	} else if v, ok := usageIntField(usage, "prompt_cache_hit_tokens"); ok {
 		read += int64(v)
-	}
-	if v, ok := usageIntField(usage, "prompt_cache_miss_tokens"); ok {
-		created += int64(v)
-	}
-	if details, ok := usageMapField(usage, "prompt_tokens_details"); ok {
+	} else if details, ok := usageMapField(usage, "prompt_tokens_details"); ok {
 		if v, ok := usageIntField(details, "cached_tokens"); ok {
 			read += int64(v)
 		}
+	}
+	if v, ok := usageIntField(usage, "cache_creation_input_tokens"); ok {
+		created += int64(v)
 	}
 	return read, created
 }

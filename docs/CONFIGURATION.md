@@ -160,7 +160,7 @@ SOCKS5 代理列表。
 - 缺省或 `true`：注入（对支持的上游提升缓存命中；GLM/Zhipu 模型会拒绝该字段，自动跳过）
 - `false`：不注入
 
-运行时观测：`stats.json` 中每个模型新增 `cache_read_tokens` / `cache_created_tokens` 聚合（来自上游 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 或 `cached_tokens` 等），可用 `cache_read / (cache_read + cache_created)` 评估命中率。
+运行时观测：`stats.json` 中每个模型新增 `cache_read_tokens` / `cache_created_tokens` 聚合（来自上游 `cache_read_input_tokens` / `cache_creation_input_tokens`、`prompt_cache_hit_tokens` 或 `prompt_tokens_details.cached_tokens` 等），管理面板也会显示“缓存读取/缓存写入”两列。DeepSeek 的 `prompt_cache_miss_tokens` 是普通未命中输入，不是缓存写入，不累计为 `cache_created_tokens`；命中率用 `cache_read / prompt_tokens` 计算。
 
 ```json
 {

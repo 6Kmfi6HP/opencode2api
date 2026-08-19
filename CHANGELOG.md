@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.7
+
+- Fix DeepSeek cache usage accounting: `prompt_cache_hit_tokens` is cached/read input, while `prompt_cache_miss_tokens` is ordinary uncached input and is no longer counted as `cache_creation_input_tokens` in Claude usage or `cache_created_tokens` in `stats.json`. The admin stats table now also displays `cache_read_tokens` / `cache_created_tokens`.
+- Harden cache usage aggregation so canonical Anthropic cache fields take precedence over DeepSeek/`cached_tokens` fallbacks and are never double-counted when multiple usage shapes are present. Add regression tests for DeepSeek and Anthropic cache semantics.
+
 ## v0.4.6
 
 - Add session-sticky egress (`socks5_sticky`, default `true`) for round-robin proxy mode. Each session/account (paid by API token, public by Claude metadata `session_id`, otherwise a shared fallback) pins one egress proxy, so upstream per-egress prompt caches keep building up: measured 99.8% cache hit on a pinned egress vs ~0% when rotation randomly switches egress between requests. Different sessions still rotate, keeping the multi-egress distribution.
@@ -10,8 +15,8 @@
 ## v0.4.5
 
 - Improve prompt-cache hit rate on the OpenCode zen upstream. Requests now inject `prompt_cache_retention: "24h"` (upstream default is ~5 min) and an Anthropic-style `cache_control: {"type":"ephemeral","ttl":"1h"}` breakpoint for models that accept it. GLM/Zhipu models, which reject unknown fields, are always skipped, and client-supplied `extra_body` values win over the injected defaults. Both behaviors are configurable via `prompt_cache_retention` (`"24h"` default, `"in_memory"`, or `"off"`) and `cache_control_breakpoints` (default `true`).
-- Map DeepSeek-style upstream counters `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` into Claude usage as `cache_read_input_tokens` / `cache_creation_input_tokens` when the standard fields are absent, so cached tokens are visible on the Messages API.
-- Aggregate per-model cache accounting in `stats.json` as `cache_read_tokens` / `cache_created_tokens` across Chat, Responses, and Messages (streaming and non-streaming), enabling hit-rate monitoring via `cache_read / (cache_read + cache_created)`.
+- Map DeepSeek-style `prompt_cache_hit_tokens` into Claude usage as `cache_read_input_tokens` when the standard fields are absent, so cached tokens are visible on the Messages API. `prompt_cache_miss_tokens` is ordinary uncached input, not a cache write, so it is intentionally not reported as `cache_creation_input_tokens`.
+- Aggregate per-model cache accounting in `stats.json` as `cache_read_tokens` / `cache_created_tokens` across Chat, Responses, and Messages (streaming and non-streaming), and add these columns to the admin panel. For DeepSeek-style upstreams the hit rate is `cache_read_tokens / prompt_tokens`.
 
 ## v0.4.4
 
