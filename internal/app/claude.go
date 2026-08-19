@@ -715,6 +715,12 @@ func buildClaudeUsageCore(upstreamUsage map[string]any) ClaudeUsage {
 	}
 
 	usage := ClaudeUsage{}
+	// readFromSplit marks cache_read sourced from DeepSeek/OpenAI-style
+	// counters (prompt_cache_hit_tokens / prompt_tokens_details.cached_tokens),
+	// whose prompt_tokens includes the hit portion. An Anthropic-style
+	// cache_read_input_tokens is already exclusive of input_tokens and must
+	// not be subtracted.
+	readFromSplit := false
 	if value, ok := usageIntField(upstreamUsage, "prompt_tokens"); ok {
 		usage["input_tokens"] = value
 	}
@@ -739,6 +745,7 @@ func buildClaudeUsageCore(upstreamUsage map[string]any) ClaudeUsage {
 	} else if promptDetails, ok := usageMapField(upstreamUsage, "prompt_tokens_details"); ok {
 		if value, ok := usageIntField(promptDetails, "cached_tokens"); ok {
 			usage["cache_read_input_tokens"] = value
+			readFromSplit = true
 		}
 	}
 	// DeepSeek-style counters split the prompt into hit (read) and miss
@@ -747,6 +754,22 @@ func buildClaudeUsageCore(upstreamUsage map[string]any) ClaudeUsage {
 	if _, exists := usage["cache_read_input_tokens"]; !exists {
 		if value, ok := usageIntField(upstreamUsage, "prompt_cache_hit_tokens"); ok {
 			usage["cache_read_input_tokens"] = value
+			readFromSplit = true
+		}
+	}
+	// Anthropic semantics: input_tokens excludes cache reads (input, read and
+	// creation are mutually exclusive). prompt_tokens from DeepSeek/OpenAI
+	// includes the hit portion, so subtract it here; otherwise a client that
+	// prices input and cache reads separately would bill the hit tokens twice.
+	if readFromSplit {
+		if read, ok := usage["cache_read_input_tokens"].(int); ok && read > 0 {
+			if input, ok := usage["input_tokens"].(int); ok {
+				if read >= input {
+					usage["input_tokens"] = 0
+				} else {
+					usage["input_tokens"] = input - read
+				}
+			}
 		}
 	}
 	if outputDetails, ok := usageMapField(upstreamUsage, "output_tokens_details"); ok {

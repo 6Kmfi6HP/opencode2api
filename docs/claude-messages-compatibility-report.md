@@ -201,7 +201,7 @@ type ClaudeResponse struct {
 
 | 上游 (OpenAI) | 输出 (Claude) | 状态 |
 |-------------|-------------|------|
-| `prompt_tokens` | `input_tokens` | ✅ |
+| `prompt_tokens` | `input_tokens`（当存在命中/`cached_tokens` 时扣除命中部分，符合 Anthropic 三者互斥语义；Anthropic 风格 `cache_read_input_tokens` 来源不扣） | ✅ |
 | `completion_tokens` | `output_tokens` | ✅ |
 | `total_tokens` | 计算 `input_tokens + output_tokens` | ✅ |
 | `prompt_tokens_details.cached_tokens` | `cache_read_input_tokens` | ✅ |

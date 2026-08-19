@@ -11,8 +11,10 @@ func TestBuildClaudeUsageCoreDeepSeekMissIsNotCreation(t *testing.T) {
 		"prompt_cache_miss_tokens": float64(40),
 		"completion_tokens":        float64(35),
 	})
-	if got := usage["input_tokens"]; got != 200 {
-		t.Fatalf("input_tokens = %v, want 200", got)
+	// input_tokens excludes the cache-hit portion (Anthropic semantics:
+	// input, read and creation are mutually exclusive).
+	if got := usage["input_tokens"]; got != 40 {
+		t.Fatalf("input_tokens = %v, want 40", got)
 	}
 	if got := usage["output_tokens"]; got != 35 {
 		t.Fatalf("output_tokens = %v, want 35", got)

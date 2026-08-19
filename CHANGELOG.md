@@ -4,6 +4,7 @@
 
 - Fix DeepSeek cache usage accounting: `prompt_cache_hit_tokens` is cached/read input, while `prompt_cache_miss_tokens` is ordinary uncached input and is no longer counted as `cache_creation_input_tokens` in Claude usage or `cache_created_tokens` in `stats.json`. The admin stats table now also displays `cache_read_tokens` / `cache_created_tokens`.
 - Harden cache usage aggregation so canonical Anthropic cache fields take precedence over DeepSeek/`cached_tokens` fallbacks and are never double-counted when multiple usage shapes are present. Add regression tests for DeepSeek and Anthropic cache semantics.
+- Align Messages-API `input_tokens` with Anthropic semantics: when `cache_read_input_tokens` is derived from DeepSeek/OpenAI-style counters (`prompt_cache_hit_tokens` or `prompt_tokens_details.cached_tokens`), the hit portion is subtracted from `input_tokens`, since `prompt_tokens` includes it. Clients that price input and cache reads separately no longer bill hit tokens twice (289 prompt + 256 hit now reports `input_tokens: 33`, `cache_read_input_tokens: 256`). Anthropic-style `cache_read_input_tokens` sources are left untouched.
 
 ## v0.4.6
 

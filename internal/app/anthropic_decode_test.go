@@ -1209,8 +1209,9 @@ func TestClaudeStream_UsageMergeMultipleChunks(t *testing.T) {
 		t.Fatalf("message_delta not found: %s", rr.Body.String())
 	}
 	pt, _ := usage["input_tokens"].(float64)
-	if int(pt) != 100 {
-		t.Fatalf("input_tokens = %v, want 100 (merged from multiple chunks)", pt)
+	// Anthropic semantics: input_tokens excludes the cached (read) portion.
+	if int(pt) != 36 {
+		t.Fatalf("input_tokens = %v, want 36 (100 prompt minus 64 cached)", pt)
 	}
 	ct, _ := usage["output_tokens"].(float64)
 	if int(ct) != 35 {

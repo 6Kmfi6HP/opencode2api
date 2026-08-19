@@ -48,7 +48,8 @@ func Test_ClaudeMessages_stream_keeps_usage_when_upstream_sends_usage_after_fini
 	in, _ := usage["input_tokens"].(float64)
 	out, _ := usage["output_tokens"].(float64)
 	cacheRead, _ := usage["cache_read_input_tokens"].(float64)
-	if int(in) != 120 || int(out) != 35 || int(cacheRead) != 64 {
-		t.Fatalf("usage = %s, want input=120 output=35 cache_read=64\nfull=%s", b, rec.Body.String())
+	// Anthropic semantics: input_tokens excludes the cached (read) portion.
+	if int(in) != 56 || int(out) != 35 || int(cacheRead) != 64 {
+		t.Fatalf("usage = %s, want input=56 output=35 cache_read=64\nfull=%s", b, rec.Body.String())
 	}
 }

@@ -39,8 +39,8 @@ func Test_ClaudeMessages_nonstream_includes_context_usage_when_upstream_provides
 	if !ok {
 		t.Fatalf("usage missing or wrong type: %#v", body["usage"])
 	}
-	if got := int(usage["input_tokens"].(float64)); got != 120 {
-		t.Fatalf("input_tokens = %d, want 120", got)
+	if got := int(usage["input_tokens"].(float64)); got != 56 {
+		t.Fatalf("input_tokens = %d, want 56", got)
 	}
 	if got := int(usage["output_tokens"].(float64)); got != 35 {
 		t.Fatalf("output_tokens = %d, want 35", got)
@@ -112,8 +112,8 @@ func Test_ClaudeMessages_stream_emits_cumulative_context_usage_when_final_usage_
 	if usage == nil {
 		t.Fatalf("message_delta event not found in stream: %s", rec.Body.String())
 	}
-	if got := int(usage["input_tokens"].(float64)); got != 120 {
-		t.Fatalf("input_tokens = %d, want 120", got)
+	if got := int(usage["input_tokens"].(float64)); got != 56 {
+		t.Fatalf("input_tokens = %d, want 56", got)
 	}
 	if got := int(usage["output_tokens"].(float64)); got != 35 {
 		t.Fatalf("output_tokens = %d, want 35", got)
