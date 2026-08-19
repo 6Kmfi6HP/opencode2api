@@ -229,6 +229,8 @@ Config lives in `config.json` (copy from `config.example.json`). Key fields:
 | `force_disable_thinking` | When `true`, disables thinking/reasoning and strips it from responses. |
 | `max_tokens_cap` | Global `max_tokens` ceiling; `0` = unlimited. |
 | `max_tokens_cap_per_model` | Per-model override; `0` = unlimited for that model. |
+| `prompt_cache_retention` | Asks the upstream zen gateway to keep prompt-prefix caches for `"24h"` (default) or `"in_memory"` (~5 min); `"off"` disables injection. |
+| `cache_control_breakpoints` | When `true` (default), adds an Anthropic-style `cache_control` breakpoint (`ttl: 1h`) to upstream requests for models that accept it. GLM/Zhipu models are always skipped. |
 | `socks5_proxies` | SOCKS5 proxy list. |
 | `active_socks5` | `""` direct, an `addr` for a fixed proxy, or `__round_robin__`. |
 | `socks5_paid_direct` | `true` makes keyed/paid requests bypass SOCKS5; only public/free goes through proxy. |

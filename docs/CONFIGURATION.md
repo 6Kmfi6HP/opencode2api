@@ -118,6 +118,35 @@ SOCKS5 代理列表。
 }
 ```
 
+### `prompt_cache_retention`
+
+向上游 zen 网关显式声明 prompt 前缀缓存的保留时长。上游默认约 5 分钟（`in_memory`），agent 任务间歇过长时缓存容易过期导致命中率低。
+
+- 不填或 `"24h"`：注入 `prompt_cache_retention: "24h"`，缓存保留一天
+- `"in_memory"`：显式维持上游默认（约 5 分钟）
+- `"off"`：完全不注入该字段
+
+```json
+{
+  "prompt_cache_retention": "24h"
+}
+```
+
+### `cache_control_breakpoints`
+
+是否向上游请求附加 Anthropic 风格缓存断点 `cache_control: {"type":"ephemeral","ttl":"1h"}`。
+
+- 缺省或 `true`：注入（对支持的上游提升缓存命中；GLM/Zhipu 模型会拒绝该字段，自动跳过）
+- `false`：不注入
+
+运行时观测：`stats.json` 中每个模型新增 `cache_read_tokens` / `cache_created_tokens` 聚合（来自上游 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 或 `cached_tokens` 等），可用 `cache_read / (cache_read + cache_created)` 评估命中率。
+
+```json
+{
+  "cache_control_breakpoints": true
+}
+```
+
 ## 管理面板
 
 打开 `http://127.0.0.1:8000/` 可进入管理面板。面板可以修改配置、刷新模型和查看 token 统计。

@@ -19,6 +19,8 @@ var (
 	forceDisableThinking bool
 	maxTokensCap         int
 	maxTokensCapPerModel = map[string]int{}
+	promptCacheRetention string // "" -> runtime default "24h"; "off" disables injection
+	cacheBreakpoints     = true
 	debugMode            bool
 	configMu             sync.RWMutex
 	storedResponses      = map[string]StoredResponseState{}
@@ -74,6 +76,13 @@ func applyConfig(cfg AppConfig) {
 	}
 	socks5PaidDirect = cfg.Socks5PaidDirect
 	socks5Mu.Unlock()
+
+	if cfg.PromptCacheRetention != "" {
+		promptCacheRetention = cfg.PromptCacheRetention
+	}
+	if cfg.CacheControlBreakpoints != nil {
+		cacheBreakpoints = *cfg.CacheControlBreakpoints
+	}
 
 }
 
@@ -143,4 +152,31 @@ func getMaxTokensCapForModel(model string) int {
 		return cap
 	}
 	return maxTokensCap
+}
+
+// getPromptCacheRetention returns the retention value injected into upstream
+// cache requests. "" (unset) yields the runtime default "24h" which pulls the
+// zen gateway's prefix cache TTL from ~5 minutes to a day; "off" disables
+// injection entirely.
+func getPromptCacheRetention() string {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	if promptCacheRetention == "" {
+		return "24h"
+	}
+	return promptCacheRetention
+}
+
+func getCacheBreakpoints() bool {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return cacheBreakpoints
+}
+
+// rejectsCacheControl reports whether a resolved upstream model is known to
+// reject the Anthropic-style cache_control field (GLM/Zhipu refuse unknown
+// top-level fields with "Extra inputs are not permitted").
+func rejectsCacheControl(modelID string) bool {
+	name := strings.ToLower(strings.TrimSpace(modelID))
+	return strings.HasPrefix(name, "glm") || strings.HasPrefix(name, "zhipu") || strings.HasPrefix(name, "z-ai") || strings.HasPrefix(name, "zai")
 }

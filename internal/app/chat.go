@@ -550,6 +550,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 					tt, _ := usage["total_tokens"].(float64)
 					if tt > 0 {
 						recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
+						recordCacheUsage(req.Model, usage)
 					}
 				}
 				continue
@@ -562,6 +563,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				tt, _ := usage["total_tokens"].(float64)
 				if tt > 0 {
 					recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
+					recordCacheUsage(req.Model, usage)
 				}
 			}
 
@@ -622,6 +624,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			tt, _ := u["total_tokens"].(float64)
 			if tt > 0 {
 				recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
+				recordCacheUsage(req.Model, u)
 			}
 		}
 	}
@@ -1006,6 +1009,22 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 			if _, exists := converted[k]; !exists {
 				converted[k] = v
 			}
+		}
+	}
+	// 缓存增强:向 zen 上游显式声明 prompt 前缀缓存的保留时长。
+	// 上游默认约 5 分钟(in_memory),agent 任务间歇易过期,导致缓存难命中;
+	// 注入 retention 后拉长到 24h。客户端显式传入的值(extra_body)优先。
+	if retention := getPromptCacheRetention(); retention != "" && retention != "off" {
+		if _, exists := converted["prompt_cache_retention"]; !exists {
+			converted["prompt_cache_retention"] = retention
+		}
+	}
+	// Anthropic 风格 cache_control 断点:对接受该字段的模型(排除 GLM/Zhipu)
+	// 显式标记缓存断点并拉长 TTL。对不支持的上游,zen 网关负责剥离;
+	// DeepSeek 等自动前缀缓存不受影响(实测追加字段后命中率一致)。
+	if getCacheBreakpoints() && !rejectsCacheControl(req.Model) {
+		if _, exists := converted["cache_control"]; !exists {
+			converted["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
 		}
 	}
 	return converted

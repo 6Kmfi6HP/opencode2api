@@ -741,6 +741,18 @@ func buildClaudeUsageCore(upstreamUsage map[string]any) ClaudeUsage {
 			usage["cache_read_input_tokens"] = value
 		}
 	}
+	// DeepSeek-style counters: hit≈read, miss≈write. Only fill when the
+	// canonical fields above were absent so shapes never double-report.
+	if _, exists := usage["cache_read_input_tokens"]; !exists {
+		if value, ok := usageIntField(upstreamUsage, "prompt_cache_hit_tokens"); ok {
+			usage["cache_read_input_tokens"] = value
+		}
+	}
+	if _, exists := usage["cache_creation_input_tokens"]; !exists {
+		if value, ok := usageIntField(upstreamUsage, "prompt_cache_miss_tokens"); ok {
+			usage["cache_creation_input_tokens"] = value
+		}
+	}
 	if outputDetails, ok := usageMapField(upstreamUsage, "output_tokens_details"); ok {
 		usage["output_tokens_details"] = outputDetails
 	} else if outputDetails, ok := usageMapField(upstreamUsage, "completion_tokens_details"); ok {
@@ -946,6 +958,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			tt, _ := u["total_tokens"].(float64)
 			if tt > 0 {
 				recordTokenUsage(claudeReq.Model, int64(pt), int64(ct), int64(tt))
+				recordCacheUsage(claudeReq.Model, u)
 			}
 		}
 	}
@@ -1023,6 +1036,7 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 			tt, _ := fullUsage["total_tokens"].(float64)
 			if tt > 0 {
 				recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
+				recordCacheUsage(model, fullUsage)
 			}
 		}
 		stats.toolCallCount = len(toolCallOrder)

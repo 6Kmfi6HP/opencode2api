@@ -13,6 +13,11 @@ type ModelStats struct {
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
+	// CacheTokens aggregates upstream prompt-cache accounting: read = tokens
+	// served from cache, created = tokens written into the cache. Both are
+	// optional and only present when the upstream reports them.
+	CacheReadTokens    int64 `json:"cache_read_tokens,omitempty"`
+	CacheCreatedTokens int64 `json:"cache_created_tokens,omitempty"`
 }
 
 type TokenStatsData struct {
@@ -69,4 +74,58 @@ func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens 
 	ms.TotalTokens += totalTokens
 	tokenStatsMu.Unlock()
 	go saveTokenStats()
+}
+
+// recordCacheUsage aggregates upstream prompt-cache accounting per model.
+// Call it with the raw upstream usage map; zero/nil inputs are no-ops so
+// call sites don't need extra branching.
+func recordCacheUsage(model string, usage map[string]any) {
+	if model == "" || len(usage) == 0 {
+		return
+	}
+	read, created := parseCacheUsage(usage)
+	if read == 0 && created == 0 {
+		return
+	}
+	tokenStatsMu.Lock()
+	ms, ok := tokenStats.Models[model]
+	if !ok {
+		ms = &ModelStats{}
+		tokenStats.Models[model] = ms
+	}
+	ms.CacheReadTokens += read
+	ms.CacheCreatedTokens += created
+	tokenStatsMu.Unlock()
+	go saveTokenStats()
+}
+
+// parseCacheUsage extracts cache token counts from the various usage shapes
+// seen across upstreams:
+//
+//	OpenAI/Anthropic: prompt_tokens_details.cached_tokens, cache_creation_input_tokens
+//	DeepSeek:         prompt_cache_hit_tokens, prompt_cache_miss_tokens
+//
+// Returns (read, created).
+func parseCacheUsage(usage map[string]any) (int64, int64) {
+	var read, created int64
+	if v, ok := usageIntField(usage, "cache_read_input_tokens"); ok {
+		read += int64(v)
+	}
+	if v, ok := usageIntField(usage, "cache_creation_input_tokens"); ok {
+		created += int64(v)
+	}
+	// DeepSeek-style counters (mutually exclusive with the above in practice,
+	// but sum defensively).
+	if v, ok := usageIntField(usage, "prompt_cache_hit_tokens"); ok {
+		read += int64(v)
+	}
+	if v, ok := usageIntField(usage, "prompt_cache_miss_tokens"); ok {
+		created += int64(v)
+	}
+	if details, ok := usageMapField(usage, "prompt_tokens_details"); ok {
+		if v, ok := usageIntField(details, "cached_tokens"); ok {
+			read += int64(v)
+		}
+	}
+	return read, created
 }

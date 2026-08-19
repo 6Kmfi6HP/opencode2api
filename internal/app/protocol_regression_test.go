@@ -601,10 +601,19 @@ func TestClaudeCodePayloadDropsContextManagementAndCacheControl(t *testing.T) {
 	}
 	out, skipped := convertClaudeRequest(req)
 	body := convertRequest(&out)
-	for _, key := range []string{"context_management", "cache_control", "anthropic-beta"} {
+	for _, key := range []string{"context_management", "anthropic-beta"} {
 		if _, ok := body[key]; ok {
 			t.Fatalf("upstream still has %s: %#v", key, body[key])
 		}
+	}
+	// The gateway now injects its own controlled cache breakpoint for models
+	// that accept it (client-supplied cache_control is still dropped; GLM is
+	// exempt — see TestConvertRequestSkipsCacheControlForGLM).
+	if cc, ok := body["cache_control"].(map[string]any); !ok || cc["type"] != "ephemeral" || cc["ttl"] != "1h" {
+		t.Fatalf("upstream cache_control = %#v, want {type:ephemeral ttl:1h}", body["cache_control"])
+	}
+	if retention, _ := body["prompt_cache_retention"].(string); retention != "24h" {
+		t.Fatalf("prompt_cache_retention = %#v, want 24h", body["prompt_cache_retention"])
 	}
 	msgsRaw := body["messages"]
 	var msgs []map[string]any
@@ -653,6 +662,37 @@ func TestClaudeCodePayloadDropsContextManagementAndCacheControl(t *testing.T) {
 	}
 	if summary["cache_control_blocks"] == nil {
 		t.Fatalf("summary missing cache_control_blocks: %#v", summary)
+	}
+}
+
+// GLM/Zhipu models reject the Anthropic-style cache_control field with
+// "Extra inputs are not permitted", so the gateway must not inject the
+// breakpoint for them (retention stays injected — it is harmless metadata).
+func TestConvertRequestSkipsCacheControlForGLM(t *testing.T) {
+	req := OpenAIRequest{
+		Model: "glm-5.2",
+		Messages: []Message{
+			{Role: "user", Content: "hi"},
+		},
+	}
+	body := convertRequest(&req)
+	if _, ok := body["cache_control"]; ok {
+		t.Fatalf("glm request still has cache_control: %#v", body["cache_control"])
+	}
+	if retention, _ := body["prompt_cache_retention"].(string); retention != "24h" {
+		t.Fatalf("prompt_cache_retention = %#v, want 24h", body["prompt_cache_retention"])
+	}
+	// Client-supplied explicit values win over the injected default.
+	req.ExtraBody = map[string]any{
+		"prompt_cache_retention": "in_memory",
+		"cache_control":          map[string]any{"type": "ephemeral", "ttl": "5m"},
+	}
+	body = convertRequest(&req)
+	if retention, _ := body["prompt_cache_retention"].(string); retention != "in_memory" {
+		t.Fatalf("explicit prompt_cache_retention lost: %#v", body["prompt_cache_retention"])
+	}
+	if cc, ok := body["cache_control"].(map[string]any); !ok || cc["ttl"] != "5m" {
+		t.Fatalf("explicit cache_control lost: %#v", body["cache_control"])
 	}
 }
 

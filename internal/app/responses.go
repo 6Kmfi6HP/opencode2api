@@ -1243,6 +1243,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			tt, _ := u["total_tokens"].(float64)
 			if tt > 0 {
 				recordTokenUsage(chatReq.Model, int64(pt), int64(ct), int64(tt))
+				recordCacheUsage(chatReq.Model, u)
 			}
 		}
 	}
@@ -1938,6 +1939,7 @@ loop:
 		tt, _ := totalUsage["total_tokens"].(float64)
 		if tt > 0 {
 			recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
+			recordCacheUsage(model, totalUsage)
 		}
 	}
 

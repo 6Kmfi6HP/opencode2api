@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.4.5
+
+- Improve prompt-cache hit rate on the OpenCode zen upstream. Requests now inject `prompt_cache_retention: "24h"` (upstream default is ~5 min) and an Anthropic-style `cache_control: {"type":"ephemeral","ttl":"1h"}` breakpoint for models that accept it. GLM/Zhipu models, which reject unknown fields, are always skipped, and client-supplied `extra_body` values win over the injected defaults. Both behaviors are configurable via `prompt_cache_retention` (`"24h"` default, `"in_memory"`, or `"off"`) and `cache_control_breakpoints` (default `true`).
+- Map DeepSeek-style upstream counters `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` into Claude usage as `cache_read_input_tokens` / `cache_creation_input_tokens` when the standard fields are absent, so cached tokens are visible on the Messages API.
+- Aggregate per-model cache accounting in `stats.json` as `cache_read_tokens` / `cache_created_tokens` across Chat, Responses, and Messages (streaming and non-streaming), enabling hit-rate monitoring via `cache_read / (cache_read + cache_created)`.
 
 ## v0.4.4
 

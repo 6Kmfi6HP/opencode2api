@@ -55,6 +55,15 @@ type AppConfig struct {
 	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
 	ActiveSocks5         string            `json:"active_socks5,omitempty"`
 	Socks5PaidDirect     bool              `json:"socks5_paid_direct,omitempty"`
+	// PromptCacheRetention asks the upstream zen gateway to keep the prompt
+	// prefix cache for "in_memory" (~5 min) or "24h". Empty defaults to "24h"
+	// at runtime; set to "off" to stop injecting the field.
+	PromptCacheRetention string `json:"prompt_cache_retention,omitempty"`
+	// CacheControlBreakpoints, when true, adds an Anthropic-style
+	// cache_control::{type:"ephemeral",ttl:"1h"} breakpoint to the upstream
+	// body for models that accept it (GLM/Zhipu reject the field and are
+	// always skipped). Defaults to true.
+	CacheControlBreakpoints *bool `json:"cache_control_breakpoints,omitempty"`
 }
 
 type Socks5Proxy struct {
