@@ -52,7 +52,7 @@ func TestEstimateClaudeInputTokens_BlockContents(t *testing.T) {
 
 func TestEstimateClaudeInputTokens_SystemAndTools(t *testing.T) {
 	req := ClaudeRequest{
-		Model: "claude-sonnet-4-5",
+		Model:  "claude-sonnet-4-5",
 		System: "You are a helpful assistant.",
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: "hi"},
