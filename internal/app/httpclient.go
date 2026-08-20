@@ -29,6 +29,11 @@ func socks5Dial(proxy Socks5Proxy) func(ctx context.Context, network, addr strin
 		if err != nil {
 			return nil, fmt.Errorf("socks5 connect to %s: %w", proxy.Addr, err)
 		}
+		// TCP keepalive：空闲时持续探测代理池连接健康，提前发现被回收的半死连接。
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			tcp.SetKeepAlive(true)
+			tcp.SetKeepAlivePeriod(30 * time.Second)
+		}
 		deadline := time.Now().Add(15 * time.Second)
 		conn.SetDeadline(deadline)
 
@@ -258,8 +263,8 @@ func buildProxyClient(proxy Socks5Proxy) *http.Client {
 		Transport: &http.Transport{
 			DialContext:         socks5Dial(proxy),
 			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConnsPerHost: 2,                // 会话并发一般 1，管道化不需要多
+			IdleConnTimeout:     30 * time.Minute, // 90s → 30min：对抗代理池空闲回收（实测池重连必换 IP，拉长连接寿命=拉长 IP 固定窗口）
 		},
 	}
 }
