@@ -229,8 +229,9 @@ type stickyProxyEntry struct {
 }
 
 var (
-	stickyMu      sync.Mutex
-	stickyEntries = map[string]*stickyProxyEntry{}
+	stickyMu         sync.Mutex
+	stickyEntries    = map[string]*stickyProxyEntry{}
+	stickyBindSeqMap = map[string]uint32{} // per-key 绑定代数：失效重绑时 +1，保证换目标
 )
 
 const (
@@ -238,11 +239,6 @@ const (
 	stickyMaxEntries     = 256
 	stickyPublicFallback = "cli://public-shared" // 无会话标识的 public 请求共用同一出口
 )
-
-// stickyRebindSeq 每次重新绑定递增,参与哈希,保证同一会话在绑定被切断
-// (上游 429/5xx/连接错误)后重新分配时换到不同出口,而不是永远钉死
-// 在同一个确定性哈希结果上。
-var stickyRebindSeq uint32
 
 // stickyKeyForRequest 生成会话粘性键。优先级：账号 token > 会话 user
 // （来自 Claude metadata 的 session_id 等）> 公共兜底。
@@ -312,7 +308,7 @@ func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any) (string, *h
 }
 
 // lookupOrCreateSticky 查找或创建会话的 (域名, 代理) 绑定。同一 key 的连续
-// 绑定因 stickyRebindSeq 递增而轮换，使失效后的重绑真正换到不同目标。
+// 绑定代数按 key 递增而轮换，使失效后的重绑真正换到不同目标。
 // proxySticky=false 时只缓存域名维（baseIdx），client 字段不使用。
 func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nProxy int, proxies []Socks5Proxy) *stickyProxyEntry {
 	stickyMu.Lock()
@@ -323,6 +319,7 @@ func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nPr
 		for k, e := range stickyEntries {
 			if now.Sub(e.lastUsed) > stickyEntryTTL {
 				delete(stickyEntries, k)
+				delete(stickyBindSeqMap, k)
 			}
 		}
 	}
@@ -335,11 +332,13 @@ func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nPr
 			}
 		}
 		delete(stickyEntries, oldestKey)
+		delete(stickyBindSeqMap, oldestKey)
 	}
 	if e, ok := stickyEntries[key]; ok {
 		if (domainSticky && e.baseIdx < 0) || (proxySticky && e.proxyIdx < 0) {
 			// 维度配置变化导致旧条目不满足当前需求，重建。
 			delete(stickyEntries, key)
+			delete(stickyBindSeqMap, key)
 		} else {
 			e.lastUsed = now
 			slog.Debug("sticky target reuse", "key", key, "baseIdx", e.baseIdx, "proxyIdx", e.proxyIdx)
@@ -347,9 +346,14 @@ func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nPr
 		}
 	}
 
-	// 哈希 + 递增序号：同一 key 的连续绑定会落在不同目标。
+	// 哈希 + per-key 递增代数：同一 key 的连续绑定会落在不同目标。
 	// base 与 proxy 使用不同哈希位独立分布，避免组合取模导致的偏斜。
-	seq := atomic.AddUint32(&stickyRebindSeq, 1)
+	// 代数存于 stickyBindSeqMap，失效删除条目后仍保留：
+	//  - 同 key 失效重绑保证换到不同目标（可用性）；
+	//  - 不同 key 完全按 fnv 差异分散（避免共享全局序号把所有 key
+	//    排成同一 0,1,2,3 序列，那会破坏会话级负载均衡）。
+	seq := stickyBindSeqMap[key] + 1
+	stickyBindSeqMap[key] = seq
 	h := fnv32a(key) + seq
 
 	baseIdx := -1

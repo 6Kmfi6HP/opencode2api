@@ -24,6 +24,7 @@ func withStickyProxyEnv(t *testing.T, proxies []Socks5Proxy, active string, stic
 	socks5Mu.Unlock()
 	stickyMu.Lock()
 	stickyEntries = map[string]*stickyProxyEntry{}
+	stickyBindSeqMap = map[string]uint32{}
 	stickyMu.Unlock()
 	t.Cleanup(func() {
 		socks5Mu.Lock()
@@ -35,6 +36,7 @@ func withStickyProxyEnv(t *testing.T, proxies []Socks5Proxy, active string, stic
 		socks5Mu.Unlock()
 		stickyMu.Lock()
 		stickyEntries = map[string]*stickyProxyEntry{}
+		stickyBindSeqMap = map[string]uint32{}
 		stickyMu.Unlock()
 	})
 }
