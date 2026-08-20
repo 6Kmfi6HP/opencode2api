@@ -571,8 +571,8 @@ func maybeLogBodySummary(ctx context.Context, label string, raw []byte) {
 	reqLogger(ctx).Debug(label, "summary", summarizeJSONBody(raw, 4096))
 }
 
-func logUpstreamError(ctx context.Context, model string, status int, body []byte) {
-	key := fmt.Sprintf("%s:%d", model, status)
+func logUpstreamError(ctx context.Context, model string, status int, body []byte, baseURL string) {
+	key := fmt.Sprintf("%s:%d:%s", model, status, baseURL)
 	now := time.Now()
 	upstreamErrDedupMu.Lock()
 	entry, ok := upstreamErrDedup[key]
@@ -583,6 +583,7 @@ func logUpstreamError(ctx context.Context, model string, status int, body []byte
 		upstreamErrDedupMu.Unlock()
 		reqLogger(ctx).Error("upstream error",
 			"model", model,
+			"base_url", baseURL,
 			"status", status,
 			"body", truncateForLog(string(body), 512),
 			"suppressed", suppressed,
@@ -593,6 +594,7 @@ func logUpstreamError(ctx context.Context, model string, status int, body []byte
 	upstreamErrDedupMu.Unlock()
 	reqLogger(ctx).Error("upstream error",
 		"model", model,
+		"base_url", baseURL,
 		"status", status,
 		"body", truncateForLog(string(body), 512),
 	)

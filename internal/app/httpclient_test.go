@@ -1,6 +1,8 @@
 package app
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -12,6 +14,7 @@ func withStickyProxyEnv(t *testing.T, proxies []Socks5Proxy, active string, stic
 	oldActive := activeSocks5
 	oldSticky := socks5Sticky
 	oldPaidDirect := socks5PaidDirect
+	oldBaseURLs := upstreamBaseURLs
 	socks5Proxies = proxies
 	activeSocks5 = active
 	socks5Sticky = sticky
@@ -26,10 +29,25 @@ func withStickyProxyEnv(t *testing.T, proxies []Socks5Proxy, active string, stic
 		activeSocks5 = oldActive
 		socks5Sticky = oldSticky
 		socks5PaidDirect = oldPaidDirect
+		upstreamBaseURLs = oldBaseURLs
 		socks5Mu.Unlock()
 		stickyMu.Lock()
 		stickyEntries = map[string]*stickyProxyEntry{}
 		stickyMu.Unlock()
+	})
+}
+
+// withBaseURLs 设置多个上游域名，结束后恢复。
+func withBaseURLs(t *testing.T, baseURLs []string) {
+	t.Helper()
+	socks5Mu.Lock()
+	old := upstreamBaseURLs
+	upstreamBaseURLs = baseURLs
+	socks5Mu.Unlock()
+	t.Cleanup(func() {
+		socks5Mu.Lock()
+		upstreamBaseURLs = old
+		socks5Mu.Unlock()
 	})
 }
 
@@ -54,96 +72,148 @@ func TestStickyKeyForRequest(t *testing.T) {
 	}
 }
 
-func TestGetHTTPClientStickyPinsSession(t *testing.T) {
+func TestSelectUpstreamTargetPinsSession(t *testing.T) {
 	withStickyProxyEnv(t, []Socks5Proxy{
 		{Addr: "p1"}, {Addr: "p2"}, {Addr: "p3"},
 	}, socks5RR, true, false)
-
-	c1 := getHTTPClientSticky(UpstreamAuth{Token: "tok-1"}, nil)
-	c2 := getHTTPClientSticky(UpstreamAuth{Token: "tok-1"}, nil)
+	// 单域名 + RR 代理：base 固定默认，仅代理 sticky。
+	b1, c1 := selectUpstreamTarget(UpstreamAuth{Token: "tok-1"}, nil)
+	b2, c2 := selectUpstreamTarget(UpstreamAuth{Token: "tok-1"}, nil)
+	if b1 != "https://opencode.ai" || b2 != "https://opencode.ai" {
+		t.Fatalf("single base = %q, %q, want default", b1, b2)
+	}
 	if c1 != c2 {
 		t.Fatalf("same session got different clients")
 	}
 	// 用户级会话也固定。
-	u1 := getHTTPClientSticky(UpstreamAuth{}, map[string]any{"user": "sess-1"})
-	u2 := getHTTPClientSticky(UpstreamAuth{}, map[string]any{"user": "sess-1"})
+	u1, _ := selectUpstreamTarget(UpstreamAuth{}, map[string]any{"user": "sess-1"})
+	u2, _ := selectUpstreamTarget(UpstreamAuth{}, map[string]any{"user": "sess-1"})
 	if u1 != u2 {
-		t.Fatalf("same user session got different clients")
+		t.Fatalf("same user session got different bases")
 	}
 	// 无会话标识的 public 请求共享同一个兜底出口。
-	p1 := getHTTPClientSticky(UpstreamAuth{}, map[string]any{})
-	p2 := getHTTPClientSticky(UpstreamAuth{}, map[string]any{})
+	p1, _ := selectUpstreamTarget(UpstreamAuth{}, map[string]any{})
+	p2, _ := selectUpstreamTarget(UpstreamAuth{}, map[string]any{})
 	if p1 != p2 {
-		t.Fatalf("public fallback sessions should share one client")
+		t.Fatalf("public fallback sessions should share one base")
 	}
 }
 
-func TestInvalidateStickyProxyRebinds(t *testing.T) {
+func TestSelectUpstreamTargetMultiBaseSticky(t *testing.T) {
 	withStickyProxyEnv(t, []Socks5Proxy{
-		{Addr: "p1"}, {Addr: "p2"}, {Addr: "p3"},
+		{Addr: "p1"}, {Addr: "p2"},
 	}, socks5RR, true, false)
+	withBaseURLs(t, []string{"https://opencode.ai", "https://zen1.example.com"})
 
-	auth := UpstreamAuth{Token: "tok-1"}
-	_ = getHTTPClientSticky(auth, nil)
-	if got := len(stickyEntries); got != 1 {
-		t.Fatalf("sticky entries = %d, want 1", got)
+	b1, c1 := selectUpstreamTarget(UpstreamAuth{Token: "tok-1"}, nil)
+	b2, c2 := selectUpstreamTarget(UpstreamAuth{Token: "tok-1"}, nil)
+	if b1 != b2 || c1 != c2 {
+		t.Fatalf("same session should pin same (base, client), got %q/%p vs %q/%p", b1, c1, b2, c2)
 	}
-	invalidateStickyProxy(auth, nil)
-	if got := len(stickyEntries); got != 0 {
-		t.Fatalf("sticky entries after invalidate = %d, want 0", got)
+	if b1 != "https://opencode.ai" && b1 != "https://zen1.example.com" {
+		t.Fatalf("base %q not in configured set", b1)
 	}
-	// 重新获取应重建绑定(可能哈希到同一代理,但绑定必须重新存在)。
-	_ = getHTTPClientSticky(auth, nil)
-	if _, ok := stickyEntries["tok:tok-1"]; !ok {
-		t.Fatal("binding should be recreated after invalidate")
-	}
-}
-
-// TestInvalidateStickyProxyRotatesEgress 验证切断绑定后重新分配会改变出口:
-// 确定性哈希 + 递增序号保证同一会话的连续绑定轮换到不同代理,而不是
-// 永远钉死在同一个哈希结果上(否则 429/错误后的"换 IP"永远不会发生)。
-func TestInvalidateStickyProxyRotatesEgress(t *testing.T) {
-	withStickyProxyEnv(t, []Socks5Proxy{
-		{Addr: "p1"}, {Addr: "p2"}, {Addr: "p3"},
-	}, socks5RR, true, false)
-
-	auth := UpstreamAuth{Token: "tok-2"}
-	seen := map[int]bool{}
-	for i := 0; i < 4; i++ {
-		_ = getHTTPClientSticky(auth, nil)
-		stickyMu.Lock()
-		idx := stickyEntries["tok:tok-2"].proxyIdx
-		stickyMu.Unlock()
-		seen[idx] = true
-		invalidateStickyProxy(auth, nil)
+	// 不同会话（不同 token）会分散到不同 base。
+	seen := map[string]bool{}
+	for i := 0; i < 8; i++ {
+		b, _ := selectUpstreamTarget(UpstreamAuth{Token: fmt.Sprintf("tok-sess-%d", i)}, nil)
+		seen[b] = true
 	}
 	if len(seen) < 2 {
-		t.Fatalf("egress did not rotate across rebinds: %v", seen)
+		t.Fatalf("different sessions should distribute across bases, got %v", seen)
 	}
 }
 
-func TestGetHTTPClientStickySkipsWhenDisabled(t *testing.T) {
+func TestInvalidateUpstreamTargetRebindsChannel(t *testing.T) {
+	withStickyProxyEnv(t, []Socks5Proxy{
+		{Addr: "p1"}, {Addr: "p2"}, {Addr: "p3"},
+	}, socks5RR, true, false)
+	withBaseURLs(t, []string{"https://opencode.ai", "https://zen2.example.com"})
+
+	auth := UpstreamAuth{Token: "tok-2"}
+	seenCombos := map[[2]int]bool{}
+	for i := 0; i < 6; i++ {
+		_, _ = selectUpstreamTarget(auth, nil)
+		stickyMu.Lock()
+		e := stickyEntries["tok:tok-2"]
+		stickyMu.Unlock()
+		if e == nil {
+			t.Fatal("binding should exist after select")
+		}
+		seenCombos[[2]int{e.baseIdx, e.proxyIdx}] = true
+		invalidateUpstreamTarget(auth, nil)
+	}
+	if len(seenCombos) < 3 {
+		t.Fatalf("channel did not rotate across rebinds: %v", seenCombos)
+	}
+}
+
+func TestSelectUpstreamTargetSkipsWhenDisabled(t *testing.T) {
 	withStickyProxyEnv(t, []Socks5Proxy{
 		{Addr: "p1"}, {Addr: "p2"},
 	}, socks5RR, false, false)
+	withBaseURLs(t, []string{"https://opencode.ai", "https://zen3.example.com"})
 
-	getHTTPClientSticky(UpstreamAuth{Token: "tok-1"}, nil)
-	if got := len(stickyEntries); got != 0 {
-		t.Fatalf("sticky disabled but entries = %d", got)
+	// socks5_sticky=false 只关闭代理维绑定：域名维仍按会话哈希 sticky，
+	// 客户端每次按当前配置轮询/固定（不缓存）。
+	b1, c1 := selectUpstreamTarget(UpstreamAuth{Token: "tok-1"}, nil)
+	b2, c2 := selectUpstreamTarget(UpstreamAuth{Token: "tok-1"}, nil)
+	if b1 != b2 {
+		t.Fatalf("domain sticky should stay when proxy sticky disabled, got %q vs %q", b1, b2)
+	}
+	// 代理维不缓存在条目里：两次返回的 client 应来自 getHTTPClient() 轮询，
+	// 且不能是 httpClient（有代理配置时）。
+	if c1 == httpClient || c2 == httpClient {
+		t.Fatalf("proxy should still route through socks5 when sticky disabled")
+	}
+	// 域名维仍有条目（用于固定 base）。
+	if got := len(stickyEntries); got != 1 {
+		t.Fatalf("domain-only sticky should keep 1 entry, got %d", got)
 	}
 }
 
-func TestGetHTTPClientStickyPaidDirectBypasses(t *testing.T) {
+func TestSelectUpstreamTargetPaidDirectBypasses(t *testing.T) {
 	withStickyProxyEnv(t, []Socks5Proxy{
 		{Addr: "p1"}, {Addr: "p2"},
 	}, socks5RR, true, true)
 
 	paid := UpstreamAuth{Token: "tok-1", Mode: AuthRouteAuto}
-	c := getHTTPClientSticky(paid, nil)
+	b, c := selectUpstreamTarget(paid, nil)
 	if c != httpClient {
 		t.Fatalf("paid direct should return the direct client, got %p", c)
 	}
+	if b != "https://opencode.ai" {
+		t.Fatalf("paid direct base = %q, want default", b)
+	}
 	if got := len(stickyEntries); got != 0 {
 		t.Fatalf("paid direct must not create sticky entries, got %d", got)
+	}
+}
+
+func TestRoundRobinBaseURLDistributes(t *testing.T) {
+	withBaseURLs(t, []string{"https://one.example.com", "https://two.example.com"})
+	seen := map[string]bool{}
+	for i := 0; i < 8; i++ {
+		seen[roundRobinBaseURL()] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("round robin should distribute across bases, got %v", seen)
+	}
+}
+
+func TestRoundRobinBaseURLSingleDefault(t *testing.T) {
+	withBaseURLs(t, defaultBaseURLs)
+	if got := roundRobinBaseURL(); got != "https://opencode.ai" {
+		t.Fatalf("single base round robin = %q, want default", got)
+	}
+}
+
+func TestNormalizeBaseURLs(t *testing.T) {
+	got := normalizeBaseURLs([]string{"https://a.com/", "https://a.com", "", "  ", "https://b.com", "https://a.com"})
+	if len(got) != 2 || got[0] != "https://a.com" || got[1] != "https://b.com" {
+		t.Fatalf("normalizeBaseURLs = %#v, want [https://a.com https://b.com]", got)
+	}
+	if got := normalizeBaseURLs(nil); strings.Join(got, ",") != strings.Join(defaultBaseURLs, ",") {
+		t.Fatalf("empty normalize = %#v, want default", got)
 	}
 }

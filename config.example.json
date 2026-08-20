@@ -30,5 +30,8 @@
       "addr": "127.0.0.1:1080",
       "name": "local"
     }
+  ],
+  "upstream_base_urls": [
+    "https://opencode.ai"
   ]
 }

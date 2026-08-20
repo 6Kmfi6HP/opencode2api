@@ -55,6 +55,11 @@ type AppConfig struct {
 	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
 	ActiveSocks5         string            `json:"active_socks5,omitempty"`
 	Socks5PaidDirect     bool              `json:"socks5_paid_direct,omitempty"`
+	// UpstreamBaseURLs lists the opencode zen upstream base URLs (e.g.
+	// reversed domains). When unset or empty the runtime falls back to
+	// ["https://opencode.ai"]. Sessions are sticky to one (base URL, proxy)
+	// pair so per-egress prompt caches keep hitting.
+	UpstreamBaseURLs []string `json:"upstream_base_urls,omitempty"`
 	// PromptCacheRetention asks the upstream zen gateway to keep the prompt
 	// prefix cache for "in_memory" (~5 min) or "24h". Empty defaults to "24h"
 	// at runtime; set to "off" to stop injecting the field.

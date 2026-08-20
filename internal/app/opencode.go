@@ -92,7 +92,7 @@ var (
 )
 
 func fetchModels() ([]ModelInfo, error) {
-	req, _ := http.NewRequest("GET", "https://opencode.ai/zen/v1/models", nil)
+	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
 	req.Header.Set("x-opencode-session", ocSessionID)
 	resp, err := getHTTPClient().Do(req)
@@ -118,7 +118,7 @@ func fetchModels() ([]ModelInfo, error) {
 }
 
 func fetchGoModels() ([]ModelInfo, error) {
-	req, _ := http.NewRequest("GET", "https://opencode.ai/zen/go/v1/models", nil)
+	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/go/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
 	req.Header.Set("x-opencode-session", ocSessionID)
 	resp, err := getHTTPClient().Do(req)
@@ -250,10 +250,11 @@ func startModelRefresh() {
 // left untouched.
 
 func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (*http.Request, error) {
-	return buildOCRequestWithEndpoint(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID))
+	baseURL, _ := selectUpstreamTarget(auth, bodyMap)
+	return buildOCRequestWithEndpoint(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID), baseURL)
 }
 
-func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool) (*http.Request, error) {
+func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string) (*http.Request, error) {
 	bodyMap["model"] = modelID
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
@@ -263,7 +264,7 @@ func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth Ups
 	if useGoEndpoint {
 		upstreamURL = "https://opencode.ai/zen/go/v1/chat/completions"
 	} else {
-		upstreamURL = "https://opencode.ai/zen/v1/chat/completions"
+		upstreamURL = baseURL + "/zen/v1/chat/completions"
 	}
 	req, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(tryBody))
 	if err != nil {
@@ -325,17 +326,19 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 	var lastBody []byte
 	var lastStatus int
 	var lastHeader http.Header
+	var lastBaseURL string
 	maxAttempts := maxUpstreamRetries
 	if max401Retries > maxAttempts {
 		maxAttempts = max401Retries
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		up, err := buildOCRequestWithEndpoint(modelID, bodyMap, auth, useGoEndpoint)
+		baseURL, client := selectUpstreamTarget(auth, bodyMap)
+		lastBaseURL = baseURL
+		up, err := buildOCRequestWithEndpoint(modelID, bodyMap, auth, useGoEndpoint, baseURL)
 		if err != nil {
 			return nil, 500, nil, err
 		}
-		client := getHTTPClientSticky(auth, bodyMap)
 		attemptStart := time.Now()
 		resp, err := client.Do(up)
 		durationMs := time.Since(attemptStart).Milliseconds()
@@ -349,6 +352,7 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 			}
 			log.Info("upstream_attempt",
 				"try_model", modelID,
+				"base_url", baseURL,
 				"surface", surface,
 				"status", 0,
 				"duration_ms", durationMs,
@@ -358,7 +362,7 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 			)
 			if canRetry {
 				client.CloseIdleConnections()
-				invalidateStickyProxy(auth, bodyMap)
+				invalidateUpstreamTarget(auth, bodyMap)
 				retryCount++
 				continue
 			}
@@ -390,6 +394,7 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 			b = convertRawToolCallsInBody(b)
 			log.Info("upstream_attempt",
 				"try_model", modelID,
+				"base_url", baseURL,
 				"surface", surface,
 				"status", resp.StatusCode,
 				"duration_ms", durationMs,
@@ -397,6 +402,7 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 			)
 			log.Info("upstream_result",
 				"models_tried", []string{modelID},
+				"base_url", baseURL,
 				"retries", retryCount,
 				"final_status", resp.StatusCode,
 				"fallback_used", false,
@@ -405,7 +411,7 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		logUpstreamError(ctx, modelID, resp.StatusCode, errBody)
+		logUpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL)
 		nonRetryable := isNonRetryableUpstreamError(resp.StatusCode, errBody)
 		canRetry := !nonRetryable && shouldRetryUpstreamStatus(resp.StatusCode) && attempt+1 < maxAttemptsForUpstreamStatus(resp.StatusCode)
 		retryReason := ""
@@ -432,12 +438,13 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		}
 		// 免费层 429 按出口 IP 限流,5xx 也可能是出口问题:
 		// 重试前切断 sticky,让同一会话换到下一个出口。
-		invalidateStickyProxy(auth, bodyMap)
+		invalidateUpstreamTarget(auth, bodyMap)
 		client.CloseIdleConnections()
 		retryCount++
 	}
 	log.Info("upstream_result",
 		"models_tried", []string{modelID},
+		"base_url", lastBaseURL,
 		"retries", retryCount,
 		"final_status", lastStatus,
 		"fallback_used", false,
@@ -523,17 +530,19 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 	var lastStatus int
 	var lastHeader http.Header
 	var retryCount int
+	var lastBaseURL string
 	maxAttempts := maxUpstreamRetries
 	if max401Retries > maxAttempts {
 		maxAttempts = max401Retries
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		up, err := buildOCRequestWithEndpoint(modelID, bodyMap, auth, useGoEndpoint)
+		baseURL, client := selectUpstreamTarget(auth, bodyMap)
+		lastBaseURL = baseURL
+		up, err := buildOCRequestWithEndpoint(modelID, bodyMap, auth, useGoEndpoint, baseURL)
 		if err != nil {
 			return nil, 500, nil, err
 		}
-		client := getHTTPClientSticky(auth, bodyMap)
 		attemptStart := time.Now()
 		resp, err := client.Do(up)
 		durationMs := time.Since(attemptStart).Milliseconds()
@@ -545,6 +554,7 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 			}
 			log.Info("upstream_attempt",
 				"try_model", modelID,
+				"base_url", baseURL,
 				"surface", surface,
 				"status", 0,
 				"duration_ms", durationMs,
@@ -554,7 +564,7 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 			)
 			if canRetry {
 				client.CloseIdleConnections()
-				invalidateStickyProxy(auth, bodyMap)
+				invalidateUpstreamTarget(auth, bodyMap)
 				retryCount++
 				continue
 			}
@@ -563,6 +573,7 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			log.Info("upstream_attempt",
 				"try_model", modelID,
+				"base_url", baseURL,
 				"surface", surface,
 				"status", resp.StatusCode,
 				"duration_ms", durationMs,
@@ -570,6 +581,7 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 			)
 			log.Info("upstream_result",
 				"models_tried", []string{modelID},
+				"base_url", baseURL,
 				"retries", retryCount,
 				"final_status", resp.StatusCode,
 				"fallback_used", false,
@@ -578,7 +590,7 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		logUpstreamError(ctx, modelID, resp.StatusCode, errBody)
+		logUpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL)
 		nonRetryable := isNonRetryableUpstreamError(resp.StatusCode, errBody)
 		canRetry := !nonRetryable && shouldRetryUpstreamStatus(resp.StatusCode) && attempt+1 < maxAttemptsForUpstreamStatus(resp.StatusCode)
 		retryReason := ""
@@ -604,12 +616,13 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 		}
 		// 免费层 429 按出口 IP 限流,5xx 也可能是出口问题:
 		// 重试前切断 sticky,让同一会话换到下一个出口。
-		invalidateStickyProxy(auth, bodyMap)
+		invalidateUpstreamTarget(auth, bodyMap)
 		client.CloseIdleConnections()
 		retryCount++
 	}
 	log.Info("upstream_result",
 		"models_tried", []string{modelID},
+		"base_url", lastBaseURL,
 		"retries", retryCount,
 		"final_status", lastStatus,
 		"fallback_used", false,

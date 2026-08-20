@@ -232,6 +232,7 @@ Tor 和 WARP 变体见 [Docker Compose 部署模版](deploy/compose/README.md)�
 | `socks5_proxies` | SOCKS5 代理列表。 |
 | `active_socks5` | `""` 直连、某个 `addr` 固定代理、或 `__round_robin__` 轮询。 |
 | `socks5_paid_direct` | `true` 时带 key/付费请求绕过 SOCKS5；仅 public/免费走代理。 |
+| `upstream_base_urls` | opencode zen 上游域名列表（例如你的反代域名）。未设置/为空默认 `["https://opencode.ai"]`。配置多个时，同一会话会 sticky 固定到某个 (域名, 代理) 组合，实现负载均衡与缓存亲和。 |
 | `text_only_models` | 只接受文本的上游模型前缀（默认 `deepseek`）；图片会被静默降级为 `[image attached]` 文本标注。 |
 
 完整说明见 [配置说明](docs/CONFIGURATION.md)。

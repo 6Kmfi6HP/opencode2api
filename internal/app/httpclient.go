@@ -178,7 +178,32 @@ var (
 	socks5Sticky     bool         // 轮询模式下按会话固定出口（默认 true）
 )
 
-// ======================== 会话粘性代理（sticky egress） ========================
+// upstreamBaseURLs holds the normalized upstream base URL list (e.g. reversed
+// zen domains). Guarded by socks5Mu like the rest of the routing state.
+var upstreamBaseURLs = normalizeBaseURLs(nil)
+
+var baseURLRRIndex uint32
+
+// getUpstreamBaseURLs returns a copy of the base URL list.
+func getUpstreamBaseURLs() []string {
+	socks5Mu.RLock()
+	defer socks5Mu.RUnlock()
+	return append([]string(nil), upstreamBaseURLs...)
+}
+
+// roundRobinBaseURL picks a base URL for server-global requests (model
+// refresh, catalog fetch) that are not tied to a session.
+func roundRobinBaseURL() string {
+	socks5Mu.RLock()
+	defer socks5Mu.RUnlock()
+	if len(upstreamBaseURLs) <= 1 {
+		return upstreamBaseURLs[0]
+	}
+	idx := atomic.AddUint32(&baseURLRRIndex, 1) % uint32(len(upstreamBaseURLs))
+	return upstreamBaseURLs[idx]
+}
+
+// ======================== 会话粘性出口（sticky egress） ========================
 //
 // 上游免费层（opencode.ai/zen -free 模型）的 prompt 缓存按出口 IP 隔离：
 // 同一请求经不同出口会各自冷启动，缓存几乎无法命中。轮询模式下若每次请求
@@ -187,9 +212,13 @@ var (
 // sticky 模式为同一会话（账号 token 或客户端会话 user）固定一个出口代理，
 // 让缓存持续累积；不同会话之间仍轮询分散，保留多出口的意义。绑定 TTL
 // 过期或代理连接失败时自动解除，重新分配出口。
+//
+// 多上游域名下，同一 (key, 域名, 代理) 三元组一起绑定，使会话在负载均衡
+// 多个反代域名时也保持同一目标，避免在 domain 间漂移破坏缓存与限流状态。
 
 type stickyProxyEntry struct {
-	proxyIdx int
+	baseIdx  int // 上游域名下标（-1 表示未启用多域名 sticky）
+	proxyIdx int // 代理下标（-1 表示直连）
 	client   *http.Client
 	lastUsed time.Time
 }
@@ -235,27 +264,54 @@ func buildProxyClient(proxy Socks5Proxy) *http.Client {
 	}
 }
 
-// getHTTPClientSticky 在轮询代理模式下选择客户端：
-// sticky 开启且能识别会话时固定出口，否则退化为普通轮询。
-func getHTTPClientSticky(auth UpstreamAuth, bodyMap map[string]any) *http.Client {
-	// 带 key 直连配置优先，不参与粘性。
-	if auth.tier() == TierPaid && getSocks5PaidDirect() {
-		return httpClient
-	}
-	if !getSocks5Sticky() {
-		return getHTTPClientForTier(auth.tier())
-	}
+// selectUpstreamTarget 为一次上游请求选择 (baseURL, client)：
+//   - 单域名(默认)时 base 固定为默认域名；多域名时按会话 key 哈希 sticky 到一个 base；
+//   - socks5 轮询+sticky 开启时同一会话同时固定一个代理出口；
+//   - paid 直连(socks5_paid_direct=true 且付费层)时 client=httpClient，但域名仍 sticky。
+//
+// 快路径(单域名 + 代理维不需要 sticky 绑定)不产生条目。
+func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any) (string, *http.Client) {
+	paidDirect := auth.tier() == TierPaid && getSocks5PaidDirect()
+	sticky := getSocks5Sticky()
+	key := stickyKeyForRequest(auth, bodyMap)
+
 	socks5Mu.RLock()
 	rr := activeSocks5 == socks5RR
 	proxies := socks5Proxies
+	baseURLs := upstreamBaseURLs
 	socks5Mu.RUnlock()
-	if !rr || len(proxies) == 0 {
-		return getHTTPClientForTier(auth.tier())
+
+	// 快路径：单域名且代理维也不需要 sticky 绑定。
+	domainSticky := len(baseURLs) > 1
+	proxySticky := sticky && rr && len(proxies) > 0 && !paidDirect
+	if !domainSticky && !proxySticky {
+		if paidDirect {
+			return baseURLs[0], httpClient
+		}
+		return baseURLs[0], getHTTPClient()
 	}
 
-	key := stickyKeyForRequest(auth, bodyMap)
+	entry := lookupOrCreateSticky(key, domainSticky, proxySticky, len(baseURLs), len(proxies), proxies)
+	base := baseURLs[0]
+	if entry.baseIdx >= 0 {
+		base = baseURLs[entry.baseIdx]
+	}
+	// 代理维未启用 sticky 时，client 每次按当前配置轮询/固定，不缓存。
+	if !proxySticky {
+		if paidDirect {
+			return base, httpClient
+		}
+		return base, getHTTPClient()
+	}
+	return base, entry.client
+}
 
+// lookupOrCreateSticky 查找或创建会话的 (域名, 代理) 绑定。同一 key 的连续
+// 绑定因 stickyRebindSeq 递增而轮换，使失效后的重绑真正换到不同目标。
+// proxySticky=false 时只缓存域名维（baseIdx），client 字段不使用。
+func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nProxy int, proxies []Socks5Proxy) *stickyProxyEntry {
 	stickyMu.Lock()
+	defer stickyMu.Unlock()
 	now := time.Now()
 	// 懒清理：先清过期条目，超出上限时再清最旧的。
 	if len(stickyEntries) > stickyMaxEntries || len(stickyEntries) > 0 {
@@ -276,35 +332,48 @@ func getHTTPClientSticky(auth UpstreamAuth, bodyMap map[string]any) *http.Client
 		delete(stickyEntries, oldestKey)
 	}
 	if e, ok := stickyEntries[key]; ok {
-		e.lastUsed = now
-		client := e.client
-		stickyMu.Unlock()
-		slog.Debug("sticky proxy reuse", "key", key, "idx", e.proxyIdx)
-		return client
+		if (domainSticky && e.baseIdx < 0) || (proxySticky && e.proxyIdx < 0) {
+			// 维度配置变化导致旧条目不满足当前需求，重建。
+			delete(stickyEntries, key)
+		} else {
+			e.lastUsed = now
+			slog.Debug("sticky target reuse", "key", key, "baseIdx", e.baseIdx, "proxyIdx", e.proxyIdx)
+			return e
+		}
 	}
 
-	// 哈希 + 递增序号:同一 key 的连续绑定会落在不同出口,使代理切换真正生效。
+	// 哈希 + 递增序号：同一 key 的连续绑定会落在不同目标。
+	// base 与 proxy 使用不同哈希位独立分布，避免组合取模导致的偏斜。
 	seq := atomic.AddUint32(&stickyRebindSeq, 1)
-	idx := int((fnv32a(key) + seq) % uint32(len(proxies)))
-	entry := &stickyProxyEntry{proxyIdx: idx, client: buildProxyClient(proxies[idx]), lastUsed: now}
+	h := fnv32a(key) + seq
+
+	baseIdx := -1
+	if domainSticky {
+		if proxySticky {
+			baseIdx = int((h / uint32(nProxy)) % uint32(nBase))
+		} else {
+			baseIdx = int(h % uint32(nBase))
+		}
+	}
+	proxyIdx := -1
+	if proxySticky {
+		proxyIdx = int(h % uint32(nProxy))
+	}
+
+	entry := &stickyProxyEntry{baseIdx: baseIdx, proxyIdx: proxyIdx, lastUsed: now}
+	if proxySticky {
+		entry.client = buildProxyClient(proxies[proxyIdx])
+	} else {
+		entry.client = httpClient
+	}
 	stickyEntries[key] = entry
-	stickyMu.Unlock()
-	slog.Debug("sticky proxy bind", "key", key, "idx", idx, "addr", proxies[idx].Addr)
-	return entry.client
+	slog.Debug("sticky target bind", "key", key, "baseIdx", baseIdx, "proxyIdx", proxyIdx)
+	return entry
 }
 
-// invalidateStickyProxy 在代理连接失败时解除会话的 sticky 绑定，
-// 让下一次请求重新分配出口，避免持续使用故障代理。
-func invalidateStickyProxy(auth UpstreamAuth, bodyMap map[string]any) {
-	if !getSocks5Sticky() {
-		return
-	}
-	socks5Mu.RLock()
-	rr := activeSocks5 == socks5RR
-	socks5Mu.RUnlock()
-	if !rr {
-		return
-	}
+// invalidateUpstreamTarget 在连接失败/上游 429/5xx 时解除会话的 sticky 绑定，
+// 让下一次请求重新分配 (base, 出口)，避免持续使用故障目标。
+func invalidateUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any) {
 	key := stickyKeyForRequest(auth, bodyMap)
 	stickyMu.Lock()
 	delete(stickyEntries, key)

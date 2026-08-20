@@ -82,6 +82,8 @@ func applyConfig(cfg AppConfig) {
 	socks5PaidDirect = cfg.Socks5PaidDirect
 	socks5Mu.Unlock()
 
+	setUpstreamBaseURLs(cfg.UpstreamBaseURLs)
+
 	socks5Sticky = true
 	if cfg.Socks5Sticky != nil {
 		socks5Sticky = *cfg.Socks5Sticky
@@ -214,3 +216,60 @@ func rejectsCacheControl(modelID string) bool {
 	name := strings.ToLower(strings.TrimSpace(modelID))
 	return strings.HasPrefix(name, "glm") || strings.HasPrefix(name, "zhipu") || strings.HasPrefix(name, "z-ai") || strings.HasPrefix(name, "zai")
 }
+
+// setUpstreamBaseURLs stores the normalized upstream base URL list. The list
+// lives in httpsclient.go's socks5Mu-guarded state; here we only normalize
+// and push it in, clearing sticky bindings when the set actually changed.
+func setUpstreamBaseURLs(raw []string) {
+	socks5Mu.Lock()
+	cur := upstreamBaseURLs
+	socks5Mu.Unlock()
+
+	normalized := normalizeBaseURLs(raw)
+	changed := len(normalized) != len(cur)
+	if !changed {
+		for i, u := range normalized {
+			if u != cur[i] {
+				changed = true
+				break
+			}
+		}
+	}
+	socks5Mu.Lock()
+	upstreamBaseURLs = normalized
+	atomic.StoreUint32(&baseURLRRIndex, 0)
+	socks5Mu.Unlock()
+	if changed {
+		stickyMu.Lock()
+		stickyEntries = map[string]*stickyProxyEntry{}
+		stickyMu.Unlock()
+	}
+}
+
+// normalizeBaseURLs trims trailing slashes, drops blanks and duplicates.
+// An empty result falls back to the default https://opencode.ai.
+func normalizeBaseURLs(raw []string) []string {
+	if len(raw) == 0 {
+		return defaultBaseURLs
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, u := range raw {
+		u = strings.TrimSpace(u)
+		if u == "" || strings.HasPrefix(u, "//") {
+			continue
+		}
+		u = strings.TrimSuffix(u, "/")
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+	if len(out) == 0 {
+		return defaultBaseURLs
+	}
+	return out
+}
+
+var defaultBaseURLs = []string{"https://opencode.ai"}

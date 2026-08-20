@@ -95,6 +95,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	oldSocks5ClientAddr := socks5ClientAddr
 	oldSocks5PaidDirect := socks5PaidDirect
 	oldSocks5Proxies := socks5Proxies
+	oldUpstreamBaseURLs := upstreamBaseURLs
 
 	transport := &fakeRetryTransport{
 		t:         t,
@@ -113,6 +114,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	socks5ClientAddr = ""
 	socks5PaidDirect = false
 	socks5Proxies = nil
+	upstreamBaseURLs = normalizeBaseURLs(nil)
 	socks5Mu.Unlock()
 
 	ocOnce = sync.Once{}
@@ -133,6 +135,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 		socks5ClientAddr = oldSocks5ClientAddr
 		socks5PaidDirect = oldSocks5PaidDirect
 		socks5Proxies = oldSocks5Proxies
+		upstreamBaseURLs = oldUpstreamBaseURLs
 		socks5Mu.Unlock()
 		ocOnce = sync.Once{}
 		ocClientVer = oldOCClientVer

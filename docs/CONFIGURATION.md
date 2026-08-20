@@ -153,6 +153,28 @@ SOCKS5 代理列表。
 }
 ```
 
+### `upstream_base_urls`
+
+opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为 `["https://opencode.ai"]`。典型用途：你自己反代的多个域名，配合 `socks5_proxies` 实现多入口负载均衡、提高可用性。
+
+```json
+{
+  "upstream_base_urls": [
+    "https://opencode.ai",
+    "https://zen1.example.com",
+    "https://zen2.example.com"
+  ]
+}
+```
+
+- 规范化：自动去除尾部 `/`、空项与重复项；全空回落默认 `https://opencode.ai`
+- 会话 sticky：同一会话（付费按账号 token，public 按 session_id，缺省按公共兜底）会固定到某个 **(域名, 代理)** 组合——多域名下请求不会在多域名间漂移，反代侧的缓存、限流状态持续累积；不同会话仍分散到不同组合实现负载均衡
+- 与 `socks5_sticky=false` 配合：仅代理维恢复轮询，域名维仍按会话固定
+- 与 `socks5_paid_direct=true` 配合：付费请求 client 直连，但域名维仍按会话固定
+- 服务端全局请求（模型目录拉取 `/v1/models` 等）不做 sticky，多域名间轮询
+
+域名列表变化（增删改）时自动清空全部 sticky 绑定，避免指向已不存在的目标。
+
 ### `prompt_cache_retention`
 
 向上游 zen 网关显式声明 prompt 前缀缓存的保留时长。上游默认约 5 分钟（`in_memory`），agent 任务间歇过长时缓存容易过期导致命中率低。

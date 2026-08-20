@@ -49,6 +49,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		cfg.Socks5Proxies = socks5Proxies
 		cfg.ActiveSocks5 = activeSocks5
 		cfg.Socks5PaidDirect = socks5PaidDirect
+		cfg.UpstreamBaseURLs = upstreamBaseURLs
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -60,6 +61,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			"socks5_proxies":           cfg.Socks5Proxies,
 			"active_socks5":            cfg.ActiveSocks5,
 			"socks5_paid_direct":       cfg.Socks5PaidDirect,
+			"upstream_base_urls":       cfg.UpstreamBaseURLs,
 			"log_level":                getLogLevelString(),
 			"log_bodies":               getLogBodies(),
 		})
@@ -437,6 +439,18 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <button class="btn btn-success" onclick="saveConfig()">保存全部</button>
 </div>
 </div>
+
+<div class="card full-row">
+<h2><span class="dot" style="background:var(--green)"></span>上游域名</h2>
+<div class="form-group">
+<label>opencode zen 上游域名（一行一个）</label>
+<textarea id="upstreamBaseURLs" rows="4" placeholder="https://opencode.ai"></textarea>
+<span class="hint">多个反代域名可实现负载均衡；同一会话 sticky 固定到某个 (域名, 代理) 组合。留空默认为 https://opencode.ai。</span>
+</div>
+<div class="actions">
+<button class="btn btn-success" onclick="saveConfig()">保存全部</button>
+</div>
+</div>
 </div>
 </div>
 <div id="toast"></div>
@@ -445,7 +459,7 @@ let aliasData={},effortData={},modelList=[],socks5Data=[],capData={};
 function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute('data-theme');const next=cur==='dark'?null:'dark';if(next)d.setAttribute('data-theme',next);else d.removeAttribute('data-theme');localStorage.setItem('theme',next||'light');document.querySelector('.theme-toggle').textContent=next==='dark'?'🌙':'☀'}
 (function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
 function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadStats();setTimeout(()=>window.scrollTo(0,sy),100)})}
-async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;document.getElementById('socks5_paid_direct').checked=!!cfg.socks5_paid_direct;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];capData=cfg.max_tokens_cap_per_model||{};document.getElementById('maxTokensCap').value=cfg.max_tokens_cap||'';const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();renderCapTable();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
+async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;document.getElementById('socks5_paid_direct').checked=!!cfg.socks5_paid_direct;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];capData=cfg.max_tokens_cap_per_model||{};document.getElementById('maxTokensCap').value=cfg.max_tokens_cap||'';document.getElementById('upstreamBaseURLs').value=(cfg.upstream_base_urls||[]).join('\n');const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();renderCapTable();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
 function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>').join('')}
 function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
 function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+modelSelectHtml('')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
@@ -460,7 +474,7 @@ function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();collectCaps();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,max_tokens_cap:parseInt(document.getElementById('maxTokensCap').value)||0,max_tokens_cap_per_model:capData,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,socks5_paid_direct:document.getElementById('socks5_paid_direct').checked};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+async function saveConfig(){collectAliases();collectEfforts();collectSocks5();collectCaps();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,max_tokens_cap:parseInt(document.getElementById('maxTokensCap').value)||0,max_tokens_cap_per_model:capData,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,socks5_paid_direct:document.getElementById('socks5_paid_direct').checked,upstream_base_urls:document.getElementById('upstreamBaseURLs').value.split('\n').map(s=>s.trim()).filter(Boolean)};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
 function renderCapTable(){const tb=document.querySelector('#capTable tbody');const ks=Object.keys(capData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无模型上限配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td>'+modelSelectHtml(k)+'</td><td><input type="number" value="'+capData[k]+'" data-field="cap" min="0" style="width:100px"></td><td><button class="btn btn-danger" onclick="delCap(this)">删除</button></td></tr>').join('')}
 function addCapRow(){const tb=document.querySelector('#capTable tbody');const tr=document.createElement('tr');tr.innerHTML='<td>'+modelSelectHtml('')+'</td><td><input type="number" value="0" data-field="cap" min="0" style="width:100px"></td><td><button class="btn btn-danger" onclick="delCap(this)">删除</button></td>';tb.appendChild(tr);if(tb.querySelector('.empty-hint'))tb.innerHTML=''}
 function collectCaps(){capData={};document.querySelectorAll('#capTable tbody tr').forEach(tr=>{const sel=tr.querySelector('[data-field=key]');const inp=tr.querySelector('[data-field=cap]');if(sel&&inp){const k=sel.value;if(k){const v=parseInt(inp.value)||0;capData[k]=v}}})}

@@ -355,7 +355,7 @@ func TestBuildOCRequestKeepsReasoningEffort(t *testing.T) {
 		ReasoningEffort: "medium",
 		Thinking:        map[string]any{"type": "enabled"},
 	})
-	req, err := buildOCRequestWithEndpoint("deepseek-v4-flash-free", body, UpstreamAuth{Mode: AuthRoutePublic}, false)
+	req, err := buildOCRequestWithEndpoint("deepseek-v4-flash-free", body, UpstreamAuth{Mode: AuthRoutePublic}, false, "https://opencode.ai")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +425,7 @@ func TestReasoningEffortMapAppliesAndSurvivesUpstreamBody(t *testing.T) {
 	if body["reasoning_effort"] != "max" {
 		t.Fatalf("mapped effort = %#v, want max", body["reasoning_effort"])
 	}
-	req, err := buildOCRequestWithEndpoint("m", body, UpstreamAuth{Mode: AuthRoutePublic}, false)
+	req, err := buildOCRequestWithEndpoint("m", body, UpstreamAuth{Mode: AuthRoutePublic}, false, "https://opencode.ai")
 	if err != nil {
 		t.Fatal(err)
 	}
