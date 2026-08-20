@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.0
+
+- Add `POST /v1/messages/count_tokens` with local heuristic estimation: Claude Code polls this endpoint to manage its context window and trigger auto-compaction, and previously it 404'd. The new `claudeCountTokensHandler` answers synchronously with a local estimate (text at ~4 chars/token, per-message/system/tool structural overhead, and fixed `1600`/`3000` token estimates for image/document blocks), never calling the upstream and never incurring usage. Invalid JSON or missing `model` return a protocol-shaped 400; non-POST returns 405.
+- Add multi-domain upstream load balancing with session stickiness: the new `upstream_base_urls` config spreads opencode zen traffic across multiple (reversed) domains. Sessions hash-stick to one (base URL, socks5 proxy) pair so per-egress prompt caches keep hitting, rebinding to a different target on 429/5xx/transport errors like the existing proxy stickiness. Catalog fetches round-robin over all domains, logs record `base_url` per attempt, and the admin UI gains an upstream domain editor. Defaults to `["https://opencode.ai"]` when unset.
+
 ## v0.4.9
 
 - Silence multi-modal downgrade for text-only upstream models: models matching the new configurable `text_only_models` prefixes (default `["deepseek"]`, prefix-matched case-insensitively) have image and document parts replaced with `[image attached]` / `[document attached]` text annotations before the request leaves the proxy, so DeepSeek requests with screenshots or pasted images keep working instead of failing upstream with an image-unsupported error. Applied uniformly across the Chat, Responses, and Claude protocol surfaces (single choke point at `buildUpstreamBody`); text content and part order are preserved.
