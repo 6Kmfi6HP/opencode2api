@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -307,6 +308,58 @@ func maxAttemptsForUpstreamStatus(status int) int {
 	return maxUpstreamRetries
 }
 
+// retryBackoff 计算重试前等待时长：
+// - 优先使用上游 Retry-After 头（带单位或裸秒）；
+// - 否则指数退避 base * 2^attempt（含少量抖动防惊群），封顶 15s。
+// 429 的退避基数为 500ms，其余临时错误 250ms。
+func retryBackoff(status int, attempt int, retryAfter string) time.Duration {
+	if ra := parseRetryAfter(retryAfter); ra > 0 {
+		if ra > 15*time.Second {
+			ra = 15 * time.Second
+		}
+		return ra
+	}
+	base := 250 * time.Millisecond
+	if status == http.StatusTooManyRequests {
+		base = 500 * time.Millisecond
+	}
+	d := base << uint(min(attempt, 5))
+	if d > 15*time.Second {
+		d = 15 * time.Second
+	}
+	return d
+}
+
+// parseRetryAfter 解析 HTTP Retry-After 头：裸秒数或 HTTP 日期。
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// waitRetry 在重试前睡眠，返回 false 表示上下文已取消/超时，应停止重试。
+func waitRetry(ctx context.Context, status int, attempt int, retryAfter string) bool {
+	d := retryBackoff(status, attempt, retryAfter)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {
 	initOCSession()
 
@@ -363,6 +416,10 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 			if canRetry {
 				client.CloseIdleConnections()
 				invalidateUpstreamTarget(auth, bodyMap)
+				// 传输错误同样退避等待,等待期间客户端取消则放弃。
+				if !waitRetry(ctx, 0, attempt, "") {
+					break
+				}
 				retryCount++
 				continue
 			}
@@ -440,6 +497,10 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		// 重试前切断 sticky,让同一会话换到下一个出口。
 		invalidateUpstreamTarget(auth, bodyMap)
 		client.CloseIdleConnections()
+		// 429 等临时错误:指数退避 + Retry-After,等待期间客户端取消则放弃。
+		if !waitRetry(ctx, resp.StatusCode, attempt, resp.Header.Get("Retry-After")) {
+			break
+		}
 		retryCount++
 	}
 	log.Info("upstream_result",
@@ -565,6 +626,10 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 			if canRetry {
 				client.CloseIdleConnections()
 				invalidateUpstreamTarget(auth, bodyMap)
+				// 传输错误同样退避等待,等待期间客户端取消则放弃。
+				if !waitRetry(ctx, 0, attempt, "") {
+					break
+				}
 				retryCount++
 				continue
 			}
@@ -618,6 +683,10 @@ func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID str
 		// 重试前切断 sticky,让同一会话换到下一个出口。
 		invalidateUpstreamTarget(auth, bodyMap)
 		client.CloseIdleConnections()
+		// 429 等临时错误:指数退避 + Retry-After,等待期间客户端取消则放弃。
+		if !waitRetry(ctx, resp.StatusCode, attempt, resp.Header.Get("Retry-After")) {
+			break
+		}
 		retryCount++
 	}
 	log.Info("upstream_result",

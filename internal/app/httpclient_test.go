@@ -2,8 +2,10 @@ package app
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 保存并替换全局代理状态,结束后恢复。
@@ -215,5 +217,33 @@ func TestNormalizeBaseURLs(t *testing.T) {
 	}
 	if got := normalizeBaseURLs(nil); strings.Join(got, ",") != strings.Join(defaultBaseURLs, ",") {
 		t.Fatalf("empty normalize = %#v, want default", got)
+	}
+}
+
+func TestRetryBackoff(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		attempt    int
+		retryAfter string
+		wantMin    time.Duration
+		wantMax    time.Duration
+	}{
+		{"429 attempt0", 429, 0, "", 500 * time.Millisecond, 1000 * time.Millisecond},
+		{"429 attempt1 doubles", 429, 1, "", 1000 * time.Millisecond, 2000 * time.Millisecond},
+		{"429 attempt5 caps", 429, 5, "", 15*time.Second - time.Second, 15 * time.Second},
+		{"5xx base", 502, 0, "", 250 * time.Millisecond, 500 * time.Millisecond},
+		{"retry-after seconds", 429, 0, "3", 3 * time.Second, 3 * time.Second},
+		{"retry-after capped", 429, 0, "120", 15 * time.Second, 15 * time.Second},
+		{"retry-after http date", 429, 0, time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat), time.Second, 3 * time.Second},
+		{"retry-after invalid", 429, 0, "abc", 500 * time.Millisecond, 1000 * time.Millisecond},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := retryBackoff(c.status, c.attempt, c.retryAfter)
+			if got < c.wantMin || got > c.wantMax {
+				t.Fatalf("retryBackoff(%d,%d,%q) = %v, want [%v, %v]", c.status, c.attempt, c.retryAfter, got, c.wantMin, c.wantMax)
+			}
+		})
 	}
 }
