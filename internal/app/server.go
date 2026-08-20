@@ -85,6 +85,7 @@ func Run() {
 	mux.HandleFunc("/v1/chat/completions", loggingMiddleware(chatCompletionsHandler))
 	mux.HandleFunc("/v1/responses", loggingMiddleware(responsesHandler))
 	mux.HandleFunc("/v1/messages", loggingMiddleware(claudeMessagesHandler))
+	mux.HandleFunc("/v1/messages/count_tokens", loggingMiddleware(claudeCountTokensHandler))
 	mux.HandleFunc("/v1/models", loggingMiddleware(listModelsHandler))
 	mux.HandleFunc("/login", loggingMiddleware(loginHandler))
 	mux.HandleFunc("/logout", loggingMiddleware(logoutHandler))

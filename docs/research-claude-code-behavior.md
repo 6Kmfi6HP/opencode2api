@@ -836,7 +836,7 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 | Extended context + interleaved thinking | 仅 beta headers | 静默不可用 | 原样转发 `anthropic-beta` |
 | Beta tool fields | beta + tool schema fields（`strict`, `defer_loading`） | 400 命名未识别的 tool schema 字段 | 同时转发两者，或 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` |
 | Effort + structured outputs | `output_config` body + 各自 beta | 400 命名 `output_config` | 同时转发字段和 headers |
-| Token counting | `count_tokens` 端点 | 回退到通过 messages 端点计数 | 暴露该端点 |
+| Token counting | `count_tokens` 端点 | 无该端点时回退到 messages 端点计数 | 已实现（本地启发式估算） |
 
 ### 5.6 端点列表
 
@@ -846,7 +846,7 @@ Claude Code 调用的核心 API 端点：
 |------|------|------|--------|
 | `/v1/messages` | POST | 主要推理 | ✅ |
 | `/v1/messages?beta=true` | POST | Beta 消息 | ✅ |
-| `/v1/messages/count_tokens` | POST | Token 计数 | ❌ 可选 |
+| `/v1/messages/count_tokens` | POST | Token 计数 | ✅ 已实现（本地启发式估算） |
 | `/v1/models` | GET | 列出可用模型 | ❌ 可选 |
 | `/v1/models/{model_id}` | GET | 检索模型 | ❌ 可选 |
 

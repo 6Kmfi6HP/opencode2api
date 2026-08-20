@@ -114,20 +114,15 @@ Claude Code 客户端
 | `server_tool_use` | 同上 | ❌ | ✅ |
 | `web_search_tool_result` | 同上 | ❌ | ✅ |
 | `container_upload` | 同上 | ❌ | ✅ |
+| `code_execution_tool_use` | 同上 | ❌ | ✅ |
+| `code_execution_tool_result` | 同上 | ❌ | ✅ |
+| `mcp_tool_use` | 同上 | ❌ | ✅ |
+| `mcp_tool_result` | 同上 | ❌ | ✅ |
+| `bash_code_execution_tool_result` | 同上 | ❌ | ✅ |
+| `web_fetch_tool_result` | 同上 | ❌ | ✅ |
+| `tool_reference` | 同上 | ❌ | ✅ |
 
-**Anthropic API 中新增但未在扫描列表中的 block 类型：**
-
-| Block 类型 | 当前行为 | 400？ | 建议 |
-|-----------|---------|-------|------|
-| `code_execution_tool_use` | 静默忽略（不在 `claudeUnsupportedBlockTypes` 中） | ❌ | ⚠️ 添加到扫描列表（可观测性） |
-| `code_execution_tool_result` | 同上 | ❌ | ⚠️ 同上 |
-| `mcp_tool_use` | 同上 | ❌ | ⚠️ 同上 |
-| `mcp_tool_result` | 同上 | ❌ | ⚠️ 同上 |
-| `bash_code_execution_tool_result` | 同上 | ❌ | ⚠️ 同上 |
-| `web_fetch_tool_result` | 同上 | ❌ | ⚠️ 同上 |
-| `tool_reference` | 同上 | ❌ | ⚠️ 同上 |
-
-> **结论**：所有不支持的 block 类型都被静默忽略，**不返回 400**。但部分新类型未在 `claudeUnsupportedBlockTypes` 中列出，影响可观测性（日志中不会计数）。建议添加。
+> **结论**：所有不支持的 block 类型（含 12 种 server tool / 新类型）都已在 `claudeUnsupportedBlockTypes` 扫描列表中，静默忽略、**不返回 400**，并在日志的 `unsupported_blocks` 中计数。
 
 ### 2.3 system 字段处理
 
@@ -165,13 +160,15 @@ Claude Code 客户端
 
 ```go
 type ClaudeResponse struct {
-    ID         string          `json:"id"`
-    Type       string          `json:"type"`
-    Role       string          `json:"role"`
-    Content    []ClaudeContent `json:"content"`
-    Model      string          `json:"model"`
-    StopReason string          `json:"stop_reason"`
-    Usage      ClaudeUsage     `json:"usage,omitempty"`
+    ID           string          `json:"id"`
+    Type         string          `json:"type"`
+    Role         string          `json:"role"`
+    Content      []ClaudeContent `json:"content"`
+    Model        string          `json:"model"`
+    StopReason   string          `json:"stop_reason"`
+    StopSequence *string         `json:"stop_sequence"`
+    StopDetails  any             `json:"stop_details,omitempty"`
+    Usage        ClaudeUsage     `json:"usage,omitempty"`
 }
 ```
 
@@ -179,8 +176,8 @@ type ClaudeResponse struct {
 
 | Anthropic API 响应字段 | 当前状态 | 影响 | 建议优先级 |
 |---------------------|---------|------|-----------|
-| `stop_sequence` | ❌ 缺失 | Claude Code 期望在 `stop_reason:"stop_sequence"` 时读取此字段 | 🔴 高 |
-| `stop_details` | ❌ 缺失 | `stop_reason:"refusal"` 时提供拒绝详情 | 🟡 中 |
+| `stop_sequence` | ✅ 已实现（恒为 `null`） | `openAIToClaudeResponse` 中 `StopSequence: nil` | ✅ |
+| `stop_details` | ⚠️ 字段已定义但从未赋值 | `stop_reason:"refusal"` 时提供拒绝详情 | 🟡 中（见 G6） |
 | `id` 格式 | ✅ `msg_` 前缀 | 使用 `normalizeClaudeMessageID()` 规范化 | ✅ |
 
 ### 3.2 stop_reason 映射
@@ -229,12 +226,12 @@ type ClaudeResponse struct {
 
 当前实现的事件流：
 ```
-event: message_start    → {type, message:{id, type, role, content:[], model, stop_reason:null, usage:{input_tokens:0, output_tokens:0}}}
+event: message_start    → {type, message:{id, type, role, content:[], model, stop_reason:null, stop_sequence:null, usage:{input_tokens:0, output_tokens:0}}}
 event: ping              → {type:"ping"}
 event: content_block_start → {type, index, content_block:{type, ...}}
 event: content_block_delta → {type, index, delta:{type, ...}}
 event: content_block_stop  → {type, index, content_block:{type}}
-event: message_delta     → {type, delta:{stop_reason}, usage:{output_tokens}}
+event: message_delta     → {type, delta:{stop_reason, stop_sequence:null}, usage:{output_tokens}}
 event: message_stop      → {type:"message_stop"}
 ```
 
@@ -243,7 +240,7 @@ event: message_stop      → {type:"message_stop"}
 | 事件 | Anthropic 规范 | 当前实现 | 差异 |
 |------|-------------|---------|------|
 | `message_start` | ✅ 必须第一个 | ✅ | ✅ |
-| `message_start.message.stop_sequence` | `null` 或匹配的停止序列 | ❌ 缺失 | 🔴 应添加 `stop_sequence: null` |
+| `message_start.message.stop_sequence` | `null` 或匹配的停止序列 | ✅ `"stop_sequence": nil` | ✅ |
 | `message_start.message.usage.input_tokens` | 实际 input token 数 | `0`（fullUsage 为空） | 🟡 低优先级 |
 | `message_start.message.usage.output_tokens` | `1` 或更多 | `0` | 🟡 低优先级 |
 | `ping` | 可选，keepalive | ✅ 紧随 message_start 发送 | ✅ |
@@ -254,7 +251,7 @@ event: message_stop      → {type:"message_stop"}
 | `content_block_delta` (input_json_delta) | ✅ | ✅ | ✅ |
 | `content_block_stop` | ✅ | ✅ | ✅ |
 | `message_delta` | ✅ 含 `stop_reason` | ✅ | ✅ |
-| `message_delta.delta.stop_sequence` | `null` 或匹配 | ❌ 缺失 | 🔴 应添加 |
+| `message_delta.delta.stop_sequence` | `null` 或匹配 | ✅ `"stop_sequence": nil` | ✅ |
 | `message_delta.usage` | 累积 usage | ✅ `buildClaudeDeltaUsage()` | ✅ |
 | `message_stop` | ✅ 最后一个 | ✅ | ✅ |
 | `error` | 流式错误 | ✅ `emitClaudeError()` | ✅ |
@@ -407,7 +404,7 @@ event: message_stop      → {type:"message_stop"}
 |---------------------|---------|------|
 | `POST /v1/messages` | ✅ `claudeMessagesHandler` | ✅ |
 | `POST /v1/messages?beta=true` | ✅ 同一 handler | ✅ |
-| `POST /v1/messages/count_tokens` | ❌ 未实现 | 🟡 可选（Claude Code 可降级） |
+| `POST /v1/messages/count_tokens` | ✅ `claudeCountTokensHandler`（本地启发式估算） | 🟢 单请求，不触发上游 |
 | `GET /v1/models` | ✅ `listModelsHandler` | ✅ |
 | `GET /v1/models/{id}` | ❌ 未实现 | 🟡 可选 |
 
@@ -419,12 +416,12 @@ event: message_stop      → {type:"message_stop"}
 
 | # | 缺口 | 严重性 | 影响范围 | 建议修改 |
 |---|------|--------|---------|---------|
-| **G1** | 非流式响应缺少 `stop_sequence` 字段 | 🔴 高 | 所有 Claude 响应 | 在 `ClaudeResponse` 结构体中添加 `StopSequence` 字段，值为 `null` |
-| **G2** | 流式 `message_start` 缺少 `stop_sequence: null` | 🔴 高 | 流式响应 | 在 `ensureMessageStart` 中添加 `"stop_sequence": nil` |
-| **G3** | 流式 `message_delta` 缺少 `stop_sequence` 字段 | 🔴 高 | 流式响应 | 在 `message_delta` 的 `delta` 中添加 `"stop_sequence": nil` |
-| **G4** | 新增 server tool block 类型未在扫描列表中 | 🟡 中 | 可观测性 | 将 `code_execution_tool_use`, `mcp_tool_use`, `mcp_tool_result` 等添加到 `claudeUnsupportedBlockTypes` |
+| ~~**G1**~~ | ~~非流式响应缺少 `stop_sequence` 字段~~ | ~~🔴 高~~ | 已解决 | `ClaudeResponse.StopSequence` 已添加，值为 `null` |
+| ~~**G2**~~ | ~~流式 `message_start` 缺少 `stop_sequence: null`~~ | ~~🔴 高~~ | 已解决 | `ensureMessageStart` 已添加 `"stop_sequence": nil` |
+| ~~**G3**~~ | ~~流式 `message_delta` 缺少 `stop_sequence` 字段~~ | ~~🔴 高~~ | 已解决 | `message_delta` 的 `delta` 已添加 `"stop_sequence": nil` |
+| ~~**G4**~~ | ~~新增 server tool block 类型未在扫描列表中~~ | ~~🟡 中~~ | 已解决 | `claudeUnsupportedBlockTypes` 已包含全部 12 种类型 |
 | **G5** | `stop_sequence` 场景的 stop_reason 映射 | 🟡 中 | stop_sequences 功能 | 当 `finish_reason:"stop"` 且请求包含 `stop_sequences` 时，考虑映射为 `stop_sequence` |
-| **G6** | 非流式响应缺少 `stop_details` 字段 | 🟡 中 | refusal 场景 | 在 `ClaudeResponse` 中添加 `StopDetails` 字段 |
+| **G6** | 非流式响应缺少 `stop_details` 字段 | 🟡 中 | refusal 场景 | `StopDetails` 字段已定义但从未赋值，`refusal` 场景需填充 |
 
 ### 8.2 不需要代码修改的缺口（正确忽略）
 
@@ -439,16 +436,15 @@ event: message_stop      → {type:"message_stop"}
 | `anthropic-beta` header 不转发 | 上游是 OpenAI 格式，正确忽略 |
 | `context_management` 不转发 | 同上 |
 | Server tools 跳过 | 同上 |
-| `count_tokens` 端点未实现 | 可选功能，Claude Code 可降级 |
+| `count_tokens` 本地估算已实现 | 启发式估算（非 byte 级精确），不影响正确性 |
 
 ### 8.3 低优先级 / 可选改进
 
 | # | 改进 | 优先级 | 说明 |
 |---|------|--------|------|
 | `message_start` 中 `input_tokens` 为 0 | 🟢 低 | OpenAI 上游在流式首 chunk 时不提供 input_tokens |
-| `request-id` 响应头 | 🟢 低 | Claude Code 用于调试，不影响功能 |
 | `anthropic-ratelimit-*` 响应头 | 🟢 低 | Claude Code 用于速率限制感知 |
-| `count_tokens` 端点 | 🟢 低 | Claude Code 可降级为估算 |
+| `count_tokens` 端点为本地启发式估算 | 🟡 中 | 非 byte 级精确，但足以支撑 context/auto-compact |
 | `GET /v1/models/{id}` | 🟢 低 | 可选功能 |
 
 ### 8.4 与其他代理项目的对比
@@ -459,7 +455,7 @@ event: message_stop      → {type:"message_stop"}
 | Claude → OpenAI 转换 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 流式 SSE 转换 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Thinking 处理 | ✅ (无签名) | ⚠️ (签名丢失) | ✅ (to-content) | ✅ | ✅ |
-| `stop_sequence` 字段 | ❌ | ? | ? | ? | ? |
+| `stop_sequence` 字段 | ✅ (恒为 null) | ? | ? | ? | ? |
 | Keepalive ping | ✅ (15s) | ✅ | ? | ✅ | ✅ |
 | Error 透传 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `cache_control` 处理 | ✅ (丢弃) | ⚠️ (条件保留) | ✅ | ❌ | ❌ |
