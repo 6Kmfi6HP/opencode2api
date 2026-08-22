@@ -88,6 +88,35 @@ make release-snapshot VERSION=v0.1.0
 
 确认 `dist/` 里有各平台 `.tar.gz` 和 `checksums.txt` 后再推 tag。
 
+## 一键安装脚本检查
+
+仓库提供两个安装脚本，分别覆盖 Unix-like 和 Windows：
+
+- `scripts/install.sh`
+- `scripts/install.ps1`
+
+它们依赖 GitHub Release 资产命名：
+
+```text
+opencode2api_<version>_<goos>_<goarch>.tar.gz
+opencode2api_<version>_<goos>_<goarch>_<variant>.tar.gz
+checksums.txt
+```
+
+发布新版本前，在本地或目标系统执行 dry-run，确认安装脚本指向的资产名与 `scripts/build-release.sh` 一致：
+
+```bash
+OPENCODE2API_VERSION=<new-tag> bash scripts/install.sh --check
+```
+
+Windows：
+
+```powershell
+.\scripts\install.ps1 -Version <new-tag> -CheckOnly
+```
+
+安装说明和 launch 后续命令见 `docs/INSTALL.md`。
+
 ## 单目标构建
 
 CI matrix 和本地调试共用同一个脚本。要只构建某个目标：

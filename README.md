@@ -36,6 +36,24 @@ Build locally:
 go build ./cmd/opencode2api
 ```
 
+## One-click install
+
+macOS, Linux, FreeBSD:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/6Kmfi6HP/opencode2api/main/scripts/install.sh | bash
+opencode2api launch claude
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/6Kmfi6HP/opencode2api/main/scripts/install.ps1 | iex
+opencode2api launch claude
+```
+
+The installer downloads the latest release, verifies its SHA256 checksum, and installs the CLI into `~/.opencode2api/bin` (or `~\.opencode2api\bin` on Windows). `launch claude` / `launch codex` still require the corresponding local CLI. For version pinning, install directories, supported platforms, and manual install, see [docs/INSTALL.md](docs/INSTALL.md) (安装 / installation).
+
 ## Quick start
 
 ```bash

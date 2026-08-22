@@ -36,6 +36,24 @@ internal/random/          # 随机 ID 工具
 go build ./cmd/opencode2api
 ```
 
+## 一键安装
+
+macOS、Linux、FreeBSD：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/6Kmfi6HP/opencode2api/main/scripts/install.sh | bash
+opencode2api launch claude
+```
+
+Windows PowerShell：
+
+```powershell
+irm https://raw.githubusercontent.com/6Kmfi6HP/opencode2api/main/scripts/install.ps1 | iex
+opencode2api launch claude
+```
+
+安装脚本会下载最新 Release、校验 SHA256、安装到 `~/.opencode2api/bin`（Windows 为 `~\.opencode2api\bin`）。`launch claude` / `launch codex` 仍然需要本机已安装对应的 CLI。版本固定、安装目录、支持平台和手动安装说明见 [docs/INSTALL.md](docs/INSTALL.md)。
+
 ## 快速开始
 
 ```bash
