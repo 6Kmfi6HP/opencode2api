@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -24,6 +25,7 @@ type launchFlags struct {
 	model     string
 	key       string
 	cfgPath   string
+	logFile   string
 	port      int
 	debug     bool
 	showVer   bool
@@ -38,6 +40,7 @@ func newLaunchFlagSet(tool string, args []string) launchFlags {
 	fs.StringVar(&f.model, "model", "", "upstream model ID (empty = interactive TUI selection)")
 	fs.StringVar(&f.key, "key", "", "OpenCode key (flag > OPENCODE_API_KEY env > public)")
 	fs.StringVar(&f.cfgPath, "config", "config.json", "config file path")
+	fs.StringVar(&f.logFile, "log-file", "", "log file path (empty = platform default)")
 	fs.IntVar(&f.port, "port", 0, "port to bind; 0 = random")
 	fs.BoolVar(&f.debug, "debug", false, "enable debug logs")
 	fs.BoolVar(&f.showVer, "version", false, "print version and exit")
@@ -85,7 +88,11 @@ func configureLaunchGlobals(f launchFlags) {
 	if f.debug {
 		logLevel = "debug"
 	}
-	logFile = "opencode2api.log"
+	if f.logFile != "" {
+		logFile = f.logFile
+	} else {
+		logFile = launchDefaultLogFile()
+	}
 	logStdout = false // launch mode: logs go to file only, never stdout (would corrupt the child TUI)
 	logMaxSize = 100
 	logMaxBackups = 7
@@ -170,7 +177,7 @@ func resolveLaunchModel(model string, extraArgs []string, extract func([]string)
 		// Interactive TUI model selection — show models from both the zen and
 		// go catalogs so the user can pick any available model.
 		allModels := append(getModelIDs(), getGoModelIDs()...)
-		selected, sErr := selectModelTTY(allModels, catalog)
+		selected, sErr := selectModelInteractive(os.Stdin, os.Stdout, os.Stderr, allModels, catalog)
 		if sErr != nil {
 			slog.Warn("model selection failed", "error", sErr)
 		}
@@ -212,7 +219,7 @@ func resolveLaunchModel(model string, extraArgs []string, extract func([]string)
 // environment. Signals are forwarded to the child, and opencode2api exits
 // with the child's exit code once the child exits.
 func runLaunchChild(tool, path string, args, extraEnv []string, server *http.Server, cleanup func()) {
-	cmd := exec.Command(path, args...)
+	cmd := newLaunchChildCommand(path, args)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -225,7 +232,7 @@ func runLaunchChild(tool, path string, args, extraEnv []string, server *http.Ser
 	go func() {
 		for sig := range sigCh {
 			if cmd.Process != nil {
-				_ = cmd.Process.Signal(sig)
+				signalLaunchChild(cmd.Process, sig)
 			}
 		}
 	}()
@@ -332,48 +339,46 @@ func launchCodex(args []string) {
 	runLaunchChild("codex", codexPath, codexArgs, buildCodexEnv(f.key), server, cleanup)
 }
 
-// findClaude locates the claude CLI binary by checking PATH, then common local
-// install locations.
+// findClaude locates the claude CLI binary by checking PATH, then common
+// platform-specific local install locations.
 func findClaude() string {
 	if path, err := exec.LookPath("claude"); err == nil {
 		return path
 	}
-	home, err := os.UserHomeDir()
-	if err == nil {
-		for _, candidate := range []string{
-			filepath.Join(home, ".local", "bin", "claude"),
-			filepath.Join(home, ".claude", "local", "claude"),
-		} {
-			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
-				return candidate
-			}
+	for _, candidate := range launchCandidatePaths("claude") {
+		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+			return candidate
 		}
 	}
-	fmt.Fprintln(os.Stderr, "claude not found in PATH, ~/.local/bin/claude, or ~/.claude/local/claude")
-	fmt.Fprintln(os.Stderr, "install with: npm install -g @anthropic-ai/claude-code")
+	if runtime.GOOS == "windows" {
+		fmt.Fprintln(os.Stderr, "claude not found in PATH,", "%USERPROFILE%\\.local\\bin, %USERPROFILE%\\.claude\\local, or %APPDATA%\\npm")
+		fmt.Fprintln(os.Stderr, "install with: npm install -g @anthropic-ai/claude-code")
+	} else {
+		fmt.Fprintln(os.Stderr, "claude not found in PATH, ~/.local/bin/claude, or ~/.claude/local/claude")
+		fmt.Fprintln(os.Stderr, "install with: npm install -g @anthropic-ai/claude-code")
+	}
 	os.Exit(1)
 	return ""
 }
 
-// findCodex locates the Codex CLI binary by checking PATH, then common local
-// install locations.
+// findCodex locates the Codex CLI binary by checking PATH, then common
+// platform-specific local install locations.
 func findCodex() string {
 	if path, err := exec.LookPath("codex"); err == nil {
 		return path
 	}
-	home, err := os.UserHomeDir()
-	if err == nil {
-		for _, candidate := range []string{
-			filepath.Join(home, ".local", "bin", "codex"),
-			filepath.Join(home, ".codex", "bin", "codex"),
-		} {
-			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
-				return candidate
-			}
+	for _, candidate := range launchCandidatePaths("codex") {
+		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+			return candidate
 		}
 	}
-	fmt.Fprintln(os.Stderr, "codex not found in PATH, ~/.local/bin/codex, or ~/.codex/bin/codex")
-	fmt.Fprintln(os.Stderr, "install Codex CLI: https://github.com/openai/codex")
+	if runtime.GOOS == "windows" {
+		fmt.Fprintln(os.Stderr, "codex not found in PATH,", "%USERPROFILE%\\.local\\bin, %USERPROFILE%\\.codex\\bin, or %APPDATA%\\npm")
+		fmt.Fprintln(os.Stderr, "install Codex CLI: https://github.com/openai/codex")
+	} else {
+		fmt.Fprintln(os.Stderr, "codex not found in PATH, ~/.local/bin/codex, or ~/.codex/bin/codex")
+		fmt.Fprintln(os.Stderr, "install Codex CLI: https://github.com/openai/codex")
+	}
 	os.Exit(1)
 	return ""
 }

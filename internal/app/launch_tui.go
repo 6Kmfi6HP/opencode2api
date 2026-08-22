@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"sort"
 	"strings"
 )
 
@@ -35,46 +34,10 @@ func selectModelTTY(modelIDs []string, catalog modelsDevCatalog) (string, error)
 		return "", nil
 	}
 
-	// Build a set of all raw model IDs for free-variant detection.
-	idSet := make(map[string]bool, len(modelIDs))
-	for _, id := range modelIDs {
-		idSet[id] = true
-	}
-
-	// Deduplicate to public-facing model IDs (strip "-free" suffix) and
-	// keep only models that have a free variant in the caches.
-	type entry struct {
-		id  string
-		ctx int
-	}
-	seen := map[string]bool{}
-	var entries []entry
-	for _, id := range modelIDs {
-		pub := publicFacingModelID(id)
-		if pub == "" || seen[pub] {
-			continue
-		}
-		seen[pub] = true
-		// Only show models with a free variant.
-		if !idSet[pub+"-free"] && !isFreeModel(id) {
-			continue
-		}
-		entries = append(entries, entry{
-			id:  pub,
-			ctx: getContextWindow(pub, catalog),
-		})
-	}
+	entries := modelSelectionEntries(modelIDs, catalog)
 	if len(entries) == 0 {
 		return "", nil
 	}
-
-	// Sort: context descending, unknown last, alphabetical for ties.
-	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].ctx != entries[j].ctx {
-			return entries[i].ctx > entries[j].ctx
-		}
-		return entries[i].id < entries[j].id
-	})
 
 	// Put terminal in raw mode.
 	rawCmd := exec.Command("stty", "raw", "-echo")
@@ -123,18 +86,18 @@ func selectModelTTY(modelIDs []string, catalog modelsDevCatalog) (string, error)
 			}
 			e := entries[idx]
 			marker := "    "
-			if e.ctx >= 1000000 {
+			if e.ContextWindow >= 1000000 {
 				marker = "[1m]"
 			}
 			ctxStr := "unknown"
-			if e.ctx > 0 {
-				ctxStr = fmt.Sprintf("%dK", e.ctx/1000)
+			if e.ContextWindow > 0 {
+				ctxStr = fmt.Sprintf("%dK", e.ContextWindow/1000)
 			}
 			prefix := "  "
 			if idx == selected {
 				prefix = "\xe2\x96\xb6 " // ▶
 			}
-			line := fmt.Sprintf("%s%-45s %10s  %s", prefix, e.id, ctxStr, marker)
+			line := fmt.Sprintf("%s%-45s %10s  %s", prefix, e.ID, ctxStr, marker)
 			if idx == selected {
 				b.WriteString("\033[36m")
 				b.WriteString(line)
@@ -183,7 +146,7 @@ func selectModelTTY(modelIDs []string, catalog modelsDevCatalog) (string, error)
 				}
 			}
 		case '\r', '\n': // Enter
-			return entries[selected].id, nil
+			return entries[selected].ID, nil
 		}
 	}
 }
