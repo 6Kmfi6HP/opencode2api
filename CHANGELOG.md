@@ -1,6 +1,6 @@
 # Changelog
 
-## unreleased
+## v0.6.0
 
 - Add one-click cross-platform installers: `scripts/install.sh` for Linux/macOS/FreeBSD and `scripts/install.ps1` for Windows. Both resolve the latest GitHub Release (or a pinned tag), select the correct OS/arch tarball, verify its SHA256 from `checksums.txt`, install the binary under `~/.opencode2api/bin`, and print next-step `launch claude` / `launch codex` commands. Installation, platform support, version pinning, and release-asset naming are documented in `docs/INSTALL.md` and linked from both READMEs.
 - Add `opencode2api launch codex`: starts the same localhost proxy as `launch claude`, then runs the installed Codex CLI with temporary `-c` provider overrides (`model_provider`, `model_providers.opencode2api.*`, `wire_api="responses"`, and `env_key="OPENCODE2API_OPENAI_API_KEY"`) so the child process uses opencode2api through its Responses API without writing `~/.codex/config.toml`. `--model` / `-m` after `--` are extracted, forwarded via Codex's `--model`, and the same `--key` / `OPENCODE_API_KEY` / `public` resolution is used. A temporary Codex model catalog is written from the current upstream model list and passed via `-c model_catalog_json=<temp path>`; it defaults to free-tier models for `public`, includes all models for paid/tier keys, and sets `context_window`, `max_context_window`, and `auto_compact_token_limit=<ctx*0.9>` so model switching and unknown upstream model IDs do not fall back to Codex's 258K default window.

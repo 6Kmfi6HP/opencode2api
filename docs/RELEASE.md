@@ -11,8 +11,8 @@ Release 由 `.github/workflows/release.yml` 管理。工作流分为三段：
 推荐通过 tag 触发：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.6.0
+git push origin v0.6.0
 ```
 
 也可以在 GitHub Actions 页面手动运行 Release workflow，并输入版本号。
@@ -83,7 +83,7 @@ permissions:
 make fmt
 make test
 make vet
-make release-snapshot VERSION=v0.1.0
+make release-snapshot VERSION=v0.6.0
 ```
 
 确认 `dist/` 里有各平台 `.tar.gz` 和 `checksums.txt` 后再推 tag。
@@ -122,7 +122,7 @@ Windows：
 CI matrix 和本地调试共用同一个脚本。要只构建某个目标：
 
 ```bash
-TARGETS="linux/amd64" CHECKSUMS=false VERSION=v0.1.0 ./scripts/build-release.sh
+TARGETS="linux/amd64" CHECKSUMS=false VERSION=v0.6.0 ./scripts/build-release.sh
 ```
 
 `TARGETS` 可以放多个以空格分隔的目标，例如：

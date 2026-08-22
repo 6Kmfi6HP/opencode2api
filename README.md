@@ -250,7 +250,7 @@ make build
 Generate local multi-platform release archives:
 
 ```bash
-make release-snapshot VERSION=v0.1.0
+make release-snapshot VERSION=v0.6.0
 ls dist/
 ```
 
@@ -271,8 +271,8 @@ Pushing a `v*` tag triggers GitHub Actions, which first runs formatting, tests, 
 Publish a release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.6.0
+git push origin v0.6.0
 ```
 
 Each release includes a per-platform `.tar.gz` and a generated `checksums.txt`.

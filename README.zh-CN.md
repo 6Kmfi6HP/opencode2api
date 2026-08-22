@@ -250,7 +250,7 @@ make build
 生成本地多平台 release 包：
 
 ```bash
-make release-snapshot VERSION=v0.1.0
+make release-snapshot VERSION=v0.6.0
 ls dist/
 ```
 
@@ -271,8 +271,8 @@ ls dist/
 发布命令：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.6.0
+git push origin v0.6.0
 ```
 
 Release 会包含每个平台的 `.tar.gz` 包和统一生成的 `checksums.txt`。

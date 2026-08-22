@@ -56,7 +56,7 @@ irm https://raw.githubusercontent.com/6Kmfi6HP/opencode2api/main/scripts/install
 | 参数 | 环境变量 | 说明 |
 | --- | --- | --- |
 | `--repo <owner/repo>` | `OPENCODE2API_REPO` | GitHub 仓库 |
-| `--version <tag>` | `OPENCODE2API_VERSION` | Release tag，例如 `v0.5.0` |
+| `--version <tag>` | `OPENCODE2API_VERSION` | Release tag，例如 `v0.6.0` |
 | `--install-dir <path>` | `OPENCODE2API_INSTALL_DIR` | 安装目录 |
 | `--no-modify-path` | | 不修改 shell 启动文件 |
 | `--check` | | 只打印检测结果和下载地址，不安装 |
@@ -64,25 +64,25 @@ irm https://raw.githubusercontent.com/6Kmfi6HP/opencode2api/main/scripts/install
 示例：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/6Kmfi6HP/opencode2api/main/scripts/install.sh | bash -s -- --version v0.5.0
+curl -fsSL https://raw.githubusercontent.com/6Kmfi6HP/opencode2api/main/scripts/install.sh | bash -s -- --version v0.6.0
 
-OPENCODE2API_VERSION=v0.5.0 OPENCODE2API_INSTALL_DIR="$HOME/bin" bash install.sh --no-modify-path
+OPENCODE2API_VERSION=v0.6.0 OPENCODE2API_INSTALL_DIR="$HOME/bin" bash install.sh --no-modify-path
 ```
 
 发布前用于检查资产名和下载地址：
 
 ```bash
-OPENCODE2API_VERSION=v0.5.0 bash scripts/install.sh --check
+OPENCODE2API_VERSION=v0.6.0 bash scripts/install.sh --check
 ```
 
 ### Windows 参数
 
 ```powershell
 # 只打印检测结果和下载地址
-irm https://raw.githubusercontent.com/6Kmfi6HP/opencode2api/main/scripts/install.ps1 | iex -Version v0.5.0 -CheckOnly
+irm https://raw.githubusercontent.com/6Kmfi6HP/opencode2api/main/scripts/install.ps1 | iex -Version v0.6.0 -CheckOnly
 
 # 固定版本，不修改用户 PATH
-& C:\path\to\install.ps1 -Version v0.5.0 -InstallDir "$HOME\.opencode2api\bin" -NoModifyPath
+& C:\path\to\install.ps1 -Version v0.6.0 -InstallDir "$HOME\.opencode2api\bin" -NoModifyPath
 ```
 
 支持的参数：
@@ -108,15 +108,15 @@ checksums.txt
 
 当前发布目标：
 
-- `opencode2api_v0.5.0_linux_amd64.tar.gz`
-- `opencode2api_v0.5.0_linux_arm64.tar.gz`
-- `opencode2api_v0.5.0_linux_arm_v7.tar.gz`
-- `opencode2api_v0.5.0_darwin_amd64.tar.gz`
-- `opencode2api_v0.5.0_darwin_arm64.tar.gz`
-- `opencode2api_v0.5.0_windows_amd64.tar.gz`
-- `opencode2api_v0.5.0_windows_arm64.tar.gz`
-- `opencode2api_v0.5.0_freebsd_amd64.tar.gz`
-- `opencode2api_v0.5.0_freebsd_arm64.tar.gz`
+- `opencode2api_v0.6.0_linux_amd64.tar.gz`
+- `opencode2api_v0.6.0_linux_arm64.tar.gz`
+- `opencode2api_v0.6.0_linux_arm_v7.tar.gz`
+- `opencode2api_v0.6.0_darwin_amd64.tar.gz`
+- `opencode2api_v0.6.0_darwin_arm64.tar.gz`
+- `opencode2api_v0.6.0_windows_amd64.tar.gz`
+- `opencode2api_v0.6.0_windows_arm64.tar.gz`
+- `opencode2api_v0.6.0_freebsd_amd64.tar.gz`
+- `opencode2api_v0.6.0_freebsd_arm64.tar.gz`
 
 ## 安装后启动 launch
 
@@ -162,15 +162,15 @@ opencode2api.exe -version
 如果不想使用脚本，也可以从 [Releases](https://github.com/6Kmfi6HP/opencode2api/releases) 下载当前平台对应的 `.tar.gz`，解压后自行放置 `opencode2api` / `opencode2api.exe` 到已在 `PATH` 中的目录。
 
 ```bash
-tar -xzf opencode2api_v0.5.0_linux_amd64.tar.gz
-./opencode2api_v0.5.0_linux_amd64/opencode2api -version
+tar -xzf opencode2api_v0.6.0_linux_amd64.tar.gz
+./opencode2api_v0.6.0_linux_amd64/opencode2api -version
 ```
 
 Windows：
 
 ```powershell
-tar -xzf .\opencode2api_v0.5.0_windows_amd64.tar.gz
-.\opencode2api_v0.5.0_windows_amd64\opencode2api.exe -version
+tar -xzf .\opencode2api_v0.6.0_windows_amd64.tar.gz
+.\opencode2api_v0.6.0_windows_amd64\opencode2api.exe -version
 ```
 
 ## 发布时检查清单
