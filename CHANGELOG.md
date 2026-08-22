@@ -1,5 +1,18 @@
 # Changelog
 
+## unreleased
+
+- `opencode2api launch claude` now supports interactive TUI model selection, 1M context window mode, and automatic compaction:
+  - When `--model` is omitted, an interactive TUI lists free-tier models from the upstream catalogs, sorted by context window (largest first), with `[1m]` markers for ≥1M-context models.
+  - After model selection, the context window is looked up from models.dev: ≥1M gets a `[1m]` suffix on the model ID and `CLAUDE_CODE_AUTO_COMPACT_WINDOW=ctx×0.9`; <1M gets only the auto-compact; unknown gets neither.
+  - Model ID is set via five `ANTHROPIC_*_MODEL` environment variables instead of `--model`, avoiding the `[claude-code:unrecognized_model]` warning.
+  - `--model` can be placed after `--` (alongside claude passthrough flags like `--dangerously-skip-permissions`) and is extracted by opencode2api instead of being forwarded to claude.
+  - The `[1m]` suffix flows through `resolveModel` / `resolveModelForAuth` / `mapPublicToFreeModel` transparently (stripped for catalog lookup, re-applied on the resolved ID).
+  - models.dev catalog is fetched with a cache-busting query parameter and parsed from both the top-level `models` section and the nested `providers.*.models` section (where OpenCode-specific models like `x-preview-f-free` live).
+  - TUI shows only models with a free variant; paid-only models are filtered out.
+- Tolerate upstream streams that end with a usage-only chunk but no `finish_reason` and no `[DONE]` (observed on `muse-spark-1.2-contributor-free`): when the turn produced output and the terminal usage chunk carried output-token accounting, the Claude and Responses stream converters now synthesize `stop` / `response.completed` instead of failing with `stream ended without finish_reason`/`server_error`. Partial EOF with no output still fails instead of fabricating a reply.
+- Fix a data race in the raw-SSE wrapper used by streaming Chat conversion: `Close()` and `Read()` on `rawSSEReader` are now synchronized.
+
 ## v0.5.0
 
 - Add `POST /v1/messages/count_tokens` with local heuristic estimation: Claude Code polls this endpoint to manage its context window and trigger auto-compaction, and previously it 404'd. The new `claudeCountTokensHandler` answers synchronously with a local estimate (text at ~4 chars/token, per-message/system/tool structural overhead, and fixed `1600`/`3000` token estimates for image/document blocks), never calling the upstream and never incurring usage. Invalid JSON or missing `model` return a protocol-shaped 400; non-POST returns 405.

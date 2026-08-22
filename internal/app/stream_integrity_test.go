@@ -141,6 +141,53 @@ func TestClaudeStream_PartialEOF_NoFinish_ErrorOnly(t *testing.T) {
 	}
 }
 
+func TestClaudeStream_UsageOnlyEnd_SynthesizesStop(t *testing.T) {
+	// Upstream (muse-spark-1.2-contributor-free) ends with a usage-only chunk,
+	// no finish_reason and no [DONE]. The turn produced output, so the gateway
+	// should complete it as a normal stop instead of reporting an error.
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}`,
+		``,
+		`data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
+		``,
+	}, "\n")
+	rr := httptest.NewRecorder()
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	events := parseSSEEvents(t, rr.Body.String())
+	if hasEvent(events, "error") {
+		t.Fatalf("must not error on usage-terminated stream:\n%s", rr.Body.String())
+	}
+	if !hasEvent(events, "message_start") {
+		t.Fatalf("expected message_start:\n%s", rr.Body.String())
+	}
+	if !hasEvent(events, "message_delta") {
+		t.Fatalf("expected message_delta:\n%s", rr.Body.String())
+	}
+	if !hasEvent(events, "message_stop") {
+		t.Fatalf("expected message_stop:\n%s", rr.Body.String())
+	}
+}
+
+func TestClaudeStream_DoneNoFinishWithUsage_SynthesizesStop(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}`,
+		``,
+		`data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	rr := httptest.NewRecorder()
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	events := parseSSEEvents(t, rr.Body.String())
+	if hasEvent(events, "error") {
+		t.Fatalf("must not error on [DONE] with usage-terminated stream:\n%s", rr.Body.String())
+	}
+	if !hasEvent(events, "message_stop") {
+		t.Fatalf("expected message_stop:\n%s", rr.Body.String())
+	}
+}
+
 func TestClaudeStream_DoneNoFinish_ErrorOnly(t *testing.T) {
 	upstream := strings.Join([]string{
 		`data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}`,
@@ -370,6 +417,46 @@ func TestClaudeStream_PartialDeltaThenReaderError(t *testing.T) {
 // =====================================================================
 // Responses stream handler tests
 // =====================================================================
+
+func TestResponsesStream_UsageOnlyEnd_SynthesizesCompleted(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"r","created":1,"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}`,
+		``,
+		`data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
+		``,
+	}, "\n")
+	rr := httptest.NewRecorder()
+	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
+	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	events := parseSSEEvents(t, rr.Body.String())
+	if hasEvent(events, "response.failed") {
+		t.Fatalf("must not emit response.failed on usage-terminated stream:\n%s", rr.Body.String())
+	}
+	if !hasEvent(events, "response.completed") {
+		t.Fatalf("expected response.completed:\n%s", rr.Body.String())
+	}
+}
+
+func TestResponsesStream_DoneNoFinishWithUsage_SynthesizesCompleted(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"r","created":1,"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}`,
+		``,
+		`data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	rr := httptest.NewRecorder()
+	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
+	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	events := parseSSEEvents(t, rr.Body.String())
+	if hasEvent(events, "response.failed") {
+		t.Fatalf("must not emit response.failed on [DONE] with usage-terminated stream:\n%s", rr.Body.String())
+	}
+	if !hasEvent(events, "response.completed") {
+		t.Fatalf("expected response.completed:\n%s", rr.Body.String())
+	}
+}
 
 func TestResponsesStream_PartialEOF_ResponseFailed(t *testing.T) {
 	upstream := strings.Join([]string{

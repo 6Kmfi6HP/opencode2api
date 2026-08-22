@@ -1302,6 +1302,10 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 	terminalEvent := "response.completed"
 	itemStatus := "completed"
 	finished := false
+	// Some upstreams (e.g. muse-spark-1.2-contributor-free) terminate a stream
+	// with a usage-only chunk but no finish_reason and no [DONE]. When the turn
+	// produced output and we saw a terminal usage chunk, synthesize completion.
+	usageTerminalSeen := false
 	toolCalls := map[int]map[string]any{}
 	toolOrder := []int{}
 	toolKinds := responsesToolKindMap(tools)
@@ -1585,6 +1589,12 @@ loop:
 			if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
 				stats.doneSeen = true
 				if !finished {
+					if usageTerminalSeen && (messageStarted || reasoningStarted || len(toolCalls) > 0) {
+						stats.sawFinish = true
+						stats.finishReason = "stop"
+						finished = true
+						break loop
+					}
 					emitResponseFailed("stream ended with [DONE] but no finish_reason")
 					return
 				}
@@ -1617,6 +1627,9 @@ loop:
 							if !ok || len(choices) == 0 {
 								if usage, ok := chunk["usage"].(map[string]any); ok {
 									totalUsage = usage
+									if usageHasCompletion(usage) {
+										usageTerminalSeen = true
+									}
 								}
 							} else {
 								choice, _ := choices[0].(map[string]any)
@@ -1825,6 +1838,12 @@ loop:
 			if pendingErr != nil {
 				if pendingErr == io.EOF {
 					if !finished {
+						if usageTerminalSeen && (messageStarted || reasoningStarted || len(toolCalls) > 0) {
+							stats.sawFinish = true
+							stats.finishReason = "stop"
+							finished = true
+							break loop
+						}
 						emitResponseFailed("stream ended without finish_reason")
 						return
 					}

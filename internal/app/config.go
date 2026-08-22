@@ -101,20 +101,33 @@ func applyConfig(cfg AppConfig) {
 
 }
 
+// stripContextSuffix splits a model ID into its base and context suffix.
+// A model ID like "deepseek-v4-flash[1m]" yields base="deepseek-v4-flash"
+// and suffix="[1m]". If the ID does not end with a "[...]" bracket suffix,
+// the returned suffix is empty and base is the trimmed input.
+func stripContextSuffix(modelID string) (base, suffix string) {
+	s := strings.TrimSpace(modelID)
+	if idx := strings.LastIndex(s, "["); idx > 0 && strings.HasSuffix(s, "]") {
+		return s[:idx], s[idx:]
+	}
+	return s, ""
+}
+
 func resolveModel(model string) string {
 	m := strings.TrimSpace(model)
+	base, suffix := stripContextSuffix(m)
 	configMu.RLock()
-	alias, ok := modelAlias[m]
+	alias, ok := modelAlias[base]
 	configMu.RUnlock()
 	if ok {
-		return alias
+		return alias + suffix
 	}
 	// Clients see free models without the "-free" suffix from /v1/models.
 	// Map the display name back to the upstream free ID when that is the only match.
-	if m != "" && !isFreeModel(m) {
-		freeID := m + "-free"
-		if !modelExistsInCaches(m) && modelExistsInCaches(freeID) {
-			return freeID
+	if base != "" && !isFreeModel(base) {
+		freeID := base + "-free"
+		if !modelExistsInCaches(base) && modelExistsInCaches(freeID) {
+			return freeID + suffix
 		}
 	}
 	return m
@@ -123,19 +136,20 @@ func resolveModel(model string) string {
 // Explicit catalog routing wins over a legacy same-name alias to the free variant.
 func resolveModelForAuth(auth UpstreamAuth, model string) string {
 	m := strings.TrimSpace(model)
+	base, suffix := stripContextSuffix(m)
 	exactModelAvailable := false
 	switch auth.Mode {
 	case AuthRouteGo:
-		exactModelAvailable = isModelInGoCatalog(m)
+		exactModelAvailable = isModelInGoCatalog(base)
 	case AuthRouteZen:
-		exactModelAvailable = isModelInZenCatalog(m)
+		exactModelAvailable = isModelInZenCatalog(base)
 	}
-	if m != "" && exactModelAvailable {
+	if base != "" && exactModelAvailable {
 		configMu.RLock()
-		alias, ok := modelAlias[m]
+		alias, ok := modelAlias[base]
 		configMu.RUnlock()
-		if ok && strings.TrimSpace(alias) == m+"-free" {
-			return m
+		if ok && strings.TrimSpace(alias) == base+"-free" {
+			return base + suffix
 		}
 	}
 	return resolveModel(m)

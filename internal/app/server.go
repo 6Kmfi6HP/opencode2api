@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,12 @@ import (
 // ======================== Main ========================
 
 func Run() {
+	// Launch subcommand: opencode2api launch <tool> [args...]
+	if len(os.Args) >= 2 && os.Args[1] == "launch" {
+		runLaunch(os.Args[2:])
+		return
+	}
+
 	var showVersion bool
 	flag.StringVar(&port, "port", "8000", "服务端口")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
@@ -39,6 +46,73 @@ func Run() {
 		return
 	}
 
+	initProxyCore()
+
+	slog.Info("server starting",
+		"port", port,
+		"log_level", getLogLevelString(),
+		"models", len(getModelIDs()),
+		"aliases", len(modelAlias),
+	)
+	if adminPassword != "" {
+		slog.Info("admin panel enabled", "url", fmt.Sprintf("http://localhost:%s/", port))
+	} else {
+		slog.Info("admin panel disabled (no password)")
+	}
+
+	mux := buildMux()
+	addr := ":" + port
+	server, listener, err := startServer(addr, mux)
+	if err != nil {
+		slog.Error("failed to start server", "addr", addr, "error", err)
+		os.Exit(1)
+	}
+	defer func() { _ = listener.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	<-ctx.Done()
+	slog.Info("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Error("graceful shutdown failed", "error", err)
+	}
+}
+
+// buildMux constructs the HTTP mux with all route registrations.
+func buildMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", loggingMiddleware(chatCompletionsHandler))
+	mux.HandleFunc("/v1/responses", loggingMiddleware(responsesHandler))
+	mux.HandleFunc("/v1/messages", loggingMiddleware(claudeMessagesHandler))
+	mux.HandleFunc("/v1/messages/count_tokens", loggingMiddleware(claudeCountTokensHandler))
+	mux.HandleFunc("/v1/models", loggingMiddleware(listModelsHandler))
+	mux.HandleFunc("/login", loggingMiddleware(loginHandler))
+	mux.HandleFunc("/logout", loggingMiddleware(logoutHandler))
+	mux.HandleFunc("/api/config", loggingMiddleware(requireAuth(adminConfigHandler)))
+	mux.HandleFunc("/api/stats", loggingMiddleware(requireAuth(adminStatsHandler)))
+	mux.HandleFunc("/api/reload", loggingMiddleware(requireAuth(reloadHandler)))
+	mux.HandleFunc("/health", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	}))
+	mux.HandleFunc("/", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			requireAuth(adminPageHandler)(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	return mux
+}
+
+// initProxyCore loads config, applies it, saves config, loads token stats,
+// initializes the OpenCode session, fetches upstream model catalogs, and
+// starts the background model refresher. Called by both the normal server
+// mode and the launch subcommand.
+func initProxyCore() {
 	cfg := loadConfig(configPath)
 	applyConfig(cfg)
 	if err := saveConfig(configPath, cfg); err != nil {
@@ -69,59 +143,24 @@ func Run() {
 		slog.Info("go catalog loaded", "count", len(goModels))
 	}
 	startModelRefresh()
-	slog.Info("server starting",
-		"port", port,
-		"log_level", getLogLevelString(),
-		"models", len(getModelIDs()),
-		"aliases", len(modelAlias),
-	)
-	if adminPassword != "" {
-		slog.Info("admin panel enabled", "url", fmt.Sprintf("http://localhost:%s/", port))
-	} else {
-		slog.Info("admin panel disabled (no password)")
+}
+
+// startServer binds the HTTP server to addr and starts serving. Returns the
+// server, the listener (so callers can read the actual port when 0 is used),
+// and any error. The server runs in a background goroutine; the caller is
+// responsible for Shutdown or for detecting listen errors.
+func startServer(addr string, mux *http.ServeMux) (*http.Server, net.Listener, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", loggingMiddleware(chatCompletionsHandler))
-	mux.HandleFunc("/v1/responses", loggingMiddleware(responsesHandler))
-	mux.HandleFunc("/v1/messages", loggingMiddleware(claudeMessagesHandler))
-	mux.HandleFunc("/v1/messages/count_tokens", loggingMiddleware(claudeCountTokensHandler))
-	mux.HandleFunc("/v1/models", loggingMiddleware(listModelsHandler))
-	mux.HandleFunc("/login", loggingMiddleware(loginHandler))
-	mux.HandleFunc("/logout", loggingMiddleware(logoutHandler))
-	mux.HandleFunc("/api/config", loggingMiddleware(requireAuth(adminConfigHandler)))
-	mux.HandleFunc("/api/stats", loggingMiddleware(requireAuth(adminStatsHandler)))
-	mux.HandleFunc("/api/reload", loggingMiddleware(requireAuth(reloadHandler)))
-	mux.HandleFunc("/health", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	}))
-	mux.HandleFunc("/", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			requireAuth(adminPageHandler)(w, r)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-
-	addr := ":" + port
-	server := &http.Server{Addr: addr, Handler: mux}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
+	server := &http.Server{Handler: mux}
 	go func() {
-		slog.Info("listening", "addr", addr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("server terminated", "error", err)
+		slog.Info("listening", "addr", listener.Addr().String())
+		if sErr := server.Serve(listener); sErr != nil && sErr != http.ErrServerClosed {
+			slog.Error("server terminated", "error", sErr)
 			os.Exit(1)
 		}
 	}()
-
-	<-ctx.Done()
-	slog.Info("shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		slog.Error("graceful shutdown failed", "error", err)
-	}
+	return server, listener, nil
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 )
 
 const (
@@ -561,6 +562,7 @@ func convertRawToolCallsInMap(body map[string]any) bool {
 // rawSSEReader wraps an upstream Chat SSE stream and rewrites raw DSML/Qwen
 // content into standard delta.tool_calls events.
 type rawSSEReader struct {
+	mu        sync.Mutex
 	src       io.ReadCloser
 	reader    *bufio.Reader
 	pending   [][]byte
@@ -581,14 +583,19 @@ func wrapRawSSE(r io.ReadCloser) io.ReadCloser {
 }
 
 func (r *rawSSEReader) Close() error {
+	r.mu.Lock()
 	if r.closed {
+		r.mu.Unlock()
 		return nil
 	}
 	r.closed = true
+	r.mu.Unlock()
 	return r.src.Close()
 }
 
 func (r *rawSSEReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
 		return 0, io.EOF
 	}

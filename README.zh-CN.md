@@ -123,6 +123,50 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 第一次部署请务必修改 `-password`。如果把服务暴露到公网，建议只通过反向代理、访问控制或 VPN 暴露管理面板。
 
+## launch 子命令
+
+`opencode2api launch claude` 在本地回环端口启动代理，然后运行 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)，通过环境变量将其请求重定向到 opencode2api。Claude Code 退出后代理自动关闭，opencode2api 以相同退出码退出。
+
+### 模型选择
+
+省略 `--model` 时弹出交互式 TUI，列出上游 catalog 中可用的免费模型。列表按上下文窗口降序排列，≥1M 上下文的模型标记 `[1m]`。
+
+```bash
+# 交互式 TUI 模型选择（仅免费模型）
+opencode2api launch claude
+
+# 直接指定模型（跳过 TUI）
+opencode2api launch claude --model deepseek-v4-flash
+
+# --model 也可放在 -- 之后（会被提取，不转发给 claude）
+opencode2api launch claude -- --dangerously-skip-permissions --model x-preview-f
+```
+
+### 上下文窗口与自动压缩
+
+选定模型后，从 [models.dev](https://models.dev/catalog.json) 查询上下文窗口：
+
+- **≥1M 上下文**：模型 ID 追加 `[1m]` 后缀（如 `deepseek-v4-flash[1m]`），并设置 `CLAUDE_CODE_AUTO_COMPACT_WINDOW = ctx × 0.9`。
+- **<1M 上下文**：不追加后缀，设置 `CLAUDE_CODE_AUTO_COMPACT_WINDOW = ctx × 0.9`。
+- **未知上下文**：不追加后缀，不设自动压缩。
+
+`[1m]` 后缀原样转发给上游；代理的 `resolveModel` / `mapPublicToFreeModel` 在 catalog 查找时去掉后缀，在结果上重新加上，所以免费层映射（如 `deepseek-v4-flash[1m]` → `deepseek-v4-flash-free[1m]`）正确工作。
+
+### 其他参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--model` | _(空)_ | 上游模型 ID；设置 `ANTHROPIC_*_MODEL` 环境变量。空 = 交互式 TUI 选择。 |
+| `--key` | `public` | OpenCode key。解析优先级：flag > `OPENCODE_API_KEY` 环境变量 > `public` |
+| `--config` | `config.json` | 配置文件路径 |
+| `--port` | `0` | 绑定端口；`0` = 系统随机分配 |
+| `--debug` | 关闭 | 启用调试日志 |
+| `--version` | 关闭 | 显示构建版本后退出 |
+
+`--` 之后的参数原样透传给 `claude`（`--model` 会被提取用于设置模型，不转发）。
+
+工作原理：`ANTHROPIC_API_KEY` 携带 OpenCode key（`public`、`sk-…`、`go:…` 或 `zen:…`）。五个环境变量（`ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_HAIKU_MODEL`、`ANTHROPIC_SMALL_FAST_MODEL`）统一设为选中的模型 ID，避免 `[claude-code:unrecognized_model]` 警告。`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` 告知 Claude Code 由宿主机管理认证（跳过 OAuth/订阅登录窗口）。代理读取 `x-api-key` header 并按前缀路由——`go:` → go 层级、`zen:` → zen 层级、`sk-` → auto、`public` → free——自动选择正确的上游。
+
 ### 排障日志
 
 默认同时写文件与 stdout。每个请求带 `request_id`（响应头 `X-Request-Id`），可串联：

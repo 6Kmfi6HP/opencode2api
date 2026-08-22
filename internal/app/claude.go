@@ -1012,6 +1012,10 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 	messageStartSent := false
 	finished := false
 	stopReason := "end_turn"
+	// Some upstreams (e.g. muse-spark-1.2-contributor-free) terminate a stream
+	// with a usage-only chunk but no finish_reason and no [DONE]. When the turn
+	// produced output and we saw a terminal usage chunk, synthesize stop.
+	usageTerminalSeen := false
 	fullUsage := map[string]any{}
 	// Accumulates reasoning when keepReasoning so we can fall back to a text
 	// block if the stream never produces content/tool_use (#37635).
@@ -1218,6 +1222,13 @@ loop:
 			if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
 				stats.doneSeen = true
 				if !finished {
+					if usageTerminalSeen && streamProducedOutput(stats, len(toolCallOrder)) {
+						stats.sawFinish = true
+						stats.finishReason = "stop"
+						finished = true
+						finalizeContentBlocks()
+						break loop
+					}
 					emitClaudeError("stream ended with [DONE] but no finish_reason")
 					return
 				}
@@ -1249,9 +1260,13 @@ loop:
 								fullUsage = mergeUsageMaps(fullUsage, usage)
 							}
 
+							usageChunk, _ := chunk["usage"].(map[string]any)
 							choices, ok := chunk["choices"].([]any)
 							if !ok || len(choices) == 0 {
 								// Usage-only trailing chunk (OpenAI stream_options.include_usage).
+								if usageHasCompletion(usageChunk) {
+									usageTerminalSeen = true
+								}
 							} else {
 								choice, _ := choices[0].(map[string]any)
 								delta, _ := choice["delta"].(map[string]any)
@@ -1388,6 +1403,13 @@ loop:
 			if pendingErr != nil {
 				if pendingErr == io.EOF {
 					if !finished {
+						if usageTerminalSeen && streamProducedOutput(stats, len(toolCallOrder)) {
+							stats.sawFinish = true
+							stats.finishReason = "stop"
+							finished = true
+							finalizeContentBlocks()
+							break loop
+						}
 						emitClaudeError("stream ended without finish_reason")
 						return
 					}
@@ -1476,6 +1498,32 @@ type anthropicBlockState struct {
 }
 
 // 0). Nested maps are recursively merged. Fields absent from src are retained.
+// usageHasCompletion reports whether an upstream usage object includes output
+// token accounting, which upstreams send as the terminal chunk when
+// stream_options.include_usage is set.
+func usageHasCompletion(usage map[string]any) bool {
+	if len(usage) == 0 {
+		return false
+	}
+	if v, ok := usage["completion_tokens"]; ok {
+		if n, ok := v.(float64); ok && n >= 0 {
+			return true
+		}
+	}
+	if v, ok := usage["output_tokens"]; ok {
+		if n, ok := v.(float64); ok && n >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// streamProducedOutput reports whether a stream has emitted any assistant
+// content or tool calls before the terminal usage chunk.
+func streamProducedOutput(stats *streamResultStats, toolCalls int) bool {
+	return stats.textChars > 0 || stats.reasoningChars > 0 || toolCalls > 0
+}
+
 func mergeUsageMaps(dst any, src map[string]any) map[string]any {
 	if src == nil {
 		if dm, ok := dst.(map[string]any); ok {

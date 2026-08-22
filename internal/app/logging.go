@@ -130,6 +130,19 @@ func redactLogAttr(_ []string, a slog.Attr) slog.Attr {
 	return a
 }
 
+// resolvedLogPath returns the absolute path of the active log file, or
+// "(stdout)" when no file is configured. Used for user-facing status lines.
+func resolvedLogPath() string {
+	if logFile == "" {
+		return "(stdout)"
+	}
+	abs, err := filepath.Abs(logFile)
+	if err != nil {
+		return logFile
+	}
+	return abs
+}
+
 func closeLogRotator() {
 	if logRotator != nil {
 		_ = logRotator.Close()

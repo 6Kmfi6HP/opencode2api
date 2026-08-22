@@ -199,13 +199,17 @@ func publicFacingModelID(modelID string) string {
 	return modelID
 }
 
-// left untouched.
+// mapPublicToFreeModel downgrades a paid model ID to its "-free" variant
+// for public/free-tier auth. Context suffixes like "[1m]" are preserved: the
+// suffix is stripped before the "-free" lookup, then re-appended to the
+// resolved free ID (e.g. "deepseek-v4-flash[1m]" → "deepseek-v4-flash-free[1m]").
 func mapPublicToFreeModel(auth UpstreamAuth, modelID string) string {
-	if auth.Mode != AuthRoutePublic || isFreeModel(modelID) {
+	base, suffix := stripContextSuffix(modelID)
+	if auth.Mode != AuthRoutePublic || isFreeModel(base) {
 		return modelID
 	}
-	if freeID := modelID + "-free"; modelExistsInCaches(freeID) {
-		return freeID
+	if freeID := base + "-free"; modelExistsInCaches(freeID) {
+		return freeID + suffix
 	}
 	return modelID
 }

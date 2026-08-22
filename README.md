@@ -123,6 +123,50 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Change `-password` on first deploy. If you expose the service publicly, put the admin panel behind a reverse proxy, access control, or VPN.
 
+## Launch subcommand
+
+`opencode2api launch claude` starts the proxy on a localhost-only port and then runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with environment variables that redirect it through opencode2api. When Claude Code exits, the proxy shuts down and opencode2api exits with the same exit code.
+
+### Model selection
+
+When `--model` is omitted, an interactive TUI lets you pick from the free-tier models available in the upstream catalogs. The list is sorted by context window (largest first); models with ≥1M context are marked `[1m]`.
+
+```bash
+# Interactive TUI model selection (free models only)
+opencode2api launch claude
+
+# Specify a model directly (skips TUI)
+opencode2api launch claude --model deepseek-v4-flash
+
+# --model can also appear after -- (extracted, not forwarded to claude)
+opencode2api launch claude -- --dangerously-skip-permissions --model x-preview-f
+```
+
+### Context window and auto-compaction
+
+After model selection, the context window is looked up from [models.dev](https://models.dev/catalog.json):
+
+- **≥1M context**: the model ID gets a `[1m]` suffix (e.g. `deepseek-v4-flash[1m]`) and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is set to `ctx × 0.9`.
+- **<1M context**: no suffix; `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is set to `ctx × 0.9`.
+- **Unknown context**: no suffix, no auto-compact.
+
+The `[1m]` suffix is forwarded to the upstream as-is; the proxy's `resolveModel` / `mapPublicToFreeModel` strip it for catalog lookup and re-apply it on the resolved ID, so free-tier mapping (e.g. `deepseek-v4-flash[1m]` → `deepseek-v4-flash-free[1m]`) works correctly.
+
+### Other flags
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--model` | _(empty)_ | Upstream model ID; sets `ANTHROPIC_*_MODEL` env vars. Empty = interactive TUI selection. |
+| `--key` | `public` | OpenCode key. Resolution order: flag > `OPENCODE_API_KEY` env > `public` |
+| `--config` | `config.json` | Config file path |
+| `--port` | `0` | Port to bind; `0` = system-assigned random port |
+| `--debug` | off | Enable debug logs |
+| `--version` | off | Print build version and exit |
+
+Anything after `--` is passed through to `claude` verbatim (except a `--model` flag, which is extracted to set the model).
+
+How it works: `ANTHROPIC_API_KEY` carries the OpenCode key (`public`, `sk-…`, `go:…`, or `zen:…`). Five environment variables (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) are all set to the selected model ID, avoiding the `[claude-code:unrecognized_model]` warning. `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` tells Claude Code the host owns auth (no OAuth/subscription login window). The proxy reads the `x-api-key` header and routes by prefix — `go:` → go tier, `zen:` → zen tier, `sk-` → auto, `public` → free — so the correct upstream is selected automatically.
+
 ### Logs and troubleshooting
 
 By default logs go to both file and stdout. Every request carries a `request_id` (response header `X-Request-Id`) you can chain:
