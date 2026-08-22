@@ -44,3 +44,29 @@ func extractModelFromExtraArgs(args []string) (model string, cleaned []string) {
 	}
 	return model, cleaned
 }
+
+// extractCodexModelFromExtraArgs is the Codex equivalent of
+// extractModelFromExtraArgs. It recognizes both Codex model spellings:
+// `--model <value>`, `--model=<value>`, `-m <value>`, and `-m=<value>`.
+func extractCodexModelFromExtraArgs(args []string) (model string, cleaned []string) {
+	cleaned = args[:0:0]
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--model" || arg == "-m":
+			if i+1 < len(args) {
+				model = strings.TrimSpace(args[i+1])
+				i++
+			}
+			continue
+		case strings.HasPrefix(arg, "--model="):
+			model = strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
+			continue
+		case strings.HasPrefix(arg, "-m="):
+			model = strings.TrimSpace(strings.TrimPrefix(arg, "-m="))
+			continue
+		}
+		cleaned = append(cleaned, arg)
+	}
+	return model, cleaned
+}

@@ -125,7 +125,7 @@ Change `-password` on first deploy. If you expose the service publicly, put the 
 
 ## Launch subcommand
 
-`opencode2api launch claude` starts the proxy on a localhost-only port and then runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with environment variables that redirect it through opencode2api. When Claude Code exits, the proxy shuts down and opencode2api exits with the same exit code.
+`opencode2api launch <tool>` starts the proxy on a localhost-only port and then runs a local coding CLI with temporary configuration that redirects it through opencode2api. Supported tools are `claude` and `codex`. Launch mode reads the proxy config file but never writes it back, so starting a child CLI does not mutate `config.json`.
 
 ### Model selection
 
@@ -134,17 +134,20 @@ When `--model` is omitted, an interactive TUI lets you pick from the free-tier m
 ```bash
 # Interactive TUI model selection (free models only)
 opencode2api launch claude
+opencode2api launch codex
 
 # Specify a model directly (skips TUI)
 opencode2api launch claude --model deepseek-v4-flash
+opencode2api launch codex --model deepseek-v4-flash
 
-# --model can also appear after -- (extracted, not forwarded to claude)
+# Model flags can also appear after -- (extracted, not forwarded to the child CLI)
 opencode2api launch claude -- --dangerously-skip-permissions --model x-preview-f
+opencode2api launch codex -- --ephemeral -m x-preview-f
 ```
 
-### Context window and auto-compaction
+### Claude Code context window and auto-compaction
 
-After model selection, the context window is looked up from [models.dev](https://models.dev/catalog.json):
+For `launch claude`, after model selection the context window is looked up from [models.dev](https://models.dev/catalog.json):
 
 - **≥1M context**: the model ID gets a `[1m]` suffix (e.g. `deepseek-v4-flash[1m]`) and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is set to `ctx × 0.9`.
 - **<1M context**: no suffix; `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is set to `ctx × 0.9`.
@@ -152,20 +155,43 @@ After model selection, the context window is looked up from [models.dev](https:/
 
 The `[1m]` suffix is forwarded to the upstream as-is; the proxy's `resolveModel` / `mapPublicToFreeModel` strip it for catalog lookup and re-apply it on the resolved ID, so free-tier mapping (e.g. `deepseek-v4-flash[1m]` → `deepseek-v4-flash-free[1m]`) works correctly.
 
+### Codex launch
+
+`opencode2api launch codex` runs the installed `codex` command normally, so it still loads the user's existing `~/.codex/config.toml` (plugins, features, sandbox settings, etc.). It then adds per-process `-c` overrides that point a new `opencode2api` custom provider at the local proxy:
+
+- `model_provider = "opencode2api"`
+- `model_providers.opencode2api.base_url = http://127.0.0.1:<port>/v1`
+- `model_providers.opencode2api.wire_api = "responses"`
+- `model_providers.opencode2api.requires_openai_auth = true`
+- `model_providers.opencode2api.env_key = "OPENCODE2API_OPENAI_API_KEY"`
+
+opencode2api also writes a temporary Codex model catalog from the currently available upstream models, then passes it with a per-process override:
+
+- `model_catalog_json = /tmp/opencode2api-codex-catalog-*/models.json`
+- With the default `public` key it includes free-tier models only, matching the interactive model list.
+- With a paid/tier key it includes the full available model set.
+- For each model with known context, the catalog sets `context_window`, `max_context_window`, and `auto_compact_token_limit = int(ctx × 0.9)`.
+
+This keeps Codex model switching and per-model context metadata working without writing any `~/.codex` file.
+
+The selected OpenCode key is passed only in the child process via `OPENCODE2API_OPENAI_API_KEY`. No `~/.codex` file is written.
+
 ### Other flags
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--model` | _(empty)_ | Upstream model ID; sets `ANTHROPIC_*_MODEL` env vars. Empty = interactive TUI selection. |
+| `--model` | _(empty)_ | Upstream model ID. Claude sets `ANTHROPIC_*_MODEL`; Codex prepends `--model`. Empty = interactive TUI selection. |
 | `--key` | `public` | OpenCode key. Resolution order: flag > `OPENCODE_API_KEY` env > `public` |
-| `--config` | `config.json` | Config file path |
+| `--config` | `config.json` | Config file path; launch mode only reads this file. |
 | `--port` | `0` | Port to bind; `0` = system-assigned random port |
 | `--debug` | off | Enable debug logs |
 | `--version` | off | Print build version and exit |
 
-Anything after `--` is passed through to `claude` verbatim (except a `--model` flag, which is extracted to set the model).
+Anything after `--` is passed through to the selected child CLI verbatim, except launch model flags (`--model` for Claude; `--model` / `-m` for Codex), which are extracted to set the model.
 
-How it works: `ANTHROPIC_API_KEY` carries the OpenCode key (`public`, `sk-…`, `go:…`, or `zen:…`). Five environment variables (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) are all set to the selected model ID, avoiding the `[claude-code:unrecognized_model]` warning. `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` tells Claude Code the host owns auth (no OAuth/subscription login window). The proxy reads the `x-api-key` header and routes by prefix — `go:` → go tier, `zen:` → zen tier, `sk-` → auto, `public` → free — so the correct upstream is selected automatically.
+How Claude works: `ANTHROPIC_API_KEY` carries the OpenCode key (`public`, `sk-…`, `go:…`, or `zen:…`). Five environment variables (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) are all set to the selected model ID, avoiding the `[claude-code:unrecognized_model]` warning. `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` tells Claude Code the host owns auth (no OAuth/subscription login window).
+
+How Codex works: the proxy is served at `http://127.0.0.1:<port>/v1` and Codex is launched with a temporary `model_providers.opencode2api` entry using the Responses wire API. The child-only `OPENCODE2API_OPENAI_API_KEY` carries the OpenCode key, and the proxy reads Authorization/x-api-key headers and routes by prefix — `go:` → go tier, `zen:` → zen tier, `sk-` → auto, `public` → free — so the correct upstream is selected automatically.
 
 ### Logs and troubleshooting
 

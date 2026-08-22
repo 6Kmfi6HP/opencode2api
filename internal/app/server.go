@@ -110,13 +110,25 @@ func buildMux() *http.ServeMux {
 
 // initProxyCore loads config, applies it, saves config, loads token stats,
 // initializes the OpenCode session, fetches upstream model catalogs, and
-// starts the background model refresher. Called by both the normal server
-// mode and the launch subcommand.
+// starts the background model refresher. Used by normal server mode.
 func initProxyCore() {
+	initProxyCoreWithSave(true)
+}
+
+// initProxyCoreReadOnly is the launch-mode variant of initProxyCore. It loads
+// and applies config.json exactly once, but never writes it back, so launching
+// claude or codex cannot mutate the user's persistent proxy configuration.
+func initProxyCoreReadOnly() {
+	initProxyCoreWithSave(false)
+}
+
+func initProxyCoreWithSave(save bool) {
 	cfg := loadConfig(configPath)
 	applyConfig(cfg)
-	if err := saveConfig(configPath, cfg); err != nil {
-		slog.Warn("failed to save config", "path", configPath, "error", err)
+	if save {
+		if err := saveConfig(configPath, cfg); err != nil {
+			slog.Warn("failed to save config", "path", configPath, "error", err)
+		}
 	}
 
 	loadTokenStats()

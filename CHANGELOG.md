@@ -2,6 +2,8 @@
 
 ## unreleased
 
+- Add `opencode2api launch codex`: starts the same localhost proxy as `launch claude`, then runs the installed Codex CLI with temporary `-c` provider overrides (`model_provider`, `model_providers.opencode2api.*`, `wire_api="responses"`, and `env_key="OPENCODE2API_OPENAI_API_KEY"`) so the child process uses opencode2api through its Responses API without writing `~/.codex/config.toml`. `--model` / `-m` after `--` are extracted, forwarded via Codex's `--model`, and the same `--key` / `OPENCODE_API_KEY` / `public` resolution is used. A temporary Codex model catalog is written from the current upstream model list and passed via `-c model_catalog_json=<temp path>`; it defaults to free-tier models for `public`, includes all models for paid/tier keys, and sets `context_window`, `max_context_window`, and `auto_compact_token_limit=<ctx*0.9>` so model switching and unknown upstream model IDs do not fall back to Codex's 258K default window.
+- Make `launch claude` and `launch codex` read-only for the proxy config: `launch` now loads and applies `config.json` without calling `saveConfig`, so launching a child CLI can no longer rewrite the user's persistent proxy configuration.
 - `opencode2api launch claude` now supports interactive TUI model selection, 1M context window mode, and automatic compaction:
   - When `--model` is omitted, an interactive TUI lists free-tier models from the upstream catalogs, sorted by context window (largest first), with `[1m]` markers for ≥1M-context models.
   - After model selection, the context window is looked up from models.dev: ≥1M gets a `[1m]` suffix on the model ID and `CLAUDE_CODE_AUTO_COMPACT_WINDOW=ctx×0.9`; <1M gets only the auto-compact; unknown gets neither.

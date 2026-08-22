@@ -125,7 +125,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## launch 子命令
 
-`opencode2api launch claude` 在本地回环端口启动代理，然后运行 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)，通过环境变量将其请求重定向到 opencode2api。Claude Code 退出后代理自动关闭，opencode2api 以相同退出码退出。
+`opencode2api launch <tool>` 在本地回环端口启动代理，然后运行本地编码 CLI，并通过临时配置将请求重定向到 opencode2api。支持的工具是 `claude` 和 `codex`。launch 模式只读取代理配置文件、不写回，因此启动子 CLI 不会修改 `config.json`。
 
 ### 模型选择
 
@@ -134,17 +134,20 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```bash
 # 交互式 TUI 模型选择（仅免费模型）
 opencode2api launch claude
+opencode2api launch codex
 
 # 直接指定模型（跳过 TUI）
 opencode2api launch claude --model deepseek-v4-flash
+opencode2api launch codex --model deepseek-v4-flash
 
-# --model 也可放在 -- 之后（会被提取，不转发给 claude）
+# -- 之后的模型参数会被提取，不转发给子 CLI
 opencode2api launch claude -- --dangerously-skip-permissions --model x-preview-f
+opencode2api launch codex -- --ephemeral -m x-preview-f
 ```
 
-### 上下文窗口与自动压缩
+### Claude Code 上下文窗口与自动压缩
 
-选定模型后，从 [models.dev](https://models.dev/catalog.json) 查询上下文窗口：
+`launch claude` 选定模型后，从 [models.dev](https://models.dev/catalog.json) 查询上下文窗口：
 
 - **≥1M 上下文**：模型 ID 追加 `[1m]` 后缀（如 `deepseek-v4-flash[1m]`），并设置 `CLAUDE_CODE_AUTO_COMPACT_WINDOW = ctx × 0.9`。
 - **<1M 上下文**：不追加后缀，设置 `CLAUDE_CODE_AUTO_COMPACT_WINDOW = ctx × 0.9`。
@@ -152,20 +155,43 @@ opencode2api launch claude -- --dangerously-skip-permissions --model x-preview-f
 
 `[1m]` 后缀原样转发给上游；代理的 `resolveModel` / `mapPublicToFreeModel` 在 catalog 查找时去掉后缀，在结果上重新加上，所以免费层映射（如 `deepseek-v4-flash[1m]` → `deepseek-v4-flash-free[1m]`）正确工作。
 
+### Codex 启动
+
+`opencode2api launch codex` 正常运行已安装的 `codex` 命令，因此仍会加载用户现有的 `~/.codex/config.toml`（插件、功能、沙箱设置等）。随后仅对本次进程添加 `-c` 覆盖，把新的 `opencode2api` 自定义 provider 指向本地代理：
+
+- `model_provider = "opencode2api"`
+- `model_providers.opencode2api.base_url = http://127.0.0.1:<port>/v1`
+- `model_providers.opencode2api.wire_api = "responses"`
+- `model_providers.opencode2api.requires_openai_auth = true`
+- `model_providers.opencode2api.env_key = "OPENCODE2API_OPENAI_API_KEY"`
+
+opencode2api 还会根据当前可用上游模型生成一个临时 Codex model catalog，并通过本次进程参数传入：
+
+- `model_catalog_json = /tmp/opencode2api-codex-catalog-*/models.json`
+- 默认 `public` key 时只包含免费模型，和交互式模型列表一致。
+- 付费/分 tier key 时包含全部可用模型。
+- 对上下文已知的模型，catalog 中设置 `context_window`、`max_context_window`、`auto_compact_token_limit = int(ctx × 0.9)`。
+
+这样 Codex 后续切换模型和 per-model 上下文都能生效，同时不写入任何 `~/.codex` 文件。
+
+选中的 OpenCode key 只通过子进程变量 `OPENCODE2API_OPENAI_API_KEY` 传入。不会写入任何 `~/.codex` 文件。
+
 ### 其他参数
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--model` | _(空)_ | 上游模型 ID；设置 `ANTHROPIC_*_MODEL` 环境变量。空 = 交互式 TUI 选择。 |
+| `--model` | _(空)_ | 上游模型 ID。Claude 设置 `ANTHROPIC_*_MODEL`；Codex 前置 `--model`。空 = 交互式 TUI 选择。 |
 | `--key` | `public` | OpenCode key。解析优先级：flag > `OPENCODE_API_KEY` 环境变量 > `public` |
-| `--config` | `config.json` | 配置文件路径 |
+| `--config` | `config.json` | 配置文件路径；launch 模式只读取该文件。 |
 | `--port` | `0` | 绑定端口；`0` = 系统随机分配 |
 | `--debug` | 关闭 | 启用调试日志 |
 | `--version` | 关闭 | 显示构建版本后退出 |
 
-`--` 之后的参数原样透传给 `claude`（`--model` 会被提取用于设置模型，不转发）。
+`--` 之后的参数原样透传给选中的子 CLI，除了模型参数（Claude 的 `--model`；Codex 的 `--model` / `-m`）会被提取用于设置模型。
 
-工作原理：`ANTHROPIC_API_KEY` 携带 OpenCode key（`public`、`sk-…`、`go:…` 或 `zen:…`）。五个环境变量（`ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_HAIKU_MODEL`、`ANTHROPIC_SMALL_FAST_MODEL`）统一设为选中的模型 ID，避免 `[claude-code:unrecognized_model]` 警告。`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` 告知 Claude Code 由宿主机管理认证（跳过 OAuth/订阅登录窗口）。代理读取 `x-api-key` header 并按前缀路由——`go:` → go 层级、`zen:` → zen 层级、`sk-` → auto、`public` → free——自动选择正确的上游。
+Claude 工作原理：`ANTHROPIC_API_KEY` 携带 OpenCode key（`public`、`sk-…`、`go:…` 或 `zen:…`）。五个环境变量（`ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_HAIKU_MODEL`、`ANTHROPIC_SMALL_FAST_MODEL`）统一设为选中的模型 ID，避免 `[claude-code:unrecognized_model]` 警告。`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` 告知 Claude Code 由宿主机管理认证（跳过 OAuth/订阅登录窗口）。
+
+Codex 工作原理：代理服务地址为 `http://127.0.0.1:<port>/v1`，Codex 通过本次进程的临时 `model_providers.opencode2api` 配置使用 Responses wire API。仅子进程可见的 `OPENCODE2API_OPENAI_API_KEY` 携带 OpenCode key；代理读取 Authorization/x-api-key header 并按前缀路由——`go:` → go 层级、`zen:` → zen 层级、`sk-` → auto、`public` → free——自动选择正确的上游。
 
 ### 排障日志
 
