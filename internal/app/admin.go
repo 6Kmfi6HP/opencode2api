@@ -107,9 +107,17 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 func adminStatsHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		tokenStatsMu.Lock()
-		data, err := json.Marshal(tokenStats)
-		tokenStatsMu.Unlock()
+		// /api/stats is the canonical observation point for the user: read the
+		// latest stats file directly so it reflects writes from all binary
+		// instances that share this file (long-running server plus short-lived
+		// `opencode2api launch claude|codex` proxies). The in-memory snapshot
+		// is used only when the file is unreadable.
+		snap, err := readTokenStatsSnapshot()
+		if err != nil {
+			http.Error(w, `{"error":"read stats failed"}`, http.StatusInternalServerError)
+			return
+		}
+		data, err := json.Marshal(snap)
 		if err != nil {
 			http.Error(w, `{"error":"marshal error"}`, http.StatusInternalServerError)
 			return
