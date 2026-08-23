@@ -74,7 +74,7 @@ func Run() {
 		"port", port,
 		"log_level", getLogLevelString(),
 		"models", len(getModelIDs()),
-		"aliases", len(modelAlias),
+		"aliases", len(getModelKeywordRules()),
 	)
 	if adminPassword != "" {
 		slog.Info("admin panel enabled", "url", fmt.Sprintf("http://localhost:%s/", port))

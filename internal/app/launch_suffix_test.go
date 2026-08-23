@@ -10,13 +10,13 @@ import (
 func TestResolveModelWithSuffix(t *testing.T) {
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
-	oldModelAlias := modelAlias
+	oldModelAlias := modelAliasRules
 	modelMu.Lock()
 	modelsCache = []ModelInfo{{ID: "deepseek-v4-flash"}, {ID: "deepseek-v4-flash-free"}}
 	goModelsCache = nil
 	modelMu.Unlock()
 	configMu.Lock()
-	modelAlias = map[string]string{}
+	modelAliasRules = nil
 	configMu.Unlock()
 	t.Cleanup(func() {
 		modelMu.Lock()
@@ -24,7 +24,7 @@ func TestResolveModelWithSuffix(t *testing.T) {
 		goModelsCache = oldGoModelsCache
 		modelMu.Unlock()
 		configMu.Lock()
-		modelAlias = oldModelAlias
+		modelAliasRules = oldModelAlias
 		configMu.Unlock()
 	})
 
@@ -42,13 +42,13 @@ func TestResolveModelWithSuffix(t *testing.T) {
 func TestResolveModelFreeOnlyWithSuffix(t *testing.T) {
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
-	oldModelAlias := modelAlias
+	oldModelAlias := modelAliasRules
 	modelMu.Lock()
 	modelsCache = []ModelInfo{{ID: "mimo-v2.5-free"}}
 	goModelsCache = nil
 	modelMu.Unlock()
 	configMu.Lock()
-	modelAlias = map[string]string{}
+	modelAliasRules = nil
 	configMu.Unlock()
 	t.Cleanup(func() {
 		modelMu.Lock()
@@ -56,7 +56,7 @@ func TestResolveModelFreeOnlyWithSuffix(t *testing.T) {
 		goModelsCache = oldGoModelsCache
 		modelMu.Unlock()
 		configMu.Lock()
-		modelAlias = oldModelAlias
+		modelAliasRules = oldModelAlias
 		configMu.Unlock()
 	})
 

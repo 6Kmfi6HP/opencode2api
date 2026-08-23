@@ -535,7 +535,7 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
 	oldModelsLoaded := modelsLoaded
-	oldModelAlias := modelAlias
+	oldModelAlias := getModelKeywordRules()
 	modelMu.Lock()
 	modelsCache = []ModelInfo{
 		{ID: "deepseek-v4-flash-free"},
@@ -549,7 +549,7 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 	modelsLoaded = true
 	modelMu.Unlock()
 	configMu.Lock()
-	modelAlias = map[string]string{}
+	modelAliasRules = nil
 	configMu.Unlock()
 	t.Cleanup(func() {
 		modelMu.Lock()
@@ -557,9 +557,7 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 		goModelsCache = oldGoModelsCache
 		modelsLoaded = oldModelsLoaded
 		modelMu.Unlock()
-		configMu.Lock()
-		modelAlias = oldModelAlias
-		configMu.Unlock()
+		applyConfig(AppConfig{ModelAlias: oldModelAlias})
 	})
 
 	tests := []struct {
@@ -617,7 +615,7 @@ func TestListModelsHandlerReplacesMappedModelIDsWithAliases(t *testing.T) {
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
 	oldModelsLoaded := modelsLoaded
-	oldModelAlias := modelAlias
+	oldModelAlias := getModelKeywordRules()
 	modelMu.Lock()
 	modelsCache = []ModelInfo{
 		{ID: "deepseek-v4-flash-free", Object: "model", OwnedBy: "opencode"},
@@ -626,20 +624,14 @@ func TestListModelsHandlerReplacesMappedModelIDsWithAliases(t *testing.T) {
 	goModelsCache = nil
 	modelsLoaded = true
 	modelMu.Unlock()
-	configMu.Lock()
-	modelAlias = map[string]string{
-		"deepseek-v4-flash": "deepseek-v4-flash-free",
-	}
-	configMu.Unlock()
+	applyConfig(AppConfig{ModelAlias: ModelAliasList{{Keyword: "deepseek-v4-flash", Target: "deepseek-v4-flash-free", MatchType: MatchExact, Enabled: true}}})
 	t.Cleanup(func() {
 		modelMu.Lock()
 		modelsCache = oldModelsCache
 		goModelsCache = oldGoModelsCache
 		modelsLoaded = oldModelsLoaded
 		modelMu.Unlock()
-		configMu.Lock()
-		modelAlias = oldModelAlias
-		configMu.Unlock()
+		applyConfig(AppConfig{ModelAlias: oldModelAlias})
 	})
 
 	for _, tt := range []struct {
@@ -690,7 +682,7 @@ func TestListModelsHandlerStripsFreeSuffixWithoutAlias(t *testing.T) {
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
 	oldModelsLoaded := modelsLoaded
-	oldModelAlias := modelAlias
+	oldModelAlias := getModelKeywordRules()
 	modelMu.Lock()
 	modelsCache = []ModelInfo{
 		{ID: "mimo-v2.5-free", Object: "model", OwnedBy: "opencode"},
@@ -699,7 +691,7 @@ func TestListModelsHandlerStripsFreeSuffixWithoutAlias(t *testing.T) {
 	modelsLoaded = true
 	modelMu.Unlock()
 	configMu.Lock()
-	modelAlias = map[string]string{}
+	modelAliasRules = nil
 	configMu.Unlock()
 	t.Cleanup(func() {
 		modelMu.Lock()
@@ -707,9 +699,7 @@ func TestListModelsHandlerStripsFreeSuffixWithoutAlias(t *testing.T) {
 		goModelsCache = oldGoModelsCache
 		modelsLoaded = oldModelsLoaded
 		modelMu.Unlock()
-		configMu.Lock()
-		modelAlias = oldModelAlias
-		configMu.Unlock()
+		applyConfig(AppConfig{ModelAlias: oldModelAlias})
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -732,22 +722,20 @@ func TestListModelsHandlerStripsFreeSuffixWithoutAlias(t *testing.T) {
 func TestResolveModelMapsStrippedFreeNameBackToUpstream(t *testing.T) {
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
-	oldModelAlias := modelAlias
+	oldModelAlias := getModelKeywordRules()
 	modelMu.Lock()
 	modelsCache = []ModelInfo{{ID: "mimo-v2.5-free"}}
 	goModelsCache = nil
 	modelMu.Unlock()
 	configMu.Lock()
-	modelAlias = map[string]string{}
+	modelAliasRules = nil
 	configMu.Unlock()
 	t.Cleanup(func() {
 		modelMu.Lock()
 		modelsCache = oldModelsCache
 		goModelsCache = oldGoModelsCache
 		modelMu.Unlock()
-		configMu.Lock()
-		modelAlias = oldModelAlias
-		configMu.Unlock()
+		applyConfig(AppConfig{ModelAlias: oldModelAlias})
 	})
 
 	if got := resolveModel("mimo-v2.5"); got != "mimo-v2.5-free" {
@@ -761,7 +749,7 @@ func TestResolveModelMapsStrippedFreeNameBackToUpstream(t *testing.T) {
 func TestResolveModelForAuthPrefersGoModelOverMatchingFreeAlias(t *testing.T) {
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
-	oldModelAlias := modelAlias
+	oldModelAlias := getModelKeywordRules()
 	modelMu.Lock()
 	modelsCache = []ModelInfo{
 		{ID: "deepseek-v4-flash"},
@@ -771,22 +759,18 @@ func TestResolveModelForAuthPrefersGoModelOverMatchingFreeAlias(t *testing.T) {
 	}
 	goModelsCache = []ModelInfo{{ID: "deepseek-v4-flash"}, {ID: "go-target"}}
 	modelMu.Unlock()
-	configMu.Lock()
-	modelAlias = map[string]string{
-		"deepseek-v4-flash": "deepseek-v4-flash-free",
-		"free-only":         "free-only-free",
-		"custom-alias":      "go-target",
-		"zen-alias":         "zen-target",
-	}
-	configMu.Unlock()
+	applyConfig(AppConfig{ModelAlias: ModelAliasList{
+		{Keyword: "deepseek-v4-flash", Target: "deepseek-v4-flash-free", MatchType: MatchExact, Enabled: true},
+		{Keyword: "free-only", Target: "free-only-free", MatchType: MatchExact, Enabled: true},
+		{Keyword: "custom-alias", Target: "go-target", MatchType: MatchExact, Enabled: true},
+		{Keyword: "zen-alias", Target: "zen-target", MatchType: MatchExact, Enabled: true},
+	}})
 	t.Cleanup(func() {
 		modelMu.Lock()
 		modelsCache = oldModelsCache
 		goModelsCache = oldGoModelsCache
 		modelMu.Unlock()
-		configMu.Lock()
-		modelAlias = oldModelAlias
-		configMu.Unlock()
+		applyConfig(AppConfig{ModelAlias: oldModelAlias})
 	})
 
 	tests := []struct {

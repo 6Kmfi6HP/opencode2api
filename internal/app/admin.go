@@ -43,7 +43,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		configMu.RLock()
-		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking, MaxTokensCap: maxTokensCap, MaxTokensCapPerModel: maxTokensCapPerModel}
+		cfg := AppConfig{ModelAlias: modelAliasRules, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking, MaxTokensCap: maxTokensCap, MaxTokensCapPerModel: maxTokensCapPerModel}
 		configMu.RUnlock()
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
@@ -1552,34 +1552,6 @@ textarea.form-control {
       </div>
     </div>
 
-    <!-- Model Aliases Section -->
-    <div class="glass-card col-6">
-      <div class="section-head">
-        <div class="section-title">
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"></polyline><line x1="4" y1="20" x2="21" y2="3"></line><polyline points="21 16 21 21 16 21"></polyline><line x1="15" y1="15" x2="21" y2="21"></line><line x1="4" y1="4" x2="9" y2="9"></line></svg>
-          <span>模型别名映射</span>
-        </div>
-      </div>
-      <div class="table-wrapper" style="margin-bottom:12px">
-        <table class="modern-table" id="aliasTable">
-          <thead>
-            <tr>
-              <th style="width:45%">请求别名 (Alias)</th>
-              <th style="width:45%">实际模型 (Upstream)</th>
-              <th style="width:10%;text-align:center">操作</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div class="card-actions">
-        <button class="btn btn-secondary" onclick="addAliasRow()">
-          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-          <span>添加别名</span>
-        </button>
-      </div>
-    </div>
-
     <!-- Reasoning Effort Mapping Section -->
     <div class="glass-card col-6">
       <div class="section-head">
@@ -1650,6 +1622,60 @@ textarea.form-control {
           <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
           <span>添加模型上限</span>
         </button>
+      </div>
+    </div>
+
+    <!-- Model Keyword Rules Section -->
+    <div class="glass-card col-12">
+      <div class="section-head" style="flex-wrap:wrap;gap:10px">
+        <div class="section-title">
+          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7V4h16v3M9 20h6M12 4v16"/></svg>
+          <span>模型关键词映射规则 (Keyword Rules)</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span style="font-size:12px;color:var(--text-ter);margin-right:2px">快捷预设:</span>
+          <button type="button" class="btn btn-xs btn-secondary" onclick="addPresetRule('sonnet','claude-sonnet-4.6')">+ sonnet</button>
+          <button type="button" class="btn btn-xs btn-secondary" onclick="addPresetRule('opus','claude-opus-4.6')">+ opus</button>
+          <button type="button" class="btn btn-xs btn-secondary" onclick="addPresetRule('haiku','claude-haiku-4.6')">+ haiku</button>
+          <button type="button" class="btn btn-xs btn-secondary" onclick="addPresetRule('sol','gpt-5.6')">+ sol</button>
+          <button type="button" class="btn btn-xs btn-secondary" onclick="addPresetRule('luna','deepseek-v4')">+ luna</button>
+          <button type="button" class="btn btn-xs btn-primary" onclick="loadAllPresets()">⚡ 一键载入全套预设</button>
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--text-ter);margin-bottom:12px">
+        按顺序从上到下匹配客户端请求模型名。剥离方括号后缀后，若命中关键词将路由至目标上游模型，并自动保留原后缀。
+      </div>
+      <div class="table-wrapper" style="margin-bottom:12px">
+        <table class="modern-table" id="keywordRuleTable">
+          <thead>
+            <tr>
+              <th style="width:6%;text-align:center">启用</th>
+              <th style="width:16%">匹配模式</th>
+              <th style="width:28%">关键词 / 表达式</th>
+              <th style="width:30%">目标模型 (Upstream)</th>
+              <th style="width:10%;text-align:center">忽略大小写</th>
+              <th style="width:10%;text-align:center">操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card-actions" style="margin-bottom:16px">
+        <button type="button" class="btn btn-secondary" onclick="addKeywordRuleRow()">
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          <span>添加映射规则</span>
+        </button>
+      </div>
+
+      <!-- Live Match Tester -->
+      <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border-color);border-radius:8px;padding:14px">
+        <div style="font-size:12.5px;font-weight:600;color:var(--text-sec);margin-bottom:8px;display:flex;align-items:center;gap:6px">
+          <span>🔍 规则实时模拟测试 (Live Match Tester)</span>
+        </div>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+          <input type="text" id="testModelInput" class="form-control" placeholder="输入客户端模型名测试 (例如: claude-3-7-sonnet-20250219[1m] 或 sol-code)" style="flex:1;min-width:240px" oninput="simulateModelResolve()">
+          <div id="testResultBox" style="font-size:12.5px;padding:8px 12px;border-radius:6px;background:rgba(0,0,0,0.2);color:var(--text-sec);min-width:280px">等待输入...</div>
+        </div>
       </div>
     </div>
 
@@ -1777,7 +1803,16 @@ textarea.form-control {
 </div>
 
 <script>
-let aliasData = {}, effortData = {}, modelList = [], socks5Data = [], capData = {};
+let effortData = {}, modelList = [], socks5Data = [], capData = {};
+let keywordRulesData = [];
+
+const KEYWORD_PRESETS = [
+  { keyword: 'sonnet', target: 'claude-sonnet-4.6', match_type: 'contains', case_insensitive: true, enabled: true },
+  { keyword: 'opus', target: 'claude-opus-4.6', match_type: 'contains', case_insensitive: true, enabled: true },
+  { keyword: 'haiku', target: 'claude-haiku-4.6', match_type: 'contains', case_insensitive: true, enabled: true },
+  { keyword: 'sol', target: 'gpt-5.6', match_type: 'contains', case_insensitive: true, enabled: true },
+  { keyword: 'luna', target: 'deepseek-v4', match_type: 'contains', case_insensitive: true, enabled: true }
+];
 let allStatsData = {};
 
 // Theme Management
@@ -1830,10 +1865,16 @@ async function loadConfig() {
     const cfg = await r.json();
     document.getElementById('force_disable_thinking').checked = !!cfg.force_disable_thinking;
     document.getElementById('socks5_paid_direct').checked = !!cfg.socks5_paid_direct;
-    aliasData = cfg.model_alias || {};
     effortData = cfg.reasoning_effort_map || {};
     socks5Data = cfg.socks5_proxies || [];
     capData = cfg.max_tokens_cap_per_model || {};
+    keywordRulesData = (cfg.model_alias || []).map(r => ({
+      keyword: r.keyword || '',
+      target: r.target || '',
+      match_type: r.match_type || 'contains',
+      case_insensitive: r.case_insensitive !== false,
+      enabled: r.enabled !== false
+    }));
     document.getElementById('maxTokensCap').value = cfg.max_tokens_cap || '';
     document.getElementById('upstreamBaseURLs').value = (cfg.upstream_base_urls || []).join('\n');
     if (cfg.log_level) document.getElementById('logLevelSelect').value = cfg.log_level.toLowerCase();
@@ -1843,10 +1884,10 @@ async function loadConfig() {
     const md = await mr.json();
     modelList = (md.data || []).map(m => m.id).sort();
 
-    renderAliasTable();
     renderEffortTable();
     renderSocks5Table();
     renderCapTable();
+    renderKeywordRuleTable();
     document.getElementById('activeSocks5').value = cfg.active_socks5 || '';
   } catch (e) {
     showToast('加载配置失败: ' + e.message, 'error');
@@ -1856,50 +1897,19 @@ async function loadConfig() {
 function modelSelectHtml(selected, fieldName = 'val') {
   let h = '<select data-field="' + fieldName + '" class="form-control form-select">';
   h += '<option value="">-- 选择模型 --</option>';
+  let found = false;
   for (const m of modelList) {
+    if (selected === m) found = true;
     h += '<option value="' + esc(m) + '"' + (selected === m ? ' selected' : '') + '>' + esc(m) + '</option>';
+  }
+  if (selected && !found) {
+    h += '<option value="' + esc(selected) + '" selected>' + esc(selected) + ' (预设/自定义)</option>';
   }
   h += '</select>';
   return h;
 }
 
-// Alias Table
-function renderAliasTable() {
-  const tb = document.querySelector('#aliasTable tbody');
-  const ks = Object.keys(aliasData);
-  if (!ks.length) {
-    tb.innerHTML = '<tr><td colspan="3" class="empty-state">暂无模型别名配置</td></tr>';
-    return;
-  }
-  tb.innerHTML = ks.map(k => '<tr><td><input class="form-control" value="' + esc(k) + '" data-field="key" placeholder="别名"></td><td>' + modelSelectHtml(aliasData[k], 'val') + '</td><td style="text-align:center"><button class="btn btn-rose btn-icon" onclick="delAlias(this)" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button></td></tr>').join('');
-}
 
-function addAliasRow() {
-  const tb = document.querySelector('#aliasTable tbody');
-  if (tb.querySelector('.empty-state')) tb.innerHTML = '';
-  tb.insertAdjacentHTML('beforeend', '<tr><td><input class="form-control" value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>' + modelSelectHtml('', 'val') + '</td><td style="text-align:center"><button class="btn btn-rose btn-icon" onclick="delAlias(this)" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button></td></tr>');
-}
-
-function delAlias(btn) {
-  const row = btn.closest('tr');
-  const ki = row.querySelector('[data-field="key"]');
-  if (ki && ki.value && aliasData[ki.value]) delete aliasData[ki.value];
-  row.remove();
-  if (!document.querySelectorAll('#aliasTable tbody tr').length) {
-    document.querySelector('#aliasTable tbody').innerHTML = '<tr><td colspan="3" class="empty-state">暂无模型别名配置</td></tr>';
-  }
-}
-
-function collectAliases() {
-  const r = {};
-  document.querySelectorAll('#aliasTable tbody tr').forEach(tr => {
-    const k = tr.querySelector('[data-field="key"]');
-    const v = tr.querySelector('[data-field="val"]');
-    if (k && k.value.trim()) r[k.value.trim()] = v ? v.value.trim() : '';
-  });
-  aliasData = r;
-  return r;
-}
 
 // Effort Table
 function renderEffortTable() {
@@ -2043,18 +2053,197 @@ function delCap(btn) {
   }
 }
 
+
+// Keyword Rules Table
+function renderKeywordRuleTable() {
+  const tb = document.querySelector('#keywordRuleTable tbody');
+  if (!tb) return;
+  if (!keywordRulesData.length) {
+    tb.innerHTML = '<tr><td colspan="6" class="empty-state">暂无关键词映射规则，可点击上方快捷预设载入</td></tr>';
+    return;
+  }
+  tb.innerHTML = keywordRulesData.map(function(r, i) {
+    var h = '<tr data-index="' + i + '">';
+    h += '<td style="text-align:center"><input type="checkbox" data-field="enabled"' + (r.enabled ? ' checked' : '') + ' onchange="onKeywordFieldChange()"></td>';
+    h += '<td><select class="form-control form-select" data-field="match_type" onchange="onKeywordFieldChange()">';
+    h += '<option value="contains"' + (r.match_type === 'contains' || !r.match_type ? ' selected' : '') + '>包含 (Contains)</option>';
+    h += '<option value="exact"' + (r.match_type === 'exact' ? ' selected' : '') + '>精确 (Exact)</option>';
+    h += '<option value="prefix"' + (r.match_type === 'prefix' ? ' selected' : '') + '>前缀 (Prefix)</option>';
+    h += '<option value="regex"' + (r.match_type === 'regex' ? ' selected' : '') + '>正则 (Regex)</option>';
+    h += '</select></td>';
+    h += '<td><input class="form-control" value="' + esc(r.keyword) + '" data-field="keyword" placeholder="关键词如: sonnet" oninput="onKeywordFieldChange()"></td>';
+    h += '<td>' + modelSelectHtml(r.target, 'target') + '</td>';
+    h += '<td style="text-align:center"><input type="checkbox" data-field="case_insensitive"' + (r.case_insensitive ? ' checked' : '') + ' onchange="onKeywordFieldChange()"></td>';
+    h += '<td style="text-align:center">';
+    h += '<button type="button" class="btn btn-icon" onclick="moveKeywordRule(' + i + ', -1)" title="上移">▲</button> ';
+    h += '<button type="button" class="btn btn-icon" onclick="moveKeywordRule(' + i + ', 1)" title="下移">▼</button> ';
+    h += '<button type="button" class="btn btn-rose btn-icon" onclick="delKeywordRule(' + i + ')" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>';
+    h += '</td></tr>';
+    return h;
+  }).join('');
+
+  tb.querySelectorAll('select[data-field="target"]').forEach(function(sel) {
+    sel.onchange = onKeywordFieldChange;
+  });
+}
+
+function onKeywordFieldChange() {
+  collectKeywordRules();
+  simulateModelResolve();
+}
+
+function addKeywordRuleRow() {
+  collectKeywordRules();
+  keywordRulesData.push({
+    keyword: '',
+    target: '',
+    match_type: 'contains',
+    case_insensitive: true,
+    enabled: true
+  });
+  renderKeywordRuleTable();
+  simulateModelResolve();
+}
+
+function collectKeywordRules() {
+  const rows = document.querySelectorAll('#keywordRuleTable tbody tr');
+  const list = [];
+  rows.forEach(tr => {
+    if (tr.querySelector('.empty-state')) return;
+    const enabled = tr.querySelector('[data-field="enabled"]')?.checked ?? true;
+    const matchType = tr.querySelector('[data-field="match_type"]')?.value || 'contains';
+    const keyword = tr.querySelector('[data-field="keyword"]')?.value.trim() || '';
+    const target = tr.querySelector('[data-field="target"]')?.value.trim() || '';
+    const caseInsensitive = tr.querySelector('[data-field="case_insensitive"]')?.checked ?? true;
+    list.push({
+      keyword: keyword,
+      target: target,
+      match_type: matchType,
+      case_insensitive: caseInsensitive,
+      enabled: enabled
+    });
+  });
+  keywordRulesData = list;
+  return keywordRulesData;
+}
+
+function delKeywordRule(index) {
+  collectKeywordRules();
+  keywordRulesData.splice(index, 1);
+  renderKeywordRuleTable();
+  simulateModelResolve();
+}
+
+function moveKeywordRule(index, delta) {
+  collectKeywordRules();
+  const targetIndex = index + delta;
+  if (targetIndex < 0 || targetIndex >= keywordRulesData.length) return;
+  const temp = keywordRulesData[index];
+  keywordRulesData[index] = keywordRulesData[targetIndex];
+  keywordRulesData[targetIndex] = temp;
+  renderKeywordRuleTable();
+  simulateModelResolve();
+}
+
+function addPresetRule(kw, target) {
+  collectKeywordRules();
+  if (keywordRulesData.some(r => r.keyword.toLowerCase() === kw.toLowerCase())) {
+    showToast('规则 [' + kw + '] 已存在', 'warn');
+    return;
+  }
+  keywordRulesData.push({
+    keyword: kw,
+    target: target,
+    match_type: 'contains',
+    case_insensitive: true,
+    enabled: true
+  });
+  renderKeywordRuleTable();
+  simulateModelResolve();
+  showToast('已添加预设规则: ' + kw);
+}
+
+function loadAllPresets() {
+  collectKeywordRules();
+  let added = 0;
+  KEYWORD_PRESETS.forEach(p => {
+    if (!keywordRulesData.some(r => r.keyword.toLowerCase() === p.keyword.toLowerCase())) {
+      keywordRulesData.push({ ...p });
+      added++;
+    }
+  });
+  renderKeywordRuleTable();
+  simulateModelResolve();
+  if (added > 0) {
+    showToast('已成功导入 ' + added + ' 条预设规则');
+  } else {
+    showToast('所有预设规则均已存在', 'warn');
+  }
+}
+
+function simulateModelResolve() {
+  var el = document.getElementById('testModelInput');
+  var raw = (el && el.value ? el.value : '').trim();
+  var resBox = document.getElementById('testResultBox');
+  if (!resBox) return;
+  if (!raw) {
+    resBox.innerHTML = '等待输入...';
+    resBox.style.color = 'var(--text-sec)';
+    return;
+  }
+
+  var base = raw;
+  var suffix = '';
+  var m = raw.match(/^(.+?)(\[[a-zA-Z0-9_-]+\])$/);
+  if (m) {
+    base = m[1];
+    suffix = m[2];
+  }
+
+  collectKeywordRules();
+  for (var i = 0; i < keywordRulesData.length; i++) {
+    var r = keywordRulesData[i];
+    if (!r.enabled || !r.keyword) continue;
+    var hit = false;
+    var tb = r.case_insensitive ? base.toLowerCase() : base;
+    var kw = r.case_insensitive ? r.keyword.toLowerCase() : r.keyword;
+
+    if (r.match_type === 'exact' && tb === kw) {
+      hit = true;
+    } else if (r.match_type === 'prefix' && tb.indexOf(kw) === 0) {
+      hit = true;
+    } else if (r.match_type === 'regex') {
+      try {
+        var re = new RegExp(r.keyword, r.case_insensitive ? 'i' : '');
+        if (re.test(base)) hit = true;
+      } catch (e) {}
+    } else if (tb.indexOf(kw) !== -1) {
+      hit = true;
+    }
+
+    if (hit) {
+      resBox.innerHTML = '🎯 命中规则「<b>' + esc(r.keyword) + '</b>」 (' + esc(r.match_type) + ') ➔ 目标: <b style="color:var(--accent-color)">' + esc(r.target) + suffix + '</b>';
+      resBox.style.color = '#10b981';
+      return;
+    }
+  }
+
+  resBox.innerHTML = '⚪ 未命中任何规则 ➔ 直通上游: <b>' + esc(raw) + '</b>';
+  resBox.style.color = 'var(--text-sec)';
+}
+
 // Save All Configs
 async function saveConfig() {
-  collectAliases();
   collectEfforts();
   collectSocks5();
   collectCaps();
+  collectKeywordRules();
 
   const logLevel = document.getElementById('logLevelSelect').value;
   const logBodies = document.getElementById('logBodiesCheck').checked;
 
   const cfg = {
-    model_alias: aliasData,
+    model_alias: keywordRulesData.filter(r => r.keyword && r.target),
     reasoning_effort_map: effortData,
     force_disable_thinking: document.getElementById('force_disable_thinking').checked,
     max_tokens_cap: parseInt(document.getElementById('maxTokensCap').value) || 0,

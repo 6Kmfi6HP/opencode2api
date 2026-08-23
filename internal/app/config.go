@@ -1,6 +1,8 @@
 package app
 
 import (
+	"github.com/6Kmfi6HP/opencode2api/internal/domain"
+	"regexp"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -12,10 +14,16 @@ import (
 
 // ======================== 配置 ========================
 
+type compiledKeywordRule struct {
+	rule          domain.ModelKeywordRule
+	compiledRegex *regexp.Regexp
+}
+
 var (
 	port                 string
 	configPath           = "config.json"
-	modelAlias           = map[string]string{}
+	modelAliasRules      = []domain.ModelKeywordRule{}
+	compiledRules        = []compiledKeywordRule{}
 	reasoningEffortMap   = map[string]string{}
 	forceDisableThinking bool
 	maxTokensCap         int
@@ -58,12 +66,87 @@ func saveConfig(path string, cfg AppConfig) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+func compileKeywordRules(rules []domain.ModelKeywordRule) ([]domain.ModelKeywordRule, []compiledKeywordRule) {
+	cleanRules := make([]domain.ModelKeywordRule, 0, len(rules))
+	compiled := make([]compiledKeywordRule, 0, len(rules))
+	for _, r := range rules {
+		k := strings.TrimSpace(r.Keyword)
+		t := strings.TrimSpace(r.Target)
+		if k == "" || t == "" {
+			continue
+		}
+		r.Keyword = k
+		r.Target = t
+		if r.MatchType == "" {
+			r.MatchType = domain.MatchContains
+		}
+		cr := compiledKeywordRule{rule: r}
+		if r.MatchType == domain.MatchRegex {
+			pattern := r.Keyword
+			if r.CaseInsensitive && !strings.HasPrefix(pattern, "(?i)") {
+				pattern = "(?i)" + pattern
+			}
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				slog.Warn("invalid keyword regex rule skipped", "pattern", r.Keyword, "error", err)
+				continue
+			}
+			cr.compiledRegex = re
+		}
+		cleanRules = append(cleanRules, r)
+		compiled = append(compiled, cr)
+	}
+	return cleanRules, compiled
+}
+
+func matchKeywordRule(base string) (string, bool) {
+	configMu.RLock()
+	defer configMu.RUnlock()
+
+	baseLower := strings.ToLower(base)
+
+	for _, cr := range compiledRules {
+		if !cr.rule.Enabled {
+			continue
+		}
+
+		targetBase := base
+		if cr.rule.CaseInsensitive {
+			targetBase = baseLower
+		}
+		kw := cr.rule.Keyword
+		if cr.rule.CaseInsensitive {
+			kw = strings.ToLower(kw)
+		}
+
+		switch cr.rule.MatchType {
+		case domain.MatchExact:
+			if targetBase == kw {
+				return cr.rule.Target, true
+			}
+		case domain.MatchPrefix:
+			if strings.HasPrefix(targetBase, kw) {
+				return cr.rule.Target, true
+			}
+		case domain.MatchRegex:
+			if cr.compiledRegex != nil && cr.compiledRegex.MatchString(base) {
+				return cr.rule.Target, true
+			}
+		case domain.MatchContains:
+			fallthrough
+		default:
+			if strings.Contains(targetBase, kw) {
+				return cr.rule.Target, true
+			}
+		}
+	}
+	return "", false
+}
+
 func applyConfig(cfg AppConfig) {
 	configMu.Lock()
 	defer configMu.Unlock()
-	if cfg.ModelAlias != nil {
-		modelAlias = cfg.ModelAlias
-	}
+	modelAliasRules, compiledRules = compileKeywordRules(cfg.ModelAlias)
 	if cfg.ReasoningEffortMap != nil {
 		reasoningEffortMap = cfg.ReasoningEffortMap
 	}
@@ -124,11 +207,8 @@ func stripContextSuffix(modelID string) (base, suffix string) {
 func resolveModel(model string) string {
 	m := strings.TrimSpace(model)
 	base, suffix := stripContextSuffix(m)
-	configMu.RLock()
-	alias, ok := modelAlias[base]
-	configMu.RUnlock()
-	if ok {
-		return alias + suffix
+	if target, matched := matchKeywordRule(base); matched {
+		return target + suffix
 	}
 	// Clients see free models without the "-free" suffix from /v1/models.
 	// Map the display name back to the upstream free ID when that is the only match.
@@ -153,11 +233,10 @@ func resolveModelForAuth(auth UpstreamAuth, model string) string {
 		exactModelAvailable = isModelInZenCatalog(base)
 	}
 	if base != "" && exactModelAvailable {
-		configMu.RLock()
-		alias, ok := modelAlias[base]
-		configMu.RUnlock()
-		if ok && strings.TrimSpace(alias) == base+"-free" {
-			return base + suffix
+		if target, matched := matchKeywordRule(base); matched {
+			if strings.TrimSpace(target) == base+"-free" {
+				return base + suffix
+			}
 		}
 	}
 	return resolveModel(m)
@@ -167,6 +246,27 @@ func getForceDisableThinking() bool {
 	configMu.RLock()
 	defer configMu.RUnlock()
 	return forceDisableThinking
+}
+
+
+func getModelKeywordRules() []domain.ModelKeywordRule {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	cp := make([]domain.ModelKeywordRule, len(modelAliasRules))
+	copy(cp, modelAliasRules)
+	return cp
+}
+
+func getModelAliasMap() map[string]string {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	m := make(map[string]string)
+	for _, r := range modelAliasRules {
+		if r.Enabled && r.MatchType == domain.MatchExact {
+			m[r.Keyword] = r.Target
+		}
+	}
+	return m
 }
 
 func getReasoningEffortMap() map[string]string {

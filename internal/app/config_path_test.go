@@ -440,7 +440,13 @@ func TestSaveConfigCreatesUserConfigDirectory(t *testing.T) {
 	path := filepath.Join(root, "opencode2api", "config.json")
 
 	var wrote AppConfig
-	wrote.ModelAlias = map[string]string{"example": "example-free"}
+	wrote.ModelAlias = []ModelKeywordRule{
+		{
+			Keyword: "example",
+			Target:  "example-free",
+			Enabled: true,
+		},
+	}
 	if err := saveConfig(path, wrote); err != nil {
 		t.Fatal(err)
 	}
@@ -453,8 +459,8 @@ func TestSaveConfigCreatesUserConfigDirectory(t *testing.T) {
 	if err := json.Unmarshal(data, &read); err != nil {
 		t.Fatal(err)
 	}
-	if read.ModelAlias["example"] != "example-free" {
-		t.Fatalf("round-trip alias = %q, want example-free", read.ModelAlias["example"])
+	if len(read.ModelAlias) == 0 || read.ModelAlias[0].Target != "example-free" {
+		t.Fatalf("round-trip alias = %+v, want target example-free", read.ModelAlias)
 	}
 }
 

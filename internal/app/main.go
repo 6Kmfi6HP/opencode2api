@@ -41,6 +41,14 @@ type FunctionCall = domain.FunctionCall
 type Tool = domain.Tool
 type ToolFunction = domain.ToolFunction
 type AppConfig = domain.AppConfig
+type KeywordMatchType = domain.KeywordMatchType
+type ModelKeywordRule = domain.ModelKeywordRule
+const MatchContains = domain.MatchContains
+const MatchPrefix = domain.MatchPrefix
+const MatchExact = domain.MatchExact
+const MatchRegex = domain.MatchRegex
+type ModelAliasList = domain.ModelAliasList
+
 type Socks5Proxy = domain.Socks5Proxy
 type ClaudeRequest = domain.ClaudeRequest
 type ClaudeMessage = domain.ClaudeMessage

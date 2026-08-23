@@ -664,12 +664,7 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 保存别名快照；目录权限仍按真实上游模型判断，最后再替换为客户端可见名称。
-	configMu.RLock()
-	aliases := make(map[string]string, len(modelAlias))
-	for alias, upstream := range modelAlias {
-		aliases[alias] = upstream
-	}
-	configMu.RUnlock()
+	aliases := getModelAliasMap()
 
 	auth := extractUpstreamAuth(r)
 	var combinedModels []ModelInfo

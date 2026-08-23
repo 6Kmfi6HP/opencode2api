@@ -1,5 +1,11 @@
 package domain
 
+import (
+	"encoding/json"
+	"sort"
+	"strings"
+)
+
 // OpenAIRequest is the canonical Chat Completions request used by the proxy.
 type OpenAIRequest struct {
 	Model           string         `json:"model"`
@@ -46,8 +52,65 @@ type ToolFunction struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
+
+type KeywordMatchType string
+
+const (
+	MatchContains KeywordMatchType = "contains"
+	MatchPrefix   KeywordMatchType = "prefix"
+	MatchExact    KeywordMatchType = "exact"
+	MatchRegex    KeywordMatchType = "regex"
+)
+
+type ModelKeywordRule struct {
+	Keyword         string           `json:"keyword"`
+	Target          string           `json:"target"`
+	MatchType       KeywordMatchType `json:"match_type,omitempty"`
+	CaseInsensitive bool             `json:"case_insensitive"`
+	Enabled         bool             `json:"enabled"`
+}
+
+type ModelAliasList []ModelKeywordRule
+
+func (m *ModelAliasList) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*m = nil
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "[") {
+		var list []ModelKeywordRule
+		if err := json.Unmarshal(data, &list); err != nil {
+			return err
+		}
+		*m = list
+		return nil
+	}
+	var legacy map[string]string
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(legacy))
+	for k := range legacy {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	list := make([]ModelKeywordRule, 0, len(legacy))
+	for _, k := range keys {
+		list = append(list, ModelKeywordRule{
+			Keyword:         k,
+			Target:          legacy[k],
+			MatchType:       MatchExact,
+			CaseInsensitive: false,
+			Enabled:         true,
+		})
+	}
+	*m = list
+	return nil
+}
+
 type AppConfig struct {
-	ModelAlias           map[string]string `json:"model_alias"`
+	ModelAlias          ModelAliasList     `json:"model_alias"`
 	ReasoningEffortMap   map[string]string `json:"reasoning_effort_map"`
 	ForceDisableThinking bool              `json:"force_disable_thinking"`
 	MaxTokensCap         int               `json:"max_tokens_cap,omitempty"`
