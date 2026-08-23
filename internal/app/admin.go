@@ -179,12 +179,11 @@ const adminLoginHTML = `<!DOCTYPE html>
   --radius-sm: 10px;
   --font: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
   --mono: 'JetBrains Mono', Consolas, monospace;
-  --shadow-card: 0 20px 50px -10px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--border);
 }
 [data-theme="light"] {
   --bg: #f8fafc;
-  --surface: rgba(255, 255, 255, 0.9);
-  --surface-elevated: rgba(241, 245, 249, 0.95);
+  --surface: rgba(255, 255, 255, 0.88);
+  --surface-elevated: #f1f5f9;
   --input-bg: #ffffff;
   --border: #e2e8f0;
   --border-hover: #cbd5e1;
@@ -199,7 +198,6 @@ const adminLoginHTML = `<!DOCTYPE html>
   --emerald-glow: rgba(5, 150, 105, 0.15);
   --rose: #e11d48;
   --rose-dim: rgba(225, 29, 72, 0.08);
-  --shadow-card: 0 20px 40px -15px rgba(15, 23, 42, 0.08), 0 0 0 1px var(--border);
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -211,8 +209,8 @@ body {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  overflow-x: hidden;
   position: relative;
+  overflow: hidden;
   transition: background-color 0.3s ease, color 0.3s ease;
 }
 #canvas-bg {
@@ -223,325 +221,221 @@ body {
   pointer-events: none;
   z-index: 0;
 }
-.ambient-glow {
-  position: fixed;
-  width: 600px;
-  height: 600px;
-  border-radius: 50%;
-  filter: blur(140px);
-  pointer-events: none;
-  opacity: 0.45;
-  z-index: 0;
-}
-.glow-1 { top: -150px; left: 10%; background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%); }
-.glow-2 { bottom: -150px; right: 10%; background: radial-gradient(circle, var(--emerald-glow) 0%, transparent 70%); }
-
-.login-wrapper {
-  width: 100%;
-  max-width: 440px;
-  position: relative;
-  z-index: 10;
-  animation: fadeInScale 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-}
-@keyframes fadeInScale {
-  from { opacity: 0; transform: scale(0.96) translateY(12px); }
-  to { opacity: 1; transform: scale(1) translateY(0); }
-}
-
-.login-card {
-  background: var(--surface);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 40px 36px 36px;
-  box-shadow: var(--shadow-card);
-  position: relative;
-  overflow: hidden;
-}
-.login-card::before {
-  content: '';
+.glow-accent {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: linear-gradient(90deg, transparent 0%, var(--accent) 50%, transparent 100%);
+  width: 420px;
+  height: 420px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+  filter: blur(80px);
+  pointer-events: none;
+  z-index: 0;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
   opacity: 0.8;
 }
-
-.top-bar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 28px;
-}
-.badge-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 4px 10px;
-  background: var(--surface-elevated);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  font-size: 11.5px;
-  font-weight: 600;
-  letter-spacing: 0.5px;
-  color: var(--emerald);
-  font-family: var(--mono);
-}
-.pulse-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--emerald);
-  box-shadow: 0 0 0 0 var(--emerald-glow);
-  animation: pulse 2s infinite;
-}
-@keyframes pulse {
-  0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
-  70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
-}
-
-.theme-btn {
-  background: var(--surface-elevated);
+.theme-btn-float {
+  position: fixed;
+  top: 24px;
+  right: 24px;
+  z-index: 20;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: var(--surface);
   border: 1px solid var(--border);
   color: var(--text-sec);
-  width: 36px;
-  height: 36px;
-  border-radius: var(--radius-sm);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  backdrop-filter: blur(12px);
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
-.theme-btn:hover {
-  border-color: var(--border-hover);
+.theme-btn-float:hover {
   color: var(--text);
+  border-color: var(--border-hover);
   transform: translateY(-1px);
 }
-.theme-btn:active {
-  transform: scale(0.95);
+.login-card {
+  position: relative;
+  z-index: 10;
+  width: 100%;
+  max-width: 400px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 38px 32px 34px;
+  box-shadow: 0 20px 48px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--border);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
 }
-
-.brand-section {
+.brand-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   text-align: center;
-  margin-bottom: 32px;
+  margin-bottom: 28px;
 }
-.brand-icon-box {
-  width: 54px;
-  height: 54px;
-  margin: 0 auto 16px;
-  background: linear-gradient(135deg, rgba(99, 102, 241, 0.15), rgba(16, 185, 129, 0.15));
-  border: 1px solid rgba(99, 102, 241, 0.3);
-  border-radius: 14px;
+.logo-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(16, 185, 129, 0.2));
+  border: 1px solid rgba(99, 102, 241, 0.4);
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--accent);
+  margin-bottom: 16px;
   box-shadow: 0 8px 24px -4px var(--accent-glow);
 }
-.brand-title {
-  font-size: 22px;
+.login-title {
+  font-size: 20px;
   font-weight: 800;
   letter-spacing: -0.5px;
   color: var(--text);
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
-.brand-desc {
+.login-sub {
   font-size: 13px;
   color: var(--text-sec);
-  font-weight: 400;
 }
-
-.error-banner {
-  display: none;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 16px;
-  background: var(--rose-dim);
-  border: 1px solid rgba(244, 63, 94, 0.25);
-  border-radius: var(--radius-sm);
-  color: var(--rose);
-  font-size: 13px;
-  font-weight: 500;
-  margin-bottom: 20px;
-  animation: shake 0.4s ease;
-}
-@keyframes shake {
-  0%, 100% { transform: translateX(0); }
-  25% { transform: translateX(-4px); }
-  75% { transform: translateX(4px); }
-}
-
 .form-group {
-  margin-bottom: 22px;
+  margin-bottom: 20px;
 }
-.form-label {
+.field-label {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  justify-content: space-between;
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-sec);
-  margin-bottom: 8px;
   text-transform: uppercase;
-  letter-spacing: 0.6px;
+  letter-spacing: 0.5px;
+  color: var(--text-ter);
+  margin-bottom: 8px;
 }
-.input-wrapper {
+.input-wrap {
   position: relative;
   display: flex;
   align-items: center;
 }
-.input-icon {
-  position: absolute;
-  left: 14px;
-  color: var(--text-ter);
-  pointer-events: none;
-  display: flex;
-  align-items: center;
-}
-.form-input {
+.input-field {
   width: 100%;
-  height: 46px;
-  padding: 0 44px 0 42px;
+  padding: 12px 42px 12px 14px;
   background: var(--input-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text);
   font-family: var(--mono);
-  font-size: 14px;
+  font-size: 13.5px;
+  outline: none;
   transition: all 0.2s ease;
 }
-.form-input:hover {
-  border-color: var(--border-hover);
-}
-.form-input:focus {
-  outline: none;
+.input-field:focus {
   border-color: var(--border-focus);
   box-shadow: 0 0 0 3px var(--accent-glow);
 }
-.toggle-pwd {
+.input-icon-btn {
   position: absolute;
   right: 12px;
   background: transparent;
   border: none;
   color: var(--text-ter);
   cursor: pointer;
+  padding: 4px;
   display: flex;
   align-items: center;
-  padding: 4px;
-  border-radius: 4px;
+  justify-content: center;
   transition: color 0.15s;
 }
-.toggle-pwd:hover {
+.input-icon-btn:hover {
   color: var(--text);
 }
-
 .submit-btn {
   width: 100%;
-  height: 46px;
+  padding: 12px 20px;
   background: linear-gradient(135deg, var(--accent), var(--accent-hover));
   color: #ffffff;
   border: none;
   border-radius: var(--radius-sm);
   font-family: var(--font);
   font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
+  font-weight: 700;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
+  box-shadow: 0 4px 18px -2px var(--accent-glow);
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-  box-shadow: 0 4px 16px -2px var(--accent-glow);
 }
 .submit-btn:hover {
   transform: translateY(-1px);
-  box-shadow: 0 6px 20px -2px var(--accent-glow);
-  filter: brightness(1.05);
+  box-shadow: 0 6px 24px -2px var(--accent-glow);
 }
 .submit-btn:active {
   transform: scale(0.98);
 }
-
-.footer-info {
+.msg-banner {
+  margin-top: 16px;
+  padding: 10px 14px;
+  background: var(--rose-dim);
+  border: 1px solid rgba(244, 63, 94, 0.3);
+  border-radius: var(--radius-sm);
+  color: var(--rose);
+  font-size: 12.5px;
   text-align: center;
-  margin-top: 24px;
-  font-size: 12px;
-  color: var(--text-ter);
+  display: none;
 }
 </style>
 </head>
 <body>
 <canvas id="canvas-bg"></canvas>
-<div class="ambient-glow glow-1"></div>
-<div class="ambient-glow glow-2"></div>
+<div class="glow-accent"></div>
 
-<div class="login-wrapper">
-  <div class="login-card">
-    <div class="top-bar">
-      <div class="badge-status">
-        <span class="pulse-dot"></span>
-        <span>GATEWAY READY</span>
-      </div>
-      <button class="theme-btn" id="themeToggle" onclick="toggleTheme()" title="切换明暗主题" aria-label="切换明暗主题">
-        <svg id="themeIconSun" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
-        <svg id="themeIconMoon" style="display:none" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
-      </button>
+<button class="theme-btn-float" onclick="toggleTheme()" title="切换明暗主题" aria-label="切换主题">
+  <svg id="themeIconSun" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+  <svg id="themeIconMoon" style="display:none" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+</button>
+
+<div class="login-card">
+  <div class="brand-box">
+    <div class="logo-icon">
+      <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
     </div>
-
-    <div class="brand-section">
-      <div class="brand-icon-box">
-        <svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
-      </div>
-      <h1 class="brand-title">OPENCODE TO API</h1>
-      <p class="brand-desc">请输入管理密码以进入控制面板</p>
-    </div>
-
-    <div class="error-banner" id="login-msg">
-      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
-      <span id="msg-text">密码错误</span>
-    </div>
-
-    <form method="post" action="/login">
-      <div class="form-group">
-        <label class="form-label" for="pwd">
-          <span>安全凭证</span>
-          <span>PASSWORD</span>
-        </label>
-        <div class="input-wrapper">
-          <span class="input-icon">
-            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-          </span>
-          <input id="pwd" name="password" type="password" class="form-input" placeholder="输入控制面板密码" autocomplete="current-password" required autofocus>
-          <button type="button" class="toggle-pwd" onclick="togglePasswordVisibility()" aria-label="显示/隐藏密码">
-            <svg id="eyeIcon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-          </button>
-        </div>
-      </div>
-      <button class="submit-btn" type="submit">
-        <span>进入控制台</span>
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
-      </button>
-    </form>
-
-    <div class="footer-info">
-      OPENCODE API GATEWAY - HIGH PERFORMANCE PROXY
-    </div>
+    <h1 class="login-title">OPENCODE TO API</h1>
+    <span class="login-sub">网关管理控制台鉴权</span>
   </div>
+
+  <form method="post" action="/login">
+    <div class="form-group">
+      <div class="field-label">
+        <span>安全凭证 PASSWORD</span>
+      </div>
+      <div class="input-wrap">
+        <input type="password" name="password" id="pwd" class="input-field" placeholder="请输入管理员访问密码" autofocus required>
+        <button type="button" class="input-icon-btn" onclick="togglePasswordVisibility()" title="显示/隐藏密码">
+          <svg id="eyeIcon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+        </button>
+      </div>
+    </div>
+
+    <button type="submit" class="submit-btn">
+      <span>进入控制台</span>
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
+    </button>
+    <div id="login-msg" class="msg-banner"></div>
+  </form>
 </div>
 
 <script>
-(function(){
+(function() {
   var t = localStorage.getItem('theme');
-  if(!t) t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  if (!t) t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
   applyTheme(t);
 })();
-
 function applyTheme(theme) {
   if (theme === 'light') {
     document.documentElement.setAttribute('data-theme', 'light');
@@ -553,14 +447,12 @@ function applyTheme(theme) {
     document.getElementById('themeIconMoon').style.display = 'none';
   }
 }
-
 function toggleTheme() {
   var cur = document.documentElement.getAttribute('data-theme') || 'dark';
   var next = cur === 'dark' ? 'light' : 'dark';
   localStorage.setItem('theme', next);
   applyTheme(next);
 }
-
 function togglePasswordVisibility() {
   var inp = document.getElementById('pwd');
   var eye = document.getElementById('eyeIcon');
@@ -572,39 +464,32 @@ function togglePasswordVisibility() {
     eye.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>';
   }
 }
-
-// Particle canvas animation
 (function() {
   var canvas = document.getElementById('canvas-bg');
-  if (!canvas) return;
   var ctx = canvas.getContext('2d');
   var width, height;
   var particles = [];
   var count = 38;
-
   function resize() {
     width = canvas.width = window.innerWidth;
     height = canvas.height = window.innerHeight;
   }
   window.addEventListener('resize', resize);
   resize();
-
   for (var i = 0; i < count; i++) {
     particles.push({
       x: Math.random() * width,
       y: Math.random() * height,
-      vx: (Math.random() - 0.5) * 0.4,
-      vy: (Math.random() - 0.5) * 0.4,
+      vx: (Math.random() - 0.5) * 0.35,
+      vy: (Math.random() - 0.5) * 0.35,
       radius: Math.random() * 1.5 + 0.8
     });
   }
-
   function render() {
     ctx.clearRect(0, 0, width, height);
     var isDark = document.documentElement.getAttribute('data-theme') !== 'light';
     var pColor = isDark ? 'rgba(99, 102, 241, 0.4)' : 'rgba(99, 102, 241, 0.25)';
     var lColor = isDark ? 'rgba(99, 102, 241, 0.06)' : 'rgba(99, 102, 241, 0.04)';
-
     for (var i = 0; i < particles.length; i++) {
       var p = particles[i];
       p.x += p.vx;
@@ -613,12 +498,10 @@ function togglePasswordVisibility() {
       if (p.x > width) p.x = 0;
       if (p.y < 0) p.y = height;
       if (p.y > height) p.y = 0;
-
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
       ctx.fillStyle = pColor;
       ctx.fill();
-
       for (var j = i + 1; j < particles.length; j++) {
         var p2 = particles[j];
         var dx = p.x - p2.x;
@@ -654,11 +537,10 @@ const adminHTML = `<!DOCTYPE html>
 <style>
 :root {
   --bg: #08090d;
-  --bg-dots: rgba(255, 255, 255, 0.04);
-  --surface: rgba(15, 17, 24, 0.82);
-  --surface-hover: rgba(20, 23, 34, 0.9);
-  --surface-elevated: rgba(24, 28, 40, 0.95);
-  --surface-inset: rgba(10, 12, 18, 0.75);
+  --surface: rgba(15, 17, 24, 0.85);
+  --surface-hover: rgba(22, 26, 38, 0.95);
+  --surface-elevated: rgba(24, 28, 42, 0.96);
+  --surface-inset: rgba(10, 12, 18, 0.85);
   --border: rgba(255, 255, 255, 0.08);
   --border-hover: rgba(255, 255, 255, 0.16);
   --border-focus: #6366f1;
@@ -668,10 +550,10 @@ const adminHTML = `<!DOCTYPE html>
   --accent: #6366f1;
   --accent-hover: #4f46e5;
   --accent-dim: rgba(99, 102, 241, 0.14);
-  --accent-glow: rgba(99, 102, 241, 0.25);
+  --accent-glow: rgba(99, 102, 241, 0.28);
   --emerald: #10b981;
   --emerald-dim: rgba(16, 185, 129, 0.14);
-  --emerald-glow: rgba(16, 185, 129, 0.2);
+  --emerald-glow: rgba(16, 185, 129, 0.25);
   --cyan: #06b6d4;
   --cyan-dim: rgba(6, 182, 212, 0.14);
   --amber: #f59e0b;
@@ -689,8 +571,7 @@ const adminHTML = `<!DOCTYPE html>
 }
 [data-theme="light"] {
   --bg: #f8fafc;
-  --bg-dots: rgba(15, 23, 42, 0.04);
-  --surface: rgba(255, 255, 255, 0.92);
+  --surface: rgba(255, 255, 255, 0.94);
   --surface-hover: #ffffff;
   --surface-elevated: #f1f5f9;
   --surface-inset: #f8fafc;
@@ -764,38 +645,45 @@ body {
 }
 
 .container {
-  max-width: 1180px;
+  max-width: 1240px;
   margin: 0 auto;
-  padding: 28px 24px 80px;
+  padding: 24px 24px 80px;
   position: relative;
   z-index: 10;
 }
 
-/* Glass Header */
+/* Sticky Unified Global Header & Tab Nav */
+.header-wrapper {
+  position: sticky;
+  top: 16px;
+  z-index: 900;
+  margin-bottom: 24px;
+}
 header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 22px;
+  padding: 12px 20px;
   background: var(--surface);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
   border: 1px solid var(--border);
   border-radius: var(--radius-xl);
   box-shadow: var(--shadow-card);
-  margin-bottom: 24px;
+  gap: 16px;
 }
 .brand-group {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
+  flex-shrink: 0;
 }
 .brand-logo {
-  width: 42px;
-  height: 42px;
+  width: 38px;
+  height: 38px;
   background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(16, 185, 129, 0.2));
   border: 1px solid rgba(99, 102, 241, 0.35);
-  border-radius: 12px;
+  border-radius: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -810,23 +698,24 @@ header {
 .brand-title-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 .brand-title {
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 800;
-  letter-spacing: -0.4px;
+  letter-spacing: -0.3px;
   color: var(--text);
+  white-space: nowrap;
 }
 .status-pill {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 2px 8px;
+  gap: 5px;
+  padding: 2px 7px;
   background: var(--emerald-dim);
   border: 1px solid rgba(16, 185, 129, 0.25);
   border-radius: 999px;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 600;
   font-family: var(--mono);
   color: var(--emerald);
@@ -845,17 +734,57 @@ header {
   70% { box-shadow: 0 0 0 5px rgba(16, 185, 129, 0); }
   100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
 }
-.brand-subtitle {
-  font-size: 12px;
+
+/* Tab Navigation Bar */
+.nav-tabs {
+  display: flex;
+  align-items: center;
+  background: var(--surface-inset);
+  border: 1px solid var(--border);
+  padding: 4px;
+  border-radius: 12px;
+  gap: 4px;
+}
+.tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
   color: var(--text-sec);
-  font-weight: 400;
-  margin-top: 1px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  position: relative;
+}
+.tab-btn:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+.tab-btn.active {
+  color: #ffffff;
+  background: var(--accent);
+  box-shadow: 0 4px 12px -2px var(--accent-glow);
+}
+[data-theme="light"] .tab-btn.active {
+  color: #ffffff;
+  background: var(--accent);
+}
+.tab-btn svg {
+  width: 15px;
+  height: 15px;
 }
 
 .header-actions {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 /* Glass Card */
@@ -873,6 +802,19 @@ header {
 }
 .glass-card:hover {
   border-color: var(--border-hover);
+}
+
+/* Tab Panels Switching */
+.tab-panel {
+  display: none;
+  animation: fadeIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+.tab-panel.active {
+  display: block;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 /* Hero HUD Grid */
@@ -951,7 +893,7 @@ header {
 .hud-bar-prompt { height: 100%; background: var(--accent); }
 .hud-bar-comp { height: 100%; background: var(--emerald); }
 
-/* Main Bento Grid */
+/* Main Bento Layout */
 .bento-grid {
   display: grid;
   grid-template-columns: repeat(12, 1fr);
@@ -1058,6 +1000,11 @@ header {
   padding: 0;
   border-radius: var(--radius-sm);
 }
+.btn-xs {
+  padding: 4px 8px;
+  font-size: 11px;
+  border-radius: 6px;
+}
 
 /* Search Bar */
 .search-box {
@@ -1081,7 +1028,7 @@ header {
   font-family: var(--font);
   font-size: 12px;
   color: var(--text);
-  width: 140px;
+  width: 150px;
 }
 .search-box input::placeholder {
   color: var(--text-ter);
@@ -1138,7 +1085,7 @@ header {
   border-top: 1px solid var(--border-hover);
 }
 
-/* Input Fields inside Tables & Forms */
+/* Form Controls */
 .form-control {
   width: 100%;
   padding: 7px 11px;
@@ -1171,7 +1118,7 @@ textarea.form-control {
   resize: vertical;
 }
 
-/* Tactical Switch / Checkbox */
+/* Tactical Switch */
 .switch-wrapper {
   display: flex;
   align-items: center;
@@ -1307,6 +1254,32 @@ textarea.form-control {
   transform: scale(0.97);
 }
 
+/* Endpoints Card List */
+.endpoint-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.endpoint-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--surface-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.endpoint-method {
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+.method-post { background: var(--accent-dim); color: var(--accent); }
+.method-get { background: var(--emerald-dim); color: var(--emerald); }
+
 /* Toast */
 #toast {
   position: fixed;
@@ -1332,6 +1305,11 @@ textarea.form-control {
 }
 #toast.success {
   background: rgba(16, 185, 129, 0.95);
+  color: #ffffff;
+  backdrop-filter: blur(12px);
+}
+#toast.warn {
+  background: rgba(245, 158, 11, 0.95);
   color: #ffffff;
   backdrop-filter: blur(12px);
 }
@@ -1400,15 +1378,19 @@ textarea.form-control {
   gap: 10px;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 960px) {
   .hero-hud { grid-template-columns: repeat(2, 1fr); }
   .col-8, .col-7, .col-6, .col-5, .col-4 { grid-column: span 12; }
+  header { flex-wrap: wrap; }
+  .nav-tabs { order: 3; width: 100%; justify-content: space-around; overflow-x: auto; }
 }
-@media (max-width: 600px) {
+@media (max-width: 640px) {
   .hero-hud { grid-template-columns: 1fr; }
   .container { padding: 16px 12px 90px; }
-  header { flex-direction: column; align-items: stretch; gap: 14px; }
+  .nav-tabs { justify-content: flex-start; padding: 2px; }
+  .tab-btn { padding: 6px 10px; font-size: 12px; }
   .header-actions { justify-content: flex-end; }
+  .floating-dock { bottom: 16px; right: 16px; left: 16px; justify-content: space-between; }
 }
 </style>
 </head>
@@ -1418,99 +1400,122 @@ textarea.form-control {
 <div class="ambient-glow-2"></div>
 
 <div class="container">
-  <!-- Header HUD -->
-  <header>
-    <div class="brand-group">
-      <div class="brand-logo">
-        <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
-      </div>
-      <div class="brand-info">
-        <div class="brand-title-row">
-          <span class="brand-title">OPENCODE TO API</span>
-          <span class="status-pill">
-            <span class="pulse-dot"></span>
-            <span>GATEWAY ONLINE</span>
-          </span>
+  <!-- Sticky Global Header & Tabs -->
+  <div class="header-wrapper">
+    <header>
+      <div class="brand-group">
+        <div class="brand-logo">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
         </div>
-        <span class="brand-subtitle">OpenCode 免费 API 模型代理网关</span>
+        <div class="brand-info">
+          <div class="brand-title-row">
+            <span class="brand-title">OPENCODE TO API</span>
+            <span class="status-pill">
+              <span class="pulse-dot"></span>
+              <span>ONLINE</span>
+            </span>
+          </div>
+        </div>
       </div>
-    </div>
-    <div class="header-actions">
-      <button class="btn btn-emerald" onclick="reloadConfig()" id="btnReloadSession" title="重新获取上游会话与模型列表">
-        <svg id="reloadIcon" xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-        <span>刷新会话</span>
-      </button>
-      <button class="btn btn-secondary btn-icon" onclick="toggleTheme()" title="切换明暗主题" aria-label="切换主题">
-        <svg id="themeIconSun" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
-        <svg id="themeIconMoon" style="display:none" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
-      </button>
-      <form method="post" action="/logout" style="margin:0">
-        <button class="btn btn-secondary" type="submit" title="安全退出登录">
-          <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
-          <span>退出</span>
+
+      <!-- Center Tabs Group -->
+      <nav class="nav-tabs" role="tablist">
+        <button class="tab-btn active" id="tabBtnOverview" onclick="switchTab('overview')">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9"></rect><rect x="14" y="3" width="7" height="5"></rect><rect x="14" y="12" width="7" height="9"></rect><rect x="3" y="16" width="7" height="5"></rect></svg>
+          <span>概览与监控</span>
         </button>
-      </form>
-    </div>
-  </header>
+        <button class="tab-btn" id="tabBtnModels" onclick="switchTab('models')">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7V4h16v3M9 20h6M12 4v16"/></svg>
+          <span>模型与路由</span>
+        </button>
+        <button class="tab-btn" id="tabBtnNetwork" onclick="switchTab('network')">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
+          <span>网络与代理</span>
+        </button>
+        <button class="tab-btn" id="tabBtnSystem" onclick="switchTab('system')">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+          <span>系统配置</span>
+        </button>
+      </nav>
 
-  <!-- Hero HUD 4 Tiles -->
-  <div class="hero-hud">
-    <div class="hud-tile">
-      <div class="hud-header">
-        <span class="hud-title">总请求次数</span>
-        <div class="hud-icon-box icon-emerald">
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
-        </div>
+      <!-- Right Header Actions -->
+      <div class="header-actions">
+        <button class="btn btn-emerald" onclick="reloadConfig()" id="btnReloadSession" title="重新获取上游会话与模型列表">
+          <svg id="reloadIcon" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+          <span>刷新会话</span>
+        </button>
+        <button class="btn btn-secondary btn-icon" onclick="toggleTheme()" title="切换明暗主题" aria-label="切换主题">
+          <svg id="themeIconSun" xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+          <svg id="themeIconMoon" style="display:none" xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+        </button>
+        <form method="post" action="/logout" style="margin:0">
+          <button class="btn btn-secondary" type="submit" title="安全退出登录">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+            <span>退出</span>
+          </button>
+        </form>
       </div>
-      <div class="hud-value" id="hudTotalRequests">0</div>
-      <div class="hud-subtext" id="hudActiveModels">活跃模型: 0</div>
-    </div>
-
-    <div class="hud-tile">
-      <div class="hud-header">
-        <span class="hud-title">总 Token 吞吐</span>
-        <div class="hud-icon-box icon-cyan">
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
-        </div>
-      </div>
-      <div class="hud-value" id="hudTotalTokens">0</div>
-      <div class="hud-subtext" id="hudPromptCompletionSum">输入 + 输出总计</div>
-    </div>
-
-    <div class="hud-tile">
-      <div class="hud-header">
-        <span class="hud-title">输入 / 输出 分布</span>
-        <div class="hud-icon-box icon-indigo">
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
-        </div>
-      </div>
-      <div class="hud-value" id="hudRatioText">0% / 0%</div>
-      <div class="hud-bar">
-        <div class="hud-bar-prompt" id="hudBarPrompt" style="width:50%"></div>
-        <div class="hud-bar-comp" id="hudBarComp" style="width:50%"></div>
-      </div>
-      <div class="hud-subtext" style="justify-content:space-between">
-        <span id="hudPromptTokensText">入: 0</span>
-        <span id="hudCompTokensText">出: 0</span>
-      </div>
-    </div>
-
-    <div class="hud-tile">
-      <div class="hud-header">
-        <span class="hud-title">缓存吞吐</span>
-        <div class="hud-icon-box icon-amber">
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
-        </div>
-      </div>
-      <div class="hud-value" id="hudCacheRead">0</div>
-      <div class="hud-subtext" id="hudCacheWrite">写入: 0</div>
-    </div>
+    </header>
   </div>
 
-  <!-- Main Bento Content -->
-  <div class="bento-grid">
-    <!-- Token Statistics Section (Full Width) -->
-    <div class="glass-card col-12">
+  <!-- ======================== TAB 1: 概览与监控 ======================== -->
+  <div class="tab-panel active" id="panelOverview">
+    <!-- Hero HUD 4 Tiles -->
+    <div class="hero-hud">
+      <div class="hud-tile">
+        <div class="hud-header">
+          <span class="hud-title">总请求次数</span>
+          <div class="hud-icon-box icon-emerald">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+          </div>
+        </div>
+        <div class="hud-value" id="hudTotalRequests">0</div>
+        <div class="hud-subtext" id="hudActiveModels">活跃模型: 0</div>
+      </div>
+
+      <div class="hud-tile">
+        <div class="hud-header">
+          <span class="hud-title">总 Token 吞吐</span>
+          <div class="hud-icon-box icon-cyan">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+          </div>
+        </div>
+        <div class="hud-value" id="hudTotalTokens">0</div>
+        <div class="hud-subtext" id="hudPromptCompletionSum">输入 + 输出总计</div>
+      </div>
+
+      <div class="hud-tile">
+        <div class="hud-header">
+          <span class="hud-title">输入 / 输出 分布</span>
+          <div class="hud-icon-box icon-indigo">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+          </div>
+        </div>
+        <div class="hud-value" id="hudRatioText">0% / 0%</div>
+        <div class="hud-bar">
+          <div class="hud-bar-prompt" id="hudBarPrompt" style="width:50%"></div>
+          <div class="hud-bar-comp" id="hudBarComp" style="width:50%"></div>
+        </div>
+        <div class="hud-subtext" style="justify-content:space-between">
+          <span id="hudPromptTokensText">入: 0</span>
+          <span id="hudCompTokensText">出: 0</span>
+        </div>
+      </div>
+
+      <div class="hud-tile">
+        <div class="hud-header">
+          <span class="hud-title">缓存吞吐</span>
+          <div class="hud-icon-box icon-amber">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+          </div>
+        </div>
+        <div class="hud-value" id="hudCacheRead">0</div>
+        <div class="hud-subtext" id="hudCacheWrite">写入: 0</div>
+      </div>
+    </div>
+
+    <!-- Token Statistics Table -->
+    <div class="glass-card">
       <div class="section-head">
         <div class="section-title">
           <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
@@ -1551,82 +1556,12 @@ textarea.form-control {
         </table>
       </div>
     </div>
+  </div>
 
-    <!-- Reasoning Effort Mapping Section -->
-    <div class="glass-card col-6">
-      <div class="section-head">
-        <div class="section-title">
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"></line><line x1="4" y1="10" x2="4" y2="3"></line><line x1="12" y1="21" x2="12" y2="12"></line><line x1="12" y1="8" x2="12" y2="3"></line><line x1="20" y1="21" x2="20" y2="16"></line><line x1="20" y1="12" x2="20" y2="3"></line><line x1="1" y1="14" x2="7" y2="14"></line><line x1="9" y1="8" x2="15" y2="8"></line><line x1="17" y1="16" x2="23" y2="16"></line></svg>
-          <span>推理力度映射</span>
-        </div>
-      </div>
-      <div class="table-wrapper" style="margin-bottom:12px">
-        <table class="modern-table" id="effortTable">
-          <thead>
-            <tr>
-              <th style="width:45%">请求值 (e.g. xhigh)</th>
-              <th style="width:45%">映射值 (e.g. max)</th>
-              <th style="width:10%;text-align:center">操作</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div class="switch-wrapper">
-        <div class="switch-label-group">
-          <span class="switch-title">强制禁用思考模式</span>
-          <span class="switch-desc">过滤并移除所有模型返回的推理内容</span>
-        </div>
-        <label class="custom-switch">
-          <input type="checkbox" id="force_disable_thinking">
-          <span class="switch-track"></span>
-        </label>
-      </div>
-      <div class="card-actions">
-        <button class="btn btn-secondary" onclick="addEffortRow()">
-          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-          <span>添加映射</span>
-        </button>
-      </div>
-    </div>
-
-    <!-- max_tokens Limits Section -->
-    <div class="glass-card col-6">
-      <div class="section-head">
-        <div class="section-title">
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M4.93 4.93l2.83 2.83M2 12h4M4.93 19.07l2.83-2.83M12 22v-4M19.07 19.07l-2.83-2.83M22 12h-4M19.07 4.93l-2.83 2.83"/><circle cx="12" cy="12" r="2"/></svg>
-          <span>max_tokens 上限控制</span>
-        </div>
-      </div>
-      <div style="margin-bottom:14px">
-        <label style="display:block;font-size:11.5px;font-weight:600;color:var(--text-ter);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">全局默认上限</label>
-        <div style="display:flex;align-items:center;gap:10px">
-          <input type="number" id="maxTokensCap" class="form-control" min="0" placeholder="0 表示不限制" style="max-width:180px">
-          <span style="font-size:12px;color:var(--text-ter)">超过此值的请求会被截断至该数值</span>
-        </div>
-      </div>
-      <div class="table-wrapper" style="margin-bottom:12px">
-        <table class="modern-table" id="capTable">
-          <thead>
-            <tr>
-              <th style="width:55%">目标模型</th>
-              <th style="width:35%">上限值</th>
-              <th style="width:10%;text-align:center">操作</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div class="card-actions">
-        <button class="btn btn-secondary" onclick="addCapRow()">
-          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-          <span>添加模型上限</span>
-        </button>
-      </div>
-    </div>
-
+  <!-- ======================== TAB 2: 模型与路由 ======================== -->
+  <div class="tab-panel" id="panelModels">
     <!-- Model Keyword Rules Section -->
-    <div class="glass-card col-12">
+    <div class="glass-card" style="margin-bottom: 20px;">
       <div class="section-head" style="flex-wrap:wrap;gap:10px">
         <div class="section-title">
           <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7V4h16v3M9 20h6M12 4v16"/></svg>
@@ -1668,103 +1603,230 @@ textarea.form-control {
       </div>
 
       <!-- Live Match Tester -->
-      <div style="background:rgba(255,255,255,0.03);border:1px solid var(--border-color);border-radius:8px;padding:14px">
+      <div style="background:var(--surface-inset);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px">
         <div style="font-size:12.5px;font-weight:600;color:var(--text-sec);margin-bottom:8px;display:flex;align-items:center;gap:6px">
-          <span>🔍 规则实时模拟测试 (Live Match Tester)</span>
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+          <span>规则实时模拟测试 (Live Match Tester)</span>
         </div>
         <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
           <input type="text" id="testModelInput" class="form-control" placeholder="输入客户端模型名测试 (例如: claude-3-7-sonnet-20250219[1m] 或 sol-code)" style="flex:1;min-width:240px" oninput="simulateModelResolve()">
-          <div id="testResultBox" style="font-size:12.5px;padding:8px 12px;border-radius:6px;background:rgba(0,0,0,0.2);color:var(--text-sec);min-width:280px">等待输入...</div>
+          <div id="testResultBox" style="font-size:12.5px;padding:8px 12px;border-radius:6px;background:var(--surface-elevated);border:1px solid var(--border);color:var(--text-sec);min-width:280px">等待输入...</div>
         </div>
       </div>
     </div>
 
-    <!-- SOCKS5 Proxy Cluster Section -->
-    <div class="glass-card col-6">
-      <div class="section-head">
-        <div class="section-title">
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
-          <span>SOCKS5 代理集群</span>
+    <!-- Effort Mapping & Token Caps Grid -->
+    <div class="bento-grid">
+      <!-- Reasoning Effort Mapping Section -->
+      <div class="glass-card col-6">
+        <div class="section-head">
+          <div class="section-title">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"></line><line x1="4" y1="10" x2="4" y2="3"></line><line x1="12" y1="21" x2="12" y2="12"></line><line x1="12" y1="8" x2="12" y2="3"></line><line x1="20" y1="21" x2="20" y2="16"></line><line x1="20" y1="12" x2="20" y2="3"></line><line x1="1" y1="14" x2="7" y2="14"></line><line x1="9" y1="8" x2="15" y2="8"></line><line x1="17" y1="16" x2="23" y2="16"></line></svg>
+            <span>推理力度映射 (Reasoning Effort)</span>
+          </div>
+        </div>
+        <div class="table-wrapper" style="margin-bottom:12px">
+          <table class="modern-table" id="effortTable">
+            <thead>
+              <tr>
+                <th style="width:45%">请求值 (e.g. xhigh)</th>
+                <th style="width:45%">映射值 (e.g. max)</th>
+                <th style="width:10%;text-align:center">操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="switch-wrapper">
+          <div class="switch-label-group">
+            <span class="switch-title">强制禁用思考模式</span>
+            <span class="switch-desc">过滤并移除所有模型返回的推理内容</span>
+          </div>
+          <label class="custom-switch">
+            <input type="checkbox" id="force_disable_thinking">
+            <span class="switch-track"></span>
+          </label>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-secondary" onclick="addEffortRow()">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            <span>添加映射</span>
+          </button>
         </div>
       </div>
-      <div class="table-wrapper" style="margin-bottom:12px">
-        <table class="modern-table" id="socks5Table">
-          <thead>
-            <tr>
-              <th style="width:25%">名称</th>
-              <th style="width:30%">地址 (Host:Port)</th>
-              <th style="width:20%">用户名</th>
-              <th style="width:20%">密码</th>
-              <th style="width:5%;text-align:center">操作</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div style="margin-bottom:12px">
-        <label style="display:block;font-size:11.5px;font-weight:600;color:var(--text-ter);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">当前生效路由</label>
-        <select id="activeSocks5" class="form-control form-select"></select>
-      </div>
-      <div class="switch-wrapper">
-        <div class="switch-label-group">
-          <span class="switch-title">带 key / 付费请求直连</span>
-          <span class="switch-desc">默认关闭：关闭时 public 与付费请求均走 SOCKS5 代理</span>
+
+      <!-- max_tokens Limits Section -->
+      <div class="glass-card col-6">
+        <div class="section-head">
+          <div class="section-title">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M4.93 4.93l2.83 2.83M2 12h4M4.93 19.07l2.83-2.83M12 22v-4M19.07 19.07l-2.83-2.83M22 12h-4M19.07 4.93l-2.83 2.83"/><circle cx="12" cy="12" r="2"/></svg>
+            <span>max_tokens 上限控制</span>
+          </div>
         </div>
-        <label class="custom-switch">
-          <input type="checkbox" id="socks5_paid_direct">
-          <span class="switch-track"></span>
-        </label>
-      </div>
-      <div class="card-actions">
-        <button class="btn btn-secondary" onclick="addSocks5Row()">
-          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-          <span>添加代理节点</span>
-        </button>
+        <div style="margin-bottom:14px">
+          <label style="display:block;font-size:11.5px;font-weight:600;color:var(--text-ter);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">全局默认上限</label>
+          <div style="display:flex;align-items:center;gap:10px">
+            <input type="number" id="maxTokensCap" class="form-control" min="0" placeholder="0 表示不限制" style="max-width:180px">
+            <span style="font-size:12px;color:var(--text-ter)">超过此值的请求会被截断至该数值</span>
+          </div>
+        </div>
+        <div class="table-wrapper" style="margin-bottom:12px">
+          <table class="modern-table" id="capTable">
+            <thead>
+              <tr>
+                <th style="width:55%">目标模型</th>
+                <th style="width:35%">上限值</th>
+                <th style="width:10%;text-align:center">操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-secondary" onclick="addCapRow()">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            <span>添加模型上限</span>
+          </button>
+        </div>
       </div>
     </div>
+  </div>
 
-    <!-- Upstream Domains Section -->
-    <div class="glass-card col-8">
-      <div class="section-head">
-        <div class="section-title">
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
-          <span>上游域名负载均衡 (Upstream URLs)</span>
+  <!-- ======================== TAB 3: 网络与代理 ======================== -->
+  <div class="tab-panel" id="panelNetwork">
+    <div class="bento-grid">
+      <!-- SOCKS5 Proxy Cluster Section -->
+      <div class="glass-card col-7">
+        <div class="section-head">
+          <div class="section-title">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+            <span>SOCKS5 代理集群</span>
+          </div>
+        </div>
+        <div class="table-wrapper" style="margin-bottom:12px">
+          <table class="modern-table" id="socks5Table">
+            <thead>
+              <tr>
+                <th style="width:25%">名称</th>
+                <th style="width:30%">地址 (Host:Port)</th>
+                <th style="width:20%">用户名</th>
+                <th style="width:20%">密码</th>
+                <th style="width:5%;text-align:center">操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div style="margin-bottom:12px">
+          <label style="display:block;font-size:11.5px;font-weight:600;color:var(--text-ter);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">当前生效路由</label>
+          <select id="activeSocks5" class="form-control form-select"></select>
+        </div>
+        <div class="switch-wrapper">
+          <div class="switch-label-group">
+            <span class="switch-title">带 key / 付费请求直连</span>
+            <span class="switch-desc">默认关闭：关闭时 public 与付费请求均走 SOCKS5 代理</span>
+          </div>
+          <label class="custom-switch">
+            <input type="checkbox" id="socks5_paid_direct">
+            <span class="switch-track"></span>
+          </label>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-secondary" onclick="addSocks5Row()">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            <span>添加代理节点</span>
+          </button>
         </div>
       </div>
-      <div style="margin-bottom:8px">
-        <textarea id="upstreamBaseURLs" rows="4" class="form-control" placeholder="https://opencode.ai"></textarea>
+
+      <!-- Upstream Domains Section -->
+      <div class="glass-card col-5">
+        <div class="section-head">
+          <div class="section-title">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
+            <span>上游域名负载均衡 (Upstream URLs)</span>
+          </div>
+        </div>
+        <div style="margin-bottom:10px">
+          <textarea id="upstreamBaseURLs" rows="6" class="form-control" placeholder="https://opencode.ai"></textarea>
+        </div>
+        <p style="font-size:12px;color:var(--text-ter);line-height:1.5">
+          每行一个上游反代域名。多个域名将自动进行负载均衡与健康轮询；同一会话将被 sticky 固定到固定的反代与代理组合。留空默认为 <code>https://opencode.ai</code>。
+        </p>
       </div>
-      <p style="font-size:12px;color:var(--text-ter)">
-        每行一个上游反代域名。多个域名可实现负载均衡与健康轮询；同一会话将被 sticky 固定到固定的反代与代理组合。留空默认为 https://opencode.ai。
-      </p>
     </div>
+  </div>
 
-    <!-- Logging & Diagnostics Section -->
-    <div class="glass-card col-4">
-      <div class="section-head">
-        <div class="section-title">
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
-          <span>日志与运行诊断</span>
+  <!-- ======================== TAB 4: 系统配置 ======================== -->
+  <div class="tab-panel" id="panelSystem">
+    <div class="bento-grid">
+      <!-- Logging & Diagnostics Section -->
+      <div class="glass-card col-6">
+        <div class="section-head">
+          <div class="section-title">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+            <span>日志与运行诊断</span>
+          </div>
+        </div>
+        <div style="margin-bottom:14px">
+          <label style="display:block;font-size:11.5px;font-weight:600;color:var(--text-ter);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">日志输出级别</label>
+          <select id="logLevelSelect" class="form-control form-select">
+            <option value="debug">DEBUG (详细排查)</option>
+            <option value="info">INFO (常规运行)</option>
+            <option value="warn">WARN (仅告警)</option>
+            <option value="error">ERROR (仅错误)</option>
+          </select>
+        </div>
+        <div class="switch-wrapper" style="margin-top:0">
+          <div class="switch-label-group">
+            <span class="switch-title">记录请求体摘要</span>
+            <span class="switch-desc">在 Debug 级别下截取并记录请求 body 摘要</span>
+          </div>
+          <label class="custom-switch">
+            <input type="checkbox" id="logBodiesCheck">
+            <span class="switch-track"></span>
+          </label>
         </div>
       </div>
-      <div style="margin-bottom:12px">
-        <label style="display:block;font-size:11.5px;font-weight:600;color:var(--text-ter);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">日志级别</label>
-        <select id="logLevelSelect" class="form-control form-select">
-          <option value="debug">DEBUG (详细排查)</option>
-          <option value="info">INFO (常规运行)</option>
-          <option value="warn">WARN (仅告警)</option>
-          <option value="error">ERROR (仅错误)</option>
-        </select>
-      </div>
-      <div class="switch-wrapper" style="margin-top:0">
-        <div class="switch-label-group">
-          <span class="switch-title">记录请求体摘要</span>
-          <span class="switch-desc">在 Debug 级别下截取并记录 body 摘要</span>
+
+      <!-- Quick Endpoints Documentation -->
+      <div class="glass-card col-6">
+        <div class="section-head">
+          <div class="section-title">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+            <span>兼容端点指引 (Endpoints)</span>
+          </div>
         </div>
-        <label class="custom-switch">
-          <input type="checkbox" id="logBodiesCheck">
-          <span class="switch-track"></span>
-        </label>
+        <div class="endpoint-list">
+          <div class="endpoint-item">
+            <div>
+              <span class="endpoint-method method-post">POST</span>
+              <span style="color:var(--text);margin-left:6px">/v1/chat/completions</span>
+            </div>
+            <span style="color:var(--text-ter)">OpenAI 兼容对话</span>
+          </div>
+          <div class="endpoint-item">
+            <div>
+              <span class="endpoint-method method-post">POST</span>
+              <span style="color:var(--text);margin-left:6px">/v1/responses</span>
+            </div>
+            <span style="color:var(--text-ter)">OpenAI Responses API</span>
+          </div>
+          <div class="endpoint-item">
+            <div>
+              <span class="endpoint-method method-post">POST</span>
+              <span style="color:var(--text);margin-left:6px">/v1/messages</span>
+            </div>
+            <span style="color:var(--text-ter)">Anthropic 原生协议</span>
+          </div>
+          <div class="endpoint-item">
+            <div>
+              <span class="endpoint-method method-get">GET</span>
+              <span style="color:var(--text);margin-left:6px">/v1/models</span>
+            </div>
+            <span style="color:var(--text-ter)">模型列表查询</span>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -1814,6 +1876,31 @@ const KEYWORD_PRESETS = [
   { keyword: 'luna', target: 'deepseek-v4', match_type: 'contains', case_insensitive: true, enabled: true }
 ];
 let allStatsData = {};
+
+// Tab Management
+function switchTab(tabId) {
+  const tabs = ['overview', 'models', 'network', 'system'];
+  if (!tabs.includes(tabId)) tabId = 'overview';
+
+  tabs.forEach(t => {
+    const btn = document.getElementById('tabBtn' + t.charAt(0).toUpperCase() + t.slice(1));
+    const panel = document.getElementById('panel' + t.charAt(0).toUpperCase() + t.slice(1));
+    if (btn) btn.classList.toggle('active', t === tabId);
+    if (panel) panel.classList.toggle('active', t === tabId);
+  });
+
+  try {
+    history.replaceState(null, '', '#' + tabId);
+  } catch(e) {}
+}
+
+// Initialize Active Tab from Hash
+(function initTabFromHash() {
+  const hash = (window.location.hash || '').replace('#', '');
+  if (['overview', 'models', 'network', 'system'].includes(hash)) {
+    switchTab(hash);
+  }
+})();
 
 // Theme Management
 (function() {
@@ -1908,8 +1995,6 @@ function modelSelectHtml(selected, fieldName = 'val') {
   h += '</select>';
   return h;
 }
-
-
 
 // Effort Table
 function renderEffortTable() {
@@ -2052,7 +2137,6 @@ function delCap(btn) {
     document.querySelector('#capTable tbody').innerHTML = '<tr><td colspan="3" class="empty-state">暂无模型上限配置</td></tr>';
   }
 }
-
 
 // Keyword Rules Table
 function renderKeywordRuleTable() {
@@ -2222,8 +2306,8 @@ function simulateModelResolve() {
     }
 
     if (hit) {
-      resBox.innerHTML = '🎯 命中规则「<b>' + esc(r.keyword) + '</b>」 (' + esc(r.match_type) + ') ➔ 目标: <b style="color:var(--accent-color)">' + esc(r.target) + suffix + '</b>';
-      resBox.style.color = '#10b981';
+      resBox.innerHTML = '🎯 命中规则「<b>' + esc(r.keyword) + '</b>」 (' + esc(r.match_type) + ') ➔ 目标: <b style="color:var(--emerald)">' + esc(r.target) + suffix + '</b>';
+      resBox.style.color = 'var(--emerald)';
       return;
     }
   }
@@ -2399,8 +2483,10 @@ function showToast(msg, type = 'success') {
   t.className = type + ' show';
   if (type === 'success') {
     ic.innerHTML = '<polyline points="20 6 9 17 4 12"></polyline>';
-  } else {
+  } else if (type === 'warn') {
     ic.innerHTML = '<circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line>';
+  } else {
+    ic.innerHTML = '<circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line>';
   }
   clearTimeout(t._tid);
   t._tid = setTimeout(() => t.classList.remove('show'), 3000);
