@@ -64,9 +64,3 @@ func selectModelInteractive(in io.Reader, out io.Writer, errOut io.Writer, model
 	}
 	return selectModelNumbered(in, out, errOut, entries)
 }
-
-// launchDefaultLogFile returns the Windows log path in the user cache
-// directory, with a temp-directory fallback.
-func launchDefaultLogFile() string {
-	return windowsLaunchDefaultLogFile()
-}

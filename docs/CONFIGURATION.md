@@ -9,6 +9,27 @@
 
 第 4 项的完整位置由 `os.UserConfigDir()` 决定（Linux 常见为 `~/.config/opencode2api/config.json`，macOS 为 `~/Library/Application Support/opencode2api/config.json`）。选择该项且服务模式需要保存配置时，目录会自动创建；launch 模式不会写回。
 
+## 统计与日志路径解析
+
+统计路径按以下优先级解析：
+
+1. 环境变量 `OPENCODE2API_STATS`
+2. 环境变量 `OPENCODE2API_STATS_FILE`
+3. 显式传入的 `-stats-file` / `--stats-file`
+4. 下面的默认规则
+
+日志路径按以下优先级解析：
+
+1. 环境变量 `OPENCODE2API_LOG_FILE`
+2. 显式传入的 `-log-file` / `--log-file`
+3. 下面的默认规则
+
+默认规则区分 config 是否显式提供：
+
+- 显式 `-config /path/config.json` 时，未单独配置的默认路径是 `/path/stats.json` 和 `/path/opencode2api.log`；当前目录已有旧文件不会覆盖该规则。
+- 未显式指定 config 时，已有当前目录旧文件继续兼容使用；否则使用 config 回退目录，通常是 `<UserConfigDir>/opencode2api/stats.json` 和 `<UserConfigDir>/opencode2api/opencode2api.log`。
+- 空环境值会被忽略。现有容器 entrypoint 显式传入 `-config /data/config.json`，并保持 `/data/config.json` 与 `/data/opencode2api.log` 行为不变。
+
 仓库开发流程仍可先从示例复制当前目录文件：
 
 ```bash
@@ -205,7 +226,7 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 - 缺省或 `true`：注入（对支持的上游提升缓存命中；GLM/Zhipu 模型会拒绝该字段，自动跳过）
 - `false`：不注入
 
-运行时观测：`stats.json` 中每个模型新增 `cache_read_tokens` / `cache_created_tokens` 聚合（来自上游 `cache_read_input_tokens` / `cache_creation_input_tokens`、`prompt_cache_hit_tokens` 或 `prompt_tokens_details.cached_tokens` 等），管理面板也会显示“缓存读取/缓存写入”两列。DeepSeek 的 `prompt_cache_miss_tokens` 是普通未命中输入，不是缓存写入，不累计为 `cache_created_tokens`；命中率用 `cache_read / prompt_tokens` 计算。
+运行时观测：统计文件路径见上文“统计与日志路径解析”。`stats.json` 中每个模型新增 `cache_read_tokens` / `cache_created_tokens` 聚合（来自上游 `cache_read_input_tokens` / `cache_creation_input_tokens`、`prompt_cache_hit_tokens` 或 `prompt_tokens_details.cached_tokens` 等），管理面板也会显示“缓存读取/缓存写入”两列。DeepSeek 的 `prompt_cache_miss_tokens` 是普通未命中输入，不是缓存写入，不累计为 `cache_created_tokens`；命中率用 `cache_read / prompt_tokens` 计算。
 
 ```json
 {
@@ -230,7 +251,7 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 
 ## 日志与排障
 
-默认写入 `opencode2api.log` 并由 lumberjack 按大小轮换；同时写 stdout。
+非容器模式默认路径由上文“统计与日志路径解析”决定，不再使用 Windows 的 `%LOCALAPPDATA%/opencode2api/logs` 旧 launch 缓存路径；容器内默认是 `/data/opencode2api.log`。日志由 lumberjack 按大小轮换；同时写 stdout。
 
 关键字段：
 

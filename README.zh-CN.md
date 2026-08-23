@@ -115,6 +115,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     服务端口，默认 8000
 -config string
     配置文件路径；默认搜索顺序见“配置文件解析”
+-stats-file string
+    统计文件路径；默认规则见“统计与日志路径解析”
 -password string
     管理面板密码，默认 123456；留空表示不启用登录验证
 -debug
@@ -151,6 +153,23 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 4. 平台用户配置目录：`<UserConfigDir>/opencode2api/config.json`（Linux 为 `~/.config/opencode2api/config.json`，macOS 为 `~/Library/Application Support/opencode2api/config.json`）
 
 选择回退路径且普通服务模式需要保存配置时，会自动创建 `opencode2api` 用户配置目录。launch 模式仍然只读。已有部署中的 `OPENCODE2API_CONFIG=/data/config.json` 会继续使用该文件。
+
+### 统计与日志路径解析
+
+统计路径优先级：
+
+1. `OPENCODE2API_STATS`
+2. `OPENCODE2API_STATS_FILE`
+3. 显式传入的 `-stats-file` / `--stats-file`
+4. 下面的默认规则
+
+日志路径优先级：
+
+1. `OPENCODE2API_LOG_FILE`
+2. 显式传入的 `-log-file` / `--log-file`
+3. 下面的默认规则
+
+只有未显式指定 config 时，当前目录旧文件才继续兼容使用。显式传入 `-config /path/config.json` 时，未单独配置的默认路径变为 `/path/stats.json` 和 `/path/opencode2api.log`；已有 `./stats.json` 或 `./opencode2api.log` 不会覆盖该规则。未显式指定 config 时，先继续使用已有的当前目录旧文件；否则使用 config 回退目录（通常是 `<UserConfigDir>/opencode2api/`）。空环境值会被忽略。
 
 ## launch 子命令
 
@@ -212,6 +231,8 @@ opencode2api 还会根据当前可用上游模型生成一个临时 Codex model 
 | `--model` | _(空)_ | 上游模型 ID。Claude 设置 `ANTHROPIC_*_MODEL`；Codex 前置 `--model`。空 = 交互式 TUI 选择。 |
 | `--key` | `public` | OpenCode key。解析优先级：flag > `OPENCODE_API_KEY` 环境变量 > `public` |
 | `--config` | 由[配置文件解析](#配置文件解析)决定 | 配置文件路径；launch 模式只读取该文件。 |
+| `--log-file` | 由[统计与日志路径解析](#统计与日志路径解析)决定 | 日志文件路径。 |
+| `--stats-file` | 由[统计与日志路径解析](#统计与日志路径解析)决定 | 统计文件路径。 |
 | `--port` | `0` | 绑定端口；`0` = 系统随机分配 |
 | `--debug` | 关闭 | 启用调试日志 |
 | `--version` | 关闭 | 显示构建版本后退出 |
@@ -244,6 +265,7 @@ rg 'promoted_reasoning=true' opencode2api.log
 | `OPENCODE2API_CONFIG` | `/data/config.json` | `-config` |
 | `OPENCODE2API_PASSWORD` | `123456` | `-password` |
 | `OPENCODE2API_LOG_FILE` | `/data/opencode2api.log` | `-log-file` |
+| `OPENCODE2API_STATS` / `OPENCODE2API_STATS_FILE` | 无 | `-stats-file` |
 | `OPENCODE2API_LOG_LEVEL` | `info` | `-log-level` |
 | `OPENCODE2API_LOG_STDOUT` | `true` | `-log-stdout` |
 | `OPENCODE2API_SOCKS5_ADDR` | *(未设置)* | 设置时在 `config.json` 中引导一个 SOCKS5 条目 |

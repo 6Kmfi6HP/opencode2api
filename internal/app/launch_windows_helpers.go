@@ -1,7 +1,6 @@
 package app
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -59,14 +58,4 @@ func windowsLaunchCandidatePaths(home, appdata, tool string) []string {
 		candidates = append(candidates, windowsPathJoin(appdata, "npm\\"+tool+".cmd"))
 	}
 	return candidates
-}
-
-// windowsLaunchDefaultLogFile returns the platform default Windows log path.
-// os.UserCacheDir usually maps to %LOCALAPPDATA%; if unavailable, use a
-// temp-directory fallback that still stays off the current working directory.
-func windowsLaunchDefaultLogFile() string {
-	if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
-		return filepath.Join(cacheDir, "opencode2api", "logs", "opencode2api.log")
-	}
-	return filepath.Join(os.TempDir(), "opencode2api-logs", "opencode2api.log")
 }

@@ -171,3 +171,32 @@ func TestLaunchFlagParsingPort(t *testing.T) {
 		t.Errorf("port = %d, want 8000", port)
 	}
 }
+
+func TestNewLaunchFlagSetStatsFile(t *testing.T) {
+	flags := newLaunchFlagSet("claude", []string{"-stats-file", "custom_stats.json", "-log-file", "custom_log.log"})
+	if flags.statsFile != "custom_stats.json" {
+		t.Errorf("statsFile = %q, want custom_stats.json", flags.statsFile)
+	}
+	if !flags.statsExplicit {
+		t.Errorf("statsExplicit = false, want true")
+	}
+	if flags.logFile != "custom_log.log" {
+		t.Errorf("logFile = %q, want custom_log.log", flags.logFile)
+	}
+	if !flags.logExplicit {
+		t.Errorf("logExplicit = false, want true")
+	}
+}
+
+func TestConfigureLaunchGlobalsStatsPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	customStats := tmpDir + "/launch_stats.json"
+	flags := launchFlags{
+		statsFile:     customStats,
+		statsExplicit: true,
+	}
+	configureLaunchGlobals(flags)
+	if got := getTokenStatsPath(); got != customStats {
+		t.Errorf("getTokenStatsPath() = %q, want %q", got, customStats)
+	}
+}

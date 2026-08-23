@@ -35,8 +35,10 @@ func Run() {
 	}
 
 	var showVersion bool
+	var statsFile string
 	flag.StringVar(&port, "port", "8000", "服务端口")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
+	flag.StringVar(&statsFile, "stats-file", "stats.json", "统计文件路径")
 	flag.StringVar(&adminPassword, "password", "123456", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
 	flag.StringVar(&logLevel, "log-level", "info", "日志级别: debug/info/warn/error")
@@ -50,7 +52,11 @@ func Run() {
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	flag.Parse()
 
-	configPath, _ = resolveConfigPath(configPath, flagSet("config"))
+	configExplicit := flagSet("config")
+	configPath, _ = resolveConfigPath(configPath, configExplicit)
+	logFile, _ = resolveLogFilePath(logFile, flagSet("log-file"), configPath, configExplicit)
+	resolvedStats, _ := resolveStatsPath(statsFile, flagSet("stats-file"), configPath, configExplicit)
+	setTokenStatsPath(resolvedStats)
 
 	initLogger()
 	defer closeLogRotator()

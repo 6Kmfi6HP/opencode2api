@@ -22,14 +22,18 @@ import (
 const codexAPIKeyEnv = "OPENCODE2API_OPENAI_API_KEY"
 
 type launchFlags struct {
-	model     string
-	key       string
-	cfgPath   string
-	logFile   string
-	port      int
-	debug     bool
-	showVer   bool
-	extraArgs []string
+	model          string
+	key            string
+	cfgPath        string
+	logFile        string
+	logExplicit    bool
+	configExplicit bool
+	statsFile      string
+	statsExplicit  bool
+	port           int
+	debug          bool
+	showVer        bool
+	extraArgs      []string
 }
 
 // newLaunchFlagSet parses the flags shared by `opencode2api launch claude` and
@@ -41,6 +45,7 @@ func newLaunchFlagSet(tool string, args []string) launchFlags {
 	fs.StringVar(&f.key, "key", "", "OpenCode key (flag > OPENCODE_API_KEY env > public)")
 	fs.StringVar(&f.cfgPath, "config", "", "config file path (default: OPENCODE2API_CONFIG, ./config.json if present, or the user config directory)")
 	fs.StringVar(&f.logFile, "log-file", "", "log file path (empty = platform default)")
+	fs.StringVar(&f.statsFile, "stats-file", "", "stats file path (empty = default rules)")
 	fs.IntVar(&f.port, "port", 0, "port to bind; 0 = random")
 	fs.BoolVar(&f.debug, "debug", false, "enable debug logs")
 	fs.BoolVar(&f.showVer, "version", false, "print version and exit")
@@ -48,14 +53,17 @@ func newLaunchFlagSet(tool string, args []string) launchFlags {
 		os.Exit(2)
 	}
 	f.extraArgs = fs.Args()
-
-	var explicit bool
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "config" {
-			explicit = true
+	fs.Visit(func(visited *flag.Flag) {
+		switch visited.Name {
+		case "config":
+			f.configExplicit = true
+		case "log-file":
+			f.logExplicit = true
+		case "stats-file":
+			f.statsExplicit = true
 		}
 	})
-	f.cfgPath, _ = resolveConfigPath(f.cfgPath, explicit)
+	f.cfgPath, _ = resolveConfigPath(f.cfgPath, f.configExplicit)
 
 	return f
 }
@@ -97,17 +105,16 @@ func configureLaunchGlobals(f launchFlags) {
 	if f.debug {
 		logLevel = "debug"
 	}
-	if f.logFile != "" {
-		logFile = f.logFile
-	} else {
-		logFile = launchDefaultLogFile()
-	}
+	logFile, _ = resolveLogFilePath(f.logFile, f.logExplicit, configPath, f.configExplicit)
 	logStdout = false // launch mode: logs go to file only, never stdout (would corrupt the child TUI)
 	logMaxSize = 100
 	logMaxBackups = 7
 	logMaxAge = 14
 	logCompress = true
 	logBodies = false
+
+	resolvedStats, _ := resolveStatsPath(f.statsFile, f.statsExplicit, configPath, f.configExplicit)
+	setTokenStatsPath(resolvedStats)
 
 	initLogger()
 }

@@ -23,9 +23,3 @@ func signalLaunchChild(proc *os.Process, sig os.Signal) {
 func selectModelInteractive(in io.Reader, out io.Writer, errOut io.Writer, modelIDs []string, catalog modelsDevCatalog) (string, error) {
 	return selectModelTTY(modelIDs, catalog)
 }
-
-// launchDefaultLogFile returns the historical Unix log path. The behavior of
-// macOS, Linux, and FreeBSD must remain unchanged.
-func launchDefaultLogFile() string {
-	return "opencode2api.log"
-}

@@ -2,7 +2,10 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -31,10 +34,30 @@ var (
 	tokenStatsPath = "stats.json"
 )
 
+// setTokenStatsPath updates the file path used to persist token usage statistics.
+func setTokenStatsPath(path string) {
+	tokenStatsMu.Lock()
+	defer tokenStatsMu.Unlock()
+	if path != "" {
+		tokenStatsPath = path
+	}
+}
+
+// getTokenStatsPath returns the currently configured token stats file path.
+func getTokenStatsPath() string {
+	tokenStatsMu.Lock()
+	defer tokenStatsMu.Unlock()
+	return tokenStatsPath
+}
+
 // ======================== Token 统计 ========================
 
 func loadTokenStats() {
-	data, err := os.ReadFile(tokenStatsPath)
+	tokenStatsMu.Lock()
+	path := tokenStatsPath
+	tokenStatsMu.Unlock()
+
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
@@ -50,14 +73,24 @@ func loadTokenStats() {
 	tokenStatsMu.Unlock()
 }
 
-func saveTokenStats() {
+func saveTokenStats() error {
 	tokenStatsMu.Lock()
 	data, err := json.MarshalIndent(tokenStats, "", "  ")
+	path := tokenStatsPath
 	tokenStatsMu.Unlock()
 	if err != nil {
-		return
+		return fmt.Errorf("marshal token stats: %w", err)
 	}
-	os.WriteFile(tokenStatsPath, data, 0644)
+
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create stats directory %s: %w", dir, err)
+		}
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("write stats file %s: %w", path, err)
+	}
+	return nil
 }
 
 func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens int64) {
@@ -73,7 +106,11 @@ func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens 
 	ms.CompletionTokens += completionTokens
 	ms.TotalTokens += totalTokens
 	tokenStatsMu.Unlock()
-	go saveTokenStats()
+	go func() {
+		if err := saveTokenStats(); err != nil {
+			slog.Warn("failed to save token stats", "path", getTokenStatsPath(), "error", err)
+		}
+	}()
 }
 
 // recordCacheUsage aggregates upstream prompt-cache accounting per model.
@@ -96,7 +133,11 @@ func recordCacheUsage(model string, usage map[string]any) {
 	ms.CacheReadTokens += read
 	ms.CacheCreatedTokens += created
 	tokenStatsMu.Unlock()
-	go saveTokenStats()
+	go func() {
+		if err := saveTokenStats(); err != nil {
+			slog.Warn("failed to save token stats", "path", getTokenStatsPath(), "error", err)
+		}
+	}()
 }
 
 // parseCacheUsage extracts cache token counts from the various usage shapes

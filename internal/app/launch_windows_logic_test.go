@@ -2,7 +2,6 @@ package app
 
 import (
 	"bytes"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -76,14 +75,6 @@ func TestWindowsLaunchCandidatePathsCodex(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("windows codex candidates = %v, want %v", got, want)
-	}
-}
-
-func TestWindowsLaunchDefaultLogFileSuffix(t *testing.T) {
-	got := windowsLaunchDefaultLogFile()
-	wantSuffix := filepath.Join("opencode2api", "logs", "opencode2api.log")
-	if !strings.HasSuffix(filepath.Clean(got), wantSuffix) {
-		t.Fatalf("windowsLaunchDefaultLogFile() = %q, want suffix %q", got, wantSuffix)
 	}
 }
 

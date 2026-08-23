@@ -1,6 +1,13 @@
 package app
 
 import (
+	"bytes"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -58,5 +65,97 @@ func TestParseCacheUsagePrefersCanonicalRead(t *testing.T) {
 	})
 	if read != 80 || created != 0 {
 		t.Fatalf("parseCacheUsage = (%d, %d), want (80, 0)", read, created)
+	}
+}
+
+func setTokenStatsForTest(t *testing.T, stats *TokenStatsData) *TokenStatsData {
+	t.Helper()
+	resetStatsAndLogTestState(t)
+
+	tokenStatsMu.Lock()
+	previous := tokenStats
+	tokenStats = stats
+	tokenStatsMu.Unlock()
+	return previous
+}
+
+func TestSaveAndLoadTokenStats(t *testing.T) {
+	setTokenStatsForTest(t, &TokenStatsData{
+		TotalRequests: 1,
+		Models: map[string]*ModelStats{
+			"test-model": {RequestCount: 1, PromptTokens: 10},
+		},
+	})
+
+	dir := t.TempDir()
+	statsPath := filepath.Join(dir, "nested", "stats_test.json")
+	setTokenStatsPath(statsPath)
+
+	if err := saveTokenStats(); err != nil {
+		t.Fatalf("saveTokenStats() error = %v", err)
+	}
+
+	tokenStatsMu.Lock()
+	tokenStats = &TokenStatsData{Models: map[string]*ModelStats{}}
+	tokenStatsMu.Unlock()
+
+	loadTokenStats()
+
+	tokenStatsMu.Lock()
+	defer tokenStatsMu.Unlock()
+	if tokenStats.TotalRequests != 1 {
+		t.Fatalf("TotalRequests = %d, want 1", tokenStats.TotalRequests)
+	}
+	modelStats := tokenStats.Models["test-model"]
+	if modelStats == nil || modelStats.PromptTokens != 10 {
+		t.Fatalf("modelStats = %+v, want PromptTokens = 10", modelStats)
+	}
+}
+
+func TestSaveTokenStatsReturnsWriteError(t *testing.T) {
+	setTokenStatsForTest(t, &TokenStatsData{Models: map[string]*ModelStats{}})
+	setTokenStatsPath(filepath.Join(t.TempDir(), "blocked"))
+
+	if err := os.MkdirAll(getTokenStatsPath(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := saveTokenStats()
+	if err == nil {
+		t.Fatal("saveTokenStats() error = nil, want write error")
+	}
+	if !strings.Contains(err.Error(), getTokenStatsPath()) {
+		t.Fatalf("error = %v, want target path %q", err, getTokenStatsPath())
+	}
+}
+
+func TestAdminStatsDeleteReturnsSaveError(t *testing.T) {
+	var buf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	setTokenStatsForTest(t, &TokenStatsData{TotalRequests: 3})
+	setTokenStatsPath(filepath.Join(t.TempDir(), "blocked"))
+
+	if err := os.MkdirAll(getTokenStatsPath(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	adminStatsHandler(rec, httptest.NewRequest(http.MethodDelete, "/api/stats", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body %q, want %d", rec.Code, rec.Body.String(), http.StatusInternalServerError)
+	}
+	contentType := rec.Header().Get("Content-Type")
+	if contentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", contentType)
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"Failed to save token stats"`) {
+		t.Fatalf("body = %q, want JSON save error", rec.Body.String())
+	}
+	if !strings.Contains(buf.String(), `msg="failed to save cleared token stats"`) {
+		t.Fatalf("log = %q, want failed-save warning/error", buf.String())
 	}
 }

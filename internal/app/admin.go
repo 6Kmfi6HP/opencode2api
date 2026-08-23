@@ -120,9 +120,15 @@ func adminStatsHandler(w http.ResponseWriter, r *http.Request) {
 		tokenStatsMu.Lock()
 		tokenStats = &TokenStatsData{Models: map[string]*ModelStats{}}
 		tokenStatsMu.Unlock()
-		saveTokenStats()
+		if err := saveTokenStats(); err != nil {
+			slog.Error("failed to save cleared token stats", "path", getTokenStatsPath(), "error", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Failed to save token stats"})
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}

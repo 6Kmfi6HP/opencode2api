@@ -115,6 +115,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     Service port, default 8000
 -config string
     Config file path; see "Config file resolution" for the default search order
+-stats-file string
+    Stats file path; see "Stats and log path resolution" for the default rules
 -password string
     Admin panel password, default 123456; empty disables login auth
 -debug
@@ -151,6 +153,23 @@ The same resolution order is used by normal server mode and `opencode2api launch
 4. The platform user configuration directory: `<UserConfigDir>/opencode2api/config.json` (`~/.config/opencode2api/config.json` on Linux, `~/Library/Application Support/opencode2api/config.json` on macOS)
 
 When the fallback path is selected and normal server mode saves configuration, it creates the `opencode2api` user-configuration directory automatically. Launch mode remains read-only. Existing deployments with `OPENCODE2API_CONFIG=/data/config.json` keep using that exact file.
+
+### Stats and log path resolution
+
+Stats uses this precedence:
+
+1. `OPENCODE2API_STATS`
+2. `OPENCODE2API_STATS_FILE`
+3. An explicit `-stats-file` / `--stats-file` value
+4. The default rule below
+
+Logs use this precedence:
+
+1. `OPENCODE2API_LOG_FILE`
+2. An explicit `-log-file` / `--log-file` value
+3. The default rule below
+
+The default rule keeps current-directory files for backward compatibility only when config was not explicitly supplied. If `-config /path/config.json` is explicit, unconfigured defaults become `/path/stats.json` and `/path/opencode2api.log`; existing `./stats.json` or `./opencode2api.log` files do not override that rule. If config was not explicit, existing current-directory files continue to be used; otherwise stats/log use the resolved config fallback directory, normally `<UserConfigDir>/opencode2api/`. Empty environment values are ignored.
 
 ## Launch subcommand
 
@@ -212,6 +231,8 @@ The selected OpenCode key is passed only in the child process via `OPENCODE2API_
 | `--model` | _(empty)_ | Upstream model ID. Claude sets `ANTHROPIC_*_MODEL`; Codex prepends `--model`. Empty = interactive TUI selection. |
 | `--key` | `public` | OpenCode key. Resolution order: flag > `OPENCODE_API_KEY` env > `public` |
 | `--config` | resolved by [Config file resolution](#config-file-resolution) | Config file path; launch mode only reads this file. |
+| `--log-file` | resolved by [Stats and log path resolution](#stats-and-log-path-resolution) | Log file path. |
+| `--stats-file` | resolved by [Stats and log path resolution](#stats-and-log-path-resolution) | Stats file path. |
 | `--port` | `0` | Port to bind; `0` = system-assigned random port |
 | `--debug` | off | Enable debug logs |
 | `--version` | off | Print build version and exit |
@@ -244,6 +265,7 @@ In the container, the default log path is `/data/opencode2api.log` (persisted on
 | `OPENCODE2API_CONFIG` | `/data/config.json` | `-config` |
 | `OPENCODE2API_PASSWORD` | `123456` | `-password` |
 | `OPENCODE2API_LOG_FILE` | `/data/opencode2api.log` | `-log-file` |
+| `OPENCODE2API_STATS` / `OPENCODE2API_STATS_FILE` | none | `-stats-file` |
 | `OPENCODE2API_LOG_LEVEL` | `info` | `-log-level` |
 | `OPENCODE2API_LOG_STDOUT` | `true` | `-log-stdout` |
 | `OPENCODE2API_SOCKS5_ADDR` | *(unset)* | bootstraps a SOCKS5 entry in `config.json` when set |
