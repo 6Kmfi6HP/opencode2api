@@ -1,12 +1,12 @@
 package app
 
 import (
-	"github.com/6Kmfi6HP/opencode2api/internal/domain"
-	"regexp"
 	"encoding/json"
+	"github.com/6Kmfi6HP/opencode2api/internal/domain"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -247,7 +247,6 @@ func getForceDisableThinking() bool {
 	defer configMu.RUnlock()
 	return forceDisableThinking
 }
-
 
 func getModelKeywordRules() []domain.ModelKeywordRule {
 	configMu.RLock()

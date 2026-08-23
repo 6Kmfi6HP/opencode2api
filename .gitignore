@@ -17,6 +17,7 @@ bin/
 .vscode/
 *.swp
 .env
+agent-browser.json
 
 # Local deployment helpers (not for upstream)
 /scripts/update-remote.sh

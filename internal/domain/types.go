@@ -52,7 +52,6 @@ type ToolFunction struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
-
 type KeywordMatchType string
 
 const (
@@ -110,7 +109,7 @@ func (m *ModelAliasList) UnmarshalJSON(data []byte) error {
 }
 
 type AppConfig struct {
-	ModelAlias          ModelAliasList     `json:"model_alias"`
+	ModelAlias           ModelAliasList    `json:"model_alias"`
 	ReasoningEffortMap   map[string]string `json:"reasoning_effort_map"`
 	ForceDisableThinking bool              `json:"force_disable_thinking"`
 	MaxTokensCap         int               `json:"max_tokens_cap,omitempty"`

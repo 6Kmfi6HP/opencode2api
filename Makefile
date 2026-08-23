@@ -1,10 +1,16 @@
 APP := opencode2api
-VERSION ?= dev
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w -X github.com/6Kmfi6HP/opencode2api/internal/app.version=$(VERSION) -X github.com/6Kmfi6HP/opencode2api/internal/app.commit=$(COMMIT) -X github.com/6Kmfi6HP/opencode2api/internal/app.date=$(DATE)
 
-.PHONY: fmt test vet build release-snapshot clean
+.PHONY: fmt test vet build release-snapshot clean version release
+
+version:
+	@echo $(VERSION)
+
+release:
+	@./scripts/release.sh $(filter-out $@,$(MAKECMDGOALS))
 
 fmt:
 	gofmt -w ./cmd ./internal

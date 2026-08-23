@@ -12,7 +12,7 @@ import (
 const (
 	statsLockExclusiveFlag = 0x00000002 // LOCKFILE_EXCLUSIVE_LOCK
 	statsLockLengthLow     = 0xffffffff
-	statsLockLengthHigh     = 0xffffffff
+	statsLockLengthHigh    = 0xffffffff
 )
 
 // lockStatsFileExclusive acquires an exclusive cross-process advisory lock on

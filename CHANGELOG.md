@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.8.0
+
+- Redesigned Admin Dashboard & Workspace Layout:
+  - Upgraded Web Admin UI to a modern top-tab layout with four dedicated workspaces: Overview & Telemetry, Models & Routing, Network & Proxy, and System Settings.
+  - Added Live Match Tester and quick preset buttons for interactive model alias rule evaluation.
+  - Fully exposed upstream behavior controls (`prompt_cache_retention`, `cache_control_breakpoints`, `text_only_models`) and network options (`socks5_sticky`) to prevent silent config overwrites when saving via the panel.
+- Advanced Model Alias Matching Rules:
+  - Expanded `model_alias` with multi-pattern matching rules (`exact`, `contains`, `prefix`, `suffix`, `regex`, `wildcard`).
+  - Automatically preserves and propagates bracket suffixes (e.g. `claude-3-7-sonnet[1m]` maps to target model while retaining `[1m]`).
+  - Full backward compatibility for legacy key-value dictionary formats.
+- Cross-Process Advisory Locking for Token Usage Statistics:
+  - Implemented atomic read-modify-write synchronization for `stats.json` using OS advisory locks (`flock` on Unix-like systems and `LockFileEx` on Windows).
+  - Prevents token usage and request count overwrite/loss when running the daemon server concurrently with short-lived `opencode2api launch claude|codex` instances.
+- models.dev Dual-Layer Cache & Proxy Reuse:
+  - Added dual-layer caching (in-memory + disk cache) for models.dev catalog data.
+  - Automatically reuses active SOCKS5 proxy configurations for catalog fetches with graceful fallback to cached catalog on network timeouts or failures.
+  - Periodic background refresh every 6 hours.
+- Shared Configuration, Statistics, and Log Path Resolution:
+  - Unified path resolution across `server` and `launch` modes with user config directory fallback (`~/.config/opencode2api`).
+  - Support for `OPENCODE2API_STATS` / `OPENCODE2API_STATS_FILE` and `OPENCODE2API_LOG` / `OPENCODE2API_LOG_FILE` environment variables and CLI overrides.
+- Automated Build & Release Versioning:
+  - Replaced hardcoded version constants with `runtime/debug.ReadBuildInfo()` dynamic module and VCS metadata resolution (commit revision, timestamp, dirty state).
+  - Added `scripts/release.sh` and `make version` / `make release` for automated SemVer release derivation, pre-flight validation, and tag deployment.
+
 ## v0.7.0
 
 - Redesign Web Admin Control Panel:

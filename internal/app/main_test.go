@@ -30,6 +30,16 @@ func TestVersionStringIncludesBuildMetadata(t *testing.T) {
 	}
 }
 
+func TestVersionStringFormat(t *testing.T) {
+	got := versionString()
+	if !strings.HasPrefix(got, "opencode2api ") {
+		t.Fatalf("versionString() = %q, want prefix 'opencode2api '", got)
+	}
+	if !strings.Contains(got, "(commit=") || !strings.Contains(got, ", date=") {
+		t.Fatalf("versionString() = %q, want commit and date info", got)
+	}
+}
+
 type fakeUpstreamResponse struct {
 	status int
 	body   string

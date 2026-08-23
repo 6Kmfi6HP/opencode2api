@@ -228,7 +228,7 @@ func saveTokenStats() error {
 	return writeTokenStatsAtomically(path, func(cur *TokenStatsData) {
 		*cur = TokenStatsData{
 			TotalRequests: snap.TotalRequests,
-			Models:         make(map[string]*ModelStats, len(snap.Models)),
+			Models:        make(map[string]*ModelStats, len(snap.Models)),
 		}
 		for k, v := range snap.Models {
 			m := *v
