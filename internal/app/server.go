@@ -15,6 +15,18 @@ import (
 
 // ======================== Main ========================
 
+// flagSet reports whether a standard-library flag was present on the command
+// line, including explicit values such as -config=.
+func flagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
 func Run() {
 	// Launch subcommand: opencode2api launch <tool> [args...]
 	if len(os.Args) >= 2 && os.Args[1] == "launch" {
@@ -37,6 +49,8 @@ func Run() {
 	flag.BoolVar(&logBodies, "log-bodies", false, "Debug 下记录截断的 body 摘要")
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	flag.Parse()
+
+	configPath, _ = resolveConfigPath(configPath, flagSet("config"))
 
 	initLogger()
 	defer closeLogRotator()

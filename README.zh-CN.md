@@ -114,7 +114,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 -port string
     服务端口，默认 8000
 -config string
-    配置文件路径，默认 config.json
+    配置文件路径；默认搜索顺序见“配置文件解析”
 -password string
     管理面板密码，默认 123456；留空表示不启用登录验证
 -debug
@@ -140,6 +140,17 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 第一次部署请务必修改 `-password`。如果把服务暴露到公网，建议只通过反向代理、访问控制或 VPN 暴露管理面板。
+
+### 配置文件解析
+
+普通服务模式和 `opencode2api launch` 使用同一套解析顺序：
+
+1. `OPENCODE2API_CONFIG`
+2. 显式传入的 `-config` / `--config`
+3. 当前目录已存在的 `./config.json`（保持旧行为兼容）
+4. 平台用户配置目录：`<UserConfigDir>/opencode2api/config.json`（Linux 为 `~/.config/opencode2api/config.json`，macOS 为 `~/Library/Application Support/opencode2api/config.json`）
+
+选择回退路径且普通服务模式需要保存配置时，会自动创建 `opencode2api` 用户配置目录。launch 模式仍然只读。已有部署中的 `OPENCODE2API_CONFIG=/data/config.json` 会继续使用该文件。
 
 ## launch 子命令
 
@@ -200,7 +211,7 @@ opencode2api 还会根据当前可用上游模型生成一个临时 Codex model 
 | --- | --- | --- |
 | `--model` | _(空)_ | 上游模型 ID。Claude 设置 `ANTHROPIC_*_MODEL`；Codex 前置 `--model`。空 = 交互式 TUI 选择。 |
 | `--key` | `public` | OpenCode key。解析优先级：flag > `OPENCODE_API_KEY` 环境变量 > `public` |
-| `--config` | `config.json` | 配置文件路径；launch 模式只读取该文件。 |
+| `--config` | 由[配置文件解析](#配置文件解析)决定 | 配置文件路径；launch 模式只读取该文件。 |
 | `--port` | `0` | 绑定端口；`0` = 系统随机分配 |
 | `--debug` | 关闭 | 启用调试日志 |
 | `--version` | 关闭 | 显示构建版本后退出 |

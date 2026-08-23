@@ -114,7 +114,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 -port string
     Service port, default 8000
 -config string
-    Config file path, default config.json
+    Config file path; see "Config file resolution" for the default search order
 -password string
     Admin panel password, default 123456; empty disables login auth
 -debug
@@ -140,6 +140,17 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 Change `-password` on first deploy. If you expose the service publicly, put the admin panel behind a reverse proxy, access control, or VPN.
+
+### Config file resolution
+
+The same resolution order is used by normal server mode and `opencode2api launch`:
+
+1. `OPENCODE2API_CONFIG`
+2. An explicit `-config` / `--config` value
+3. `./config.json`, if that file already exists (backward compatible)
+4. The platform user configuration directory: `<UserConfigDir>/opencode2api/config.json` (`~/.config/opencode2api/config.json` on Linux, `~/Library/Application Support/opencode2api/config.json` on macOS)
+
+When the fallback path is selected and normal server mode saves configuration, it creates the `opencode2api` user-configuration directory automatically. Launch mode remains read-only. Existing deployments with `OPENCODE2API_CONFIG=/data/config.json` keep using that exact file.
 
 ## Launch subcommand
 
@@ -200,7 +211,7 @@ The selected OpenCode key is passed only in the child process via `OPENCODE2API_
 | --- | --- | --- |
 | `--model` | _(empty)_ | Upstream model ID. Claude sets `ANTHROPIC_*_MODEL`; Codex prepends `--model`. Empty = interactive TUI selection. |
 | `--key` | `public` | OpenCode key. Resolution order: flag > `OPENCODE_API_KEY` env > `public` |
-| `--config` | `config.json` | Config file path; launch mode only reads this file. |
+| `--config` | resolved by [Config file resolution](#config-file-resolution) | Config file path; launch mode only reads this file. |
 | `--port` | `0` | Port to bind; `0` = system-assigned random port |
 | `--debug` | off | Enable debug logs |
 | `--version` | off | Print build version and exit |

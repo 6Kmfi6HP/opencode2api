@@ -1,6 +1,15 @@
 # 配置说明
 
-默认配置文件是 `config.json`。首次运行可以从示例复制：
+普通服务模式和 `launch` 子命令按以下顺序解析配置文件：
+
+1. 环境变量 `OPENCODE2API_CONFIG`
+2. 显式传入的 `-config` / `--config`
+3. 当前目录已存在的 `config.json`
+4. 用户配置目录下的 `opencode2api/config.json`
+
+第 4 项的完整位置由 `os.UserConfigDir()` 决定（Linux 常见为 `~/.config/opencode2api/config.json`，macOS 为 `~/Library/Application Support/opencode2api/config.json`）。选择该项且服务模式需要保存配置时，目录会自动创建；launch 模式不会写回。
+
+仓库开发流程仍可先从示例复制当前目录文件：
 
 ```bash
 cp config.example.json config.json

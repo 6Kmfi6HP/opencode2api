@@ -39,7 +39,7 @@ func newLaunchFlagSet(tool string, args []string) launchFlags {
 	fs := flag.NewFlagSet("opencode2api launch "+tool, flag.ContinueOnError)
 	fs.StringVar(&f.model, "model", "", "upstream model ID (empty = interactive TUI selection)")
 	fs.StringVar(&f.key, "key", "", "OpenCode key (flag > OPENCODE_API_KEY env > public)")
-	fs.StringVar(&f.cfgPath, "config", "config.json", "config file path")
+	fs.StringVar(&f.cfgPath, "config", "", "config file path (default: OPENCODE2API_CONFIG, ./config.json if present, or the user config directory)")
 	fs.StringVar(&f.logFile, "log-file", "", "log file path (empty = platform default)")
 	fs.IntVar(&f.port, "port", 0, "port to bind; 0 = random")
 	fs.BoolVar(&f.debug, "debug", false, "enable debug logs")
@@ -48,6 +48,15 @@ func newLaunchFlagSet(tool string, args []string) launchFlags {
 		os.Exit(2)
 	}
 	f.extraArgs = fs.Args()
+
+	var explicit bool
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "config" {
+			explicit = true
+		}
+	})
+	f.cfgPath, _ = resolveConfigPath(f.cfgPath, explicit)
+
 	return f
 }
 
