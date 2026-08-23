@@ -236,7 +236,7 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 
 ## 管理面板
 
-打开 `http://127.0.0.1:8000/` 可进入管理面板。面板可以修改配置、刷新模型和查看 token 统计。
+打开 `http://127.0.0.1:8000/` 可进入管理面板。面板可以修改配置、刷新模型和查看 token 统计。管理面板现已可设置 `prompt_cache_retention`、`cache_control_breakpoints`、`socks5_sticky`、`text_only_models`（「模型与路由」/「网络与代理」Tab），保存时这些字段随其余配置一并持久化到 `config.json`，不再被静默回擦。
 
 默认管理密码是 `123456`，生产部署必须修改：
 

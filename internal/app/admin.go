@@ -44,6 +44,10 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		configMu.RLock()
 		cfg := AppConfig{ModelAlias: modelAliasRules, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking, MaxTokensCap: maxTokensCap, MaxTokensCapPerModel: maxTokensCapPerModel}
+		promptCacheRetentionRT := promptCacheRetention
+		cacheBreakpointsRT := cacheBreakpoints
+		socks5StickyRT := socks5Sticky
+		textOnlyModelsRT := append([]string(nil), textOnlyModels...)
 		configMu.RUnlock()
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
@@ -53,17 +57,21 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"model_alias":              cfg.ModelAlias,
-			"reasoning_effort_map":     cfg.ReasoningEffortMap,
-			"force_disable_thinking":   cfg.ForceDisableThinking,
-			"max_tokens_cap":           cfg.MaxTokensCap,
-			"max_tokens_cap_per_model": cfg.MaxTokensCapPerModel,
-			"socks5_proxies":           cfg.Socks5Proxies,
-			"active_socks5":            cfg.ActiveSocks5,
-			"socks5_paid_direct":       cfg.Socks5PaidDirect,
-			"upstream_base_urls":       cfg.UpstreamBaseURLs,
-			"log_level":                getLogLevelString(),
-			"log_bodies":               getLogBodies(),
+			"model_alias":               cfg.ModelAlias,
+			"reasoning_effort_map":      cfg.ReasoningEffortMap,
+			"force_disable_thinking":    cfg.ForceDisableThinking,
+			"max_tokens_cap":            cfg.MaxTokensCap,
+			"max_tokens_cap_per_model":  cfg.MaxTokensCapPerModel,
+			"socks5_proxies":            cfg.Socks5Proxies,
+			"active_socks5":             cfg.ActiveSocks5,
+			"socks5_paid_direct":        cfg.Socks5PaidDirect,
+			"upstream_base_urls":        cfg.UpstreamBaseURLs,
+			"prompt_cache_retention":    promptCacheRetentionRT,
+			"cache_control_breakpoints": cacheBreakpointsRT,
+			"socks5_sticky":             socks5StickyRT,
+			"text_only_models":          textOnlyModelsRT,
+			"log_level":                 getLogLevelString(),
+			"log_bodies":                getLogBodies(),
 		})
 	case http.MethodPost:
 		var payload struct {
@@ -1698,6 +1706,44 @@ textarea.form-control {
         </div>
       </div>
     </div>
+
+    <!-- Upstream Behavior & Optimization -->
+    <div class="glass-card" style="margin-bottom: 20px;">
+      <div class="section-head">
+        <div class="section-title">
+          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 2 13 8 19 8"/><polyline points="19 16 19 22 13 22"/><polyline points="5 8 5 2 11 2"/><polyline points="5 22 5 16 11 16"/><line x1="3" y1="12" x2="21" y2="12"/></svg>
+          <span>上游行为与优化 (Upstream Behavior)</span>
+        </div>
+      </div>
+      <div class="bento-grid">
+        <div class="glass-card col-6" style="margin-bottom:0">
+          <label style="display:block;font-size:11.5px;font-weight:600;color:var(--text-ter);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">Prompt 缓存保留时长</label>
+          <select id="promptCacheRetention" class="form-control form-select" style="max-width:280px">
+            <option value="24h">24 小时（默认）</option>
+            <option value="in_memory">约 5 分钟（内存缓存）</option>
+            <option value="off">不注入（关闭）</option>
+          </select>
+          <p style="font-size:12px;color:var(--text-ter);line-height:1.5;margin-top:8px">未填或 <code>24h</code> 让上游把前缀缓存保留 24 小时；<code>in_memory</code> 维持约 5 分钟；<code>off</code> 完全不注入。</p>
+        </div>
+        <div class="glass-card col-6" style="margin-bottom:0">
+          <div class="switch-wrapper" style="margin-top:0">
+            <div class="switch-label-group">
+              <span class="switch-title">上游缓存断点 (cache_control)</span>
+              <span class="switch-desc">对支持的上游注入 Anthropic 风格缓存断点（GLM/Zhipu 自动跳过）</span>
+            </div>
+            <label class="custom-switch">
+              <input type="checkbox" id="cache_control_breakpoints">
+              <span class="switch-track"></span>
+            </label>
+          </div>
+        </div>
+      </div>
+      <div style="margin-top:16px">
+        <label style="display:block;font-size:11.5px;font-weight:600;color:var(--text-ter);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">纯文本模型 (text_only_models)</label>
+        <textarea id="textOnlyModels" rows="4" class="form-control" placeholder="deepseek"></textarea>
+        <p style="font-size:12px;color:var(--text-ter);line-height:1.5;margin-top:8px">每行一个大小写不敏感的模型前缀；命中时图片/文档会被静默降级为 <code>[image attached]</code> 文本标注；留空表示无前缀；显式留空（即便空数组）会覆盖默认 <code>["deepseek"]</code>。</p>
+      </div>
+    </div>
   </div>
 
   <!-- ======================== TAB 3: 网络与代理 ======================== -->
@@ -1736,6 +1782,16 @@ textarea.form-control {
           </div>
           <label class="custom-switch">
             <input type="checkbox" id="socks5_paid_direct">
+            <span class="switch-track"></span>
+          </label>
+        </div>
+        <div class="switch-wrapper">
+          <div class="switch-label-group">
+            <span class="switch-title">轮询模式会话粘性出口</span>
+            <span class="switch-desc">开启（默认）时，同一会话固定使用同一出口代理，上游 per-egress 前缀缓存持续累积；关闭时每次请求随机换出口。仅当「当前生效路由」为 <code>__round_robin__</code> 时生效</span>
+          </div>
+          <label class="custom-switch">
+            <input type="checkbox" id="socks5_sticky">
             <span class="switch-track"></span>
           </label>
         </div>
@@ -1974,6 +2030,11 @@ async function loadConfig() {
     document.getElementById('upstreamBaseURLs').value = (cfg.upstream_base_urls || []).join('\n');
     if (cfg.log_level) document.getElementById('logLevelSelect').value = cfg.log_level.toLowerCase();
     if (cfg.log_bodies !== undefined) document.getElementById('logBodiesCheck').checked = !!cfg.log_bodies;
+    const _pcr = cfg.prompt_cache_retention || '';
+    document.getElementById('promptCacheRetention').value = _pcr === '' ? '24h' : _pcr;
+    document.getElementById('cache_control_breakpoints').checked = cfg.cache_control_breakpoints !== false;
+    document.getElementById('socks5_sticky').checked = cfg.socks5_sticky !== false;
+    document.getElementById('textOnlyModels').value = (cfg.text_only_models || []).join('\n');
 
     const mr = await fetch('/v1/models');
     const md = await mr.json();
@@ -1990,18 +2051,32 @@ async function loadConfig() {
 }
 
 function modelSelectHtml(selected, fieldName = 'val') {
-  let h = '<select data-field="' + fieldName + '" class="form-control form-select">';
+  const isCustom = selected && !modelList.includes(selected);
+  let h = '<div class="model-select-wrapper" style="display:flex;gap:4px;align-items:center">';
+  h += '<select data-field="' + fieldName + '" class="form-control form-select" onchange="onModelSelectChange(this)" style="flex:1">';
   h += '<option value="">-- 选择模型 --</option>';
-  let found = false;
   for (const m of modelList) {
-    if (selected === m) found = true;
     h += '<option value="' + esc(m) + '"' + (selected === m ? ' selected' : '') + '>' + esc(m) + '</option>';
   }
-  if (selected && !found) {
-    h += '<option value="' + esc(selected) + '" selected>' + esc(selected) + ' (预设/自定义)</option>';
-  }
+  h += '<option value="__custom__"' + (isCustom ? ' selected' : '') + '>自定义...</option>';
   h += '</select>';
+  h += '<input type="text" data-field="' + fieldName + '_custom" class="form-control model-custom-input" placeholder="输入自定义模型名" value="' + (isCustom ? esc(selected) : '') + '" style="display:' + (isCustom ? 'block' : 'none') + ';flex:1">';
+  h += '</div>';
   return h;
+}
+
+function onModelSelectChange(sel) {
+  const wrapper = sel.closest('.model-select-wrapper');
+  if (!wrapper) return;
+  const customInput = wrapper.querySelector('.model-custom-input');
+  if (!customInput) return;
+  if (sel.value === '__custom__') {
+    customInput.style.display = 'block';
+    customInput.focus();
+  } else {
+    customInput.style.display = 'none';
+    customInput.value = '';
+  }
 }
 
 // Effort Table
@@ -2129,7 +2204,10 @@ function collectCaps() {
     const sel = tr.querySelector('[data-field="key"]');
     const inp = tr.querySelector('[data-field="cap"]');
     if (sel && inp) {
-      const k = sel.value;
+      let k = sel.value;
+      if (k === '__custom__') {
+        k = tr.querySelector('[data-field="key_custom"]')?.value.trim() || '';
+      }
       if (k) {
         const v = parseInt(inp.value) || 0;
         capData[k] = v;
@@ -2175,7 +2253,10 @@ function renderKeywordRuleTable() {
   }).join('');
 
   tb.querySelectorAll('select[data-field="target"]').forEach(function(sel) {
-    sel.onchange = onKeywordFieldChange;
+    sel.onchange = function() { onModelSelectChange(this); onKeywordFieldChange(); };
+  });
+  tb.querySelectorAll('.model-custom-input[data-field="target_custom"]').forEach(function(inp) {
+    inp.oninput = onKeywordFieldChange;
   });
 }
 
@@ -2205,7 +2286,13 @@ function collectKeywordRules() {
     const enabled = tr.querySelector('[data-field="enabled"]')?.checked ?? true;
     const matchType = tr.querySelector('[data-field="match_type"]')?.value || 'contains';
     const keyword = tr.querySelector('[data-field="keyword"]')?.value.trim() || '';
-    const target = tr.querySelector('[data-field="target"]')?.value.trim() || '';
+    const targetSel = tr.querySelector('[data-field="target"]');
+    let target = '';
+    if (targetSel && targetSel.value === '__custom__') {
+      target = tr.querySelector('[data-field="target_custom"]')?.value.trim() || '';
+    } else {
+      target = targetSel ? targetSel.value.trim() : '';
+    }
     const caseInsensitive = tr.querySelector('[data-field="case_insensitive"]')?.checked ?? true;
     list.push({
       keyword: keyword,
@@ -2344,6 +2431,10 @@ async function saveConfig() {
     active_socks5: document.getElementById('activeSocks5').value,
     socks5_paid_direct: document.getElementById('socks5_paid_direct').checked,
     upstream_base_urls: document.getElementById('upstreamBaseURLs').value.split('\n').map(s => s.trim()).filter(Boolean),
+    prompt_cache_retention: document.getElementById('promptCacheRetention').value,
+    cache_control_breakpoints: document.getElementById('cache_control_breakpoints').checked,
+    socks5_sticky: document.getElementById('socks5_sticky').checked,
+    text_only_models: document.getElementById('textOnlyModels').value.split('\n').map(s => s.trim()).filter(Boolean),
     log_level: logLevel,
     log_bodies: logBodies
   };
