@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.7.0
+
+- Redesign Web Admin Control Panel:
+  - Modern aesthetic with refined dark palette, glassmorphism cards, and Lucide icons.
+  - Responsive multi-section layout with sidebar navigation (Overview, Proxy & Upstream, Logs, Documentation, Configuration).
+  - Live metric cards for active models, requests, cache hit rates, upstream health, and response latency.
+  - Real-time log streaming viewer with auto-refresh, search filter, level tags, auto-scroll toggle, and pause/resume controls.
+  - Visual upstream base URLs manager, model alias editor, and rate-limit cap configuration.
+  - Clean authentication modal with seamless session management.
+- Unified Config File Resolution Order:
+  - Consistent config path resolution across server and launch modes:
+    1. `OPENCODE2API_CONFIG` environment variable
+    2. Explicit `-config` / `--config` CLI flags
+    3. Existing `./config.json` in the working directory (preserves backward compatibility)
+    4. Platform user configuration directory: `<UserConfigDir>/opencode2api/config.json` (`~/.config/opencode2api/config.json` on Linux, `~/Library/Application Support/opencode2api/config.json` on macOS)
+  - When persisting configuration in server mode, automatically create parent user config directories if they do not exist.
+  - Launch mode respects the same resolution order while remaining read-only.
+
 ## v0.6.0
 
 - Add one-click cross-platform installers: `scripts/install.sh` for Linux/macOS/FreeBSD and `scripts/install.ps1` for Windows. Both resolve the latest GitHub Release (or a pinned tag), select the correct OS/arch tarball, verify its SHA256 from `checksums.txt`, install the binary under `~/.opencode2api/bin`, and print next-step `launch claude` / `launch codex` commands. Installation, platform support, version pinning, and release-asset naming are documented in `docs/INSTALL.md` and linked from both READMEs.
