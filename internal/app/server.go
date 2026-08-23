@@ -57,6 +57,8 @@ func Run() {
 	logFile, _ = resolveLogFilePath(logFile, flagSet("log-file"), configPath, configExplicit)
 	resolvedStats, _ := resolveStatsPath(statsFile, flagSet("stats-file"), configPath, configExplicit)
 	setTokenStatsPath(resolvedStats)
+	resolvedModelsDevCache, _ := resolveModelsDevCachePath(configPath, configExplicit)
+	setModelsDevCachePath(resolvedModelsDevCache)
 
 	initLogger()
 	defer closeLogRotator()
@@ -174,6 +176,12 @@ func initProxyCoreWithSave(save bool) {
 		modelMu.Unlock()
 		slog.Info("go catalog loaded", "count", len(goModels))
 	}
+
+	modelsDevCat := getCachedModelsDevCatalog()
+	if len(modelsDevCat) > 0 {
+		slog.Info("models.dev catalog loaded", "count", len(modelsDevCat))
+	}
+
 	startModelRefresh()
 }
 

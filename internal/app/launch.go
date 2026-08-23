@@ -115,6 +115,8 @@ func configureLaunchGlobals(f launchFlags) {
 
 	resolvedStats, _ := resolveStatsPath(f.statsFile, f.statsExplicit, configPath, f.configExplicit)
 	setTokenStatsPath(resolvedStats)
+	resolvedModelsDevCache, _ := resolveModelsDevCachePath(configPath, f.configExplicit)
+	setModelsDevCachePath(resolvedModelsDevCache)
 
 	initLogger()
 }
@@ -166,15 +168,7 @@ func startLaunchProxy(f launchFlags) (*http.Server, net.Listener, string) {
 }
 
 func fetchLaunchCatalog() modelsDevCatalog {
-	catalogCh := make(chan modelsDevCatalog, 1)
-	go func() {
-		cat, ferr := fetchModelsDevCatalog()
-		if ferr != nil {
-			slog.Warn("failed to fetch models.dev catalog", "error", ferr)
-		}
-		catalogCh <- cat
-	}()
-	return <-catalogCh
+	return getCachedModelsDevCatalog()
 }
 
 func resolveLaunchModel(model string, extraArgs []string, extract func([]string) (string, []string), catalog modelsDevCatalog, contextSuffix bool) (string, []string, int, int) {

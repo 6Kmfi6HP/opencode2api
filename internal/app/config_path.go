@@ -107,3 +107,22 @@ func resolveLogFilePath(flagValue string, flagExplicit bool, configPath string, 
 		"opencode2api.log",
 	)
 }
+
+// resolveModelsDevCachePath returns the effective models.dev cache file path and reports whether
+// the path came from a configuration/user-directory fallback.
+//
+// Precedence:
+//  1. OPENCODE2API_MODELSDEV_CACHE or OPENCODE2API_MODELSDEV_CACHE_FILE
+//  2. <dir(configPath)>/modelsdev_cache.json when -config was explicit
+//  3. an existing ./modelsdev_cache.json (for backward compatibility), then the
+//     config fallback directory, normally <os.UserConfigDir()>/opencode2api
+func resolveModelsDevCachePath(configPath string, configExplicit bool) (string, bool) {
+	return resolveRelatedFilePath(
+		[]string{"OPENCODE2API_MODELSDEV_CACHE", "OPENCODE2API_MODELSDEV_CACHE_FILE"},
+		"",
+		false,
+		configPath,
+		configExplicit,
+		"modelsdev_cache.json",
+	)
+}

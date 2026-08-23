@@ -492,3 +492,107 @@ func TestServerExplicitConfigResolution(t *testing.T) {
 		t.Fatalf("logPath = %q, want %q", logPath, wantLog)
 	}
 }
+
+func TestResolveModelsDevCachePathPrecedence(t *testing.T) {
+	tmpDir := t.TempDir()
+	localCache := filepath.Join(tmpDir, "modelsdev_cache.json")
+	if err := os.WriteFile(localCache, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	userDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Skipf("user config directory unavailable: %v", err)
+	}
+	userFallback := filepath.Join(userDir, "opencode2api", "modelsdev_cache.json")
+	explicitCfg := filepath.Join(tmpDir, "explicit", "config.json")
+	customCfg := filepath.Join(tmpDir, "custom", "config.json")
+
+	tests := []struct {
+		name           string
+		envCache       string
+		envCacheFile   string
+		cfgPath        string
+		configExplicit bool
+		want           string
+		wantFallback   bool
+	}{
+		{
+			name:           "OPENCODE2API_MODELSDEV_CACHE environment wins",
+			envCache:       "/tmp/env-modelsdev.json",
+			cfgPath:        explicitCfg,
+			configExplicit: true,
+			want:           "/tmp/env-modelsdev.json",
+		},
+		{
+			name:           "OPENCODE2API_MODELSDEV_CACHE_FILE environment wins",
+			envCacheFile:   "/tmp/env-modelsdev-file.json",
+			cfgPath:        explicitCfg,
+			configExplicit: true,
+			want:           "/tmp/env-modelsdev-file.json",
+		},
+		{
+			name:           "explicit config follows its directory despite legacy local cache",
+			cfgPath:        explicitCfg,
+			configExplicit: true,
+			want:           filepath.Join(tmpDir, "explicit", "modelsdev_cache.json"),
+			wantFallback:   true,
+		},
+		{
+			name:    "non-explicit config honors legacy local cache",
+			cfgPath: explicitCfg,
+			want:    "modelsdev_cache.json",
+		},
+		{
+			name:    "non-explicit resolved config honors legacy local cache",
+			cfgPath: customCfg,
+			want:    "modelsdev_cache.json",
+		},
+		{
+			name:           "blank environment is ignored",
+			envCache:       "   ",
+			envCacheFile:   "   ",
+			cfgPath:        explicitCfg,
+			configExplicit: true,
+			want:           filepath.Join(tmpDir, "explicit", "modelsdev_cache.json"),
+			wantFallback:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("OPENCODE2API_MODELSDEV_CACHE", tt.envCache)
+			t.Setenv("OPENCODE2API_MODELSDEV_CACHE_FILE", tt.envCacheFile)
+
+			got, gotFallback := resolveModelsDevCachePath(tt.cfgPath, tt.configExplicit)
+			if got != tt.want || gotFallback != tt.wantFallback {
+				t.Fatalf("resolveModelsDevCachePath() = (%q, %v), want (%q, %v)", got, gotFallback, tt.want, tt.wantFallback)
+			}
+		})
+	}
+
+	if err := os.Remove(localCache); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENCODE2API_MODELSDEV_CACHE", "")
+	t.Setenv("OPENCODE2API_MODELSDEV_CACHE_FILE", "")
+
+	got, gotFallback := resolveModelsDevCachePath(customCfg, false)
+	wantCfgCache := filepath.Join(tmpDir, "custom", "modelsdev_cache.json")
+	if got != wantCfgCache || !gotFallback {
+		t.Fatalf("config-directory fallback = (%q, %v), want (%q, true)", got, gotFallback, wantCfgCache)
+	}
+
+	got, gotFallback = resolveModelsDevCachePath("", false)
+	if got != userFallback || !gotFallback {
+		t.Fatalf("user-directory fallback = (%q, %v), want (%q, true)", got, gotFallback, userFallback)
+	}
+}

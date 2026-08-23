@@ -217,31 +217,43 @@ func isNonRetryableUpstreamError(status int, body []byte) bool {
 	return strings.Contains(msg, "insufficient balance") || strings.Contains(msg, "insufficient credits")
 }
 
-// startModelRefresh 定时刷新模型列表（每 10 分钟）
+// startModelRefresh 定时刷新模型列表（OpenCode 模型每 10 分钟，models.dev 每 1 小时）
 func startModelRefresh() {
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			fetched, err := fetchModels()
-			if err == nil && len(fetched) > 0 {
-				modelMu.Lock()
-				modelsCache = fetched
-				modelsLoaded = true
-				modelMu.Unlock()
-				slog.Info("models auto-refreshed", "count", len(fetched))
-			} else if err != nil {
-				slog.Error("free models refresh failed", "error", err)
-			}
+		modelsDevTicker := time.NewTicker(1 * time.Hour)
+		defer modelsDevTicker.Stop()
 
-			goFetched, goErr := fetchGoModels()
-			if goErr == nil && len(goFetched) > 0 {
-				modelMu.Lock()
-				goModelsCache = goFetched
-				modelMu.Unlock()
-				slog.Info("go catalog auto-refreshed", "count", len(goFetched))
-			} else if goErr != nil {
-				slog.Error("go catalog refresh failed", "error", goErr)
+		for {
+			select {
+			case <-ticker.C:
+				fetched, err := fetchModels()
+				if err == nil && len(fetched) > 0 {
+					modelMu.Lock()
+					modelsCache = fetched
+					modelsLoaded = true
+					modelMu.Unlock()
+					slog.Info("models auto-refreshed", "count", len(fetched))
+				} else if err != nil {
+					slog.Error("free models refresh failed", "error", err)
+				}
+
+				goFetched, goErr := fetchGoModels()
+				if goErr == nil && len(goFetched) > 0 {
+					modelMu.Lock()
+					goModelsCache = goFetched
+					modelMu.Unlock()
+					slog.Info("go catalog auto-refreshed", "count", len(goFetched))
+				} else if goErr != nil {
+					slog.Error("go catalog refresh failed", "error", goErr)
+				}
+			case <-modelsDevTicker.C:
+				if _, err := refreshModelsDevCatalogBackground(); err != nil {
+					slog.Error("models.dev catalog refresh failed", "error", err)
+				} else {
+					slog.Info("models.dev catalog auto-refreshed")
+				}
 			}
 		}
 	}()
