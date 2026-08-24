@@ -16,6 +16,7 @@ type OpenAIRequest struct {
 	TopP            *float64       `json:"top_p,omitempty"`
 	Thinking        any            `json:"thinking,omitempty"`
 	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
+	User            string         `json:"user,omitempty"`
 	ExtraBody       map[string]any `json:"extra_body,omitempty"`
 	Tools           []Tool         `json:"tools,omitempty"`
 	ToolChoice      any            `json:"tool_choice,omitempty"`

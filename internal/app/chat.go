@@ -1078,6 +1078,10 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 			}
 		}
 	}
+	// 会话透传：顶层 user 优先于 extra_body.user（OpenAI 规范顶层为准）
+	if req.User != "" {
+		converted["user"] = req.User
+	}
 	// 缓存增强:向 zen 上游显式声明 prompt 前缀缓存的保留时长。
 	// 上游默认约 5 分钟(in_memory),agent 任务间歇易过期,导致缓存难命中;
 	// 注入 retention 后拉长到 24h。客户端显式传入的值(extra_body)优先。

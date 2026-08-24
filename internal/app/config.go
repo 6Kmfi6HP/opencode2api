@@ -168,6 +168,7 @@ func applyConfig(cfg AppConfig) {
 		// 代理配置变化后旧 sticky 绑定可能指向已不存在的出口,全部清空重建。
 		stickyMu.Lock()
 		stickyEntries = map[string]*stickyProxyEntry{}
+		stickyBindSeqMap = map[string]uint32{}
 		stickyMu.Unlock()
 	}
 	socks5PaidDirect = cfg.Socks5PaidDirect
@@ -363,6 +364,7 @@ func setUpstreamBaseURLs(raw []string) {
 	if changed {
 		stickyMu.Lock()
 		stickyEntries = map[string]*stickyProxyEntry{}
+		stickyBindSeqMap = map[string]uint32{}
 		stickyMu.Unlock()
 	}
 }

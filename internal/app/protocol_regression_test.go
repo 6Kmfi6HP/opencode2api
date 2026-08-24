@@ -537,6 +537,27 @@ func TestClaudeToolChoiceDisableParallelMapsExtraBody(t *testing.T) {
 	}
 }
 
+func TestChatTopLevelUserPassesThrough(t *testing.T) {
+	body := convertRequest(&OpenAIRequest{
+		Model:    "m",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+		User:     "sess-abc",
+	})
+	if body["user"] != "sess-abc" {
+		t.Fatalf("user = %#v, want sess-abc", body["user"])
+	}
+	// 顶层 user 优先于 extra_body.user。
+	body2 := convertRequest(&OpenAIRequest{
+		Model:     "m",
+		Messages:  []Message{{Role: "user", Content: "hi"}},
+		User:      "sess-top",
+		ExtraBody: map[string]any{"user": "sess-extra"},
+	})
+	if body2["user"] != "sess-top" {
+		t.Fatalf("user = %#v, want sess-top (top-level wins)", body2["user"])
+	}
+}
+
 func TestNarrowClaudeMetadataUserKeepsSessionID(t *testing.T) {
 	meta := map[string]any{
 		"user_id": `{"device_id":"dev-1","session_id":"sess-42"}`,
