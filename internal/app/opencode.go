@@ -267,6 +267,10 @@ func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (
 }
 
 func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string) (*http.Request, error) {
+	return buildOCRequestWithSubpath(modelID, bodyMap, auth, useGoEndpoint, baseURL, "chat/completions")
+}
+
+func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string, subpath string) (*http.Request, error) {
 	bodyMap["model"] = modelID
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
@@ -274,9 +278,9 @@ func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth Ups
 	}
 	var upstreamURL string
 	if useGoEndpoint {
-		upstreamURL = "https://opencode.ai/zen/go/v1/chat/completions"
+		upstreamURL = "https://opencode.ai/zen/go/v1/" + subpath
 	} else {
-		upstreamURL = baseURL + "/zen/v1/chat/completions"
+		upstreamURL = baseURL + "/zen/v1/" + subpath
 	}
 	req, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(tryBody))
 	if err != nil {
@@ -319,7 +323,9 @@ func maxAttemptsForUpstreamStatus(status int) int {
 	return maxUpstreamRetries
 }
 
-func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {
+// callOpenCodeEndpoint 统一封装所有对上游 /zen/v1/* 和 /zen/go/v1/* 端点的 HTTP 调用，
+// 包含重试机制、SOCKS5 会话粘性与轮换、多域名轮换、错误归一与结构化日志输出。
+func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
 
 	var bodyMap map[string]any
@@ -347,10 +353,11 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		baseURL, client := selectUpstreamTarget(auth, bodyMap)
 		lastBaseURL = baseURL
-		up, err := buildOCRequestWithEndpoint(modelID, bodyMap, auth, useGoEndpoint, baseURL)
+		up, err := buildOCRequestWithSubpath(modelID, bodyMap, auth, useGoEndpoint, baseURL, endpointSubpath)
 		if err != nil {
 			return nil, 500, nil, err
 		}
+		up = up.WithContext(ctx)
 		attemptStart := time.Now()
 		resp, err := client.Do(up)
 		durationMs := time.Since(attemptStart).Milliseconds()
@@ -381,29 +388,6 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 			break
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			b, readErr := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if readErr != nil {
-				return nil, 0, nil, readErr
-			}
-			if isAnthropicFormat(b) {
-				converted, convErr := convertAnthropicToOpenAI(b, modelID)
-				if convErr != nil {
-					log.Info("upstream_attempt",
-						"try_model", modelID,
-						"surface", surface,
-						"status", resp.StatusCode,
-						"duration_ms", durationMs,
-						"attempt_index", attempt,
-					)
-					// Only anthropicProtocolError errors carry type/message;
-					// non-typed conversion errors stay generic so
-					// writeUpstreamError emits a safe default.
-					return nil, http.StatusBadGateway, nil, convErr
-				}
-				b = converted
-			}
-			b = convertRawToolCallsInBody(b)
 			log.Info("upstream_attempt",
 				"try_model", modelID,
 				"base_url", baseURL,
@@ -419,9 +403,9 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 				"final_status", resp.StatusCode,
 				"fallback_used", false,
 			)
-			return b, resp.StatusCode, resp.Header, nil
+			return resp.Body, resp.StatusCode, resp.Header, nil
 		}
-		errBody, _ := io.ReadAll(resp.Body)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		resp.Body.Close()
 		logUpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL)
 		nonRetryable := isNonRetryableUpstreamError(resp.StatusCode, errBody)
@@ -435,6 +419,7 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		}
 		log.Info("upstream_attempt",
 			"try_model", modelID,
+			"base_url", baseURL,
 			"surface", surface,
 			"status", resp.StatusCode,
 			"duration_ms", durationMs,
@@ -461,7 +446,46 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		"final_status", lastStatus,
 		"fallback_used", false,
 	)
-	return lastBody, lastStatus, lastHeader, lastErr
+	if lastStatus != 0 {
+		return io.NopCloser(bytes.NewReader(lastBody)), lastStatus, lastHeader, nil
+	}
+	if lastErr != nil {
+		return nil, 0, nil, lastErr
+	}
+	return nil, 0, nil, fmt.Errorf("upstream request failed")
+}
+
+func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {
+	rc, status, header, err := callOpenCodeEndpoint(ctx, "chat/completions", upstreamBody, modelID, auth)
+	if err != nil || status < 200 || status >= 300 {
+		var errBody []byte
+		if rc != nil {
+			errBody, _ = io.ReadAll(rc)
+			rc.Close()
+		}
+		if err == nil {
+			err = fmt.Errorf("upstream error")
+		}
+		return errBody, status, header, err
+	}
+	defer rc.Close()
+
+	b, readErr := io.ReadAll(rc)
+	if readErr != nil {
+		return nil, 0, nil, readErr
+	}
+	if isAnthropicFormat(b) {
+		converted, convErr := convertAnthropicToOpenAI(b, modelID)
+		if convErr != nil {
+			// Only anthropicProtocolError errors carry type/message;
+			// non-typed conversion errors stay generic so
+			// writeUpstreamError emits a safe default.
+			return nil, http.StatusBadGateway, nil, convErr
+		}
+		b = converted
+	}
+	b = convertRawToolCallsInBody(b)
+	return b, status, header, nil
 }
 
 // to extract it; do not parse error strings.
@@ -525,124 +549,14 @@ func writeUpstreamError(w http.ResponseWriter, status int, err error, protocol s
 }
 
 func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
-	initOCSession()
-
-	var bodyMap map[string]any
-	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
-		return nil, 500, nil, fmt.Errorf("invalid request body")
+	rc, status, header, err := callOpenCodeEndpoint(ctx, "chat/completions", upstreamBody, modelID, auth)
+	if err != nil || status < 200 || status >= 300 {
+		if status == 0 {
+			status = 500
+		}
+		return rc, status, header, err
 	}
-	useGoEndpoint := auth.shouldUseGoEndpoint(modelID)
-	surface := "zen"
-	if useGoEndpoint {
-		surface = "go"
-	}
-	log := reqLogger(ctx)
-
-	var lastBody []byte
-	var lastStatus int
-	var lastHeader http.Header
-	var retryCount int
-	var lastBaseURL string
-	maxAttempts := maxUpstreamRetries
-	if max401Retries > maxAttempts {
-		maxAttempts = max401Retries
-	}
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		baseURL, client := selectUpstreamTarget(auth, bodyMap)
-		lastBaseURL = baseURL
-		up, err := buildOCRequestWithEndpoint(modelID, bodyMap, auth, useGoEndpoint, baseURL)
-		if err != nil {
-			return nil, 500, nil, err
-		}
-		attemptStart := time.Now()
-		resp, err := client.Do(up)
-		durationMs := time.Since(attemptStart).Milliseconds()
-		if err != nil {
-			retryReason := "transport_error"
-			canRetry := attempt+1 < maxUpstreamRetries
-			if !canRetry {
-				retryReason = ""
-			}
-			log.Info("upstream_attempt",
-				"try_model", modelID,
-				"base_url", baseURL,
-				"surface", surface,
-				"status", 0,
-				"duration_ms", durationMs,
-				"attempt_index", attempt,
-				"retry_reason", retryReason,
-				"error", err.Error(),
-			)
-			if canRetry {
-				client.CloseIdleConnections()
-				invalidateUpstreamTarget(auth, bodyMap)
-				retryCount++
-				continue
-			}
-			break
-		}
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			log.Info("upstream_attempt",
-				"try_model", modelID,
-				"base_url", baseURL,
-				"surface", surface,
-				"status", resp.StatusCode,
-				"duration_ms", durationMs,
-				"attempt_index", attempt,
-			)
-			log.Info("upstream_result",
-				"models_tried", []string{modelID},
-				"base_url", baseURL,
-				"retries", retryCount,
-				"final_status", resp.StatusCode,
-				"fallback_used", false,
-			)
-			return wrapRawSSE(resp.Body), resp.StatusCode, resp.Header, nil
-		}
-		errBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		logUpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL)
-		nonRetryable := isNonRetryableUpstreamError(resp.StatusCode, errBody)
-		canRetry := !nonRetryable && shouldRetryUpstreamStatus(resp.StatusCode) && attempt+1 < maxAttemptsForUpstreamStatus(resp.StatusCode)
-		retryReason := ""
-		if canRetry {
-			retryReason = fmt.Sprintf("status_%d", resp.StatusCode)
-		}
-		if nonRetryable {
-			retryReason = "non_retryable_upstream"
-		}
-		log.Info("upstream_attempt",
-			"try_model", modelID,
-			"surface", surface,
-			"status", resp.StatusCode,
-			"duration_ms", durationMs,
-			"attempt_index", attempt,
-			"retry_reason", retryReason,
-		)
-		lastBody = errBody
-		lastStatus = resp.StatusCode
-		lastHeader = resp.Header
-		if !canRetry {
-			break
-		}
-		// 免费层 429 按出口 IP 限流,5xx 也可能是出口问题:
-		// 重试前切断 sticky,让同一会话换到下一个出口。
-		invalidateUpstreamTarget(auth, bodyMap)
-		client.CloseIdleConnections()
-		retryCount++
-	}
-	log.Info("upstream_result",
-		"models_tried", []string{modelID},
-		"base_url", lastBaseURL,
-		"retries", retryCount,
-		"final_status", lastStatus,
-		"fallback_used", false,
-	)
-	if lastStatus != 0 {
-		return io.NopCloser(bytes.NewReader(lastBody)), lastStatus, lastHeader, nil
-	}
-	return nil, 500, nil, fmt.Errorf("upstream request failed")
+	return wrapRawSSE(rc), status, header, nil
 }
 
 // ======================== 安全响应头过滤 ========================

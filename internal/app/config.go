@@ -189,6 +189,9 @@ func applyConfig(cfg AppConfig) {
 	if cfg.TextOnlyModels != nil {
 		textOnlyModels = cfg.TextOnlyModels
 	}
+	if cfg.NativeResponsesModels != nil {
+		setNativeResponsesModels(cfg.NativeResponsesModels)
+	}
 
 }
 

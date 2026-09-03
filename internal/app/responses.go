@@ -1020,12 +1020,14 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if isNativeResponsesModel(respReq.Model) {
 		slog.Info("responses passthrough (remembered)",
 			"model_in", modelIn, "model", respReq.Model, "stream", respReq.Stream)
-		if passthroughNativeResponses(r.Context(), w, auth, respReq.Model, body, respReq.Stream) {
+		if forwardNativeResponses(r.Context(), w, auth, respReq.Model, body, respReq.Stream, respReq) {
 			return
 		}
+		// 仅传输层错误（拿不到上游响应）才会到这里，上游 4xx/5xx 已由
+		// forward 原样透传状态码与错误信息。
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error"}})
+		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream connection error"}})
 		return
 	}
 
@@ -1206,7 +1208,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			// 翻译路径失败：探测上游原生 responses，成功则透传并记住该模型。
 			// 类型化转换错误（上游有明确错误信息）不探测，原样返回。
-			if shouldProbeNativeResponses(status, err) && passthroughNativeResponses(r.Context(), w, auth, chatReq.Model, body, true) {
+			if shouldProbeNativeResponses(status, err) && probeNativeResponses(r.Context(), w, auth, chatReq.Model, body, true, respReq) {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -1233,7 +1235,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil || status < 200 || status >= 300 {
 		// 翻译路径失败：探测上游原生 responses，成功则透传并记住该模型。
 		// 类型化转换错误（上游有明确错误信息）不探测，原样返回。
-		if shouldProbeNativeResponses(status, err) && passthroughNativeResponses(r.Context(), w, auth, chatReq.Model, body, false) {
+		if shouldProbeNativeResponses(status, err) && probeNativeResponses(r.Context(), w, auth, chatReq.Model, body, false, respReq) {
 			return
 		}
 		if err != nil {

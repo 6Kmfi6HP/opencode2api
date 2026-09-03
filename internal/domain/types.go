@@ -144,6 +144,12 @@ type AppConfig struct {
 	// upstream that rejects them. Defaults to ["deepseek"] when unset;
 	// an explicit value (even empty) replaces the default.
 	TextOnlyModels []string `json:"text_only_models,omitempty"`
+	// NativeResponsesModels lists upstream model IDs known to require the
+	// native /responses endpoint (chat translation path unsupported).
+	// Requests for these models skip translation and go straight to the
+	// passthrough relay. Dynamic probing still learns additional models at
+	// runtime. An explicit value (even empty) replaces the built-in default.
+	NativeResponsesModels []string `json:"native_responses_models,omitempty"`
 }
 
 type Socks5Proxy struct {

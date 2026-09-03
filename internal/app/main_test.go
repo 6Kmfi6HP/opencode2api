@@ -44,6 +44,7 @@ type fakeUpstreamResponse struct {
 	status int
 	body   string
 	header http.Header
+	err    error
 }
 
 type fakeRetryTransport struct {
@@ -75,6 +76,9 @@ func (f *fakeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 
 	next := f.responses[0]
 	f.responses = f.responses[1:]
+	if next.err != nil {
+		return nil, next.err
+	}
 	header := next.header
 	if header == nil {
 		header = make(http.Header)
