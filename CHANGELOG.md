@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.9.0
+
+- Native Responses Passthrough with Memory:
+  - Requests whose chat translation path fails (404/501/502/500) are automatically probed against the upstream native `/responses` endpoint; on success the model is remembered and served directly on subsequent requests.
+  - Confirmed models are served by a fidelity reverse proxy that preserves upstream 4xx/5xx status codes and error bodies instead of masking client errors as 502.
+  - Unified all upstream calls (`chat/completions`, `responses`) on `callOpenCodeEndpoint` with retry/rotation, context propagation, and structured attempt logging.
+- Streaming Relay Quality:
+  - SSE is relayed line-by-line with per-event flush, fixing the 32KB `io.Copy` buffering stall that broke typewriter streaming.
+  - Tail `usage` is extracted from `response.completed`/usage events for token accounting, upstream rate-limit headers are forwarded, and completed responses persist session state for `previous_response_id` chains.
+- Safer Probing & Self-Healing Registry:
+  - Probing never fires on 401/403/429/400, typed conversion errors, context cancellation, or transport errors, avoiding retry storms under rate limiting or credential failure.
+  - Static preset models (`muse-spark-1.3-contributor`) skip translation from the first request; the new `native_responses_models` config merges additively without clearing learned models; dynamically learned models are evicted after consecutive failures while static models are immune.
+
 ## v0.8.0
 
 - Redesigned Admin Dashboard & Workspace Layout:
