@@ -551,8 +551,10 @@ func TestResponsesPassthroughStreamRecordsUsage(t *testing.T) {
 	if !rec.Flushed {
 		t.Fatal("streaming relay must flush to the client")
 	}
-	if rec.Body.String() != sse {
-		t.Fatalf("stream body = %q, want verbatim relay", rec.Body.String())
+	// 上游未发 [DONE] 哨兵时，relay 会补发一行 data: [DONE]（见
+	// relayResponsesStream 尾部注释），因此期望 body = sse + 哨兵。
+	if rec.Body.String() != sse+"data: [DONE]\n\n" {
+		t.Fatalf("stream body = %q, want verbatim relay + trailing [DONE]", rec.Body.String())
 	}
 	tokenStatsMu.Lock()
 	after := int64(0)
@@ -565,6 +567,111 @@ func TestResponsesPassthroughStreamRecordsUsage(t *testing.T) {
 	}
 	if _, ok := loadResponseState("resp_stream_usage"); !ok {
 		t.Fatal("streamed completed response state not stored")
+	}
+}
+
+// 上游原生 responses 流不发 [DONE] 哨兵时（muse-spark 系行为，见
+// responses.go 容错注释），relay 必须在干净 EOF 后补发 data: [DONE]，
+// 否则期望哨兵的客户端报 "SSE stream ended without [DONE]"。
+func TestResponsesPassthroughStreamAppendsMissingDone(t *testing.T) {
+	const model = "no-done-sentinel-model"
+
+	oldModelAlias := getModelKeywordRules()
+	applyConfig(AppConfig{})
+	t.Cleanup(func() { applyConfig(AppConfig{ModelAlias: oldModelAlias}) })
+	nativeResponsesModels.Lock()
+	nativeResponsesModels.ids[model] = true
+	nativeResponsesModels.Unlock()
+	t.Cleanup(func() {
+		nativeResponsesModels.Lock()
+		delete(nativeResponsesModels.ids, model)
+		nativeResponsesModels.Unlock()
+	})
+
+	sse := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_no_done\",\"status\":\"completed\"}}\n\n"
+	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusOK, body: sse},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"`+model+`","input":"hi","stream":true}`))
+	rec := httptest.NewRecorder()
+	responsesHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+	want := sse + "data: [DONE]\n\n"
+	if rec.Body.String() != want {
+		t.Fatalf("stream body = %q, want %q", rec.Body.String(), want)
+	}
+}
+
+// 上游已发送 [DONE] 哨兵时，relay 必须原样透传且不得重复补发。
+func TestResponsesPassthroughStreamKeepsExistingDone(t *testing.T) {
+	const model = "with-done-sentinel-model"
+
+	oldModelAlias := getModelKeywordRules()
+	applyConfig(AppConfig{})
+	t.Cleanup(func() { applyConfig(AppConfig{ModelAlias: oldModelAlias}) })
+	nativeResponsesModels.Lock()
+	nativeResponsesModels.ids[model] = true
+	nativeResponsesModels.Unlock()
+	t.Cleanup(func() {
+		nativeResponsesModels.Lock()
+		delete(nativeResponsesModels.ids, model)
+		nativeResponsesModels.Unlock()
+	})
+
+	sse := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_with_done\",\"status\":\"completed\"}}\n\n" +
+		"data: [DONE]\n\n"
+	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusOK, body: sse},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"`+model+`","input":"hi","stream":true}`))
+	rec := httptest.NewRecorder()
+	responsesHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != sse {
+		t.Fatalf("stream body = %q, want verbatim %q", got, sse)
+	}
+	if n := strings.Count(rec.Body.String(), "[DONE]"); n != 1 {
+		t.Fatalf("body contains %d [DONE] markers, want exactly 1:\n%s", n, rec.Body.String())
+	}
+}
+
+// 零事件空流（上游发了头就 EOF）不补发哨兵，避免掩盖上游异常。
+func TestResponsesPassthroughStreamEmptyBodyNoDone(t *testing.T) {
+	const model = "empty-stream-model"
+
+	oldModelAlias := getModelKeywordRules()
+	applyConfig(AppConfig{})
+	t.Cleanup(func() { applyConfig(AppConfig{ModelAlias: oldModelAlias}) })
+	nativeResponsesModels.Lock()
+	nativeResponsesModels.ids[model] = true
+	nativeResponsesModels.Unlock()
+	t.Cleanup(func() {
+		nativeResponsesModels.Lock()
+		delete(nativeResponsesModels.ids, model)
+		nativeResponsesModels.Unlock()
+	})
+
+	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusOK, body: ""},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"`+model+`","input":"hi","stream":true}`))
+	rec := httptest.NewRecorder()
+	responsesHandler(rec, req)
+
+	if strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Fatalf("empty upstream stream must not get a synthesized [DONE]:\n%s", rec.Body.String())
 	}
 }
 

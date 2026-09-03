@@ -273,17 +273,30 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 	reader := bufio.NewReader(rc)
 	var lastUsage map[string]any
 	var lastResponse map[string]any
+	// sawData：是否转发过至少一条 data 行；doneSeen：上游是否已发送
+	// `data: [DONE]` 哨兵；writeFailed：客户端已断开，无需再补写。
+	sawData := false
+	doneSeen := false
+	writeFailed := false
 
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			if _, werr := w.Write(line); werr != nil {
+				writeFailed = true
 				break
 			}
 			// 逐行 Flush：标准 SSE 用空行分隔事件，非标准单换行输出也能
 			// 被及时推送，避免 io.Copy 式 32KB 缓冲卡死打字机效果。
 			if flusher != nil {
 				flusher.Flush()
+			}
+			trimmed := bytes.TrimSpace(line)
+			if bytes.Equal(trimmed, []byte("data: [DONE]")) || bytes.Equal(trimmed, []byte("[DONE]")) {
+				doneSeen = true
+			}
+			if bytes.HasPrefix(trimmed, []byte("data:")) {
+				sawData = true
 			}
 			if usage, response := extractStreamEventUsage(line); usage != nil || response != nil {
 				if usage != nil {
@@ -308,6 +321,19 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 	if lastResponse != nil {
 		if _, hasID := lastResponse["id"].(string); hasID {
 			storeResponseState(lastResponse, req)
+		}
+	}
+
+	// 部分上游（如 muse-spark 系，见 responses.go 对 muse-spark 的容错注释）
+	// 在原生 responses 流结束时只发事件不发 `data: [DONE]` 哨兵，期望该哨兵
+	// 的客户端会报 "SSE stream ended without [DONE]"。在干净 EOF、已转发过
+	// 事件且上游未发送哨兵时补发一行：以 response.completed 判定结束的客户端
+	// 不会读到这行，以 [DONE] 为终止标志的客户端借此正常退出读循环。
+	// 客户端断开或零事件空流不补发（空流补发会掩盖上游异常）。
+	if !writeFailed && sawData && !doneSeen {
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if flusher != nil {
+			flusher.Flush()
 		}
 	}
 }

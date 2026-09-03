@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.9.1
+
+- Fix `SSE stream ended without [DONE]` on native Responses passthrough models (`muse-spark` etc.): the streaming relay now appends a `data: [DONE]` sentinel on clean EOF when the upstream ended its `/zen/v1/responses` stream without one (same upstream quirk already tolerated in the chat translation path). Streams that already carry a sentinel are relayed verbatim with no duplicate, and empty zero-event streams still pass through untouched so upstream failures are not masked.
+
 ## v0.9.0
 
 - Native Responses Passthrough with Memory:
