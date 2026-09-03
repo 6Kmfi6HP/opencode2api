@@ -1016,6 +1016,19 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	respReq.Model = mapPublicToFreeModel(auth, respReq.Model)
 
+	// 内存记忆：该模型已确认支持上游原生 responses，直接透传，不再转换。
+	if isNativeResponsesModel(respReq.Model) {
+		slog.Info("responses passthrough (remembered)",
+			"model_in", modelIn, "model", respReq.Model, "stream", respReq.Stream)
+		if passthroughNativeResponses(r.Context(), w, auth, respReq.Model, body, respReq.Stream) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error"}})
+		return
+	}
+
 	// 多模态路由
 
 	messages := respReq.Messages
@@ -1185,14 +1198,22 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if respReq.Stream {
 		upResp, status, _, err := callOpenCodeAPIStream(r.Context(), upstreamBody, chatReq.Model, auth)
 		if err != nil || status < 200 || status >= 300 {
+			// 先保留翻译路径的上游错误体，再探测原生透传。
+			var transErrBody []byte
+			if upResp != nil {
+				transErrBody, _ = io.ReadAll(upResp)
+				upResp.Close()
+			}
+			// 翻译路径失败：探测上游原生 responses，成功则透传并记住该模型。
+			// 类型化转换错误（上游有明确错误信息）不探测，原样返回。
+			if shouldProbeNativeResponses(status, err) && passthroughNativeResponses(r.Context(), w, auth, chatReq.Model, body, true) {
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
-			if upResp != nil {
-				errBody, _ := io.ReadAll(upResp)
-				if len(errBody) > 0 {
-					w.Write(errBody)
-					return
-				}
+			if len(transErrBody) > 0 {
+				w.Write(transErrBody)
+				return
 			}
 			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error"}})
 			return
@@ -1210,6 +1231,11 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
+		// 翻译路径失败：探测上游原生 responses，成功则透传并记住该模型。
+		// 类型化转换错误（上游有明确错误信息）不探测，原样返回。
+		if shouldProbeNativeResponses(status, err) && passthroughNativeResponses(r.Context(), w, auth, chatReq.Model, body, false) {
+			return
+		}
 		if err != nil {
 			writeUpstreamError(w, status, err, "responses")
 		} else {
