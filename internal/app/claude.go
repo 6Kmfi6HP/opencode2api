@@ -848,6 +848,24 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	if !validateRequestTemperature(w, claudeReq.Temperature, "claude", 0, 1) {
 		return
 	}
+
+	// 原生 responses 快路径：已记住模型直接走 Claude->Responses 转换，不再经过
+	// chat 翻译。此分支为 lenient 模式：不支持的 block 做降级，不返回 400，
+	// 因此跳过 validateClaudeDocumentBlocks 的严格校验。
+	wantReasoningEarly := !getForceDisableThinking()
+	if claudeReq.Thinking != nil && isThinkingDisabled(claudeReq.Thinking) {
+		wantReasoningEarly = false
+	}
+	if isNativeResponsesModel(claudeReq.Model) {
+		slog.Info("claude responses passthrough (remembered)",
+			"model_in", modelIn, "model", claudeReq.Model, "stream", claudeReq.Stream)
+		if forwardClaudeViaResponses(r.Context(), w, auth, claudeReq.Model, claudeReq, claudeReq.Stream, wantReasoningEarly) {
+			return
+		}
+		// 仅传输层错误才会到这里（上游 4xx/5xx 已转换写回）。继续回落到
+		// 常规 chat 翻译路径，做 best-effort 二次尝试。
+		slog.Warn("claude remembered responses forward failed, falling back to chat", "model", claudeReq.Model)
+	}
 	if msg := validateClaudeDocumentBlocks(claudeReq.Messages); msg != "" {
 		writeProtocolValidation400(w, "claude", "", msg)
 		return
@@ -920,6 +938,16 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	if claudeReq.Stream {
 		upResp, status, _, err := callOpenCodeAPIStream(r.Context(), upstreamBody, chatReq.Model, auth)
 		if err != nil || status < 200 || status >= 300 {
+			var transErrBody []byte
+			if upResp != nil {
+				transErrBody, _ = io.ReadAll(upResp)
+				upResp.Close()
+			}
+			_ = transErrBody
+			// 翻译路径失败：探测上游原生 responses，成功则转换并记住该模型。
+			if shouldProbeNativeResponses(status, err) && probeClaudeViaResponses(r.Context(), w, auth, chatReq.Model, claudeReq, true, wantReasoning) {
+				return
+			}
 			errResp := map[string]any{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": "upstream error"},
@@ -936,6 +964,13 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
+		// 翻译路径失败：探测上游原生 responses，成功则转换并记住该模型。
+		// 本地转换失败（上游 200 但包体无法解析，err 非 "upstream error"）
+		// 与类型化转换错误不探测，原样返回，避免把合成 502 误判为上游 502。
+		isUpstreamHTTPError := err != nil && err.Error() == "upstream error"
+		if isUpstreamHTTPError && shouldProbeNativeResponses(status, err) && probeClaudeViaResponses(r.Context(), w, auth, chatReq.Model, claudeReq, false, wantReasoning) {
+			return
+		}
 		if err != nil {
 			writeUpstreamError(w, status, err, "claude")
 		} else {

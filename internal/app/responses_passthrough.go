@@ -12,6 +12,164 @@ import (
 	"sync"
 )
 
+
+// ======================== function_call 参数浮点归一化 ========================
+//
+// 部分上游模型（如 muse-spark）对整数参数输出浮点字面量（如 1000.0），而
+// Codex 等 Rust 客户端以 usize 反序列化，遇到浮点直接报错：
+// "failed to parse function arguments: invalid type: floating point `1000.0`,
+// expected usize"。这里做 best-effort 归一化：把 JSON 字符串外的整数浮点
+// （1000.0 / 1000.00，后接 , } ] 空白 : 或结尾）改写为整数，字符串内的
+// 内容（如 echo 1.0）绝不动。仅用于透传写回，不因不支持返回 400。
+
+type argsNormState struct {
+	inString bool
+	escaped  bool
+}
+
+func isArgsDelim(c byte) bool {
+	switch c {
+	case ',', '}', ']', ':', ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
+}
+
+// normalizeArgsFragment 归一化一段 arguments JSON 片段（完整或流式增量均可），
+// 并滚动更新跨分片的字符串状态。调用方按 output_index 为每个工具调用维护
+// 独立的 state，避免分片边界误判字符串内外。
+func normalizeArgsFragment(s string, st *argsNormState) string {
+	inString := false
+	escaped := false
+	if st != nil {
+		inString = st.inString
+		escaped = st.escaped
+	}
+	var out []byte
+	out = make([]byte, 0, len(s))
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if inString {
+			out = append(out, c)
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			i++
+			continue
+		}
+		// 字符串外
+		if c == '"' {
+			inString = true
+			out = append(out, c)
+			i++
+			continue
+		}
+		if c == '-' || (c >= '0' && c <= '9') {
+			j := i
+			if s[j] == '-' {
+				j++
+				if j >= len(s) || s[j] < '0' || s[j] > '9' {
+					out = append(out, c)
+					i++
+					continue
+				}
+			}
+			k := j
+			for k < len(s) && s[k] >= '0' && s[k] <= '9' {
+				k++
+			}
+			if k < len(s) && s[k] == '.' {
+				m := k + 1
+				for m < len(s) && s[m] >= '0' && s[m] <= '9' {
+					m++
+				}
+				frac := ""
+				if m > k+1 {
+					frac = s[k+1 : m]
+				}
+				allZero := len(frac) > 0
+				for p := 0; p < len(frac); p++ {
+					if frac[p] != '0' {
+						allZero = false
+						break
+					}
+				}
+				var next byte
+				hasNext := m < len(s)
+				if hasNext {
+					next = s[m]
+				}
+				// 小数部分全零且后接分隔符/结尾（排除 1.05 / 1.0e3 等真浮点/科学计数）。
+				if allZero && (!hasNext || isArgsDelim(next)) {
+					out = append(out, s[i:k]...)
+					i = m
+					continue
+				}
+			}
+			// 非整数浮点或普通数字：原样拷贝数字前缀，后续字符主循环处理。
+			for i < k {
+				out = append(out, s[i])
+				i++
+			}
+			continue
+		}
+		out = append(out, c)
+		i++
+	}
+	if st != nil {
+		st.inString = inString
+		st.escaped = escaped
+	}
+	return string(out)
+}
+
+// normalizeArgumentsString 归一化完整 arguments JSON 字符串（无状态便捷封装）。
+func normalizeArgumentsString(s string) string {
+	if s == "" {
+		return s
+	}
+	st := &argsNormState{}
+	return normalizeArgsFragment(s, st)
+}
+
+// normalizeResponseOutputArguments 归一化响应 output 数组中各工具调用
+//（function_call/tool_call/shell/apply_patch/custom_tool_call 等）的 arguments
+// 或 input 字符串，返回是否改动。output_text 类可见文本绝不动。
+func normalizeResponseOutputArguments(output []any) bool {
+	changed := false
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		t, _ := item["type"].(string)
+		switch t {
+		case "function_call", "tool_call", "shell_call", "apply_patch_call",
+			"custom_tool_call", "local_shell_call", "mcp_call":
+		default:
+			continue
+		}
+		for _, key := range []string{"arguments", "input"} {
+			args, _ := item[key].(string)
+			if args == "" {
+				continue
+			}
+			if norm := normalizeArgumentsString(args); norm != args {
+				item[key] = norm
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+
 // ======================== Responses 原生透传（探测 + 记忆） ========================
 //
 // 有些模型的上游 /zen/v1/chat/completions 通道不可用，但原生
@@ -171,7 +329,74 @@ func shouldProbeNativeResponses(status int, err error) bool {
 // probeNativeResponses 专用于 chat 翻译路径失败后的投机探测：仅当上游原生
 // responses 返回 2xx 时才把响应写回客户端并记住该模型；任何失败都返回 false
 // 且不写任何响应，调用方保留原翻译路径的错误原样返回。
+// sanitizeResponsesPassthroughBody 对原生透传体做 lenient 归一化，避免上游
+// 严格校验 400（如 required 缺 key、reasoning.effort 非法），绝不因不支持返回 400。
+// 合法请求归一化后等价（幂等），可安全用于保真透传。
+func sanitizeResponsesPassthroughBody(rawBody []byte, modelID string) []byte {
+	if !isMuseSparkModel(modelID) {
+		return rawBody
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return rawBody
+	}
+	changed := false
+	if tools, ok := body["tools"].([]any); ok {
+		for i, t := range tools {
+			tm, ok := t.(map[string]any)
+			if !ok {
+				continue
+			}
+			// 两种形状：{parameters:{...}} 与 {function:{parameters:{...}}}。
+			if params, ok := tm["parameters"].(map[string]any); ok {
+				tm["parameters"] = normalizeResponsesToolParameters(params)
+				tools[i] = tm
+				changed = true
+				continue
+			}
+			if fn, ok := tm["function"].(map[string]any); ok {
+				if params, ok := fn["parameters"].(map[string]any); ok {
+					fn["parameters"] = normalizeResponsesToolParameters(params)
+					tm["function"] = fn
+					tools[i] = tm
+					changed = true
+				} else if _, hasParams := fn["parameters"]; !hasParams {
+					// 缺 parameters 时补最小可用 shapes，避免上游 400。
+					fn["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}, "required": []any{}}
+					tm["function"] = fn
+					tools[i] = tm
+					changed = true
+				}
+			}
+		}
+		if changed {
+			body["tools"] = tools
+		}
+	}
+	if r, ok := body["reasoning"].(map[string]any); ok {
+		if e, _ := r["effort"].(string); e != "" {
+			if ne := normalizeResponsesEffort(e); ne != e {
+				if ne == "" {
+					delete(body, "reasoning")
+				} else {
+					r["effort"] = ne
+					body["reasoning"] = r
+				}
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return rawBody
+	}
+	if b, err := json.Marshal(body); err == nil {
+		return b
+	}
+	return rawBody
+}
+
 func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool, req ResponsesAPIRequest) bool {
+	rawBody = sanitizeResponsesPassthroughBody(rawBody, modelID)
 	rc, status, header, err := callOpenCodeEndpoint(ctx, "responses", rawBody, modelID, auth)
 	if err != nil || status < 200 || status >= 300 {
 		if rc != nil {
@@ -192,6 +417,7 @@ func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth Upstr
 // 2xx、4xx 还是 5xx，均保真透传状态码与错误信息（符合标准代理语义）。仅在
 // 真正的传输层错误（无法拿到上游响应）时返回 false，调用方兜底写 502。
 func forwardNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool, req ResponsesAPIRequest) bool {
+	rawBody = sanitizeResponsesPassthroughBody(rawBody, modelID)
 	rc, status, header, err := callOpenCodeEndpoint(ctx, "responses", rawBody, modelID, auth)
 	if err != nil {
 		markNativeResponsesFailure(modelID)
@@ -234,6 +460,21 @@ func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Re
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte(`{"error":{"message":"failed to read upstream body"}}`))
 		return
+	}
+
+	// 非流式成功响应：仅 muse-spark 归一化 function_call 参数中的整数浮点
+	//（如 1000.0->1000），避免 Codex 等严格客户端反序列化失败。字符串内数字不动。
+	if status >= 200 && status < 300 && isMuseSparkModel(modelID) {
+		var tmp map[string]any
+		if json.Unmarshal(respBody, &tmp) == nil {
+			if output, ok := tmp["output"].([]any); ok {
+				if normalizeResponseOutputArguments(output) {
+					if nb, merr := json.Marshal(tmp); merr == nil {
+						respBody = nb
+					}
+				}
+			}
+		}
 	}
 
 	if ct := header.Get("Content-Type"); ct != "" {
@@ -279,10 +520,20 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 	doneSeen := false
 	writeFailed := false
 
+	argStates := map[int]*argsNormState{}
+	argItemToOutput := map[string]int{}
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			if _, werr := w.Write(line); werr != nil {
+			outLine := line
+			// 流式参数归一化（仅 muse-spark）：只处理 arguments 增量与 completed，
+			// output_text 等文本增量绝不动（避免改写 echo 1.0 等可见输出）。
+			if isMuseSparkModel(modelID) {
+				if normalized, ok := normalizeResponsesStreamLine(line, argStates, argItemToOutput); ok {
+					outLine = normalized
+				}
+			}
+			if _, werr := w.Write(outLine); werr != nil {
 				writeFailed = true
 				break
 			}
@@ -291,14 +542,14 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 			if flusher != nil {
 				flusher.Flush()
 			}
-			trimmed := bytes.TrimSpace(line)
+			trimmed := bytes.TrimSpace(outLine)
 			if bytes.Equal(trimmed, []byte("data: [DONE]")) || bytes.Equal(trimmed, []byte("[DONE]")) {
 				doneSeen = true
 			}
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				sawData = true
 			}
-			if usage, response := extractStreamEventUsage(line); usage != nil || response != nil {
+			if usage, response := extractStreamEventUsage(outLine); usage != nil || response != nil {
 				if usage != nil {
 					lastUsage = usage
 				}
@@ -336,6 +587,112 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 			flusher.Flush()
 		}
 	}
+}
+
+// normalizeResponsesStreamLine 归一化单行 SSE data 事件中的 function_call 参数，
+// 返回归一化后的完整行与是否改动。output_text 类文本增量永不动。
+func normalizeResponsesStreamLine(line []byte, argStates map[int]*argsNormState, argItemToOutput map[string]int) ([]byte, bool) {
+	if !bytes.HasPrefix(line, []byte("data:")) && !bytes.HasPrefix(line, []byte("data: ")) {
+		return nil, false
+	}
+	// 保留原始行尾（\n / \r\n）与 data 前缀风格。
+	prefix := "data: "
+	rest := line
+	if bytes.HasPrefix(line, []byte("data: ")) {
+		prefix = "data: "
+		rest = line[len("data: "):]
+	} else {
+		// "data:" 后无空格的非标准形态
+		prefix = "data:"
+		rest = line[len("data:"):]
+	}
+	payload := bytes.TrimSpace(rest)
+	if len(payload) == 0 || payload[0] != '{' {
+		return nil, false
+	}
+	// 去掉行尾换行后再解析，避免 \r 干扰。
+	payloadTrim := bytes.TrimRight(payload, "\r\n")
+	var evt map[string]any
+	if json.Unmarshal(payloadTrim, &evt) != nil {
+		return nil, false
+	}
+	typ, _ := evt["type"].(string)
+	// 可见文本/推理/语音增量绝不动（避免改写 echo 1.0 等可见输出）。
+	switch typ {
+	case "response.output_text.delta", "response.refusal.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.audio.delta", "response.audio_transcript.delta":
+		return nil, false
+	}
+	outputIndex := -1
+	if v, ok := evt["output_index"].(float64); ok {
+		outputIndex = int(v)
+	}
+	itemID, _ := evt["item_id"].(string)
+	changed := false
+
+	// output_item.added/done：登记映射，并归一化 item 内自带的参数全量。
+	if item, ok := evt["item"].(map[string]any); ok && item != nil {
+		if id, _ := item["id"].(string); id != "" && outputIndex >= 0 {
+			argItemToOutput[id] = outputIndex
+			if callID, _ := item["call_id"].(string); callID != "" {
+				argItemToOutput[callID] = outputIndex
+			}
+		}
+		for _, key := range []string{"arguments", "input"} {
+			if s, _ := item[key].(string); s != "" {
+				if norm := normalizeArgumentsString(s); norm != s {
+					item[key] = norm
+					changed = true
+				}
+			}
+		}
+	}
+	// done 类事件顶层 arguments/input 全量（如 function_call_arguments.done）。
+	for _, key := range []string{"arguments", "input"} {
+		if s, _ := evt[key].(string); s != "" {
+			// 顶层全量字符串用无状态归一化（与分片状态无关，避免污染）。
+			if norm := normalizeArgumentsString(s); norm != s {
+				evt[key] = norm
+				changed = true
+			}
+		}
+	}
+	// 增量 delta：用按 output 分片的状态归一化（跨分片字符串跟踪）。
+	if delta, _ := evt["delta"].(string); delta != "" {
+		oi := outputIndex
+		if oi < 0 && itemID != "" {
+			if mapped, ok := argItemToOutput[itemID]; ok {
+				oi = mapped
+			}
+		}
+		if oi < 0 {
+			oi = -1 // 共享 fallback，顺序到达时等价
+		}
+		st, ok := argStates[oi]
+		if !ok {
+			st = &argsNormState{}
+			argStates[oi] = st
+		}
+		if norm := normalizeArgsFragment(delta, st); norm != delta {
+			evt["delta"] = norm
+			changed = true
+		}
+	}
+	// completed/incomplete 内嵌全量 output。
+	if resp, ok := evt["response"].(map[string]any); ok && resp != nil {
+		if output, ok := resp["output"].([]any); ok && len(output) > 0 {
+			if normalizeResponseOutputArguments(output) {
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return nil, false
+	}
+	nb, err := json.Marshal(evt)
+	if err != nil {
+		return nil, false
+	}
+	return append([]byte(prefix), append(nb, '\n')...), true
 }
 
 // extractStreamEventUsage 解析单行 SSE 事件，返回其中携带的 usage 与完整
