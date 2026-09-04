@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.10.0
+
+- Claude to native Responses passthrough:
+  - `POST /v1/messages` now converts Claude Messages to the upstream native `/responses` endpoint when the chat translation path fails (404/500/501/502) or the model is remembered as native-only, reusing the passthrough memory registry shared with `/v1/responses`.
+  - Lenient conversion throughout: unsupported blocks degrade to text annotations instead of HTTP 400; assistant message parts use `output_text` (upstream rejects `input_text` on assistant messages); tool schemas are normalized so `required` covers every property key; `reasoning.effort=max` maps to `xhigh`.
+  - Native Responses output (message/reasoning/function_call/apply_patch/shell) converts back to Claude content blocks for both unary and SSE streaming.
+- muse-spark strict-upstream hardening (gated to `muse-spark` models only):
+  - Function-call arguments with integral floats (`1000.0`) are normalized to integers outside JSON strings in both unary and streaming relay, fixing strict clients (Codex Rust `usize` parsing) while leaving visible text like `echo 1.0` untouched.
+  - Responses tool schemas and reasoning effort are sanitized before native passthrough.
+- Verified end to end with `launch claude` and `launch codex` on `muse-spark-1.3-contributor`, including multi-turn tool-use and shell execution.
+
+
 ## v0.9.1
 
 - Fix `SSE stream ended without [DONE]` on native Responses passthrough models (`muse-spark` etc.): the streaming relay now appends a `data: [DONE]` sentinel on clean EOF when the upstream ended its `/zen/v1/responses` stream without one (same upstream quirk already tolerated in the chat translation path). Streams that already carry a sentinel are relayed verbatim with no duplicate, and empty zero-event streams still pass through untouched so upstream failures are not masked.

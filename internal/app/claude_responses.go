@@ -295,7 +295,7 @@ func isMuseSparkModel(modelID string) bool {
 // responsesTextPart 按 role 返回合法的文本 part 类型：
 // user/developer 用 input_text，assistant 用 output_text。
 // 上游原生 responses 对 assistant 消息中的 input_text 会 400
-//（invalid_request_error: content type `input_text` is not valid on `assistant` messages），
+// （invalid_request_error: content type `input_text` is not valid on `assistant` messages），
 // 因此必须区分。
 func responsesTextPart(role, text string) map[string]any {
 	if role == "assistant" {
@@ -670,9 +670,9 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 // 解析失败时返回最小可用空文本消息，不报错。
 func convertResponsesToClaude(respBody []byte, model string, wantReasoning bool) []byte {
 	var resp struct {
-		ID     string `json:"id"`
-		Output []any  `json:"output"`
-		Status string `json:"status"`
+		ID     string         `json:"id"`
+		Output []any          `json:"output"`
+		Status string         `json:"status"`
 		Usage  map[string]any `json:"usage"`
 	}
 	if err := json.Unmarshal(respBody, &resp); err != nil {
@@ -1570,7 +1570,7 @@ func finalizeClaudeResponsesStream(emit func(string, any), blocks map[int]*claud
 	}
 	// 占位块（claudeIndex==-1，从未真正开块）无需关闭。
 	emit("message_delta", map[string]any{
-		"type": "message_delta",
+		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
 		"usage": buildClaudeDeltaUsage(responsesUsageToChat(fullUsage)),
 	})

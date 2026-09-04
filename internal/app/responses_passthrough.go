@@ -12,7 +12,6 @@ import (
 	"sync"
 )
 
-
 // ======================== function_call 参数浮点归一化 ========================
 //
 // 部分上游模型（如 muse-spark）对整数参数输出浮点字面量（如 1000.0），而
@@ -139,7 +138,7 @@ func normalizeArgumentsString(s string) string {
 }
 
 // normalizeResponseOutputArguments 归一化响应 output 数组中各工具调用
-//（function_call/tool_call/shell/apply_patch/custom_tool_call 等）的 arguments
+// （function_call/tool_call/shell/apply_patch/custom_tool_call 等）的 arguments
 // 或 input 字符串，返回是否改动。output_text 类可见文本绝不动。
 func normalizeResponseOutputArguments(output []any) bool {
 	changed := false
@@ -168,7 +167,6 @@ func normalizeResponseOutputArguments(output []any) bool {
 	}
 	return changed
 }
-
 
 // ======================== Responses 原生透传（探测 + 记忆） ========================
 //
