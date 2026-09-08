@@ -757,3 +757,133 @@ func TestExtractStreamEventUsage(t *testing.T) {
 		t.Fatalf("comment line must be ignored, got %v %v", u, r)
 	}
 }
+
+// ======================== 超长 name 缩短与还原 ========================
+
+func TestShortenResponsesName(t *testing.T) {
+	// <=64 的名字原样返回
+	short := "mcp__codex_apps__github___create_pull_request"
+	if got := shortenResponsesName(short); got != short {
+		t.Fatalf("short name changed: %q", got)
+	}
+	// 66 字符的真实超长插件名（plugin_management___update_app_permissions 形态）
+	long := "mcp__codex_apps__plugin_management___update_app_permissionsXYZi000"
+	if len([]rune(long)) != 66 {
+		t.Fatalf("test fixture must be 66 runes, got %d", len([]rune(long)))
+	}
+	got := shortenResponsesName(long)
+	if n := len([]rune(got)); n != responsesMaxNameLength {
+		t.Fatalf("shortened length = %d, want %d: %q", n, responsesMaxNameLength, got)
+	}
+	// 确定性
+	if shortenResponsesName(long) != got {
+		t.Fatal("shortenResponsesName must be deterministic")
+	}
+	// 相似名字产生不同缩短哈希，避免碰撞
+	other := "mcp__codex_apps__plugin_management___update_app_permissionsXYZj111"
+	if shortenResponsesName(other) == got {
+		t.Fatal("different long names must not collide")
+	}
+	// 多字节字符不在中间被截断
+	cjk := "工具名称_" + string(make([]rune, 70)) // 长度保证 >64
+	for i, r := range []rune(cjk) {
+		_ = i
+		_ = r
+	}
+	cjk = string(append([]rune("工具名-"), []rune(long)...))
+	if g := shortenResponsesName(cjk); len([]rune(g)) > responsesMaxNameLength {
+		t.Fatalf("multibyte name truncated beyond limit: %q (%d runes)", g, len([]rune(g)))
+	}
+}
+
+func TestSanitizeResponsesPassthroughBody_ShortensLongToolNames(t *testing.T) {
+	long := "mcp__codex_apps__plugin_management___update_app_permissionsXYZi000" // 66
+	raw := `{"model":"muse-spark-1.3-contributor","stream":true,"input":[{"type":"function_call","call_id":"c1","name":"` + long + `","arguments":"{}"}],"tool_choice":{"type":"function","name":"` + long + `"},"tools":[{"type":"function","name":"` + long + `","description":"d","parameters":{"type":"object","properties":{},"required":[]}}]}`
+	sanitized, rw := sanitizeResponsesPassthroughBody([]byte(raw), "muse-spark-1.3-contributor")
+	// 出站请求里不再出现超长名
+	if strings.Contains(string(sanitized), long) {
+		t.Fatalf("sanitized body still contains long name: %s", sanitized)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(sanitized, &body); err != nil {
+		t.Fatalf("sanitized body not JSON: %v", err)
+	}
+	shortened := shortenResponsesName(long)
+	tools := body["tools"].([]any)
+	if got := tools[0].(map[string]any)["name"].(string); got != shortened {
+		t.Fatalf("tools[0].name = %q, want %q", got, shortened)
+	}
+	tc := body["tool_choice"].(map[string]any)
+	if got := tc["name"].(string); got != shortened {
+		t.Fatalf("tool_choice.name = %q, want %q", got, shortened)
+	}
+	inputItems := body["input"].([]any)
+	if got := inputItems[0].(map[string]any)["name"].(string); got != shortened {
+		t.Fatalf("input[0].name = %q, want %q", got, shortened)
+	}
+	// 映射包含 original->shortened 与 shortened->original 双向登记
+	if rw.outbound[long] != shortened || rw.inbound[shortened] != long {
+		t.Fatalf("rewrites mismatch: outbound=%q inbound=%q", rw.outbound[long], rw.inbound[shortened])
+	}
+}
+
+func TestResponsesNameRewrites_RestoresShortenedNamesInResponses(t *testing.T) {
+	long := "mcp__codex_apps__plugin_management___update_app_permissionsXYZi000"
+	shortened := shortenResponsesName(long)
+	rw := newResponsesNameRewrites()
+	rw.shortenRecord(long)
+
+	// 模拟上游非流式响应
+	resp := map[string]any{
+		"id": "resp_1",
+		"output": []any{
+			map[string]any{
+				"type": "function_call", "id": "fc_1", "call_id": "c1",
+				"name": shortened, "arguments": "{}",
+			},
+			map[string]any{
+				"type": "message", "role": "assistant",
+				"content": []any{map[string]any{"type": "output_text", "text": "echo " + shortened}},
+			},
+		},
+	}
+	if !rw.restoreResponsesPayloadNames(resp) {
+		t.Fatal("expected restore to change response")
+	}
+	out := resp["output"].([]any)
+	if got := out[0].(map[string]any)["name"].(string); got != long {
+		t.Fatalf("function_call name not restored: %q", got)
+	}
+	// 文本里自然出现的相同串不强制保护，但注册名之外的字段必须原样
+	if got := out[1].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string); got != "echo "+shortened {
+		t.Fatalf("text content must remain untouched: %q", got)
+	}
+}
+
+func TestNormalizeResponsesStreamLine_RestoresShortenedNameInEvents(t *testing.T) {
+	long := "mcp__codex_apps__plugin_management___update_app_permissionsXYZi000"
+	shortened := shortenResponsesName(long)
+	rw := newResponsesNameRewrites()
+	rw.shortenRecord(long)
+
+	states := map[int]*argsNormState{}
+	mapping := map[string]int{}
+	// function_call 全量事件（item_added 带 name）应还原 name
+	ev := []byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"c1","name":"` + shortened + `","arguments":"{}"}}` + "\n")
+	out, ok := normalizeResponsesStreamLine(ev, states, mapping, rw)
+	if !ok {
+		t.Fatal("event should be marked changed (name restored)")
+	}
+	if !strings.Contains(string(out), `"name":"`+long+`"`) {
+		t.Fatalf("restored long name missing: %s", string(out))
+	}
+	if strings.Contains(string(out), shortened) {
+		t.Fatalf("shortened name should be gone: %s", string(out))
+	}
+
+	// output_text delta 永不动（即便文本恰好包含缩短名）
+	textEv := []byte(`data: {"type":"response.output_text.delta","output_index":0,"delta":"` + shortened + `"}` + "\n")
+	if _, ok := normalizeResponsesStreamLine(textEv, states, mapping, rw); ok {
+		t.Fatal("output_text delta must not be rewritten")
+	}
+}

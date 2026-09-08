@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.10.1
+
+- Fix `muse-spark-*` `/v1/responses` 400 `name` must be at most 64 characters for over-64-character connector/tool names sent by Codex:
+  - Shorten outgoing `tools[].name`, `tools[].function.name`, `tool_choice.name`, and `input[].name` fields beyond 64 characters with a deterministic prefix + SHA-256 suffix.
+  - Restore the original name in upstream response/SSE `function_call` events before relaying back, so clients (including Codex) see unchanged tool names.
+  - Keep textual output untouched; non-`muse-spark` models remain byte-for-byte passthrough.
+
+
 ## v0.10.0
 
 - Claude to native Responses passthrough:

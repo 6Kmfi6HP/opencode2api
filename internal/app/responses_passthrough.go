@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 )
 
@@ -161,6 +164,193 @@ func normalizeResponseOutputArguments(output []any) bool {
 			}
 			if norm := normalizeArgumentsString(args); norm != args {
 				item[key] = norm
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// ======================== 超长 name 缩短（Anthropic 风格 64 上限） ========================
+//
+// muse-spark 上游的工具/name 字段沿用 Anthropic Messages 的 64 字符上限
+// （超过即 400 invalid_request_error: `name` must be at most 64 characters）。
+// Codex 桌面端会把已启用的连接器插件按
+// mcp__codex_apps__<plugin>___<tool> 的完整拼法注入 Responses tools
+// （如 mcp__codex_apps__plugin_management___update_app_permissions 恰好 66
+// 字符），透传后被上游拒绝。这里做 lenient 缩短（前缀 + 短哈希，保持惟一与
+// 确定性），并在把上游响应转发回客户端时按相反映射还原，保证客户端看到的
+// function_call 名字仍是原始长名字。仅 muse-spark 系模型启用，不影响其它
+// 上游与存储的会话状态（responsesHandler 用的是原始请求体）。
+
+// responsesNameKey 记录请求中一类 name 字段的位置，用于统一遍历。
+// 这里不需要结构体，使用函数指针即可。
+
+// responsesMaxNameLength 是上游 Anthropic 风格 name 字段的硬性上限（字符数）。
+const responsesMaxNameLength = 64
+
+// shortenResponsesName 把超过 64 字符的 name 确定性缩短为 <=64。
+// 保留原名的尾部相关段（通常是工具动作名），前缀加 "x-" 与 16 位十六进制
+// 哈希，保证同名输入稳定得到同一缩短名（跨请求可观察、可缓存），不同名
+// 几乎不碰撞（哈希 64 bit）。<=64 的名字原样返回。
+func shortenResponsesName(name string) string {
+	// 按 rune 截断，避免多字节字符被截坏（上限按字符而非字节解释）。
+	runes := []rune(name)
+	if len(runes) <= responsesMaxNameLength {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	suffix := hex.EncodeToString(sum[:8]) // 16 hex chars
+	// 布局：[:keep] + "-" + suffix，总长恒为 64。
+	keep := responsesMaxNameLength - 1 - len(suffix) // 47
+	var b strings.Builder
+	b.Grow(responsesMaxNameLength)
+	b.WriteString(string(runes[:keep]))
+	b.WriteByte('-')
+	b.WriteString(suffix)
+	return b.String()
+}
+
+// responsesNameRewrites 记录出站缩短映射（original -> shortened）与
+// 入站还原映射（shortened -> original）。
+type responsesNameRewrites struct {
+	outbound map[string]string // original -> shortened
+	inbound  map[string]string // shortened -> original
+}
+
+func newResponsesNameRewrites() *responsesNameRewrites {
+	return &responsesNameRewrites{
+		outbound: map[string]string{},
+		inbound:  map[string]string{},
+	}
+}
+
+func (rw *responsesNameRewrites) empty() bool {
+	return rw == nil || len(rw.outbound) == 0
+}
+
+// shortenRecord 缩短 name 并登记映射；<=64 或未变化时原样返回。
+func (rw *responsesNameRewrites) shortenRecord(name string) string {
+	shortened := shortenResponsesName(name)
+	if shortened == name {
+		return name
+	}
+	if existing, ok := rw.outbound[name]; ok && existing != "" {
+		return existing
+	}
+	rw.outbound[name] = shortened
+	rw.inbound[shortened] = name
+	return shortened
+}
+
+// restore 把上游响应里的缩短名还原为客户端原始名；未知名字原样返回。
+func (rw *responsesNameRewrites) restore(name string) string {
+	if rw == nil {
+		return name
+	}
+	if original, ok := rw.inbound[name]; ok {
+		return original
+	}
+	return name
+}
+
+// shortenResponsesBodyNames 统一处理请求体中所有会出现 name 的位置：
+// tools[].name、tools[].function.name、tool_choice.name、input[].name
+// （function_call / custom_tool_call 等历史工具调用项）。返回是否发生改动。
+func (rw *responsesNameRewrites) shortenResponsesBodyNames(body map[string]any) bool {
+	changed := false
+	if tools, ok := body["tools"].([]any); ok {
+		for i, t := range tools {
+			tm, ok := t.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, ok := tm["name"].(string); ok && name != "" {
+				if shortened := rw.shortenRecord(name); shortened != name {
+					tm["name"] = shortened
+					tools[i] = tm
+					changed = true
+				}
+			}
+			if fn, ok := tm["function"].(map[string]any); ok {
+				if name, ok := fn["name"].(string); ok && name != "" {
+					if shortened := rw.shortenRecord(name); shortened != name {
+						fn["name"] = shortened
+						tm["function"] = fn
+						tools[i] = tm
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	if tc, ok := body["tool_choice"]; ok {
+		switch v := tc.(type) {
+		case map[string]any:
+			if name, ok := v["name"].(string); ok && name != "" {
+				if shortened := rw.shortenRecord(name); shortened != name {
+					v["name"] = shortened
+					body["tool_choice"] = v
+					changed = true
+				}
+			}
+			if fn, ok := v["function"].(map[string]any); ok {
+				if name, ok := fn["name"].(string); ok && name != "" {
+					if shortened := rw.shortenRecord(name); shortened != name {
+						fn["name"] = shortened
+						v["function"] = fn
+						body["tool_choice"] = v
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	if input, ok := body["input"].([]any); ok {
+		for i, item := range input {
+			im, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, ok := im["name"].(string); ok && name != "" {
+				if shortened := rw.shortenRecord(name); shortened != name {
+					im["name"] = shortened
+					input[i] = im
+					changed = true
+				}
+			}
+		}
+	}
+	return changed
+}
+
+// restoreResponsesPayloadNames 把上游响应 JSON（单个 output item、completed
+// 事件的 response 对象或整个非流式响应）中出现的缩短名还原为原始名。
+// 只还原 rw.inbound 中登记过的名字，最大限度避免误改用户自然语言文本。
+// 返回是否发生改动。
+func (rw *responsesNameRewrites) restoreResponsesPayloadNames(v any) bool {
+	if rw == nil || len(rw.inbound) == 0 {
+		return false
+	}
+	changed := false
+	switch t := v.(type) {
+	case map[string]any:
+		if name, ok := t["name"].(string); ok && name != "" {
+			if original := rw.restore(name); original != name {
+				t["name"] = original
+				changed = true
+			}
+		}
+		for _, key := range []string{"item", "response", "output", "content"} {
+			if child, ok := t[key]; ok {
+				if rw.restoreResponsesPayloadNames(child) {
+					changed = true
+				}
+			}
+		}
+	case []any:
+		for _, child := range t {
+			if rw.restoreResponsesPayloadNames(child) {
 				changed = true
 			}
 		}
@@ -328,15 +518,19 @@ func shouldProbeNativeResponses(status int, err error) bool {
 // responses 返回 2xx 时才把响应写回客户端并记住该模型；任何失败都返回 false
 // 且不写任何响应，调用方保留原翻译路径的错误原样返回。
 // sanitizeResponsesPassthroughBody 对原生透传体做 lenient 归一化，避免上游
-// 严格校验 400（如 required 缺 key、reasoning.effort 非法），绝不因不支持返回 400。
-// 合法请求归一化后等价（幂等），可安全用于保真透传。
-func sanitizeResponsesPassthroughBody(rawBody []byte, modelID string) []byte {
+// 严格校验 400（如 required 缺 key、reasoning.effort 非法、name 超长），
+// 绝不因不支持返回 400。合法请求归一化后等价（幂等），可安全用于保真透传。
+// 返回归一化后的请求体以及名字缩短映射（用于把上游响应里的缩短名还原回
+// 客户端原始名）。非 muse-spark 模型或无法解析时，rewrites 为空但不返回 nil
+// 指针，调用方恒可用。
+func sanitizeResponsesPassthroughBody(rawBody []byte, modelID string) ([]byte, *responsesNameRewrites) {
+	rewrites := newResponsesNameRewrites()
 	if !isMuseSparkModel(modelID) {
-		return rawBody
+		return rawBody, rewrites
 	}
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
-		return rawBody
+		return rawBody, rewrites
 	}
 	changed := false
 	if tools, ok := body["tools"].([]any); ok {
@@ -384,17 +578,20 @@ func sanitizeResponsesPassthroughBody(rawBody []byte, modelID string) []byte {
 			}
 		}
 	}
+	if rwChanged := rewrites.shortenResponsesBodyNames(body); rwChanged {
+		changed = true
+	}
 	if !changed {
-		return rawBody
+		return rawBody, rewrites
 	}
 	if b, err := json.Marshal(body); err == nil {
-		return b
+		return b, rewrites
 	}
-	return rawBody
+	return rawBody, rewrites
 }
 
 func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool, req ResponsesAPIRequest) bool {
-	rawBody = sanitizeResponsesPassthroughBody(rawBody, modelID)
+	rawBody, rewrites := sanitizeResponsesPassthroughBody(rawBody, modelID)
 	rc, status, header, err := callOpenCodeEndpoint(ctx, "responses", rawBody, modelID, auth)
 	if err != nil || status < 200 || status >= 300 {
 		if rc != nil {
@@ -407,7 +604,7 @@ func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth Upstr
 	rememberNativeResponsesModel(modelID)
 	reqLogger(ctx).Info("responses_probe_succeeded", "model", modelID, "stream", stream)
 
-	relayResponsesToClient(ctx, w, rc, status, header, modelID, stream, req)
+	relayResponsesToClient(ctx, w, rc, status, header, modelID, stream, req, rewrites)
 	return true
 }
 
@@ -415,7 +612,7 @@ func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth Upstr
 // 2xx、4xx 还是 5xx，均保真透传状态码与错误信息（符合标准代理语义）。仅在
 // 真正的传输层错误（无法拿到上游响应）时返回 false，调用方兜底写 502。
 func forwardNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool, req ResponsesAPIRequest) bool {
-	rawBody = sanitizeResponsesPassthroughBody(rawBody, modelID)
+	rawBody, rewrites := sanitizeResponsesPassthroughBody(rawBody, modelID)
 	rc, status, header, err := callOpenCodeEndpoint(ctx, "responses", rawBody, modelID, auth)
 	if err != nil {
 		markNativeResponsesFailure(modelID)
@@ -427,7 +624,7 @@ func forwardNativeResponses(ctx context.Context, w http.ResponseWriter, auth Ups
 		markNativeResponsesFailure(modelID)
 	}
 
-	relayResponsesToClient(ctx, w, rc, status, header, modelID, stream, req)
+	relayResponsesToClient(ctx, w, rc, status, header, modelID, stream, req, rewrites)
 	return true
 }
 
@@ -441,14 +638,14 @@ func passthroughNativeResponses(ctx context.Context, w http.ResponseWriter, auth
 
 // relayResponsesToClient 统一负责流式与非流式的保真透传：过滤后的安全响应头、
 // 流式实时 Flush、流/非流双路 Token 统计、成功响应的会话状态保存。
-func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, header http.Header, modelID string, stream bool, req ResponsesAPIRequest) {
+func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, header http.Header, modelID string, stream bool, req ResponsesAPIRequest, rewrites *responsesNameRewrites) {
 	// 拷贝上游安全响应头（X-RateLimit-* 等），客户端可见剩余额度与重置时间。
 	for k, v := range filterResponseHeaders(header) {
 		w.Header()[k] = v
 	}
 
 	if stream && status >= 200 && status < 300 {
-		relayResponsesStream(ctx, w, rc, status, modelID, req)
+		relayResponsesStream(ctx, w, rc, status, modelID, req, rewrites)
 		return
 	}
 
@@ -465,11 +662,18 @@ func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Re
 	if status >= 200 && status < 300 && isMuseSparkModel(modelID) {
 		var tmp map[string]any
 		if json.Unmarshal(respBody, &tmp) == nil {
+			changed := false
 			if output, ok := tmp["output"].([]any); ok {
 				if normalizeResponseOutputArguments(output) {
-					if nb, merr := json.Marshal(tmp); merr == nil {
-						respBody = nb
-					}
+					changed = true
+				}
+			}
+			if rewrites.restoreResponsesPayloadNames(tmp) {
+				changed = true
+			}
+			if changed {
+				if nb, merr := json.Marshal(tmp); merr == nil {
+					respBody = nb
 				}
 			}
 		}
@@ -496,7 +700,7 @@ func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Re
 // relayResponsesStream 逐行透传 SSE 并在每个事件行后 Flush，保证打字机效果；
 // 同时从 response.completed / usage 事件中提取 usage 做 Token 统计，并保存
 // 完整响应对象以维持 previous_response_id 会话链条。
-func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, modelID string, req ResponsesAPIRequest) {
+func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, modelID string, req ResponsesAPIRequest, rewrites *responsesNameRewrites) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -524,10 +728,11 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			outLine := line
-			// 流式参数归一化（仅 muse-spark）：只处理 arguments 增量与 completed，
-			// output_text 等文本增量绝不动（避免改写 echo 1.0 等可见输出）。
+			// 流式参数归一化 + 超长 name 还原（仅 muse-spark）：只处理 arguments
+			// 增量与 completed，output_text 等文本增量绝不动（避免改写 echo 1.0
+			// 等可见输出）；仅 rw.inbound 中登记的缩短名会被还原，不会误伤普通文本。
 			if isMuseSparkModel(modelID) {
-				if normalized, ok := normalizeResponsesStreamLine(line, argStates, argItemToOutput); ok {
+				if normalized, ok := normalizeResponsesStreamLine(line, argStates, argItemToOutput, rewrites); ok {
 					outLine = normalized
 				}
 			}
@@ -589,7 +794,7 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 
 // normalizeResponsesStreamLine 归一化单行 SSE data 事件中的 function_call 参数，
 // 返回归一化后的完整行与是否改动。output_text 类文本增量永不动。
-func normalizeResponsesStreamLine(line []byte, argStates map[int]*argsNormState, argItemToOutput map[string]int) ([]byte, bool) {
+func normalizeResponsesStreamLine(line []byte, argStates map[int]*argsNormState, argItemToOutput map[string]int, rewrites *responsesNameRewrites) ([]byte, bool) {
 	if !bytes.HasPrefix(line, []byte("data:")) && !bytes.HasPrefix(line, []byte("data: ")) {
 		return nil, false
 	}
@@ -682,6 +887,9 @@ func normalizeResponsesStreamLine(line []byte, argStates map[int]*argsNormState,
 				changed = true
 			}
 		}
+	}
+	if rewrites.restoreResponsesPayloadNames(evt) {
+		changed = true
 	}
 	if !changed {
 		return nil, false

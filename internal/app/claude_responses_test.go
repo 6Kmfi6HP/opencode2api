@@ -535,7 +535,8 @@ func TestSanitizeResponsesPassthroughBody_FixesRequiredAndEffort(t *testing.T) {
 			{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}
 		]
 	}`
-	fixed := sanitizeResponsesPassthroughBody([]byte(raw), "muse-spark-1.3-contributor")
+	fixed, nameRewrites := sanitizeResponsesPassthroughBody([]byte(raw), "muse-spark-1.3-contributor")
+	_ = nameRewrites // 本用例不校验映射
 	var body map[string]any
 	if err := json.Unmarshal(fixed, &body); err != nil {
 		t.Fatalf("fixed body is not JSON: %v", err)
@@ -615,7 +616,7 @@ func TestNormalizeResponsesStreamLine_DeltaAndCompleted(t *testing.T) {
 	mapping := map[string]int{}
 	// output_item.added 登记映射
 	added := []byte("data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n")
-	if _, ok := normalizeResponsesStreamLine(added, states, mapping); ok {
+	if _, ok := normalizeResponsesStreamLine(added, states, mapping, nil); ok {
 		t.Fatal("added should not rewrite")
 	}
 	// arguments delta 被归一化
@@ -625,12 +626,12 @@ func TestNormalizeResponsesStreamLine_DeltaAndCompleted(t *testing.T) {
 	_ = delta
 	// output_text delta 永不动
 	textLine := []byte("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"echo 1.0\"}\n")
-	if _, ok := normalizeResponsesStreamLine(textLine, states, mapping); ok {
+	if _, ok := normalizeResponsesStreamLine(textLine, states, mapping, nil); ok {
 		t.Fatal("output_text delta must not be rewritten")
 	}
 	// completed 全量 arguments 被归一化
 	completed := []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"x\",\"arguments\":\"{\\\"n\\\":1000.0}\"}]}}\n")
-	norm, ok := normalizeResponsesStreamLine(completed, states, mapping)
+	norm, ok := normalizeResponsesStreamLine(completed, states, mapping, nil)
 	if !ok {
 		t.Fatal("completed should be rewritten")
 	}
@@ -641,7 +642,7 @@ func TestNormalizeResponsesStreamLine_DeltaAndCompleted(t *testing.T) {
 
 func TestSanitizeResponsesPassthroughBody_NonMuseSparkUnchanged(t *testing.T) {
 	raw := `{"model":"gpt-5","input":"hi","reasoning":{"effort":"max"},"tools":[{"type":"function","name":"x","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}]}`
-	fixed := sanitizeResponsesPassthroughBody([]byte(raw), "gpt-5")
+	fixed, _ := sanitizeResponsesPassthroughBody([]byte(raw), "gpt-5")
 	if string(fixed) != raw {
 		t.Fatalf("non muse-spark must pass through unchanged, got %s", string(fixed))
 	}
