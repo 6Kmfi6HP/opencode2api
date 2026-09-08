@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.10.2
+
+- Session-aware launch stub and upstream routing:
+  - Preserve downstream client session identity for Claude Code (`X-Claude-Code-Session-Id`) and Codex (`Thread-Id` / `Session-Id`) headers.
+  - Hash client session IDs for local sticky-routing keys and logs instead of echoing them verbatim.
+  - Keep local sticky entries for downstream OpenCode sessions even when only one upstream domain is configured, so retries can rebind without losing the client session.
+  - Propagate `x-opencode-session` downstream values to upstream OpenCode calls; generate a session fallback only when neither the client nor launch session supplies one.
+  - Reset the sticky rebind sequence whenever the configured upstream base URL list changes.
+
 ## v0.10.1
 
 - Fix `muse-spark-*` `/v1/responses` 400 `name` must be at most 64 characters for over-64-character connector/tool names sent by Codex:

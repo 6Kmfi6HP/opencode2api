@@ -103,14 +103,20 @@ func Run() {
 	}
 }
 
+func sessionContextMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		next(w, withSessionFromRequest(r))
+	}
+}
+
 // buildMux constructs the HTTP mux with all route registrations.
 func buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", loggingMiddleware(chatCompletionsHandler))
-	mux.HandleFunc("/v1/responses", loggingMiddleware(responsesHandler))
-	mux.HandleFunc("/v1/messages", loggingMiddleware(claudeMessagesHandler))
-	mux.HandleFunc("/v1/messages/count_tokens", loggingMiddleware(claudeCountTokensHandler))
-	mux.HandleFunc("/v1/models", loggingMiddleware(listModelsHandler))
+	mux.HandleFunc("/v1/chat/completions", sessionContextMiddleware(loggingMiddleware(chatCompletionsHandler)))
+	mux.HandleFunc("/v1/responses", sessionContextMiddleware(loggingMiddleware(responsesHandler)))
+	mux.HandleFunc("/v1/messages", sessionContextMiddleware(loggingMiddleware(claudeMessagesHandler)))
+	mux.HandleFunc("/v1/messages/count_tokens", sessionContextMiddleware(loggingMiddleware(claudeCountTokensHandler)))
+	mux.HandleFunc("/v1/models", sessionContextMiddleware(loggingMiddleware(listModelsHandler)))
 	mux.HandleFunc("/login", loggingMiddleware(loginHandler))
 	mux.HandleFunc("/logout", loggingMiddleware(logoutHandler))
 	mux.HandleFunc("/api/config", loggingMiddleware(requireAuth(adminConfigHandler)))

@@ -366,6 +366,7 @@ func setUpstreamBaseURLs(raw []string) {
 	if changed {
 		stickyMu.Lock()
 		stickyEntries = map[string]*stickyProxyEntry{}
+		stickyRebindSeq = 0
 		stickyMu.Unlock()
 	}
 }

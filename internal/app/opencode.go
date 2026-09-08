@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,55 @@ func randomHex(n int) string {
 }
 
 // ======================== OpenCode 会话 ========================
+
+const (
+	headerOpencodeSession = "x-opencode-session"
+)
+
+type opencodeSessionContextKey struct{}
+
+type opencodeUpstreamHeadersContextKey struct{}
+
+func sessionFromRequestContext(ctx context.Context, fallback string) string {
+	if ctx == nil {
+		return fallback
+	}
+	if session, ok := ctx.Value(opencodeSessionContextKey{}).(string); ok && strings.TrimSpace(session) != "" {
+		return strings.TrimSpace(session)
+	}
+	return fallback
+}
+
+func withSessionFromRequest(r *http.Request) *http.Request {
+	headers := r.Header.Clone()
+	session := strings.TrimSpace(headers.Get(headerOpencodeSession))
+	ctx := context.WithValue(r.Context(), opencodeUpstreamHeadersContextKey{}, headers)
+	if session == "" {
+		return r.WithContext(ctx)
+	}
+	return r.WithContext(context.WithValue(ctx, opencodeSessionContextKey{}, session))
+}
+
+func upstreamHeadersFromContext(ctx context.Context) http.Header {
+	if ctx == nil {
+		return nil
+	}
+	headers, _ := ctx.Value(opencodeUpstreamHeadersContextKey{}).(http.Header)
+	return headers
+}
+
+// normalizedTransportScope derives the routing scope for sticky upstream
+// selection. The scope is intentionally opaque and hashed below: the downstream
+// client's own x-opencode-session may contain identity-ish data and must not
+// be used verbatim as a local log/routing key.
+func normalizedTransportScope(session string) string {
+	session = strings.TrimSpace(session)
+	if session == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(session))
+	return fmt.Sprintf("%x", sum[:8])
+}
 
 var (
 	ocSessionID  string
@@ -94,7 +144,14 @@ var (
 func fetchModels() ([]ModelInfo, error) {
 	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
-	req.Header.Set("x-opencode-session", ocSessionID)
+	session := sessionFromRequestContext(nil, ocSessionID)
+	if strings.TrimSpace(session) == "" {
+		session = ocSessionID
+	}
+	if strings.TrimSpace(session) == "" {
+		session = "ses_" + randomString(24)
+	}
+	req.Header.Set("x-opencode-session", strings.TrimSpace(session))
 	resp, err := getHTTPClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -120,7 +177,14 @@ func fetchModels() ([]ModelInfo, error) {
 func fetchGoModels() ([]ModelInfo, error) {
 	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/go/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
-	req.Header.Set("x-opencode-session", ocSessionID)
+	session := sessionFromRequestContext(nil, ocSessionID)
+	if strings.TrimSpace(session) == "" {
+		session = ocSessionID
+	}
+	if strings.TrimSpace(session) == "" {
+		session = "ses_" + randomString(24)
+	}
+	req.Header.Set("x-opencode-session", strings.TrimSpace(session))
 	resp, err := getHTTPClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -262,15 +326,15 @@ func startModelRefresh() {
 // left untouched.
 
 func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (*http.Request, error) {
-	baseURL, _ := selectUpstreamTarget(auth, bodyMap)
-	return buildOCRequestWithEndpoint(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID), baseURL)
+	baseURL, _ := selectUpstreamTarget(auth, bodyMap, nil, ocSessionID)
+	return buildOCRequestWithSubpath(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID), baseURL, "chat/completions", ocSessionID)
 }
 
 func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string) (*http.Request, error) {
-	return buildOCRequestWithSubpath(modelID, bodyMap, auth, useGoEndpoint, baseURL, "chat/completions")
+	return buildOCRequestWithSubpath(modelID, bodyMap, auth, useGoEndpoint, baseURL, "chat/completions", ocSessionID)
 }
 
-func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string, subpath string) (*http.Request, error) {
+func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string, subpath string, ocSession string) (*http.Request, error) {
 	bodyMap["model"] = modelID
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
@@ -291,7 +355,14 @@ func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth Upst
 	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s", ocClientVer))
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-project", ocProjectID)
-	req.Header.Set("x-opencode-session", ocSessionID)
+	session := sessionFromRequestContext(nil, ocSessionID)
+	if strings.TrimSpace(session) == "" {
+		session = ocSessionID
+	}
+	if strings.TrimSpace(session) == "" {
+		session = "ses_" + randomString(24)
+	}
+	req.Header.Set("x-opencode-session", strings.TrimSpace(session))
 	req.Header.Set("x-opencode-request", "req_"+randomString(24))
 	req.Header.Set("Accept", "application/json")
 	return req, nil
@@ -351,9 +422,11 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		baseURL, client := selectUpstreamTarget(auth, bodyMap)
+		ocSession := sessionFromRequestContext(ctx, ocSessionID)
+		upstreamHeaders := upstreamHeadersFromContext(ctx)
+		baseURL, client := selectUpstreamTarget(auth, bodyMap, upstreamHeaders, normalizedTransportScope(ocSession))
 		lastBaseURL = baseURL
-		up, err := buildOCRequestWithSubpath(modelID, bodyMap, auth, useGoEndpoint, baseURL, endpointSubpath)
+		up, err := buildOCRequestWithSubpath(modelID, bodyMap, auth, useGoEndpoint, baseURL, endpointSubpath, ocSession)
 		if err != nil {
 			return nil, 500, nil, err
 		}
@@ -381,7 +454,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 			)
 			if canRetry {
 				client.CloseIdleConnections()
-				invalidateUpstreamTarget(auth, bodyMap)
+				invalidateUpstreamTarget(auth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, ocSessionID))
 				retryCount++
 				continue
 			}
@@ -435,7 +508,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		}
 		// 免费层 429 按出口 IP 限流,5xx 也可能是出口问题:
 		// 重试前切断 sticky,让同一会话换到下一个出口。
-		invalidateUpstreamTarget(auth, bodyMap)
+		invalidateUpstreamTarget(auth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, ocSessionID))
 		client.CloseIdleConnections()
 		retryCount++
 	}

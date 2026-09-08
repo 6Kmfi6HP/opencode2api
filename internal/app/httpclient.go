@@ -2,11 +2,13 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -232,23 +234,83 @@ const (
 	stickyEntryTTL       = 15 * time.Minute
 	stickyMaxEntries     = 256
 	stickyPublicFallback = "cli://public-shared" // 无会话标识的 public 请求共用同一出口
+
+	headerClaudeSession   = "X-Claude-Code-Session-Id"
+	headerClaudeAgent     = "X-Claude-Code-Agent-Id"
+	headerClaudeParent    = "X-Claude-Code-Parent-Agent-Id"
+	headerCodexSession1   = "Session-Id"
+	headerCodexSession2   = "Session_id"
+	headerCodexThread1    = "Thread-Id"
+	headerCodexThread2    = "Thread_id"
+	headerCodexTurnMeta   = "X-Codex-Turn-Metadata"
+	headerCodexParentTID  = "X-Codex-Parent-Thread-Id"
+	headerCodexParentTID2 = "x-codex-parent-thread-id"
 )
+
+// sessionHeaderValue returns the first non-empty session header value, matching
+// header names case-insensitively.
+func sessionHeaderValue(headers http.Header, name string) string {
+	if headers == nil {
+		return ""
+	}
+	if value := strings.TrimSpace(headers.Get(name)); value != "" {
+		return value
+	}
+	for key, values := range headers {
+		if strings.EqualFold(key, name) {
+			for _, raw := range values {
+				if value := strings.TrimSpace(raw); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// hashSessionRouteKey is the routing-only view of a session identity. The
+// downstream may send session IDs that embed account-ish data; local sticky
+// keys and logs should never echo it verbatim.
+func hashSessionRouteKey(session string) string {
+	session = strings.TrimSpace(session)
+	if session == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(session))
+	return fmt.Sprintf("%x", sum[:8])
+}
 
 // stickyRebindSeq 每次重新绑定递增,参与哈希,保证同一会话在绑定被切断
 // (上游 429/5xx/连接错误)后重新分配时换到不同出口,而不是永远钉死
 // 在同一个确定性哈希结果上。
 var stickyRebindSeq uint32
 
-// stickyKeyForRequest 生成会话粘性键。优先级：账号 token > 会话 user
-// （来自 Claude metadata 的 session_id 等）> 公共兜底。
-func stickyKeyForRequest(auth UpstreamAuth, bodyMap map[string]any) string {
+// stickyKeyForRequest 生成会话粘性键。优先级：账号 token > 客户端会话 route
+// scope > 会话 user（Claude metadata 的 session_id 等） > 公共兜底。
+func stickyKeyForRequest(auth UpstreamAuth, bodyMap map[string]any, upstreamHeaders http.Header, ocScope string) string {
+	base := stickyPublicFallback
 	if auth.Token != "" {
-		return "tok:" + auth.Token
+		base = "tok:" + auth.Token
+	} else if u, ok := bodyMap["user"].(string); ok && u != "" {
+		base = "usr:" + u
 	}
-	if u, ok := bodyMap["user"].(string); ok && u != "" {
-		return "usr:" + u
+
+	for _, raw := range []string{
+		hashSessionRouteKey(sessionHeaderValue(upstreamHeaders, headerClaudeSession)),
+		hashSessionRouteKey(sessionHeaderValue(upstreamHeaders, headerCodexThread1)),
+		hashSessionRouteKey(sessionHeaderValue(upstreamHeaders, headerCodexThread2)),
+		hashSessionRouteKey(sessionHeaderValue(upstreamHeaders, headerCodexSession1)),
+		hashSessionRouteKey(sessionHeaderValue(upstreamHeaders, headerCodexSession2)),
+	} {
+		if raw != "" {
+			return base + "|cli:" + raw
+		}
 	}
-	return stickyPublicFallback
+
+	if strings.TrimSpace(ocScope) != "" {
+		return base + "|oc:" + strings.TrimSpace(ocScope)
+	}
+	return base
 }
 
 // buildProxyClient 为指定代理构建带 SOCKS5 dial 的 HTTP 客户端。
@@ -270,10 +332,10 @@ func buildProxyClient(proxy Socks5Proxy) *http.Client {
 //   - paid 直连(socks5_paid_direct=true 且付费层)时 client=httpClient，但域名仍 sticky。
 //
 // 快路径(单域名 + 代理维不需要 sticky 绑定)不产生条目。
-func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any) (string, *http.Client) {
+func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any, upstreamHeaders http.Header, ocScope string) (string, *http.Client) {
 	paidDirect := auth.tier() == TierPaid && getSocks5PaidDirect()
 	sticky := getSocks5Sticky()
-	key := stickyKeyForRequest(auth, bodyMap)
+	key := stickyKeyForRequest(auth, bodyMap, upstreamHeaders, ocScope)
 
 	socks5Mu.RLock()
 	rr := activeSocks5 == socks5RR
@@ -281,8 +343,11 @@ func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any) (string, *h
 	baseURLs := upstreamBaseURLs
 	socks5Mu.RUnlock()
 
-	// 快路径：单域名且代理维也不需要 sticky 绑定。
-	domainSticky := len(baseURLs) > 1
+	// 快路径：单域名且代理维也不需要 sticky 绑定。跟随下游 OpenCode 会话
+	// 时，即使只有一个上游域名也要保留 sticky entry：这样本地重试能基于
+	// 会话 key 改绑，同时把 x-opencode-session 原样交给上游自行做后端亲和。
+	followOCSession := strings.TrimSpace(ocScope) != ""
+	domainSticky := len(baseURLs) > 1 || followOCSession
 	proxySticky := sticky && rr && len(proxies) > 0 && !paidDirect
 	if !domainSticky && !proxySticky {
 		if paidDirect {
@@ -373,8 +438,8 @@ func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nPr
 
 // invalidateUpstreamTarget 在连接失败/上游 429/5xx 时解除会话的 sticky 绑定，
 // 让下一次请求重新分配 (base, 出口)，避免持续使用故障目标。
-func invalidateUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any) {
-	key := stickyKeyForRequest(auth, bodyMap)
+func invalidateUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any, upstreamHeaders http.Header, ocSession string) {
+	key := stickyKeyForRequest(auth, bodyMap, upstreamHeaders, normalizedTransportScope(ocSession))
 	stickyMu.Lock()
 	delete(stickyEntries, key)
 	stickyMu.Unlock()
