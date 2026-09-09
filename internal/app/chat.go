@@ -14,6 +14,7 @@ import (
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/ids"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
 
@@ -462,7 +463,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		"tools_count":          len(req.Tools),
 		"messages_count":       len(req.Messages),
 		"multimodal_parts":     countMultimodalParts(req.Messages),
-		"text_only_model":      config.IsTextOnlyModel(req.Model),
+		"text_only_model":      modelIsTextOnly(req.Model),
 		"max_tokens":           req.MaxTokens,
 		"max_tokens_cap":       config.MaxTokensCapFor(req.Model),
 	})
@@ -904,6 +905,16 @@ const (
 	multimodalDocumentLabel = "[document attached]"
 )
 
+// modelIsTextOnly reports whether the resolved upstream model should receive
+// text-only content. The models.dev catalog data decides for known models
+// (input modalities containing only "text"); the configured text_only_models
+// prefixes act as an explicit manual override on top. Unknown models are not
+// downgraded so the upstream error stays truthful.
+func modelIsTextOnly(model string) bool {
+	return config.IsTextOnlyModel(model) ||
+		modelsdev.IsTextOnly(model, modelsdev.GetCachedModalities())
+}
+
 // countMultimodalParts returns the number of image/document content parts in
 // a request, for observability (request_plan).
 func countMultimodalParts(messages []Message) int {
@@ -999,7 +1010,7 @@ func convertMessagesForUpstream(messages []Message, textOnly bool) []map[string]
 func convertRequest(req *OpenAIRequest) map[string]any {
 	converted := map[string]any{
 		"model":    req.Model,
-		"messages": convertMessagesForUpstream(req.Messages, config.IsTextOnlyModel(req.Model)),
+		"messages": convertMessagesForUpstream(req.Messages, modelIsTextOnly(req.Model)),
 		"stream":   req.Stream,
 	}
 	if req.Temperature != nil {

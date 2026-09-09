@@ -2,10 +2,13 @@ package app
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 )
 
 // ======================== text-only model downgrade ========================
@@ -158,5 +161,80 @@ func TestConvertMessagesForUpstreamTextOnlyKeepsPlainStrings(t *testing.T) {
 	}
 	if got := msgs[1]["content"]; got != "world" {
 		t.Fatalf("plain string content = %#v, want world", got)
+	}
+}
+
+// withTextOnlyState pins both judgment inputs: the configured prefixes and the
+// models.dev modalities the union decision reads.
+func withTextOnlyState(t *testing.T, prefixes []string, mods modelsdev.Modalities) {
+	t.Helper()
+	blockModelsDevTransport(t)
+	old := config.Get()
+	tmpCachePath := filepath.Join(t.TempDir(), "modelsdev_cache.json")
+	modelsdev.SetCachePath(tmpCachePath)
+	os.Remove(tmpCachePath) // drop anything an earlier test fetched into it
+	modelsdev.ClearModalitiesForTest()
+	modelsdev.SetModalitiesForTest(mods)
+	config.Update(func(s *config.Snapshot) { s.TextOnlyModels = prefixes })
+	t.Cleanup(func() {
+		config.Update(func(s *config.Snapshot) { *s = old })
+		modelsdev.ClearModalitiesForTest()
+	})
+}
+
+func TestModelIsTextOnlyDrivenByModelsDevData(t *testing.T) {
+	withTextOnlyState(t, nil, modelsdev.Modalities{
+		"glm-5.2":             {"text"},
+		"deepseek-v4-flash":   {"text"},
+		"deepseek-vision-exp": {"text", "image"},
+		"grok-4.5":            {"text", "image"},
+	})
+
+	if !modelIsTextOnly("glm-5.2") {
+		t.Fatal("glm-5.2 (input=[text]) should be text-only without any configured prefix")
+	}
+	if !modelIsTextOnly("deepseek-v4-flash-free") {
+		t.Fatal("deepseek-v4-flash-free should inherit the base model's text-only data")
+	}
+	if modelIsTextOnly("deepseek-vision-exp") {
+		t.Fatal("vision-capable model must not be treated as text-only")
+	}
+	if modelIsTextOnly("grok-4.5") {
+		t.Fatal("image-capable model must not be treated as text-only")
+	}
+	if modelIsTextOnly("model-unknown-to-catalog") {
+		t.Fatal("unknown models must fail open (not text-only)")
+	}
+}
+
+func TestModelIsTextOnlyConfigPrefixUnion(t *testing.T) {
+	withTextOnlyState(t, []string{"deepseek"}, modelsdev.Modalities{
+		"deepseek-vision-exp": {"text", "image"},
+	})
+
+	if !modelIsTextOnly("deepseek-vision-exp") {
+		t.Fatal("configured prefix must keep its force-downgrade power on top of the data")
+	}
+	if !modelIsTextOnly("deepseek-anything-new") {
+		t.Fatal("configured prefix covers models the catalog does not know")
+	}
+}
+
+func TestBuildUpstreamBodyDowngradesForModelsDevTextOnlyModel(t *testing.T) {
+	withTextOnlyState(t, nil, modelsdev.Modalities{"glm-5.2": {"text"}})
+
+	req := multimodalRequest("glm-5.2")
+	body := buildUpstreamBody(&req)
+	got := contentTypes(contentParts(body))
+	if strings.Join(got, ",") != "text,text,text,text" {
+		t.Fatalf("content types = %v, want all text for a catalog text-only model", got)
+	}
+}
+
+func TestModelIsTextOnlyWithoutAnyCatalogData(t *testing.T) {
+	withTextOnlyState(t, nil, nil)
+
+	if modelIsTextOnly("deepseek-v4-flash-free") {
+		t.Fatal("with no catalog data and no prefixes nothing may be judged text-only")
 	}
 }

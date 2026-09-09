@@ -42,3 +42,50 @@ func TestGetContextWindow(t *testing.T) {
 		}
 	}
 }
+
+func TestIsTextOnly(t *testing.T) {
+	mods := Modalities{
+		"deepseek-v4-flash":      {"text"},
+		"glm-5.3-flash":          {"text", "image", "video", "pdf"},
+		"deepseek-vision-exp":    {"text", "image"},
+		"x-preview-f-free":       {"text"},
+		"explicit-free":          {"text", "image"},
+		"explicit-free-free":     {"text"},
+		"empty-input-considered": {},
+	}
+
+	tests := []struct {
+		modelID string
+		want    bool
+	}{
+		// Exact match.
+		{"deepseek-v4-flash", true},
+		{"glm-5.3-flash", false},
+		{"deepseek-vision-exp", false},
+		// Strip "-free": deepseek-v4-flash-free inherits the base model entry.
+		{"deepseek-v4-flash-free", true},
+		// Add "-free": x-preview-f matches x-preview-f-free.
+		{"x-preview-f", true},
+		// Exact entry wins over the strip-"-free" fallback.
+		{"explicit-free-free", true},
+		{"explicit-free", false},
+		// Unknown / empty data fails open (not text-only).
+		{"unknown-model", false},
+		{"unknown-model-free", false},
+		{"", false},
+		{"empty-input-considered", false},
+	}
+
+	for _, tc := range tests {
+		if got := IsTextOnly(tc.modelID, mods); got != tc.want {
+			t.Errorf("IsTextOnly(%q) = %v, want %v", tc.modelID, got, tc.want)
+		}
+	}
+
+	if IsTextOnly("deepseek-v4-flash", nil) {
+		t.Error("nil modalities should never report text-only")
+	}
+	if IsTextOnly("deepseek-v4-flash", Modalities{"deepseek-v4-flash": {"Text"}}) != true {
+		t.Error("modality matching should be case-insensitive")
+	}
+}

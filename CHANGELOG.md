@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Text-only model detection is now driven by the models.dev catalog `modalities.input` data instead of a hardcoded `deepseek` prefix:
+  - Known models reporting text-only input (e.g. `deepseek-v4-flash(-free)`, `glm-5.2`, `qwen3-coder*`, `grok-code`) now get the same `[image attached]` / `[document attached]` downgrade everywhere (Chat, Responses, Claude).
+  - Multimodal models that used to be falsely caught by the `deepseek` prefix (e.g. `deepseek-v4-flash-vision-exp`) now keep their images.
+  - `text_only_models` is still honored as an explicit case-insensitive prefix override on top of the catalog data; its default is now empty. Unknown models are never downgraded — with no catalog reachable, requests fail open and the upstream error remains truthful.
+
 ## v0.10.3
 
 - Internal refactor (no user-facing behavior change): split the monolithic `internal/app` package into focused subpackages — `internal/config` (immutable config snapshot + accessors), `internal/logging` (logger init, request tracing, stream stats, redaction), `internal/stats` (token/cache usage accounting), `internal/modelsdev` (models.dev catalog fetch/cache with injectable proxy-aware HTTP client), and `internal/util` (shared helpers).

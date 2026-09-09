@@ -924,7 +924,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		"tools_count":             len(chatReq.Tools),
 		"messages_count":          len(chatReq.Messages),
 		"multimodal_parts":        countMultimodalParts(chatReq.Messages),
-		"text_only_model":         config.IsTextOnlyModel(chatReq.Model),
+		"text_only_model":         modelIsTextOnly(chatReq.Model),
 		"system_merged":           systemMerged,
 		"context_management":      claudeReq.ContextManagement != nil,
 		"cache_control_blocks":    countClaudeCacheControlBlocks(claudeReq),

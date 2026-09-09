@@ -18,7 +18,7 @@ func resetModelsDevCacheTestState(t *testing.T) {
 	origTime := memoryTime
 	origURL := catalogURL
 	origPath := cachePath
-	memoryCache = nil
+	memoryCache = cache{}
 	memoryTime = time.Time{}
 	mu.Unlock()
 
@@ -45,7 +45,7 @@ func TestModelsDevColdStartCacheAndDisk(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{
 			"models": {
-				"vendor/model-a": {"id": "vendor/model-a", "limit": {"context": 128000}}
+				"vendor/model-a": {"id": "vendor/model-a", "limit": {"context": 128000}, "modalities": {"input": ["text"]}}
 			}
 		}`))
 	}))
@@ -65,12 +65,22 @@ func TestModelsDevColdStartCacheAndDisk(t *testing.T) {
 	}
 
 	// Verify disk cache file was created and is valid
-	diskCat, _, err := loadDiskCache(cachePath)
+	diskCache, _, err := loadDiskCache(cachePath)
 	if err != nil {
 		t.Fatalf("failed to read written disk cache: %v", err)
 	}
-	if diskCat["model-a"] != 128000 {
-		t.Fatalf("disk cache model-a = %d, want 128000", diskCat["model-a"])
+	if diskCache.catalog["model-a"] != 128000 {
+		t.Fatalf("disk cache model-a = %d, want 128000", diskCache.catalog["model-a"])
+	}
+	if got := diskCache.modalities["model-a"]; len(got) != 1 || got[0] != "text" {
+		t.Fatalf("disk cache model-a modalities = %v, want [text]", got)
+	}
+	mods := GetCachedModalities()
+	if !IsTextOnly("model-a", mods) {
+		t.Fatal("model-a should be text-only from cached modalities")
+	}
+	if IsTextOnly("model-b", mods) {
+		t.Fatal("unknown model-b should not be text-only")
 	}
 
 	// 2. Warm call: In-memory cache hit.
@@ -139,7 +149,7 @@ func TestModelsDevDiskCacheStaleWhileRevalidate(t *testing.T) {
 
 	// Now memory cache should have the new refreshed model
 	mu.RLock()
-	newCat := cloneCatalog(memoryCache)
+	newCat := cloneCatalog(memoryCache.catalog)
 	mu.RUnlock()
 	if newCat["refreshed-model"] != 200000 {
 		t.Fatalf("expected refreshed-model in memory after async update, got %d", newCat["refreshed-model"])
@@ -209,11 +219,11 @@ func TestRefreshModelsDevCatalogBackground(t *testing.T) {
 		t.Fatalf("expected bg-model context 524288, got %d", cat["bg-model"])
 	}
 
-	diskCat, _, err := loadDiskCache(cachePath)
+	diskCache, _, err := loadDiskCache(cachePath)
 	if err != nil {
 		t.Fatalf("loadDiskCache failed: %v", err)
 	}
-	if diskCat["bg-model"] != 524288 {
-		t.Fatalf("diskCache bg-model = %d, want 524288", diskCat["bg-model"])
+	if diskCache.catalog["bg-model"] != 524288 {
+		t.Fatalf("diskCache bg-model = %d, want 524288", diskCache.catalog["bg-model"])
 	}
 }

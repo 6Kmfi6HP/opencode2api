@@ -11,7 +11,10 @@ import (
 )
 
 func TestModelsDevProxyRouting(t *testing.T) {
+	// Full reset before and after: FetchCatalog uses the live client getter,
+	// so it must restore the blocking TestMain transport for later tests.
 	modelsdev.ResetForTest()
+	t.Cleanup(modelsdev.ResetForTest)
 	modelsdev.SetClientGetter(getHTTPClient)
 
 	var proxyHits int32

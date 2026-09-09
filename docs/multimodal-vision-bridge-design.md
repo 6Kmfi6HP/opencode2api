@@ -26,7 +26,7 @@
 | `internal/app/responses.go` | `input_image` 转为内部 `image_url`；`input_file` 转为内部 `file` | 一期应识别转换后的图片；普通 PDF/文件不能直接当图片交给 VLM |
 | `internal/app/claude.go` | Anthropic 的 base64/url 图片转为内部 `image_url`，文档转为 `file` | 三个协议可以共用一个内部图片提取器 |
 | `internal/app/chat.go` | `convertMessagesForUpstream` 对文本模型把 `image_url` 和 `file` 静态替换为 `[image attached]` / `[document attached]` | 桥接成功后应在此之前替换图片；桥接失败时复用这套占位降级 |
-| `internal/app/config.go`、`internal/domain/types.go` | `text_only_models` 是大小写不敏感的前缀匹配，默认值为 `deepseek` | 新配置需要保持同样的运行时重载和前缀语义 |
+| `internal/app/config.go`、`internal/domain/types.go`、 `internal/modelsdev` | `text_only_models` 是大小写不敏感的前缀匹配，默认为空；纯文本判定由 models.dev `modalities.input` 数据驱动（配置前缀作为补充） | 新配置需要保持同样的运行时重载和配合数据判定的 union 语义 |
 | `internal/app/opencode.go` | Zen 使用 `/zen/v1/chat/completions`，Go 使用 `/zen/go/v1/chat/completions`，并复用请求认证和会话头 | 视觉调用应复用已有上游路由、代理和认证策略，不要另造一个固定 URL 客户端 |
 
 当前请求体读取上限为 10 MiB。视觉桥接不能绕过这个上限；新增的图片大小限制应小于或等于请求体上限，并明确 base64 的膨胀比例。

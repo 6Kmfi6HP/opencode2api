@@ -30,7 +30,7 @@ func Default() Snapshot {
 		ReasoningEffortMap:   map[string]string{},
 		PromptCacheRetention: "", // "" -> runtime default "24h"; "off" disables injection
 		CacheBreakpoints:     true,
-		TextOnlyModels:       []string{"deepseek"}, // default: text-only upstreams
+		TextOnlyModels:       []string{}, // models.dev modality data drives the default
 	}
 }
 
@@ -100,11 +100,13 @@ func ReasoningEffortMap() map[string]string {
 	return cp
 }
 
-// IsTextOnlyModel reports whether the resolved upstream model ID only accepts
-// text input. Matching is case-insensitive prefix matching, so one configured
-// prefix covers every variant (e.g. "deepseek" matches both
-// "deepseek-v4-flash" and "deepseek-v4-flash-free"). When a request resolves
-// to a text-only model, multimodal image/document parts are downgraded to text
+// IsTextOnlyModel reports whether the configured text_only_models prefixes
+// mark the resolved upstream model ID as text-only. Matching is
+// case-insensitive prefix matching, so one configured prefix covers every
+// variant (e.g. "deepseek" matches both "deepseek-v4-flash" and
+// "deepseek-v4-flash-free"). This list is a manual escape hatch on top of the
+// models.dev modality data, which drives the default decision. Models judged
+// text-only have their multimodal image/document parts downgraded to text
 // annotations instead of being forwarded upstream.
 func IsTextOnlyModel(modelID string) bool {
 	name := strings.ToLower(strings.TrimSpace(modelID))
