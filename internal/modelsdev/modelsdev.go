@@ -32,11 +32,12 @@ type Catalog map[string]int
 // models.dev catalog reports for it (e.g. ["text"], ["text", "image"]).
 type Modalities map[string][]string
 
-// cache pairs the context-window catalog with input modalities; both come
-// from the same fetch, so they always travel together.
+// cache pairs the context-window catalog with input modalities; all three
+// come from the same fetch, so they always travel together.
 type cache struct {
 	catalog    Catalog
 	modalities Modalities
+	free       map[string]bool
 }
 
 // response is the JSON envelope returned by models.dev.
@@ -49,6 +50,7 @@ type entry struct {
 	ID         string     `json:"id"`
 	Limit      limit      `json:"limit"`
 	Modalities modalities `json:"modalities"`
+	Cost       *cost      `json:"cost"`
 }
 
 type provider struct {
@@ -64,10 +66,24 @@ type modalities struct {
 	Input []string `json:"input"`
 }
 
+// cost mirrors the models.dev cost block. A model is free on the upstream
+// public tier when every numeric cost field is zero.
+type cost struct {
+	Input      float64 `json:"input"`
+	Output     float64 `json:"output"`
+	CacheRead  float64 `json:"cache_read"`
+	CacheWrite float64 `json:"cache_write"`
+}
+
+func (c cost) zero() bool {
+	return c.Input == 0 && c.Output == 0 && c.CacheRead == 0 && c.CacheWrite == 0
+}
+
 type diskCache struct {
-	UpdatedAt  time.Time  `json:"updated_at"`
-	Catalog    Catalog    `json:"catalog"`
-	Modalities Modalities `json:"modalities,omitempty"`
+	UpdatedAt  time.Time       `json:"updated_at"`
+	Catalog    Catalog         `json:"catalog"`
+	Modalities Modalities      `json:"modalities,omitempty"`
+	Free       map[string]bool `json:"free,omitempty"`
 }
 
 var (
@@ -133,6 +149,19 @@ func SetModalitiesForTest(mods Modalities) {
 	memoryTime = time.Now()
 }
 
+// SetFreeModelsForTest injects an in-memory free-model set (with a fresh
+// timestamp) so tests can drive IsFreeModel without touching disk or network.
+func SetFreeModelsForTest(ids ...string) {
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	memoryCache.free = set
+	memoryTime = time.Now()
+}
+
 // ClearModalitiesForTest drops only the in-memory catalog/modalities state,
 // leaving the injected client getter and URL untouched.
 func ClearModalitiesForTest() {
@@ -164,8 +193,19 @@ func cloneModalities(src Modalities) Modalities {
 	return dst
 }
 
+func cloneFreeSet(src map[string]bool) map[string]bool {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]bool, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
 func cloneCache(src cache) cache {
-	return cache{catalog: cloneCatalog(src.catalog), modalities: cloneModalities(src.modalities)}
+	return cache{catalog: cloneCatalog(src.catalog), modalities: cloneModalities(src.modalities), free: cloneFreeSet(src.free)}
 }
 
 func loadDiskCache(path string) (cache, time.Time, error) {
@@ -177,12 +217,15 @@ func loadDiskCache(path string) (cache, time.Time, error) {
 	if err := json.Unmarshal(data, &dc); err != nil {
 		return cache{}, time.Time{}, err
 	}
-	c := cache{catalog: dc.Catalog, modalities: dc.Modalities}
+	c := cache{catalog: dc.Catalog, modalities: dc.Modalities, free: dc.Free}
 	if c.catalog == nil {
 		c.catalog = Catalog{}
 	}
 	if c.modalities == nil {
 		c.modalities = Modalities{}
+	}
+	if c.free == nil {
+		c.free = map[string]bool{}
 	}
 	return c, dc.UpdatedAt, nil
 }
@@ -191,7 +234,7 @@ func saveDiskCache(path string, c cache) error {
 	if path == "" {
 		return fmt.Errorf("empty cache path")
 	}
-	dc := diskCache{UpdatedAt: time.Now(), Catalog: c.catalog, Modalities: c.modalities}
+	dc := diskCache{UpdatedAt: time.Now(), Catalog: c.catalog, Modalities: c.modalities, Free: c.free}
 	data, err := json.MarshalIndent(dc, "", "  ")
 	if err != nil {
 		return err
@@ -206,7 +249,7 @@ func saveDiskCache(path string, c cache) error {
 
 // fetchCatalog downloads the models.dev catalog and builds a map from
 // OpenCode-style model IDs to their context window sizes, plus the reported
-// input modalities per model.
+// input modalities and the set of zero-cost (free-tier) models per model.
 func fetchCatalog() (cache, error) {
 	mu.RLock()
 	url := catalogURL + fmt.Sprintf("?v=%d", time.Now().UnixNano())
@@ -240,6 +283,7 @@ func fetchCatalog() (cache, error) {
 	c := cache{
 		catalog:    make(Catalog, len(parsed.Models)),
 		modalities: make(Modalities, len(parsed.Models)),
+		free:       make(map[string]bool),
 	}
 
 	for id, e := range parsed.Models {
@@ -254,13 +298,19 @@ func fetchCatalog() (cache, error) {
 			c.modalities[short] = append([]string(nil), e.Modalities.Input...)
 		}
 	}
-	for _, prov := range parsed.Providers {
+	for provName, prov := range parsed.Providers {
 		for id, e := range prov.Models {
 			if e.Limit.Context > 0 {
 				c.catalog[id] = e.Limit.Context
 			}
 			if len(e.Modalities.Input) > 0 {
 				c.modalities[id] = append([]string(nil), e.Modalities.Input...)
+			}
+			// Only the opencode provider's cost reflects upstream free-tier
+			// availability: other providers may ship the same model ID with
+			// promotional pricing, which must not mark it free here.
+			if provName == "opencode" && e.Cost != nil && e.Cost.zero() {
+				c.free[id] = true
 			}
 		}
 	}
@@ -300,13 +350,15 @@ func getCached() cache {
 	path := cachePath
 	mu.RUnlock()
 
-	if len(memCache.catalog)+len(memCache.modalities) > 0 && time.Since(memTime) < memoryTTL {
+	if len(memCache.catalog)+len(memCache.modalities)+len(memCache.free) > 0 && time.Since(memTime) < memoryTTL {
 		return memCache
 	}
 
 	diskCache, diskTime, diskErr := loadDiskCache(path)
-	// Treat the disk entry as fresh when it carries any usable payload.
-	if diskErr == nil && (len(diskCache.catalog) > 0 || len(diskCache.modalities) > 0) {
+	// Treat the disk entry as fresh when it carries any usable payload. The
+	// "free" set may be empty when upgrading from an older schema; IsFreeModel
+	// then errs on the paid side until a successful refresh rewrites the file.
+	if diskErr == nil && cacheHasPayload(diskCache) {
 		age := time.Since(diskTime)
 		if age < diskTTL {
 			mu.Lock()
@@ -338,11 +390,11 @@ func getCached() cache {
 		return freshCache
 	}
 
-	if diskErr == nil && (len(diskCache.catalog) > 0 || len(diskCache.modalities) > 0) {
+	if diskErr == nil && cacheHasPayload(diskCache) {
 		slog.Warn("failed to fetch fresh models.dev catalog, falling back to disk cache", "error", fetchErr)
 		return diskCache
 	}
-	if len(memCache.catalog)+len(memCache.modalities) > 0 {
+	if len(memCache.catalog)+len(memCache.modalities)+len(memCache.free) > 0 {
 		slog.Warn("failed to fetch fresh models.dev catalog, falling back to memory cache", "error", fetchErr)
 		return memCache
 	}
@@ -350,6 +402,10 @@ func getCached() cache {
 		slog.Warn("failed to fetch models.dev catalog and no cache available", "error", fetchErr)
 	}
 	return cache{}
+}
+
+func cacheHasPayload(c cache) bool {
+	return len(c.catalog) > 0 || len(c.modalities) > 0 || len(c.free) > 0
 }
 
 // GetCachedCatalog retrieves the catalog from memory, disk, or the network,
@@ -362,6 +418,23 @@ func GetCachedCatalog() Catalog {
 // same memory/disk/network path as GetCachedCatalog.
 func GetCachedModalities() Modalities {
 	return getCached().modalities
+}
+
+// IsFreeModel reports whether the models.dev cost data marks the exact model
+// as zero-cost (upstream free tier). It is intentionally stricter than
+// ContextWindow: strip-"-free" is honored so callers passing a public-facing
+// name still work, but add-"-free" is NOT — a paid model that happens to
+// have a "-free" sibling must not be treated as free itself. Unknown models
+// return false so callers fail closed.
+func IsFreeModel(modelID string) bool {
+	free := getCached().free
+	if free[modelID] {
+		return true
+	}
+	if base := strings.TrimSuffix(modelID, "-free"); base != modelID {
+		return free[base]
+	}
+	return false
 }
 
 // ContextWindow looks up the context window for a model ID in the catalog,

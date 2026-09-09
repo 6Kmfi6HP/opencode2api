@@ -74,3 +74,46 @@ func TestFetchModelsDevCatalogParsing(t *testing.T) {
 		t.Errorf("ContextWindow(x-preview-f) = %d, want 1000000", ctx)
 	}
 }
+
+// TestFetchCatalogFreeModels verifies that the cost parser marks zero-cost
+// catalog entries (e.g. big-pickle, which has no "-free" suffix) as free,
+// while paid and bundled models are left out.
+func TestFetchCatalogFreeModels(t *testing.T) {
+	raw := `{
+  "models": {},
+  "providers": {
+    "opencode": {
+      "id": "opencode",
+      "models": {
+        "big-pickle":       {"id":"big-pickle","limit":{"context":200000},"cost":{"input":0,"output":0,"cache_read":0,"cache_write":0}},
+        "deepseek-v4-flash": {"id":"deepseek-v4-flash","limit":{"context":1000000},"cost":{"input":0.14,"output":0.28}},
+        "no-cost-entry":     {"id":"no-cost-entry","limit":{"context":128000}}
+      }
+    }
+  }
+}`
+
+	var parsed response
+	if err := json.NewDecoder(strings.NewReader(raw)).Decode(&parsed); err != nil {
+		t.Fatalf("failed to parse test JSON: %v", err)
+	}
+
+	free := make(map[string]bool)
+	for _, prov := range parsed.Providers {
+		for id, e := range prov.Models {
+			if e.Cost != nil && e.Cost.zero() {
+				free[id] = true
+			}
+		}
+	}
+
+	if !free["big-pickle"] {
+		t.Error("big-pickle should be marked free (zero cost, no -free suffix)")
+	}
+	if free["deepseek-v4-flash"] {
+		t.Error("deepseek-v4-flash should not be marked free (non-zero cost)")
+	}
+	if free["no-cost-entry"] {
+		t.Error("entry without cost block should not be marked free (zero-value parse traps would mark every unknown model)")
+	}
+}

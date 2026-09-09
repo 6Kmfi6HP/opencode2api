@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 )
 
 // ======================== 管理面板认证 ========================
@@ -186,9 +188,14 @@ func (auth UpstreamAuth) shouldUseGoEndpoint(modelID string) bool {
 	}
 }
 
-// isFreeModel 判断模型是否属于免费模型（以 -free 结尾）
+// isFreeModel 判断模型是否属于免费模型：既包括以 "-free" 结尾的显式免费
+// 变体，也包括 models.dev 目录中全部费用为零的上游免费模型（如 big-pickle）。
 func isFreeModel(modelID string) bool {
-	return strings.HasSuffix(modelID, "-free")
+	base, _ := stripContextSuffix(modelID)
+	if strings.HasSuffix(base, "-free") {
+		return true
+	}
+	return modelsdev.IsFreeModel(base)
 }
 
 // publicFacingModelID strips the upstream "-free" suffix for client-visible catalogs.

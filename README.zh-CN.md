@@ -77,7 +77,7 @@ curl http://127.0.0.1:8000/v1/models
 
 ### 认证模式
 
-- 不带 `Authorization`，或 `Bearer public` → 走 OpenCode public，只可稳定访问 `-free` 结尾的免费 Zen 模型。
+- 不带 `Authorization`，或 `Bearer public` → 走 OpenCode public，只可稳定访问零费用的免费模型（`-free` 结尾的 Zen 免费模型，以及通过 models.dev 目录识别的其他零费用模型，例如 `big-pickle`）。
 - `Bearer <api-key>` → 默认走 Zen；如果请求的是仅存在于 Go 目录中的模型，会自动切到 Go。
 - `Bearer zen:<api-key>` → 强制走 Zen 按量计费目录。
 - `Bearer go:<api-key>` → 优先走 Go 订阅目录；共享模型也会按 Go 路径请求。

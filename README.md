@@ -77,7 +77,7 @@ curl http://127.0.0.1:8000/v1/models
 
 ### Authentication modes
 
-- No `Authorization`, or `Bearer public` → OpenCode public tier; only the `-free` Zen models are reachable.
+- No `Authorization`, or `Bearer public` → OpenCode public tier; only zero-cost models (the `-free` Zen models and other free models such as `big-pickle`, detected via the models.dev catalog) are reachable.
 - `Bearer <api-key>` → defaults to Zen; auto-switches to Go if the requested model only exists in the Go catalog.
 - `Bearer zen:<api-key>` → forces the Zen metered catalog.
 - `Bearer go:<api-key>` → prefers the Go subscription catalog; shared models are also requested via the Go path.
