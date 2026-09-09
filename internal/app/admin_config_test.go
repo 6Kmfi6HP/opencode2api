@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 )
 
 // TestAdminConfigRoundTripFourFields verifies that the four config fields
@@ -16,7 +18,7 @@ import (
 // "save all config" round-trip without being silently wiped.
 func TestAdminConfigRoundTripFourFields(t *testing.T) {
 	// --- save global state ---
-	oldSnap := getConfig()
+	oldSnap := config.Get()
 	configMu.Lock()
 	oldCP := configPath
 	configMu.Unlock()
@@ -24,7 +26,7 @@ func TestAdminConfigRoundTripFourFields(t *testing.T) {
 	oldSticky := socks5Sticky
 	socks5Mu.Unlock()
 	t.Cleanup(func() {
-		configSnapshot.Store(oldSnap)
+		config.Update(func(s *config.Snapshot) { *s = oldSnap })
 		configMu.Lock()
 		configPath = oldCP
 		configMu.Unlock()

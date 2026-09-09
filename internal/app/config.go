@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/domain"
 	"log/slog"
 	"os"
@@ -29,55 +30,6 @@ var (
 	storedResponses   = map[string]StoredResponseState{}
 	storedResponsesMu sync.RWMutex
 )
-
-// ConfigSnapshot is an immutable snapshot of the read-only package config
-// fields. It is exchanged atomically via configSnapshot, so readers never
-// touch the RWMutex-guarded mutable state below.
-type ConfigSnapshot struct {
-	MaxTokensCap         int
-	MaxTokensCapPerModel map[string]int
-	ReasoningEffortMap   map[string]string
-	ForceDisableThinking bool
-	PromptCacheRetention string
-	CacheBreakpoints     bool
-	TextOnlyModels       []string
-}
-
-// configSnapshot holds the current ConfigSnapshot. All reads go through
-// getConfig, which lazily seeds the default snapshot on first use so startup
-// never observes a zero value.
-var configSnapshot atomic.Value
-
-func defaultConfigSnapshot() ConfigSnapshot {
-	return ConfigSnapshot{
-		MaxTokensCapPerModel: map[string]int{},
-		ReasoningEffortMap:   map[string]string{},
-		PromptCacheRetention: "", // "" -> runtime default "24h"; "off" disables injection
-		CacheBreakpoints:     true,
-		TextOnlyModels:       []string{"deepseek"}, // default: text-only upstreams
-	}
-}
-
-// getConfig returns the current immutable config snapshot, seeding the default
-// snapshot on first use.
-func getConfig() ConfigSnapshot {
-	if s, ok := configSnapshot.Load().(ConfigSnapshot); ok {
-		return s
-	}
-	s := defaultConfigSnapshot()
-	configSnapshot.Store(s)
-	return s
-}
-
-// updateConfigSnapshot applies fn to a copy of the current snapshot and stores
-// the result. Test code (the only writer outside applyConfig) uses this to
-// adjust read-only fields without mutating shared maps/slices in place; fn
-// should replace maps/slices rather than mutate their contents.
-func updateConfigSnapshot(fn func(*ConfigSnapshot)) {
-	snap := getConfig()
-	fn(&snap)
-	configSnapshot.Store(snap)
-}
 
 // ======================== 配置管理 ========================
 
@@ -194,15 +146,33 @@ func applyConfig(cfg AppConfig) {
 	// the config omits keep their prior value (matching the previous global
 	// behavior). Maps/slices are deep-copied so callers mutating cfg later
 	// cannot race readers.
-	snap := getConfig()
-	if cfg.ReasoningEffortMap != nil {
-		snap.ReasoningEffortMap = cloneStringMap(cfg.ReasoningEffortMap)
-	}
-	snap.ForceDisableThinking = cfg.ForceDisableThinking
-	snap.MaxTokensCap = cfg.MaxTokensCap
-	if cfg.MaxTokensCapPerModel != nil {
-		snap.MaxTokensCapPerModel = cloneIntMap(cfg.MaxTokensCapPerModel)
-	}
+	config.Update(func(s *config.Snapshot) {
+		if cfg.ReasoningEffortMap != nil {
+			m := make(map[string]string, len(cfg.ReasoningEffortMap))
+			for k, v := range cfg.ReasoningEffortMap {
+				m[k] = v
+			}
+			s.ReasoningEffortMap = m
+		}
+		s.ForceDisableThinking = cfg.ForceDisableThinking
+		s.MaxTokensCap = cfg.MaxTokensCap
+		if cfg.MaxTokensCapPerModel != nil {
+			m := make(map[string]int, len(cfg.MaxTokensCapPerModel))
+			for k, v := range cfg.MaxTokensCapPerModel {
+				m[k] = v
+			}
+			s.MaxTokensCapPerModel = m
+		}
+		if cfg.PromptCacheRetention != "" {
+			s.PromptCacheRetention = cfg.PromptCacheRetention
+		}
+		if cfg.CacheControlBreakpoints != nil {
+			s.CacheBreakpoints = *cfg.CacheControlBreakpoints
+		}
+		if cfg.TextOnlyModels != nil {
+			s.TextOnlyModels = append([]string(nil), cfg.TextOnlyModels...)
+		}
+	})
 
 	socks5Mu.Lock()
 	if cfg.Socks5Proxies != nil {
@@ -228,36 +198,9 @@ func applyConfig(cfg AppConfig) {
 		socks5Sticky = *cfg.Socks5Sticky
 	}
 
-	if cfg.PromptCacheRetention != "" {
-		snap.PromptCacheRetention = cfg.PromptCacheRetention
-	}
-	if cfg.CacheControlBreakpoints != nil {
-		snap.CacheBreakpoints = *cfg.CacheControlBreakpoints
-	}
-	if cfg.TextOnlyModels != nil {
-		snap.TextOnlyModels = append([]string(nil), cfg.TextOnlyModels...)
-	}
 	if cfg.NativeResponsesModels != nil {
 		setNativeResponsesModels(cfg.NativeResponsesModels)
 	}
-
-	configSnapshot.Store(snap)
-}
-
-func cloneStringMap(m map[string]string) map[string]string {
-	cp := make(map[string]string, len(m))
-	for k, v := range m {
-		cp[k] = v
-	}
-	return cp
-}
-
-func cloneIntMap(m map[string]int) map[string]int {
-	cp := make(map[string]int, len(m))
-	for k, v := range m {
-		cp[k] = v
-	}
-	return cp
 }
 
 // stripContextSuffix splits a model ID into its base and context suffix.
@@ -310,10 +253,6 @@ func resolveModelForAuth(auth UpstreamAuth, model string) string {
 	return resolveModel(m)
 }
 
-func getForceDisableThinking() bool {
-	return getConfig().ForceDisableThinking
-}
-
 func getModelKeywordRules() []domain.ModelKeywordRule {
 	configMu.RLock()
 	defer configMu.RUnlock()
@@ -332,61 +271,6 @@ func getModelAliasMap() map[string]string {
 		}
 	}
 	return m
-}
-
-func getReasoningEffortMap() map[string]string {
-	m := getConfig().ReasoningEffortMap
-	cp := make(map[string]string, len(m))
-	for k, v := range m {
-		cp[k] = v
-	}
-	return cp
-}
-
-// getMaxTokensCapForModel returns the effective max_tokens cap for the given
-// model: the per-model value if set, otherwise the global default. A return
-// value of 0 means no cap (max_tokens is forwarded as-is).
-func getMaxTokensCapForModel(model string) int {
-	snap := getConfig()
-	if cap, ok := snap.MaxTokensCapPerModel[model]; ok {
-		return cap
-	}
-	return snap.MaxTokensCap
-}
-
-// getPromptCacheRetention returns the retention value injected into upstream
-// cache requests. "" (unset) yields the runtime default "24h" which pulls the
-// zen gateway's prefix cache TTL from ~5 minutes to a day; "off" disables
-// injection entirely.
-func getPromptCacheRetention() string {
-	if v := getConfig().PromptCacheRetention; v == "" {
-		return "24h"
-	} else {
-		return v
-	}
-}
-
-func getCacheBreakpoints() bool {
-	return getConfig().CacheBreakpoints
-}
-
-// isTextOnlyModel reports whether the resolved upstream model ID only accepts
-// text input. Matching is case-insensitive prefix matching, so one configured
-// prefix covers every variant (e.g. "deepseek" matches both
-// "deepseek-v4-flash" and "deepseek-v4-flash-free"). When a request resolves
-// to a text-only model, multimodal image/document parts are downgraded to text
-// annotations instead of being forwarded upstream.
-func isTextOnlyModel(modelID string) bool {
-	name := strings.ToLower(strings.TrimSpace(modelID))
-	if name == "" {
-		return false
-	}
-	for _, prefix := range getConfig().TextOnlyModels {
-		if strings.HasPrefix(name, strings.ToLower(strings.TrimSpace(prefix))) {
-			return true
-		}
-	}
-	return false
 }
 
 // rejectsCacheControl reports whether a resolved upstream model is known to

@@ -4,42 +4,44 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 )
 
 // ======================== text-only model downgrade ========================
 
 func TestIsTextOnlyModelDefaultMatchesDeepseek(t *testing.T) {
-	old := getConfig()
-	defer func() { configSnapshot.Store(old) }()
-	updateConfigSnapshot(func(s *ConfigSnapshot) { s.TextOnlyModels = []string{"deepseek"} })
+	old := config.Get()
+	defer func() { config.Update(func(s *config.Snapshot) { *s = old }) }()
+	config.Update(func(s *config.Snapshot) { s.TextOnlyModels = []string{"deepseek"} })
 
-	if !isTextOnlyModel("deepseek-v4-flash") {
+	if !config.IsTextOnlyModel("deepseek-v4-flash") {
 		t.Fatal("deepseek-v4-flash should be text-only")
 	}
-	if !isTextOnlyModel("deepseek-v4-flash-free") {
+	if !config.IsTextOnlyModel("deepseek-v4-flash-free") {
 		t.Fatal("deepseek-v4-flash-free should be text-only")
 	}
-	if !isTextOnlyModel("DEEPSEEK-v4-flash") {
+	if !config.IsTextOnlyModel("DEEPSEEK-v4-flash") {
 		t.Fatal("matching should be case-insensitive")
 	}
-	if isTextOnlyModel("gpt-5.5") {
+	if config.IsTextOnlyModel("gpt-5.5") {
 		t.Fatal("gpt-5.5 should not be text-only")
 	}
-	if isTextOnlyModel("") {
+	if config.IsTextOnlyModel("") {
 		t.Fatal("empty model should not be text-only")
 	}
 }
 
 func TestIsTextOnlyModelConfigOverride(t *testing.T) {
-	old := getConfig()
-	defer func() { configSnapshot.Store(old) }()
+	old := config.Get()
+	defer func() { config.Update(func(s *config.Snapshot) { *s = old }) }()
 	// An explicit config replaces the default list.
-	updateConfigSnapshot(func(s *ConfigSnapshot) { s.TextOnlyModels = []string{"gpt"} })
+	config.Update(func(s *config.Snapshot) { s.TextOnlyModels = []string{"gpt"} })
 
-	if isTextOnlyModel("deepseek-v4-flash") {
+	if config.IsTextOnlyModel("deepseek-v4-flash") {
 		t.Fatal("config override should drop the deepseek default")
 	}
-	if !isTextOnlyModel("gpt-5.5") {
+	if !config.IsTextOnlyModel("gpt-5.5") {
 		t.Fatal("configured prefix gpt should match gpt-5.5")
 	}
 }
@@ -97,9 +99,9 @@ func contentTypes(parts []any) []string {
 }
 
 func TestBuildUpstreamBodyDowngradesMultimodalForTextOnlyModel(t *testing.T) {
-	old := getConfig()
-	defer func() { configSnapshot.Store(old) }()
-	updateConfigSnapshot(func(s *ConfigSnapshot) { s.TextOnlyModels = []string{"deepseek"} })
+	old := config.Get()
+	defer func() { config.Update(func(s *config.Snapshot) { *s = old }) }()
+	config.Update(func(s *config.Snapshot) { s.TextOnlyModels = []string{"deepseek"} })
 
 	req := multimodalRequest("deepseek-v4-flash-free")
 	body := buildUpstreamBody(&req)
@@ -122,9 +124,9 @@ func TestBuildUpstreamBodyDowngradesMultimodalForTextOnlyModel(t *testing.T) {
 }
 
 func TestBuildUpstreamBodyPreservesMultimodalForVisionModel(t *testing.T) {
-	old := getConfig()
-	defer func() { configSnapshot.Store(old) }()
-	updateConfigSnapshot(func(s *ConfigSnapshot) { s.TextOnlyModels = []string{"deepseek"} })
+	old := config.Get()
+	defer func() { config.Update(func(s *config.Snapshot) { *s = old }) }()
+	config.Update(func(s *config.Snapshot) { s.TextOnlyModels = []string{"deepseek"} })
 
 	req := multimodalRequest("gpt-5.5")
 	body := buildUpstreamBody(&req)
@@ -135,9 +137,9 @@ func TestBuildUpstreamBodyPreservesMultimodalForVisionModel(t *testing.T) {
 }
 
 func TestConvertMessagesForUpstreamTextOnlyKeepsPlainStrings(t *testing.T) {
-	old := getConfig()
-	defer func() { configSnapshot.Store(old) }()
-	updateConfigSnapshot(func(s *ConfigSnapshot) { s.TextOnlyModels = []string{"deepseek"} })
+	old := config.Get()
+	defer func() { config.Update(func(s *config.Snapshot) { *s = old }) }()
+	config.Update(func(s *config.Snapshot) { s.TextOnlyModels = []string{"deepseek"} })
 
 	req := OpenAIRequest{
 		Model: "deepseek-v4-flash",

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
@@ -1147,13 +1148,13 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		chatReq.ExtraBody["stream_options"] = streamOptions
 	}
 	// 将 Responses API reasoning.effort 映射到 Chat Completions
-	if !getForceDisableThinking() && respReq.Reasoning.Effort != "" {
+	if !config.ForceDisableThinking() && respReq.Reasoning.Effort != "" {
 		if respReq.Reasoning.Effort != "none" {
 			chatReq.ReasoningEffort = respReq.Reasoning.Effort
 		}
 	}
 
-	wantReasoning := !getForceDisableThinking()
+	wantReasoning := !config.ForceDisableThinking()
 	chatReq.Messages = fixToolCallGaps(chatReq.Messages)
 	keepReasoning := wantsReasoning(&chatReq)
 	chatReq.Messages = ensureReasoningContent(chatReq.Messages, keepReasoning)
@@ -1182,9 +1183,9 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		"tools_count":          len(respReq.Tools),
 		"messages_count":       len(chatReq.Messages),
 		"multimodal_parts":     countMultimodalParts(chatReq.Messages),
-		"text_only_model":      isTextOnlyModel(chatReq.Model),
+		"text_only_model":      config.IsTextOnlyModel(chatReq.Model),
 		"max_tokens":           chatReq.MaxTokens,
-		"max_tokens_cap":       getMaxTokensCapForModel(chatReq.Model),
+		"max_tokens_cap":       config.MaxTokensCapFor(chatReq.Model),
 	})
 
 	upstreamBody := buildUpstreamBody(&chatReq)

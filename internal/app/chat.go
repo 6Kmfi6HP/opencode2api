@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/ids"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
@@ -460,9 +461,9 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		"tools_count":          len(req.Tools),
 		"messages_count":       len(req.Messages),
 		"multimodal_parts":     countMultimodalParts(req.Messages),
-		"text_only_model":      isTextOnlyModel(req.Model),
+		"text_only_model":      config.IsTextOnlyModel(req.Model),
 		"max_tokens":           req.MaxTokens,
-		"max_tokens_cap":       getMaxTokensCapForModel(req.Model),
+		"max_tokens_cap":       config.MaxTokensCapFor(req.Model),
 	})
 	upstreamBody := buildUpstreamBody(&req)
 
@@ -812,7 +813,7 @@ func reasoningEffortFromThinking(value any) string {
 }
 
 func wantsReasoning(req *OpenAIRequest) bool {
-	if getForceDisableThinking() {
+	if config.ForceDisableThinking() {
 		return false
 	}
 	if isThinkingDisabled(req.Thinking) {
@@ -997,7 +998,7 @@ func convertMessagesForUpstream(messages []Message, textOnly bool) []map[string]
 func convertRequest(req *OpenAIRequest) map[string]any {
 	converted := map[string]any{
 		"model":    req.Model,
-		"messages": convertMessagesForUpstream(req.Messages, isTextOnlyModel(req.Model)),
+		"messages": convertMessagesForUpstream(req.Messages, config.IsTextOnlyModel(req.Model)),
 		"stream":   req.Stream,
 	}
 	if req.Temperature != nil {
@@ -1005,7 +1006,7 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	}
 	if req.MaxTokens != nil {
 		v := *req.MaxTokens
-		if cap := getMaxTokensCapForModel(req.Model); cap > 0 && v > cap {
+		if cap := config.MaxTokensCapFor(req.Model); cap > 0 && v > cap {
 			v = cap
 		}
 		converted["max_tokens"] = v
@@ -1020,7 +1021,7 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 		converted["tool_choice"] = req.ToolChoice
 	}
 	// 处理思维模式 — 仅当用户显式指定时才发送，避免 MiniMax 等模型报错
-	if getForceDisableThinking() || isThinkingDisabled(req.Thinking) {
+	if config.ForceDisableThinking() || isThinkingDisabled(req.Thinking) {
 		converted["thinking"] = map[string]string{"type": "disabled"}
 	} else if req.Thinking != nil && isThinkingEnabled(req.Thinking) {
 		converted["thinking"] = buildUpstreamThinking(req.Thinking)
@@ -1036,8 +1037,8 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	if effort == "" && !isThinkingDisabled(req.Thinking) {
 		effort = reasoningEffortFromThinking(req.Thinking)
 	}
-	if !getForceDisableThinking() && effort != "" {
-		effortMap := getReasoningEffortMap()
+	if !config.ForceDisableThinking() && effort != "" {
+		effortMap := config.ReasoningEffortMap()
 		if mapped, ok := effortMap[effort]; ok {
 			converted["reasoning_effort"] = mapped
 		} else {
@@ -1055,7 +1056,7 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	// 缓存增强:向 zen 上游显式声明 prompt 前缀缓存的保留时长。
 	// 上游默认约 5 分钟(in_memory),agent 任务间歇易过期,导致缓存难命中;
 	// 注入 retention 后拉长到 24h。客户端显式传入的值(extra_body)优先。
-	if retention := getPromptCacheRetention(); retention != "" && retention != "off" {
+	if retention := config.PromptCacheRetention(); retention != "" && retention != "off" {
 		if _, exists := converted["prompt_cache_retention"]; !exists {
 			converted["prompt_cache_retention"] = retention
 		}
@@ -1063,7 +1064,7 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	// Anthropic 风格 cache_control 断点:对接受该字段的模型(排除 GLM/Zhipu)
 	// 显式标记缓存断点并拉长 TTL。对不支持的上游,zen 网关负责剥离;
 	// DeepSeek 等自动前缀缓存不受影响(实测追加字段后命中率一致)。
-	if getCacheBreakpoints() && !rejectsCacheControl(req.Model) {
+	if config.CacheBreakpoints() && !rejectsCacheControl(req.Model) {
 		if _, exists := converted["cache_control"]; !exists {
 			converted["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
 		}

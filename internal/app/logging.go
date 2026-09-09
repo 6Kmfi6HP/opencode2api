@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -340,7 +341,7 @@ func mappedReasoningEffort(in string) string {
 	if in == "" {
 		return ""
 	}
-	effortMap := getReasoningEffortMap()
+	effortMap := config.ReasoningEffortMap()
 	if mapped, ok := effortMap[in]; ok {
 		return mapped
 	}

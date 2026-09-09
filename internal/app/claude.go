@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
@@ -856,7 +857,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	// 原生 responses 快路径：已记住模型直接走 Claude->Responses 转换，不再经过
 	// chat 翻译。此分支为 lenient 模式：不支持的 block 做降级，不返回 400，
 	// 因此跳过 validateClaudeDocumentBlocks 的严格校验。
-	wantReasoningEarly := !getForceDisableThinking()
+	wantReasoningEarly := !config.ForceDisableThinking()
 	if claudeReq.Thinking != nil && isThinkingDisabled(claudeReq.Thinking) {
 		wantReasoningEarly = false
 	}
@@ -890,7 +891,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	// reasoning when force-disabled or the client explicitly disables thinking.
 	// Empty-reply protection is handled by promoteMisplacedReasoning (!keep)
 	// and emitEmptyTextFallback (keep + no text/tool_use).
-	wantReasoning := !getForceDisableThinking()
+	wantReasoning := !config.ForceDisableThinking()
 	if claudeReq.Thinking != nil && isThinkingDisabled(claudeReq.Thinking) {
 		wantReasoning = false
 	}
@@ -922,7 +923,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		"tools_count":             len(chatReq.Tools),
 		"messages_count":          len(chatReq.Messages),
 		"multimodal_parts":        countMultimodalParts(chatReq.Messages),
-		"text_only_model":         isTextOnlyModel(chatReq.Model),
+		"text_only_model":         config.IsTextOnlyModel(chatReq.Model),
 		"system_merged":           systemMerged,
 		"context_management":      claudeReq.ContextManagement != nil,
 		"cache_control_blocks":    countClaudeCacheControlBlocks(claudeReq),
@@ -930,7 +931,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		"client_beta_count":       countAnthropicBetas(r.Header.Get("anthropic-beta")),
 		"unsupported_blocks":      scanClaudeUnsupportedBlocks(claudeReq.Messages),
 		"max_tokens":              chatReq.MaxTokens,
-		"max_tokens_cap":          getMaxTokensCapForModel(chatReq.Model),
+		"max_tokens_cap":          config.MaxTokensCapFor(chatReq.Model),
 	}
 	if len(skippedServerTools) > 0 {
 		plan["skipped_server_tools"] = skippedServerTools

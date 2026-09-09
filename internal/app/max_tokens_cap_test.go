@@ -1,15 +1,19 @@
 package app
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
+)
 
 func TestMaxTokensCapGlobal(t *testing.T) {
 	// Set up global cap
-	old := getConfig()
-	updateConfigSnapshot(func(s *ConfigSnapshot) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
 		s.MaxTokensCap = 131072
 		s.MaxTokensCapPerModel = nil
 	})
-	t.Cleanup(func() { configSnapshot.Store(old) })
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
 
 	tests := []struct {
 		name      string
@@ -37,15 +41,15 @@ func TestMaxTokensCapGlobal(t *testing.T) {
 }
 
 func TestMaxTokensCapPerModel(t *testing.T) {
-	old := getConfig()
-	updateConfigSnapshot(func(s *ConfigSnapshot) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
 		s.MaxTokensCap = 131072
 		s.MaxTokensCapPerModel = map[string]int{
 			"model-a": 50000,
 			"model-b": 0, // 0 = no cap for this model
 		}
 	})
-	t.Cleanup(func() { configSnapshot.Store(old) })
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
 
 	tests := []struct {
 		name      string
@@ -76,12 +80,12 @@ func TestMaxTokensCapPerModel(t *testing.T) {
 }
 
 func TestMaxTokensCapNoCapWhenZero(t *testing.T) {
-	old := getConfig()
-	updateConfigSnapshot(func(s *ConfigSnapshot) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
 		s.MaxTokensCap = 0
 		s.MaxTokensCapPerModel = nil
 	})
-	t.Cleanup(func() { configSnapshot.Store(old) })
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
 
 	req := &OpenAIRequest{Model: "any-model", MaxTokens: ptr(9999999)}
 	body := convertRequest(req)
@@ -95,12 +99,12 @@ func TestMaxTokensCapNoCapWhenZero(t *testing.T) {
 }
 
 func TestMaxTokensCapNilMaxTokens(t *testing.T) {
-	old := getConfig()
-	updateConfigSnapshot(func(s *ConfigSnapshot) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
 		s.MaxTokensCap = 131072
 		s.MaxTokensCapPerModel = nil
 	})
-	t.Cleanup(func() { configSnapshot.Store(old) })
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
 
 	// When max_tokens is not set, it should not appear in the converted request
 	req := &OpenAIRequest{Model: "any-model", MaxTokens: nil}

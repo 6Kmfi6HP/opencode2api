@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
@@ -393,7 +394,7 @@ func claudeToolChoiceToResponses(choice any) any {
 // 上游原生 responses 对 effort 白名单校验（minimal/low/medium/high/xhigh），
 // 不支持 max/none 等，非法值一律归一化或省略，绝不 400。
 func claudeThinkingToResponsesEffort(claudeReq ClaudeRequest, modelID string) string {
-	if getForceDisableThinking() || isThinkingDisabled(claudeReq.Thinking) {
+	if config.ForceDisableThinking() || isThinkingDisabled(claudeReq.Thinking) {
 		return ""
 	}
 	var effort string
@@ -446,7 +447,7 @@ func claudeToResponsesBody(claudeReq ClaudeRequest, modelID string) []byte {
 	}
 	if claudeReq.MaxTokens != nil {
 		v := *claudeReq.MaxTokens
-		if cap := getMaxTokensCapForModel(modelID); cap > 0 && v > cap {
+		if cap := config.MaxTokensCapFor(modelID); cap > 0 && v > cap {
 			v = cap
 		}
 		body["max_output_tokens"] = v

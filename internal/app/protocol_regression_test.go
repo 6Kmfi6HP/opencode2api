@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 )
 
 func ptr[T any](v T) *T { return &v }
@@ -414,11 +416,11 @@ func TestConvertClaudeRequestForwardsThinking(t *testing.T) {
 }
 
 func TestReasoningEffortMapAppliesAndSurvivesUpstreamBody(t *testing.T) {
-	old := getConfig()
-	updateConfigSnapshot(func(s *ConfigSnapshot) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
 		s.ReasoningEffortMap = map[string]string{"xhigh": "max", "minimal": "low"}
 	})
-	t.Cleanup(func() { configSnapshot.Store(old) })
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
 
 	body := convertRequest(&OpenAIRequest{
 		Model: "m", Messages: []Message{{Role: "user", Content: "hi"}},

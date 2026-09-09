@@ -3,6 +3,7 @@ package app
 import (
 	_ "embed"
 	"encoding/json"
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"log/slog"
 	"net/http"
@@ -44,7 +45,7 @@ func reloadHandler(w http.ResponseWriter, r *http.Request) {
 func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		snap := getConfig()
+		snap := config.Get()
 		configMu.RLock()
 		cfg := AppConfig{ModelAlias: modelAliasRules}
 		configMu.RUnlock()
