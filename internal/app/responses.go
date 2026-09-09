@@ -970,9 +970,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cnt := requestCount.Add(1)
 	maybeLogBodySummary(r.Context(), "responses request body", body)
-	_ = cnt
 
 	var respReq ResponsesAPIRequest
 	if err := json.Unmarshal(body, &respReq); err != nil {

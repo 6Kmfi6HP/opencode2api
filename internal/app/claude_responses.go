@@ -1578,6 +1578,3 @@ func finalizeClaudeResponsesStream(emit func(string, any), blocks map[int]*claud
 	_ = msgID
 	_ = model
 }
-
-var _ = slog.Info
-var _ = fmt.Sprintf

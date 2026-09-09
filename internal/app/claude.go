@@ -833,9 +833,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cnt := requestCount.Add(1)
 	maybeLogBodySummary(r.Context(), "claude messages request body", body)
-	_ = cnt
 
 	var claudeReq ClaudeRequest
 	if err := json.Unmarshal(body, &claudeReq); err != nil {

@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/random"
@@ -80,11 +79,10 @@ func normalizedTransportScope(session string) string {
 }
 
 var (
-	ocSessionID  string
-	ocProjectID  string
-	ocClientVer  string
-	ocOnce       sync.Once
-	requestCount atomic.Int64
+	ocSessionID string
+	ocProjectID string
+	ocClientVer string
+	ocOnce      sync.Once
 )
 
 func fetchOCVersion() string {

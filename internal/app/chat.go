@@ -409,9 +409,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cnt := requestCount.Add(1)
 	maybeLogBodySummary(r.Context(), "chat completion request body", body)
-	_ = cnt
 
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
