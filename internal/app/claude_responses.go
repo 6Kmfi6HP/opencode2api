@@ -931,15 +931,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 	fullReasoningLen := 0
 
 	emitEvent := func(event string, data any) {
-		b, err := json.Marshal(data)
-		if err != nil {
-			return
-		}
-		_, _ = w.Write([]byte("event: " + event + "\n"))
-		_, _ = w.Write([]byte("data: " + string(b) + "\n\n"))
-		if flusher != nil {
-			flusher.Flush()
-		}
+		writeSSEEvent(w, flusher, event, data)
 	}
 	emitError := func(msg string) {
 		emitEvent("error", map[string]any{

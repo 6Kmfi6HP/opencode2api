@@ -16,6 +16,18 @@ import (
 	"time"
 )
 
+func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, data any) {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return
+	}
+	_, _ = w.Write([]byte("event: " + event + "\n"))
+	_, _ = w.Write([]byte("data: " + string(jsonData) + "\n\n"))
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
 // ======================== Claude Messages API ========================
 
 func extractClaudeSystemText(system any) string {
@@ -1089,16 +1101,7 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 	}()
 
 	emitClaudeEvent := func(event string, data any) {
-		jsonData, err := json.Marshal(data)
-		if err != nil {
-			reqLogger(ctx).Error("marshal SSE event failed", "error", err)
-			return
-		}
-		w.Write([]byte("event: " + event + "\n"))
-		w.Write([]byte("data: " + string(jsonData) + "\n\n"))
-		if flusher != nil {
-			flusher.Flush()
-		}
+		writeSSEEvent(w, flusher, event, data)
 	}
 
 	emitClaudeError := func(msg string) {
