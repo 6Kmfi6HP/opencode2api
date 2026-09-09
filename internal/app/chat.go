@@ -545,26 +545,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			if out == "" {
 				// 空choices chunk，但可能有 usage
 				if usage != nil {
-					pt, _ := usage["prompt_tokens"].(float64)
-					ct, _ := usage["completion_tokens"].(float64)
-					tt, _ := usage["total_tokens"].(float64)
-					if tt > 0 {
-						recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-						recordCacheUsage(req.Model, usage)
-					}
+					recordChatUsage(req.Model, usage)
 				}
 				continue
 			}
 
 			// 提取 usage（已在 convertStreamChunkWithUsage 中解析）
 			if usage != nil && !doneSeen {
-				pt, _ := usage["prompt_tokens"].(float64)
-				ct, _ := usage["completion_tokens"].(float64)
-				tt, _ := usage["total_tokens"].(float64)
-				if tt > 0 {
-					recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-					recordCacheUsage(req.Model, usage)
-				}
+				recordChatUsage(req.Model, usage)
 			}
 
 			w.Write([]byte(out))
@@ -619,13 +607,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
-			pt, _ := u["prompt_tokens"].(float64)
-			ct, _ := u["completion_tokens"].(float64)
-			tt, _ := u["total_tokens"].(float64)
-			if tt > 0 {
-				recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-				recordCacheUsage(req.Model, u)
-			}
+			recordChatUsage(req.Model, u)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")

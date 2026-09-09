@@ -300,6 +300,22 @@ func recordCacheUsage(model string, usage map[string]any) {
 	})
 }
 
+// recordChatUsage records token and cache usage from a Chat-protocol usage
+// map (prompt_tokens/completion_tokens/total_tokens). Absent or zero totals
+// are ignored; recordCacheUsage is itself a no-op when no cache fields exist.
+func recordChatUsage(model string, usage map[string]any) {
+	if usage == nil {
+		return
+	}
+	pt, _ := numberAsFloat(usage["prompt_tokens"])
+	ct, _ := numberAsFloat(usage["completion_tokens"])
+	tt, _ := numberAsFloat(usage["total_tokens"])
+	if tt > 0 {
+		recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
+		recordCacheUsage(model, usage)
+	}
+}
+
 // readTokenStatsSnapshot returns the most recent on-disk token stats when
 // available; otherwise it falls back to the in-memory snapshot. Used by
 // /api/stats GET so the admin panel reflects contributions from every binary

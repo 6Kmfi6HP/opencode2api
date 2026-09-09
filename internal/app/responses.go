@@ -1266,13 +1266,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
-			pt, _ := u["prompt_tokens"].(float64)
-			ct, _ := u["completion_tokens"].(float64)
-			tt, _ := u["total_tokens"].(float64)
-			if tt > 0 {
-				recordTokenUsage(chatReq.Model, int64(pt), int64(ct), int64(tt))
-				recordCacheUsage(chatReq.Model, u)
-			}
+			recordChatUsage(chatReq.Model, u)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1981,13 +1975,7 @@ loop:
 	}
 
 	if totalUsage != nil {
-		pt, _ := totalUsage["prompt_tokens"].(float64)
-		ct, _ := totalUsage["completion_tokens"].(float64)
-		tt, _ := totalUsage["total_tokens"].(float64)
-		if tt > 0 {
-			recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
-			recordCacheUsage(model, totalUsage)
-		}
+		recordChatUsage(model, totalUsage)
 	}
 
 	seq++

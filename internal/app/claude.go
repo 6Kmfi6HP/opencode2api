@@ -1007,13 +1007,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
-			pt, _ := u["prompt_tokens"].(float64)
-			ct, _ := u["completion_tokens"].(float64)
-			tt, _ := u["total_tokens"].(float64)
-			if tt > 0 {
-				recordTokenUsage(claudeReq.Model, int64(pt), int64(ct), int64(tt))
-				recordCacheUsage(claudeReq.Model, u)
-			}
+			recordChatUsage(claudeReq.Model, u)
 		}
 	}
 
@@ -1089,13 +1083,7 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 
 	defer func() {
 		if len(fullUsage) > 0 {
-			pt, _ := fullUsage["prompt_tokens"].(float64)
-			ct, _ := fullUsage["completion_tokens"].(float64)
-			tt, _ := fullUsage["total_tokens"].(float64)
-			if tt > 0 {
-				recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
-				recordCacheUsage(model, fullUsage)
-			}
+			recordChatUsage(model, fullUsage)
 		}
 		stats.toolCallCount = len(toolCallOrder)
 		stats.log(ctx, "claude")
