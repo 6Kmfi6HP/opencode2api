@@ -300,6 +300,40 @@ func recordCacheUsage(model string, usage map[string]any) {
 	})
 }
 
+// tokenUsage is a typed view over an upstream usage map. It normalizes the
+// Chat spelling (prompt_tokens/completion_tokens/total_tokens) and the
+// Responses spelling (input_tokens/output_tokens/total_tokens) so call sites
+// do not repeat the (prompt, completion, total) triple extraction.
+type tokenUsage struct {
+	PromptTokens     int64
+	CompletionTokens int64
+	TotalTokens      int64
+}
+
+// fromMap builds a tokenUsage from a usage map. Values are read through
+// numberAsFloat so integer-valued JSON numbers (decoded as int/int64) are not
+// dropped by a raw float64 type assertion. The Responses spelling
+// (input/output_tokens) is preferred when present, matching the existing
+// Chat-to-Responses fallback order in the Claude/Response helpers.
+func (tokenUsage) fromMap(m map[string]any) tokenUsage {
+	var u tokenUsage
+	u.PromptTokens = firstUsageToken(m, "input_tokens", "prompt_tokens")
+	u.CompletionTokens = firstUsageToken(m, "output_tokens", "completion_tokens")
+	u.TotalTokens = firstUsageToken(m, "total_tokens")
+	return u
+}
+
+// firstUsageToken returns the first present key's value as int64, or 0 when
+// none of the keys hold a number.
+func firstUsageToken(m map[string]any, keys ...string) int64 {
+	for _, k := range keys {
+		if v, ok := numberAsFloat(m[k]); ok {
+			return int64(v)
+		}
+	}
+	return 0
+}
+
 // recordChatUsage records token and cache usage from a Chat-protocol usage
 // map (prompt_tokens/completion_tokens/total_tokens). Absent or zero totals
 // are ignored; recordCacheUsage is itself a no-op when no cache fields exist.
@@ -307,11 +341,9 @@ func recordChatUsage(model string, usage map[string]any) {
 	if usage == nil {
 		return
 	}
-	pt, _ := numberAsFloat(usage["prompt_tokens"])
-	ct, _ := numberAsFloat(usage["completion_tokens"])
-	tt, _ := numberAsFloat(usage["total_tokens"])
-	if tt > 0 {
-		recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
+	u := tokenUsage{}.fromMap(usage)
+	if u.TotalTokens > 0 {
+		recordTokenUsage(model, u.PromptTokens, u.CompletionTokens, u.TotalTokens)
 		recordCacheUsage(model, usage)
 	}
 }

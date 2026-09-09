@@ -765,20 +765,8 @@ func recordClaudeResponsesUsage(model string, usage map[string]any) {
 	if usage == nil {
 		return
 	}
-	var pt, ct, tt int64
-	if v, ok := numberAsFloat(usage["input_tokens"]); ok {
-		pt = int64(v)
-	} else if v, ok := numberAsFloat(usage["prompt_tokens"]); ok {
-		pt = int64(v)
-	}
-	if v, ok := numberAsFloat(usage["output_tokens"]); ok {
-		ct = int64(v)
-	} else if v, ok := numberAsFloat(usage["completion_tokens"]); ok {
-		ct = int64(v)
-	}
-	if v, ok := numberAsFloat(usage["total_tokens"]); ok {
-		tt = int64(v)
-	}
+	u := tokenUsage{}.fromMap(usage)
+	pt, ct, tt := u.PromptTokens, u.CompletionTokens, u.TotalTokens
 	if tt <= 0 && (pt > 0 || ct > 0) {
 		tt = pt + ct
 	}
@@ -1238,20 +1226,8 @@ func indexOfToolOrder(order []int, v int) (int, bool) {
 }
 
 func usageFromResponsesMap(usage map[string]any) (int64, int64, int64) {
-	var pt, ct, tt int64
-	if v, ok := numberAsFloat(usage["input_tokens"]); ok {
-		pt = int64(v)
-	} else if v, ok := numberAsFloat(usage["prompt_tokens"]); ok {
-		pt = int64(v)
-	}
-	if v, ok := numberAsFloat(usage["output_tokens"]); ok {
-		ct = int64(v)
-	} else if v, ok := numberAsFloat(usage["completion_tokens"]); ok {
-		ct = int64(v)
-	}
-	if v, ok := numberAsFloat(usage["total_tokens"]); ok {
-		tt = int64(v)
-	}
+	u := tokenUsage{}.fromMap(usage)
+	pt, ct, tt := u.PromptTokens, u.CompletionTokens, u.TotalTokens
 	if tt <= 0 && (pt > 0 || ct > 0) {
 		tt = pt + ct
 	}

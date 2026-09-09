@@ -937,12 +937,10 @@ func recordResponsesUsage(modelID string, usage any) {
 	if !ok {
 		return
 	}
-	it, _ := u["input_tokens"].(float64)
-	ot, _ := u["output_tokens"].(float64)
-	tt, _ := u["total_tokens"].(float64)
-	if tt <= 0 {
+	t := tokenUsage{}.fromMap(u)
+	if t.TotalTokens <= 0 {
 		return
 	}
-	recordTokenUsage(modelID, int64(it), int64(ot), int64(tt))
+	recordTokenUsage(modelID, t.PromptTokens, t.CompletionTokens, t.TotalTokens)
 	recordCacheUsage(modelID, u)
 }
