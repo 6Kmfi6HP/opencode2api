@@ -9,9 +9,9 @@ import (
 // ======================== text-only model downgrade ========================
 
 func TestIsTextOnlyModelDefaultMatchesDeepseek(t *testing.T) {
-	old := textOnlyModels
-	defer func() { textOnlyModels = old }()
-	textOnlyModels = []string{"deepseek"}
+	old := getConfig()
+	defer func() { configSnapshot.Store(old) }()
+	updateConfigSnapshot(func(s *ConfigSnapshot) { s.TextOnlyModels = []string{"deepseek"} })
 
 	if !isTextOnlyModel("deepseek-v4-flash") {
 		t.Fatal("deepseek-v4-flash should be text-only")
@@ -31,10 +31,10 @@ func TestIsTextOnlyModelDefaultMatchesDeepseek(t *testing.T) {
 }
 
 func TestIsTextOnlyModelConfigOverride(t *testing.T) {
-	old := textOnlyModels
-	defer func() { textOnlyModels = old }()
+	old := getConfig()
+	defer func() { configSnapshot.Store(old) }()
 	// An explicit config replaces the default list.
-	textOnlyModels = []string{"gpt"}
+	updateConfigSnapshot(func(s *ConfigSnapshot) { s.TextOnlyModels = []string{"gpt"} })
 
 	if isTextOnlyModel("deepseek-v4-flash") {
 		t.Fatal("config override should drop the deepseek default")
@@ -97,9 +97,9 @@ func contentTypes(parts []any) []string {
 }
 
 func TestBuildUpstreamBodyDowngradesMultimodalForTextOnlyModel(t *testing.T) {
-	old := textOnlyModels
-	defer func() { textOnlyModels = old }()
-	textOnlyModels = []string{"deepseek"}
+	old := getConfig()
+	defer func() { configSnapshot.Store(old) }()
+	updateConfigSnapshot(func(s *ConfigSnapshot) { s.TextOnlyModels = []string{"deepseek"} })
 
 	req := multimodalRequest("deepseek-v4-flash-free")
 	body := buildUpstreamBody(&req)
@@ -122,9 +122,9 @@ func TestBuildUpstreamBodyDowngradesMultimodalForTextOnlyModel(t *testing.T) {
 }
 
 func TestBuildUpstreamBodyPreservesMultimodalForVisionModel(t *testing.T) {
-	old := textOnlyModels
-	defer func() { textOnlyModels = old }()
-	textOnlyModels = []string{"deepseek"}
+	old := getConfig()
+	defer func() { configSnapshot.Store(old) }()
+	updateConfigSnapshot(func(s *ConfigSnapshot) { s.TextOnlyModels = []string{"deepseek"} })
 
 	req := multimodalRequest("gpt-5.5")
 	body := buildUpstreamBody(&req)
@@ -135,9 +135,9 @@ func TestBuildUpstreamBodyPreservesMultimodalForVisionModel(t *testing.T) {
 }
 
 func TestConvertMessagesForUpstreamTextOnlyKeepsPlainStrings(t *testing.T) {
-	old := textOnlyModels
-	defer func() { textOnlyModels = old }()
-	textOnlyModels = []string{"deepseek"}
+	old := getConfig()
+	defer func() { configSnapshot.Store(old) }()
+	updateConfigSnapshot(func(s *ConfigSnapshot) { s.TextOnlyModels = []string{"deepseek"} })
 
 	req := OpenAIRequest{
 		Model: "deepseek-v4-flash",

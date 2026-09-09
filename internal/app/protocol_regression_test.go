@@ -414,9 +414,11 @@ func TestConvertClaudeRequestForwardsThinking(t *testing.T) {
 }
 
 func TestReasoningEffortMapAppliesAndSurvivesUpstreamBody(t *testing.T) {
-	old := reasoningEffortMap
-	reasoningEffortMap = map[string]string{"xhigh": "max", "minimal": "low"}
-	t.Cleanup(func() { reasoningEffortMap = old })
+	old := getConfig()
+	updateConfigSnapshot(func(s *ConfigSnapshot) {
+		s.ReasoningEffortMap = map[string]string{"xhigh": "max", "minimal": "low"}
+	})
+	t.Cleanup(func() { configSnapshot.Store(old) })
 
 	body := convertRequest(&OpenAIRequest{
 		Model: "m", Messages: []Message{{Role: "user", Content: "hi"}},

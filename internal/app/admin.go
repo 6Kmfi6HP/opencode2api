@@ -43,18 +43,23 @@ func reloadHandler(w http.ResponseWriter, r *http.Request) {
 func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		snap := getConfig()
 		configMu.RLock()
-		cfg := AppConfig{ModelAlias: modelAliasRules, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking, MaxTokensCap: maxTokensCap, MaxTokensCapPerModel: maxTokensCapPerModel}
-		promptCacheRetentionRT := promptCacheRetention
-		cacheBreakpointsRT := cacheBreakpoints
-		socks5StickyRT := socks5Sticky
-		textOnlyModelsRT := append([]string(nil), textOnlyModels...)
+		cfg := AppConfig{ModelAlias: modelAliasRules}
 		configMu.RUnlock()
+		cfg.ReasoningEffortMap = snap.ReasoningEffortMap
+		cfg.ForceDisableThinking = snap.ForceDisableThinking
+		cfg.MaxTokensCap = snap.MaxTokensCap
+		cfg.MaxTokensCapPerModel = snap.MaxTokensCapPerModel
+		promptCacheRetentionRT := snap.PromptCacheRetention
+		cacheBreakpointsRT := snap.CacheBreakpoints
+		textOnlyModelsRT := append([]string(nil), snap.TextOnlyModels...)
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
 		cfg.ActiveSocks5 = activeSocks5
 		cfg.Socks5PaidDirect = socks5PaidDirect
 		cfg.UpstreamBaseURLs = upstreamBaseURLs
+		socks5StickyRT := socks5Sticky
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{

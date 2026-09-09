@@ -16,20 +16,16 @@ import (
 // "save all config" round-trip without being silently wiped.
 func TestAdminConfigRoundTripFourFields(t *testing.T) {
 	// --- save global state ---
+	oldSnap := getConfig()
 	configMu.Lock()
-	oldPCR := promptCacheRetention
-	oldCB := cacheBreakpoints
-	oldTOM := textOnlyModels
 	oldCP := configPath
 	configMu.Unlock()
 	socks5Mu.Lock()
 	oldSticky := socks5Sticky
 	socks5Mu.Unlock()
 	t.Cleanup(func() {
+		configSnapshot.Store(oldSnap)
 		configMu.Lock()
-		promptCacheRetention = oldPCR
-		cacheBreakpoints = oldCB
-		textOnlyModels = oldTOM
 		configPath = oldCP
 		configMu.Unlock()
 		socks5Mu.Lock()

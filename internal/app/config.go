@@ -20,22 +20,64 @@ type compiledKeywordRule struct {
 }
 
 var (
-	port                 string
-	configPath           = "config.json"
-	modelAliasRules      = []domain.ModelKeywordRule{}
-	compiledRules        = []compiledKeywordRule{}
-	reasoningEffortMap   = map[string]string{}
-	forceDisableThinking bool
-	maxTokensCap         int
-	maxTokensCapPerModel = map[string]int{}
-	promptCacheRetention string // "" -> runtime default "24h"; "off" disables injection
-	cacheBreakpoints     = true
-	textOnlyModels       = []string{"deepseek"} // default: text-only upstreams
-	debugMode            bool
-	configMu             sync.RWMutex
-	storedResponses      = map[string]StoredResponseState{}
-	storedResponsesMu    sync.RWMutex
+	port               string
+	configPath         = "config.json"
+	modelAliasRules    = []domain.ModelKeywordRule{}
+	compiledRules      = []compiledKeywordRule{}
+	debugMode          bool
+	configMu           sync.RWMutex
+	storedResponses    = map[string]StoredResponseState{}
+	storedResponsesMu  sync.RWMutex
 )
+
+// ConfigSnapshot is an immutable snapshot of the read-only package config
+// fields. It is exchanged atomically via configSnapshot, so readers never
+// touch the RWMutex-guarded mutable state below.
+type ConfigSnapshot struct {
+	MaxTokensCap         int
+	MaxTokensCapPerModel map[string]int
+	ReasoningEffortMap   map[string]string
+	ForceDisableThinking bool
+	PromptCacheRetention string
+	CacheBreakpoints     bool
+	TextOnlyModels       []string
+}
+
+// configSnapshot holds the current ConfigSnapshot. All reads go through
+// getConfig, which lazily seeds the default snapshot on first use so startup
+// never observes a zero value.
+var configSnapshot atomic.Value
+
+func defaultConfigSnapshot() ConfigSnapshot {
+	return ConfigSnapshot{
+		MaxTokensCapPerModel: map[string]int{},
+		ReasoningEffortMap:   map[string]string{},
+		PromptCacheRetention: "", // "" -> runtime default "24h"; "off" disables injection
+		CacheBreakpoints:     true,
+		TextOnlyModels:       []string{"deepseek"}, // default: text-only upstreams
+	}
+}
+
+// getConfig returns the current immutable config snapshot, seeding the default
+// snapshot on first use.
+func getConfig() ConfigSnapshot {
+	if s, ok := configSnapshot.Load().(ConfigSnapshot); ok {
+		return s
+	}
+	s := defaultConfigSnapshot()
+	configSnapshot.Store(s)
+	return s
+}
+
+// updateConfigSnapshot applies fn to a copy of the current snapshot and stores
+// the result. Test code (the only writer outside applyConfig) uses this to
+// adjust read-only fields without mutating shared maps/slices in place; fn
+// should replace maps/slices rather than mutate their contents.
+func updateConfigSnapshot(fn func(*ConfigSnapshot)) {
+	snap := getConfig()
+	fn(&snap)
+	configSnapshot.Store(snap)
+}
 
 // ======================== 配置管理 ========================
 
@@ -145,15 +187,21 @@ func matchKeywordRule(base string) (string, bool) {
 
 func applyConfig(cfg AppConfig) {
 	configMu.Lock()
-	defer configMu.Unlock()
 	modelAliasRules, compiledRules = compileKeywordRules(cfg.ModelAlias)
+	configMu.Unlock()
+
+	// Build a fresh snapshot, overlaying cfg onto the current value so fields
+	// the config omits keep their prior value (matching the previous global
+	// behavior). Maps/slices are deep-copied so callers mutating cfg later
+	// cannot race readers.
+	snap := getConfig()
 	if cfg.ReasoningEffortMap != nil {
-		reasoningEffortMap = cfg.ReasoningEffortMap
+		snap.ReasoningEffortMap = cloneStringMap(cfg.ReasoningEffortMap)
 	}
-	forceDisableThinking = cfg.ForceDisableThinking
-	maxTokensCap = cfg.MaxTokensCap
+	snap.ForceDisableThinking = cfg.ForceDisableThinking
+	snap.MaxTokensCap = cfg.MaxTokensCap
 	if cfg.MaxTokensCapPerModel != nil {
-		maxTokensCapPerModel = cfg.MaxTokensCapPerModel
+		snap.MaxTokensCapPerModel = cloneIntMap(cfg.MaxTokensCapPerModel)
 	}
 
 	socks5Mu.Lock()
@@ -181,18 +229,35 @@ func applyConfig(cfg AppConfig) {
 	}
 
 	if cfg.PromptCacheRetention != "" {
-		promptCacheRetention = cfg.PromptCacheRetention
+		snap.PromptCacheRetention = cfg.PromptCacheRetention
 	}
 	if cfg.CacheControlBreakpoints != nil {
-		cacheBreakpoints = *cfg.CacheControlBreakpoints
+		snap.CacheBreakpoints = *cfg.CacheControlBreakpoints
 	}
 	if cfg.TextOnlyModels != nil {
-		textOnlyModels = cfg.TextOnlyModels
+		snap.TextOnlyModels = append([]string(nil), cfg.TextOnlyModels...)
 	}
 	if cfg.NativeResponsesModels != nil {
 		setNativeResponsesModels(cfg.NativeResponsesModels)
 	}
 
+	configSnapshot.Store(snap)
+}
+
+func cloneStringMap(m map[string]string) map[string]string {
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+func cloneIntMap(m map[string]int) map[string]int {
+	cp := make(map[string]int, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
 }
 
 // stripContextSuffix splits a model ID into its base and context suffix.
@@ -246,9 +311,7 @@ func resolveModelForAuth(auth UpstreamAuth, model string) string {
 }
 
 func getForceDisableThinking() bool {
-	configMu.RLock()
-	defer configMu.RUnlock()
-	return forceDisableThinking
+	return getConfig().ForceDisableThinking
 }
 
 func getModelKeywordRules() []domain.ModelKeywordRule {
@@ -272,10 +335,9 @@ func getModelAliasMap() map[string]string {
 }
 
 func getReasoningEffortMap() map[string]string {
-	configMu.RLock()
-	defer configMu.RUnlock()
-	cp := make(map[string]string, len(reasoningEffortMap))
-	for k, v := range reasoningEffortMap {
+	m := getConfig().ReasoningEffortMap
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
 		cp[k] = v
 	}
 	return cp
@@ -285,12 +347,11 @@ func getReasoningEffortMap() map[string]string {
 // model: the per-model value if set, otherwise the global default. A return
 // value of 0 means no cap (max_tokens is forwarded as-is).
 func getMaxTokensCapForModel(model string) int {
-	configMu.RLock()
-	defer configMu.RUnlock()
-	if cap, ok := maxTokensCapPerModel[model]; ok {
+	snap := getConfig()
+	if cap, ok := snap.MaxTokensCapPerModel[model]; ok {
 		return cap
 	}
-	return maxTokensCap
+	return snap.MaxTokensCap
 }
 
 // getPromptCacheRetention returns the retention value injected into upstream
@@ -298,18 +359,15 @@ func getMaxTokensCapForModel(model string) int {
 // zen gateway's prefix cache TTL from ~5 minutes to a day; "off" disables
 // injection entirely.
 func getPromptCacheRetention() string {
-	configMu.RLock()
-	defer configMu.RUnlock()
-	if promptCacheRetention == "" {
+	if v := getConfig().PromptCacheRetention; v == "" {
 		return "24h"
+	} else {
+		return v
 	}
-	return promptCacheRetention
 }
 
 func getCacheBreakpoints() bool {
-	configMu.RLock()
-	defer configMu.RUnlock()
-	return cacheBreakpoints
+	return getConfig().CacheBreakpoints
 }
 
 // isTextOnlyModel reports whether the resolved upstream model ID only accepts
@@ -323,9 +381,7 @@ func isTextOnlyModel(modelID string) bool {
 	if name == "" {
 		return false
 	}
-	configMu.RLock()
-	defer configMu.RUnlock()
-	for _, prefix := range textOnlyModels {
+	for _, prefix := range getConfig().TextOnlyModels {
 		if strings.HasPrefix(name, strings.ToLower(strings.TrimSpace(prefix))) {
 			return true
 		}

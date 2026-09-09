@@ -4,18 +4,12 @@ import "testing"
 
 func TestMaxTokensCapGlobal(t *testing.T) {
 	// Set up global cap
-	configMu.Lock()
-	origGlobal := maxTokensCap
-	origPerModel := maxTokensCapPerModel
-	maxTokensCap = 131072
-	maxTokensCapPerModel = nil
-	configMu.Unlock()
-	t.Cleanup(func() {
-		configMu.Lock()
-		maxTokensCap = origGlobal
-		maxTokensCapPerModel = origPerModel
-		configMu.Unlock()
+	old := getConfig()
+	updateConfigSnapshot(func(s *ConfigSnapshot) {
+		s.MaxTokensCap = 131072
+		s.MaxTokensCapPerModel = nil
 	})
+	t.Cleanup(func() { configSnapshot.Store(old) })
 
 	tests := []struct {
 		name      string
@@ -43,21 +37,15 @@ func TestMaxTokensCapGlobal(t *testing.T) {
 }
 
 func TestMaxTokensCapPerModel(t *testing.T) {
-	configMu.Lock()
-	origGlobal := maxTokensCap
-	origPerModel := maxTokensCapPerModel
-	maxTokensCap = 131072
-	maxTokensCapPerModel = map[string]int{
-		"model-a": 50000,
-		"model-b": 0, // 0 = no cap for this model
-	}
-	configMu.Unlock()
-	t.Cleanup(func() {
-		configMu.Lock()
-		maxTokensCap = origGlobal
-		maxTokensCapPerModel = origPerModel
-		configMu.Unlock()
+	old := getConfig()
+	updateConfigSnapshot(func(s *ConfigSnapshot) {
+		s.MaxTokensCap = 131072
+		s.MaxTokensCapPerModel = map[string]int{
+			"model-a": 50000,
+			"model-b": 0, // 0 = no cap for this model
+		}
 	})
+	t.Cleanup(func() { configSnapshot.Store(old) })
 
 	tests := []struct {
 		name      string
@@ -88,18 +76,12 @@ func TestMaxTokensCapPerModel(t *testing.T) {
 }
 
 func TestMaxTokensCapNoCapWhenZero(t *testing.T) {
-	configMu.Lock()
-	origGlobal := maxTokensCap
-	origPerModel := maxTokensCapPerModel
-	maxTokensCap = 0
-	maxTokensCapPerModel = nil
-	configMu.Unlock()
-	t.Cleanup(func() {
-		configMu.Lock()
-		maxTokensCap = origGlobal
-		maxTokensCapPerModel = origPerModel
-		configMu.Unlock()
+	old := getConfig()
+	updateConfigSnapshot(func(s *ConfigSnapshot) {
+		s.MaxTokensCap = 0
+		s.MaxTokensCapPerModel = nil
 	})
+	t.Cleanup(func() { configSnapshot.Store(old) })
 
 	req := &OpenAIRequest{Model: "any-model", MaxTokens: ptr(9999999)}
 	body := convertRequest(req)
@@ -113,18 +95,12 @@ func TestMaxTokensCapNoCapWhenZero(t *testing.T) {
 }
 
 func TestMaxTokensCapNilMaxTokens(t *testing.T) {
-	configMu.Lock()
-	origGlobal := maxTokensCap
-	origPerModel := maxTokensCapPerModel
-	maxTokensCap = 131072
-	maxTokensCapPerModel = nil
-	configMu.Unlock()
-	t.Cleanup(func() {
-		configMu.Lock()
-		maxTokensCap = origGlobal
-		maxTokensCapPerModel = origPerModel
-		configMu.Unlock()
+	old := getConfig()
+	updateConfigSnapshot(func(s *ConfigSnapshot) {
+		s.MaxTokensCap = 131072
+		s.MaxTokensCapPerModel = nil
 	})
+	t.Cleanup(func() { configSnapshot.Store(old) })
 
 	// When max_tokens is not set, it should not appear in the converted request
 	req := &OpenAIRequest{Model: "any-model", MaxTokens: nil}
