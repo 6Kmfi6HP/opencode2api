@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"syscall"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"golang.org/x/sys/windows"
 )
 
@@ -56,7 +57,7 @@ func windowsTaskkillTree(pid int) error {
 }
 
 // selectModelInteractive presents the Windows numbered model selector.
-func selectModelInteractive(in io.Reader, out io.Writer, errOut io.Writer, modelIDs []string, catalog modelsDevCatalog) (string, error) {
+func selectModelInteractive(in io.Reader, out io.Writer, errOut io.Writer, modelIDs []string, catalog modelsdev.Catalog) (string, error) {
 	entries := modelSelectionEntries(modelIDs, catalog)
 	if len(entries) == 0 {
 		fmt.Fprintln(errOut, "opencode2api: no free launch models available; using CLI defaults")

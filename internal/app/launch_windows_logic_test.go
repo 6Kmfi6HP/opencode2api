@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"reflect"
 	"strings"
 	"testing"
@@ -146,7 +147,7 @@ func TestSelectModelNumberedEOF(t *testing.T) {
 }
 
 func TestModelSelectionEntriesFiltersAndSorts(t *testing.T) {
-	catalog := modelsDevCatalog{
+	catalog := modelsdev.Catalog{
 		"model-a-free": 1200000,
 		"model-a":      1200000,
 		"model-b-free": 200000,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"log/slog"
 	"net"
 	"net/http"
@@ -116,7 +117,8 @@ func configureLaunchGlobals(f launchFlags) {
 	resolvedStats, _ := resolveStatsPath(f.statsFile, f.statsExplicit, configPath, f.configExplicit)
 	setTokenStatsPath(resolvedStats)
 	resolvedModelsDevCache, _ := resolveModelsDevCachePath(configPath, f.configExplicit)
-	setModelsDevCachePath(resolvedModelsDevCache)
+	modelsdev.SetCachePath(resolvedModelsDevCache)
+	modelsdev.SetClientGetter(getHTTPClient)
 
 	initLogger()
 }
@@ -167,11 +169,11 @@ func startLaunchProxy(f launchFlags) (*http.Server, net.Listener, string) {
 	return server, listener, baseURL
 }
 
-func fetchLaunchCatalog() modelsDevCatalog {
-	return getCachedModelsDevCatalog()
+func fetchLaunchCatalog() modelsdev.Catalog {
+	return modelsdev.GetCachedCatalog()
 }
 
-func resolveLaunchModel(model string, extraArgs []string, extract func([]string) (string, []string), catalog modelsDevCatalog, contextSuffix bool) (string, []string, int, int) {
+func resolveLaunchModel(model string, extraArgs []string, extract func([]string) (string, []string), catalog modelsdev.Catalog, contextSuffix bool) (string, []string, int, int) {
 	// Throwaway model flags may appear after `--` in the child args. Extract
 	// them so the TUI is skipped and they are not forwarded to child CLI.
 	if model == "" {
@@ -198,7 +200,7 @@ func resolveLaunchModel(model string, extraArgs []string, extract func([]string)
 	ctx := 0
 	if modelID != "" {
 		base, _ := stripContextSuffix(modelID)
-		ctx = getContextWindow(base, catalog)
+		ctx = modelsdev.ContextWindow(base, catalog)
 		if contextSuffix {
 			if ctx >= 1000000 {
 				modelID = base + "[1m]"
@@ -494,7 +496,7 @@ type codexModelCatalogSpec struct {
 // buildCodexModelCatalogSpecs builds the catalog model set passed to Codex.
 // When freeOnly is true (default public tier), only models with a usable
 // "-free" variant are kept, matching the interactive launch model list.
-func buildCodexModelCatalogSpecs(catalog modelsDevCatalog, freeOnly bool) []codexModelCatalogSpec {
+func buildCodexModelCatalogSpecs(catalog modelsdev.Catalog, freeOnly bool) []codexModelCatalogSpec {
 	modelIDs := append(getModelIDs(), getGoModelIDs()...)
 
 	idSet := make(map[string]bool, len(modelIDs))
@@ -515,7 +517,7 @@ func buildCodexModelCatalogSpecs(catalog modelsDevCatalog, freeOnly bool) []code
 		seen[pub] = true
 		specs = append(specs, codexModelCatalogSpec{
 			ID:            pub,
-			ContextWindow: getContextWindow(pub, catalog),
+			ContextWindow: modelsdev.ContextWindow(pub, catalog),
 		})
 	}
 

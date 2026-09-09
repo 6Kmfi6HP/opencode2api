@@ -1,4 +1,4 @@
-package app
+package modelsdev
 
 import (
 	"encoding/json"
@@ -29,13 +29,13 @@ func TestFetchModelsDevCatalogParsing(t *testing.T) {
   }
 }`
 
-	var parsed modelsDevResponse
+	var parsed response
 	if err := json.NewDecoder(strings.NewReader(raw)).Decode(&parsed); err != nil {
 		t.Fatalf("failed to parse test JSON: %v", err)
 	}
 
-	// Replicate the catalog-building logic from fetchModelsDevCatalog.
-	catalog := make(modelsDevCatalog, len(parsed.Models))
+	// Replicate the catalog-building logic from fetchCatalog.
+	catalog := make(Catalog, len(parsed.Models))
 	for id, entry := range parsed.Models {
 		short := id
 		if idx := strings.Index(id, "/"); idx >= 0 {
@@ -69,8 +69,8 @@ func TestFetchModelsDevCatalogParsing(t *testing.T) {
 		t.Errorf("catalog[gemini-3-pro] = %d, want 1048576", ctx)
 	}
 
-	// Verify getContextWindow finds x-preview-f-free via the add-"-free" strategy.
-	if ctx := getContextWindow("x-preview-f", catalog); ctx != 1000000 {
-		t.Errorf("getContextWindow(x-preview-f) = %d, want 1000000", ctx)
+	// Verify ContextWindow finds x-preview-f-free via the add-"-free" strategy.
+	if ctx := ContextWindow("x-preview-f", catalog); ctx != 1000000 {
+		t.Errorf("ContextWindow(x-preview-f) = %d, want 1000000", ctx)
 	}
 }

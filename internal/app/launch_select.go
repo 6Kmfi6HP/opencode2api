@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"io"
 	"sort"
 	"strconv"
@@ -23,7 +24,7 @@ type launchModelSelectionEntry struct {
 // catalog) are shown, since the default launch tier is public/free. Models
 // are deduplicated by their public-facing ID, sorted by context window
 // descending, then alphabetically.
-func modelSelectionEntries(modelIDs []string, catalog modelsDevCatalog) []launchModelSelectionEntry {
+func modelSelectionEntries(modelIDs []string, catalog modelsdev.Catalog) []launchModelSelectionEntry {
 	idSet := make(map[string]bool, len(modelIDs))
 	for _, id := range modelIDs {
 		idSet[id] = true
@@ -42,7 +43,7 @@ func modelSelectionEntries(modelIDs []string, catalog modelsDevCatalog) []launch
 		}
 		entries = append(entries, launchModelSelectionEntry{
 			ID:            pub,
-			ContextWindow: getContextWindow(pub, catalog),
+			ContextWindow: modelsdev.ContextWindow(pub, catalog),
 		})
 	}
 

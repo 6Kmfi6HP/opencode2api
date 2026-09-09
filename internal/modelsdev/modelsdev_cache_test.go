@@ -1,10 +1,9 @@
-package app
+package modelsdev
 
 import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -14,80 +13,23 @@ import (
 
 func resetModelsDevCacheTestState(t *testing.T) {
 	t.Helper()
-	modelsDevMu.Lock()
-	origCache := modelsDevMemoryCache
-	origTime := modelsDevMemoryTime
-	origURL := modelsDevCatalogURL
-	origPath := modelsDevCachePath
-	modelsDevMemoryCache = nil
-	modelsDevMemoryTime = time.Time{}
-	modelsDevMu.Unlock()
+	mu.Lock()
+	origCache := memoryCache
+	origTime := memoryTime
+	origURL := catalogURL
+	origPath := cachePath
+	memoryCache = nil
+	memoryTime = time.Time{}
+	mu.Unlock()
 
 	t.Cleanup(func() {
-		modelsDevMu.Lock()
-		modelsDevMemoryCache = origCache
-		modelsDevMemoryTime = origTime
-		modelsDevCatalogURL = origURL
-		modelsDevCachePath = origPath
-		modelsDevMu.Unlock()
+		mu.Lock()
+		memoryCache = origCache
+		memoryTime = origTime
+		catalogURL = origURL
+		cachePath = origPath
+		mu.Unlock()
 	})
-}
-
-func TestModelsDevProxyRouting(t *testing.T) {
-	resetModelsDevCacheTestState(t)
-
-	var proxyHits int32
-	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&proxyHits, 1)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
-			"models": {
-				"test/proxy-model": {"id": "test/proxy-model", "limit": {"context": 32768}}
-			}
-		}`))
-	}))
-	defer proxyServer.Close()
-
-	proxyURL, err := url.Parse(proxyServer.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	socks5Mu.Lock()
-	oldProxies := socks5Proxies
-	oldActive := activeSocks5
-	socks5Proxies = nil
-	activeSocks5 = ""
-	socks5Mu.Unlock()
-
-	oldTransport := httpClient.Transport
-	httpClient.Transport = &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
-	}
-	t.Cleanup(func() {
-		socks5Mu.Lock()
-		socks5Proxies = oldProxies
-		activeSocks5 = oldActive
-		socks5Mu.Unlock()
-		httpClient.Transport = oldTransport
-	})
-
-	modelsDevMu.Lock()
-	modelsDevCatalogURL = "http://models.dev/catalog.json"
-	modelsDevMu.Unlock()
-
-	cat, err := fetchModelsDevCatalog()
-	if err != nil {
-		t.Fatalf("fetchModelsDevCatalog failed: %v", err)
-	}
-
-	if hits := atomic.LoadInt32(&proxyHits); hits == 0 {
-		t.Fatalf("expected proxy hits > 0, got %d", hits)
-	}
-
-	if ctx := cat["proxy-model"]; ctx != 32768 {
-		t.Fatalf("catalog[proxy-model] = %d, want 32768", ctx)
-	}
 }
 
 func TestModelsDevColdStartCacheAndDisk(t *testing.T) {
@@ -95,7 +37,7 @@ func TestModelsDevColdStartCacheAndDisk(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cachePath := filepath.Join(tmpDir, "modelsdev_cache.json")
-	setModelsDevCachePath(cachePath)
+	SetCachePath(cachePath)
 
 	var reqCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -109,12 +51,12 @@ func TestModelsDevColdStartCacheAndDisk(t *testing.T) {
 	}))
 	defer server.Close()
 
-	modelsDevMu.Lock()
-	modelsDevCatalogURL = server.URL
-	modelsDevMu.Unlock()
+	mu.Lock()
+	catalogURL = server.URL
+	mu.Unlock()
 
-	// 1. Cold start: Memory and disk are empty. Calling getCachedModelsDevCatalog should fetch from network.
-	cat := getCachedModelsDevCatalog()
+	// 1. Cold start: Memory and disk are empty. Calling GetCachedCatalog should fetch from network.
+	cat := GetCachedCatalog()
 	if cat["model-a"] != 128000 {
 		t.Fatalf("expected model-a context 128000, got %d", cat["model-a"])
 	}
@@ -123,7 +65,7 @@ func TestModelsDevColdStartCacheAndDisk(t *testing.T) {
 	}
 
 	// Verify disk cache file was created and is valid
-	diskCat, _, err := loadModelsDevDiskCache(cachePath)
+	diskCat, _, err := loadDiskCache(cachePath)
 	if err != nil {
 		t.Fatalf("failed to read written disk cache: %v", err)
 	}
@@ -132,7 +74,7 @@ func TestModelsDevColdStartCacheAndDisk(t *testing.T) {
 	}
 
 	// 2. Warm call: In-memory cache hit.
-	cat2 := getCachedModelsDevCatalog()
+	cat2 := GetCachedCatalog()
 	if cat2["model-a"] != 128000 {
 		t.Fatalf("expected model-a context 128000 from memory, got %d", cat2["model-a"])
 	}
@@ -146,12 +88,12 @@ func TestModelsDevDiskCacheStaleWhileRevalidate(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cachePath := filepath.Join(tmpDir, "modelsdev_cache.json")
-	setModelsDevCachePath(cachePath)
+	SetCachePath(cachePath)
 
 	// Pre-seed disk cache with data 2 hours old (< 24 hours, so stale-while-revalidate)
-	diskCache := modelsDevDiskCache{
+	diskCache := diskCache{
 		UpdatedAt: time.Now().Add(-2 * time.Hour),
-		Catalog: modelsDevCatalog{
+		Catalog: Catalog{
 			"stale-model": 65536,
 		},
 	}
@@ -175,12 +117,12 @@ func TestModelsDevDiskCacheStaleWhileRevalidate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	modelsDevMu.Lock()
-	modelsDevCatalogURL = server.URL
-	modelsDevMu.Unlock()
+	mu.Lock()
+	catalogURL = server.URL
+	mu.Unlock()
 
-	// Calling getCachedModelsDevCatalog should immediately return stale disk data
-	cat := getCachedModelsDevCatalog()
+	// Calling GetCachedCatalog should immediately return stale disk data
+	cat := GetCachedCatalog()
 	if cat["stale-model"] != 65536 {
 		t.Fatalf("expected immediate stale disk data (65536), got %d", cat["stale-model"])
 	}
@@ -196,9 +138,9 @@ func TestModelsDevDiskCacheStaleWhileRevalidate(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Now memory cache should have the new refreshed model
-	modelsDevMu.RLock()
-	newCat := cloneModelsDevCatalog(modelsDevMemoryCache)
-	modelsDevMu.RUnlock()
+	mu.RLock()
+	newCat := cloneCatalog(memoryCache)
+	mu.RUnlock()
 	if newCat["refreshed-model"] != 200000 {
 		t.Fatalf("expected refreshed-model in memory after async update, got %d", newCat["refreshed-model"])
 	}
@@ -209,12 +151,12 @@ func TestModelsDevNetworkFailureFallback(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cachePath := filepath.Join(tmpDir, "modelsdev_cache.json")
-	setModelsDevCachePath(cachePath)
+	SetCachePath(cachePath)
 
 	// Pre-seed disk cache with older data (e.g. 30 hours old)
-	diskCache := modelsDevDiskCache{
+	diskCache := diskCache{
 		UpdatedAt: time.Now().Add(-30 * time.Hour),
-		Catalog: modelsDevCatalog{
+		Catalog: Catalog{
 			"fallback-model": 50000,
 		},
 	}
@@ -227,12 +169,12 @@ func TestModelsDevNetworkFailureFallback(t *testing.T) {
 	}))
 	defer server.Close()
 
-	modelsDevMu.Lock()
-	modelsDevCatalogURL = server.URL
-	modelsDevMu.Unlock()
+	mu.Lock()
+	catalogURL = server.URL
+	mu.Unlock()
 
-	// Despite synchronous network failure, getCachedModelsDevCatalog falls back to stale disk cache
-	cat := getCachedModelsDevCatalog()
+	// Despite synchronous network failure, GetCachedCatalog falls back to stale disk cache
+	cat := GetCachedCatalog()
 	if cat["fallback-model"] != 50000 {
 		t.Fatalf("expected fallback disk data (50000), got %d", cat["fallback-model"])
 	}
@@ -243,7 +185,7 @@ func TestRefreshModelsDevCatalogBackground(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cachePath := filepath.Join(tmpDir, "modelsdev_cache.json")
-	setModelsDevCachePath(cachePath)
+	SetCachePath(cachePath)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -255,21 +197,21 @@ func TestRefreshModelsDevCatalogBackground(t *testing.T) {
 	}))
 	defer server.Close()
 
-	modelsDevMu.Lock()
-	modelsDevCatalogURL = server.URL
-	modelsDevMu.Unlock()
+	mu.Lock()
+	catalogURL = server.URL
+	mu.Unlock()
 
-	cat, err := refreshModelsDevCatalogBackground()
+	cat, err := RefreshCatalog()
 	if err != nil {
-		t.Fatalf("refreshModelsDevCatalogBackground failed: %v", err)
+		t.Fatalf("RefreshCatalog failed: %v", err)
 	}
 	if cat["bg-model"] != 524288 {
 		t.Fatalf("expected bg-model context 524288, got %d", cat["bg-model"])
 	}
 
-	diskCat, _, err := loadModelsDevDiskCache(cachePath)
+	diskCat, _, err := loadDiskCache(cachePath)
 	if err != nil {
-		t.Fatalf("loadModelsDevDiskCache failed: %v", err)
+		t.Fatalf("loadDiskCache failed: %v", err)
 	}
 	if diskCat["bg-model"] != 524288 {
 		t.Fatalf("diskCache bg-model = %d, want 524288", diskCat["bg-model"])

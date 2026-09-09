@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"github.com/6Kmfi6HP/opencode2api/internal/random"
 )
 
@@ -311,7 +312,7 @@ func startModelRefresh() {
 					slog.Error("go catalog refresh failed", "error", goErr)
 				}
 			case <-modelsDevTicker.C:
-				if _, err := refreshModelsDevCatalogBackground(); err != nil {
+				if _, err := modelsdev.RefreshCatalog(); err != nil {
 					slog.Error("models.dev catalog refresh failed", "error", err)
 				} else {
 					slog.Info("models.dev catalog auto-refreshed")

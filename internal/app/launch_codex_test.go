@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -86,7 +87,7 @@ func TestBuildCodexModelCatalogSpecs(t *testing.T) {
 		modelMu.Unlock()
 	})
 
-	catalog := modelsDevCatalog{
+	catalog := modelsdev.Catalog{
 		"deepseek-v4-flash":      1048576,
 		"deepseek-v4-flash-free": 1048576,
 		"paid-only-model":        200000,

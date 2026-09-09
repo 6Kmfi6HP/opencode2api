@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
@@ -60,7 +61,8 @@ func Run() {
 	resolvedStats, _ := resolveStatsPath(statsFile, flagSet("stats-file"), configPath, configExplicit)
 	setTokenStatsPath(resolvedStats)
 	resolvedModelsDevCache, _ := resolveModelsDevCachePath(configPath, configExplicit)
-	setModelsDevCachePath(resolvedModelsDevCache)
+	modelsdev.SetCachePath(resolvedModelsDevCache)
+	modelsdev.SetClientGetter(getHTTPClient)
 
 	initLogger()
 	defer closeLogRotator()
@@ -185,7 +187,7 @@ func initProxyCoreWithSave(save bool) {
 		slog.Info("go catalog loaded", "count", len(goModels))
 	}
 
-	modelsDevCat := getCachedModelsDevCatalog()
+	modelsDevCat := modelsdev.GetCachedCatalog()
 	if len(modelsDevCat) > 0 {
 		slog.Info("models.dev catalog loaded", "count", len(modelsDevCat))
 	}

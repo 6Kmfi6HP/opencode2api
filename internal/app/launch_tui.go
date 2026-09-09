@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"os"
 	"os/exec"
 	"strings"
@@ -23,7 +24,7 @@ import (
 // If stdin is not a terminal the function returns an empty string with a
 // stderr hint, so the launch flow can fall back to Claude Code's defaults.
 // On cancel the return is also an empty string.
-func selectModelTTY(modelIDs []string, catalog modelsDevCatalog) (string, error) {
+func selectModelTTY(modelIDs []string, catalog modelsdev.Catalog) (string, error) {
 	fi, err := os.Stdin.Stat()
 	if err != nil || (fi.Mode()&os.ModeCharDevice) == 0 {
 		fmt.Fprintln(os.Stderr, "opencode2api: stdin is not a terminal; skipping model selection")

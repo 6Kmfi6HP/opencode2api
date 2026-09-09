@@ -3,6 +3,7 @@
 package app
 
 import (
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"io"
 	"os"
 	"os/exec"
@@ -20,6 +21,6 @@ func signalLaunchChild(proc *os.Process, sig os.Signal) {
 
 // selectModelInteractive is the platform selection entry point. Unix-likes
 // keep the existing terminal raw-mode selector.
-func selectModelInteractive(in io.Reader, out io.Writer, errOut io.Writer, modelIDs []string, catalog modelsDevCatalog) (string, error) {
+func selectModelInteractive(in io.Reader, out io.Writer, errOut io.Writer, modelIDs []string, catalog modelsdev.Catalog) (string, error) {
 	return selectModelTTY(modelIDs, catalog)
 }
