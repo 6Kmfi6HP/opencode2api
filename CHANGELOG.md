@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.10.3
+
+- Internal refactor (no user-facing behavior change): split the monolithic `internal/app` package into focused subpackages — `internal/config` (immutable config snapshot + accessors), `internal/logging` (logger init, request tracing, stream stats, redaction), `internal/stats` (token/cache usage accounting), `internal/modelsdev` (models.dev catalog fetch/cache with injectable proxy-aware HTTP client), and `internal/util` (shared helpers).
+- Fix token usage accounting to correctly record integer-valued tokens, which a `float64` type assertion previously dropped.
+- Fix a data race on the `socks5_sticky` flag when the config is reloaded concurrently (found via `go test -race`).
+
 ## v0.10.2
 
 - Session-aware launch stub and upstream routing:
