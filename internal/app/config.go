@@ -189,14 +189,13 @@ func applyConfig(cfg AppConfig) {
 		stickyMu.Unlock()
 	}
 	socks5PaidDirect = cfg.Socks5PaidDirect
-	socks5Mu.Unlock()
-
-	setUpstreamBaseURLs(cfg.UpstreamBaseURLs)
-
 	socks5Sticky = true
 	if cfg.Socks5Sticky != nil {
 		socks5Sticky = *cfg.Socks5Sticky
 	}
+	socks5Mu.Unlock()
+
+	setUpstreamBaseURLs(cfg.UpstreamBaseURLs)
 
 	if cfg.NativeResponsesModels != nil {
 		setNativeResponsesModels(cfg.NativeResponsesModels)
