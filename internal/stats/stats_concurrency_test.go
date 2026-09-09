@@ -1,4 +1,4 @@
-package app
+package stats
 
 import (
 	"encoding/json"
@@ -20,8 +20,8 @@ import (
 func TestWriteTokenStatsAtomicallyConcurrentWritersAccumulateExactly(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "nested", "stats.json")
-	setTokenStatsPath(path)
-	t.Cleanup(func() { setTokenStatsPath("stats.json") })
+	SetPath(path)
+	t.Cleanup(func() { SetPath("stats.json") })
 
 	must := func(ok bool, msg string) {
 		t.Helper()
@@ -100,13 +100,13 @@ func TestWriteTokenStatsAtomicallyConcurrentWritersAccumulateExactly(t *testing.
 }
 
 // TestRecordTokenUsagePersistDeltas proves the user-facing record path
-// (recordTokenUsage) does not lose increments on disk when concurrent
+// (RecordTokenUsage) does not lose increments on disk when concurrent
 // goroutines drive the stats through the file-backed read-modify-write path.
 func TestRecordTokenUsagePersistDeltas(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "stats.json")
-	resetStatsAndLogTestState(t)
-	setTokenStatsPath(path)
+	resetStatsForTest(t)
+	SetPath(path)
 	replaceTokenStatsSnapshot(&TokenStatsData{Models: map[string]*ModelStats{}})
 
 	if err := os.WriteFile(path, []byte(`{"total_requests":0,"models":{}}`), 0o644); err != nil {
@@ -123,7 +123,7 @@ func TestRecordTokenUsagePersistDeltas(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < per; j++ {
-				recordTokenUsage("race-model", 1, 2, 3)
+				RecordTokenUsage("race-model", 1, 2, 3)
 			}
 		}()
 	}
@@ -165,8 +165,8 @@ func TestRecordTokenUsagePersistDeltas(t *testing.T) {
 func TestRecordCacheUsageMergesAcrossWriters(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "stats.json")
-	resetStatsAndLogTestState(t)
-	setTokenStatsPath(path)
+	resetStatsForTest(t)
+	SetPath(path)
 	if err := os.WriteFile(path, []byte(`{"total_requests":0,"models":{"cache-model":{"request_count":0}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestRecordCacheUsageMergesAcrossWriters(t *testing.T) {
 	for i := 0; i < iters; i++ {
 		go func() {
 			defer wg.Done()
-			recordCacheUsage("cache-model", map[string]any{
+			RecordCacheUsage("cache-model", map[string]any{
 				"cache_read_input_tokens":     float64(4),
 				"cache_creation_input_tokens": float64(8),
 			})

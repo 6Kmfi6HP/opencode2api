@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
 	"net/http"
@@ -765,14 +766,14 @@ func recordClaudeResponsesUsage(model string, usage map[string]any) {
 	if usage == nil {
 		return
 	}
-	u := tokenUsage{}.fromMap(usage)
+	u := statsx.TokenUsage{}.FromMap(usage)
 	pt, ct, tt := u.PromptTokens, u.CompletionTokens, u.TotalTokens
 	if tt <= 0 && (pt > 0 || ct > 0) {
 		tt = pt + ct
 	}
 	if tt > 0 {
-		recordTokenUsage(model, pt, ct, tt)
-		recordCacheUsage(model, responsesUsageToChat(usage))
+		statsx.RecordTokenUsage(model, pt, ct, tt)
+		statsx.RecordCacheUsage(model, responsesUsageToChat(usage))
 	}
 }
 
@@ -1065,8 +1066,8 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		if len(fullUsage) > 0 {
 			pt, ct, tt := usageFromResponsesMap(fullUsage)
 			if tt > 0 {
-				recordTokenUsage(model, pt, ct, tt)
-				recordCacheUsage(model, responsesUsageToChat(fullUsage))
+				statsx.RecordTokenUsage(model, pt, ct, tt)
+				statsx.RecordCacheUsage(model, responsesUsageToChat(fullUsage))
 			}
 		}
 	}()
@@ -1218,7 +1219,7 @@ func indexOfToolOrder(order []int, v int) (int, bool) {
 }
 
 func usageFromResponsesMap(usage map[string]any) (int64, int64, int64) {
-	u := tokenUsage{}.fromMap(usage)
+	u := statsx.TokenUsage{}.FromMap(usage)
 	pt, ct, tt := u.PromptTokens, u.CompletionTokens, u.TotalTokens
 	if tt <= 0 && (pt > 0 || ct > 0) {
 		tt = pt + ct

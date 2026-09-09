@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/ids"
+	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
 
 // Claude roundtrip; convertResponse strips it before responding to clients.
@@ -538,14 +539,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			if out == "" {
 				// 空choices chunk，但可能有 usage
 				if usage != nil {
-					recordChatUsage(req.Model, usage)
+					statsx.RecordChatUsage(req.Model, usage)
 				}
 				continue
 			}
 
 			// 提取 usage（已在 convertStreamChunkWithUsage 中解析）
 			if usage != nil && !doneSeen {
-				recordChatUsage(req.Model, usage)
+				statsx.RecordChatUsage(req.Model, usage)
 			}
 
 			w.Write([]byte(out))
@@ -600,7 +601,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
-			recordChatUsage(req.Model, u)
+			statsx.RecordChatUsage(req.Model, u)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")

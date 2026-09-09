@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"errors"
+	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -519,16 +520,12 @@ func TestResponsesPassthroughStreamRecordsUsage(t *testing.T) {
 		delete(nativeResponsesModels.ids, streamModel)
 		nativeResponsesModels.Unlock()
 	})
-	tokenStatsMu.Lock()
 	before := int64(0)
-	if ms := tokenStats.Models[streamModel]; ms != nil {
+	if ms := stats.Snapshot().Models[streamModel]; ms != nil {
 		before = ms.TotalTokens
 	}
-	tokenStatsMu.Unlock()
 	t.Cleanup(func() {
-		tokenStatsMu.Lock()
-		delete(tokenStats.Models, streamModel)
-		tokenStatsMu.Unlock()
+		delete(stats.Snapshot().Models, streamModel)
 	})
 
 	sse := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
@@ -556,12 +553,10 @@ func TestResponsesPassthroughStreamRecordsUsage(t *testing.T) {
 	if rec.Body.String() != sse+"data: [DONE]\n\n" {
 		t.Fatalf("stream body = %q, want verbatim relay + trailing [DONE]", rec.Body.String())
 	}
-	tokenStatsMu.Lock()
 	after := int64(0)
-	if ms := tokenStats.Models[streamModel]; ms != nil {
+	if ms := stats.Snapshot().Models[streamModel]; ms != nil {
 		after = ms.TotalTokens
 	}
-	tokenStatsMu.Unlock()
 	if after-before != 15 {
 		t.Fatalf("streamed usage delta = %d, want 15", after-before)
 	}

@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,16 +11,12 @@ import (
 func resetStatsAndLogTestState(t *testing.T) {
 	t.Helper()
 
-	tokenStatsMu.Lock()
-	origStatsPointer := tokenStats
-	tokenStatsMu.Unlock()
+	origStatsPointer := stats.Snapshot()
 	origStatsPath := getTokenStatsPath()
 	origLog := logFile
 
 	t.Cleanup(func() {
-		tokenStatsMu.Lock()
-		tokenStats = origStatsPointer
-		tokenStatsMu.Unlock()
+		stats.SetSnapshot(origStatsPointer)
 		setTokenStatsPath(origStatsPath)
 		logFile = origLog
 	})

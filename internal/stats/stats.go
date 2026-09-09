@@ -1,4 +1,4 @@
-package app
+package stats
 
 import (
 	"encoding/json"
@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/util"
 )
 
 // ======================== Token 统计 ========================
@@ -36,8 +38,8 @@ var (
 	tokenStatsPath = "stats.json"
 )
 
-// setTokenStatsPath updates the file path used to persist token usage statistics.
-func setTokenStatsPath(path string) {
+// SetPath updates the file path used to persist token usage statistics.
+func SetPath(path string) {
 	tokenStatsMu.Lock()
 	defer tokenStatsMu.Unlock()
 	if path != "" {
@@ -45,8 +47,8 @@ func setTokenStatsPath(path string) {
 	}
 }
 
-// getTokenStatsPath returns the currently configured token stats file path.
-func getTokenStatsPath() string {
+// GetPath returns the currently configured token stats file path.
+func GetPath() string {
 	tokenStatsMu.Lock()
 	defer tokenStatsMu.Unlock()
 	return tokenStatsPath
@@ -101,11 +103,35 @@ func replaceTokenStatsSnapshot(snap *TokenStatsData) {
 	tokenStats = snap
 }
 
-// loadTokenStats reads the on-disk token stats file into the in-memory
+// Snapshot returns the current in-memory stats snapshot. Intended for the app
+// package (and its tests) to seed or restore per-test state.
+func Snapshot() *TokenStatsData {
+	tokenStatsMu.Lock()
+	defer tokenStatsMu.Unlock()
+	return tokenStats
+}
+
+// SetSnapshot replaces the in-memory stats snapshot and returns the previous
+// one. Intended for the app package to restore test state.
+func SetSnapshot(snap *TokenStatsData) *TokenStatsData {
+	tokenStatsMu.Lock()
+	defer tokenStatsMu.Unlock()
+	previous := tokenStats
+	if snap == nil {
+		snap = &TokenStatsData{Models: map[string]*ModelStats{}}
+	}
+	if snap.Models == nil {
+		snap.Models = map[string]*ModelStats{}
+	}
+	tokenStats = snap
+	return previous
+}
+
+// LoadTokenStats reads the on-disk token stats file into the in-memory
 // snapshot, which is used by /api/stats as a low-latency fallback when the
 // disk read fails.
-func loadTokenStats() {
-	path := getTokenStatsPath()
+func LoadTokenStats() {
+	path := GetPath()
 	st, err := readTokenStatsFromDisk(path)
 	if err != nil {
 		return
@@ -211,7 +237,7 @@ func readStatsFromLockedFile(f *os.File) (*TokenStatsData, error) {
 // Asynchronous invocation keeps the request hot-path lock-free while
 // guarding against concurrent writers from other binaries (server + launch).
 func persistTokenStatsDelta(delta func(cur *TokenStatsData)) {
-	path := getTokenStatsPath()
+	path := GetPath()
 	if err := writeTokenStatsAtomically(path, delta); err != nil {
 		slog.Warn("failed to persist token stats", "path", path, "error", err)
 	}
@@ -219,11 +245,11 @@ func persistTokenStatsDelta(delta func(cur *TokenStatsData)) {
 
 // saveTokenStats overwrites the stats file with the current in-memory snapshot
 // under an exclusive lock. Used by the admin DELETE handler and tests that
-// require explicit disk-mirror semantics. Pre-recordTokenUsage writers (the
+// require explicit disk-mirror semantics. Pre-RecordTokenUsage writers (the
 // old hot-path) are intentionally replaced by persistTokenStatsDelta which
 // merges deltas against the latest disk state.
 func saveTokenStats() error {
-	path := getTokenStatsPath()
+	path := GetPath()
 	snap := cloneTokenStatsSnapshot()
 	return writeTokenStatsAtomically(path, func(cur *TokenStatsData) {
 		*cur = TokenStatsData{
@@ -237,7 +263,7 @@ func saveTokenStats() error {
 	})
 }
 
-func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens int64) {
+func RecordTokenUsage(model string, promptTokens, completionTokens, totalTokens int64) {
 	// Update the in-memory snapshot synchronously so an immediately-following
 	// /api/stats GET sees the fresh count even before the async disk write
 	// completes on a contention-free process.
@@ -268,10 +294,10 @@ func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens 
 	})
 }
 
-// recordCacheUsage aggregates upstream prompt-cache accounting per model.
+// RecordCacheUsage aggregates upstream prompt-cache accounting per model.
 // Call it with the raw upstream usage map; zero/nil inputs are no-ops so
 // call sites don't need extra branching.
-func recordCacheUsage(model string, usage map[string]any) {
+func RecordCacheUsage(model string, usage map[string]any) {
 	if model == "" || len(usage) == 0 {
 		return
 	}
@@ -300,23 +326,23 @@ func recordCacheUsage(model string, usage map[string]any) {
 	})
 }
 
-// tokenUsage is a typed view over an upstream usage map. It normalizes the
+// TokenUsage is a typed view over an upstream usage map. It normalizes the
 // Chat spelling (prompt_tokens/completion_tokens/total_tokens) and the
 // Responses spelling (input_tokens/output_tokens/total_tokens) so call sites
 // do not repeat the (prompt, completion, total) triple extraction.
-type tokenUsage struct {
+type TokenUsage struct {
 	PromptTokens     int64
 	CompletionTokens int64
 	TotalTokens      int64
 }
 
-// fromMap builds a tokenUsage from a usage map. Values are read through
-// numberAsFloat so integer-valued JSON numbers (decoded as int/int64) are not
-// dropped by a raw float64 type assertion. The Responses spelling
+// FromMap builds a TokenUsage from a usage map. Values are read through
+// util.NumberAsFloat so integer-valued JSON numbers (decoded as int/int64) are
+// not dropped by a raw float64 type assertion. The Responses spelling
 // (input/output_tokens) is preferred when present, matching the existing
 // Chat-to-Responses fallback order in the Claude/Response helpers.
-func (tokenUsage) fromMap(m map[string]any) tokenUsage {
-	var u tokenUsage
+func (TokenUsage) FromMap(m map[string]any) TokenUsage {
+	var u TokenUsage
 	u.PromptTokens = firstUsageToken(m, "input_tokens", "prompt_tokens")
 	u.CompletionTokens = firstUsageToken(m, "output_tokens", "completion_tokens")
 	u.TotalTokens = firstUsageToken(m, "total_tokens")
@@ -327,33 +353,33 @@ func (tokenUsage) fromMap(m map[string]any) tokenUsage {
 // none of the keys hold a number.
 func firstUsageToken(m map[string]any, keys ...string) int64 {
 	for _, k := range keys {
-		if v, ok := numberAsFloat(m[k]); ok {
+		if v, ok := util.NumberAsFloat(m[k]); ok {
 			return int64(v)
 		}
 	}
 	return 0
 }
 
-// recordChatUsage records token and cache usage from a Chat-protocol usage
+// RecordChatUsage records token and cache usage from a Chat-protocol usage
 // map (prompt_tokens/completion_tokens/total_tokens). Absent or zero totals
-// are ignored; recordCacheUsage is itself a no-op when no cache fields exist.
-func recordChatUsage(model string, usage map[string]any) {
+// are ignored; RecordCacheUsage is itself a no-op when no cache fields exist.
+func RecordChatUsage(model string, usage map[string]any) {
 	if usage == nil {
 		return
 	}
-	u := tokenUsage{}.fromMap(usage)
+	u := TokenUsage{}.FromMap(usage)
 	if u.TotalTokens > 0 {
-		recordTokenUsage(model, u.PromptTokens, u.CompletionTokens, u.TotalTokens)
-		recordCacheUsage(model, usage)
+		RecordTokenUsage(model, u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+		RecordCacheUsage(model, usage)
 	}
 }
 
-// readTokenStatsSnapshot returns the most recent on-disk token stats when
+// ReadTokenStatsSnapshot returns the most recent on-disk token stats when
 // available; otherwise it falls back to the in-memory snapshot. Used by
 // /api/stats GET so the admin panel reflects contributions from every binary
 // instance writing the same shared stats file.
-func readTokenStatsSnapshot() (*TokenStatsData, error) {
-	path := getTokenStatsPath()
+func ReadTokenStatsSnapshot() (*TokenStatsData, error) {
+	path := GetPath()
 	if st, err := readTokenStatsFromDisk(path); err == nil {
 		return st, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -364,10 +390,19 @@ func readTokenStatsSnapshot() (*TokenStatsData, error) {
 	return cloneTokenStatsSnapshot(), nil
 }
 
+// ResetTokenStats clears the shared stats file and the in-memory copy. Used
+// by the admin DELETE handler.
+func ResetTokenStats() error {
+	tokenStatsMu.Lock()
+	tokenStats = &TokenStatsData{Models: map[string]*ModelStats{}}
+	tokenStatsMu.Unlock()
+	return saveTokenStats()
+}
+
 // resetTokenStatsOnDisk clears the shared stats file and the in-memory copy.
 // Used by the admin DELETE handler.
 func resetTokenStatsOnDisk() error {
-	path := getTokenStatsPath()
+	path := GetPath()
 	if err := ensureStatsDir(path); err != nil {
 		return err
 	}
@@ -377,7 +412,7 @@ func resetTokenStatsOnDisk() error {
 	}
 	defer func() { _ = f.Close() }()
 	if err := lockStatsFileExclusive(f); err != nil {
-		return fmt.Errorf("lock stats file: %w", err)
+		return fmt.Errorf("lock stats file %s: %w", path, err)
 	}
 	defer func() { _ = unlockStatsFile(f) }()
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -408,16 +443,16 @@ func parseCacheUsage(usage map[string]any) (int64, int64) {
 	// Prefer the canonical Anthropic cache field. The fallbacks use the same
 	// semantic category (already-cached prompt tokens), so any combination is
 	// read once instead of double-counted.
-	if v, ok := usageIntField(usage, "cache_read_input_tokens"); ok {
+	if v, ok := util.NumberAsFloat(usage["cache_read_input_tokens"]); ok {
 		read += int64(v)
-	} else if v, ok := usageIntField(usage, "prompt_cache_hit_tokens"); ok {
+	} else if v, ok := util.NumberAsFloat(usage["prompt_cache_hit_tokens"]); ok {
 		read += int64(v)
-	} else if details, ok := usageMapField(usage, "prompt_tokens_details"); ok {
-		if v, ok := usageIntField(details, "cached_tokens"); ok {
+	} else if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
+		if v, ok := util.NumberAsFloat(details["cached_tokens"]); ok {
 			read += int64(v)
 		}
 	}
-	if v, ok := usageIntField(usage, "cache_creation_input_tokens"); ok {
+	if v, ok := util.NumberAsFloat(usage["cache_creation_input_tokens"]); ok {
 		created += int64(v)
 	}
 	return read, created

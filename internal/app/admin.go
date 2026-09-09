@@ -3,6 +3,7 @@ package app
 import (
 	_ "embed"
 	"encoding/json"
+	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"log/slog"
 	"net/http"
 )
@@ -126,7 +127,7 @@ func adminStatsHandler(w http.ResponseWriter, r *http.Request) {
 		// instances that share this file (long-running server plus short-lived
 		// `opencode2api launch claude|codex` proxies). The in-memory snapshot
 		// is used only when the file is unreadable.
-		snap, err := readTokenStatsSnapshot()
+		snap, err := stats.ReadTokenStatsSnapshot()
 		if err != nil {
 			http.Error(w, `{"error":"read stats failed"}`, http.StatusInternalServerError)
 			return
@@ -139,10 +140,7 @@ func adminStatsHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(data)
 	case http.MethodDelete:
-		tokenStatsMu.Lock()
-		tokenStats = &TokenStatsData{Models: map[string]*ModelStats{}}
-		tokenStatsMu.Unlock()
-		if err := saveTokenStats(); err != nil {
+		if err := stats.ResetTokenStats(); err != nil {
 			slog.Error("failed to save cleared token stats", "path", getTokenStatsPath(), "error", err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)

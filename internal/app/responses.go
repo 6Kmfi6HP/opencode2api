@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1259,7 +1260,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
-			recordChatUsage(chatReq.Model, u)
+			statsx.RecordChatUsage(chatReq.Model, u)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1968,7 +1969,7 @@ loop:
 	}
 
 	if totalUsage != nil {
-		recordChatUsage(model, totalUsage)
+		statsx.RecordChatUsage(model, totalUsage)
 	}
 
 	seq++

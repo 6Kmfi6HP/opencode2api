@@ -4,7 +4,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
+
+// setTokenStatsPath is a thin delegate over stats.SetPath so existing app
+// callers keep working after the stats domain moved into internal/stats.
+func setTokenStatsPath(path string) { stats.SetPath(path) }
+
+// getTokenStatsPath is a thin delegate over stats.GetPath so existing app
+// callers keep working after the stats domain moved into internal/stats.
+func getTokenStatsPath() string { return stats.GetPath() }
 
 // resolveConfigPath returns the effective config file path and reports whether
 // the path came from the user-level fallback.

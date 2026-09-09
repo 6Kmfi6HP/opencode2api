@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
 	"math"
@@ -1012,7 +1013,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
-			recordChatUsage(claudeReq.Model, u)
+			statsx.RecordChatUsage(claudeReq.Model, u)
 		}
 	}
 
@@ -1088,7 +1089,7 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 
 	defer func() {
 		if len(fullUsage) > 0 {
-			recordChatUsage(model, fullUsage)
+			statsx.RecordChatUsage(model, fullUsage)
 		}
 		stats.toolCallCount = len(toolCallOrder)
 		stats.log(ctx, "claude")

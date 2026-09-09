@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/util"
 	"math"
 	"net/http"
 	"strings"
@@ -49,26 +50,10 @@ func anthropicUsageToChat(usage map[string]any) map[string]any {
 	return out
 }
 
-func numberAsFloat(v any) (float64, bool) {
-	switch n := v.(type) {
-	case float64:
-		return n, true
-	case int:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	default:
-		return 0, false
-	}
-}
+func numberAsFloat(v any) (float64, bool) { return util.NumberAsFloat(v) }
 
 // toString converts a value to string, returning "" for non-strings.
-func toString(v any) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
-}
+func toString(v any) string { return util.ToString(v) }
 
 // validateTemperature checks an optional temperature against an inclusive
 // [min, max] range. nil (absent) and any in-range value (including the

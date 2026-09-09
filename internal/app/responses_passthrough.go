@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
 	"net/http"
@@ -937,10 +938,10 @@ func recordResponsesUsage(modelID string, usage any) {
 	if !ok {
 		return
 	}
-	t := tokenUsage{}.fromMap(u)
+	t := stats.TokenUsage{}.FromMap(u)
 	if t.TotalTokens <= 0 {
 		return
 	}
-	recordTokenUsage(modelID, t.PromptTokens, t.CompletionTokens, t.TotalTokens)
-	recordCacheUsage(modelID, u)
+	stats.RecordTokenUsage(modelID, t.PromptTokens, t.CompletionTokens, t.TotalTokens)
+	stats.RecordCacheUsage(modelID, u)
 }

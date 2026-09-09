@@ -20,14 +20,14 @@ type compiledKeywordRule struct {
 }
 
 var (
-	port               string
-	configPath         = "config.json"
-	modelAliasRules    = []domain.ModelKeywordRule{}
-	compiledRules      = []compiledKeywordRule{}
-	debugMode          bool
-	configMu           sync.RWMutex
-	storedResponses    = map[string]StoredResponseState{}
-	storedResponsesMu  sync.RWMutex
+	port              string
+	configPath        = "config.json"
+	modelAliasRules   = []domain.ModelKeywordRule{}
+	compiledRules     = []compiledKeywordRule{}
+	debugMode         bool
+	configMu          sync.RWMutex
+	storedResponses   = map[string]StoredResponseState{}
+	storedResponsesMu sync.RWMutex
 )
 
 // ConfigSnapshot is an immutable snapshot of the read-only package config

@@ -136,3 +136,30 @@ func TestBuildClaudeUsageCoreInputTokensExcludesSplitHit(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildClaudeUsageCoreDeepSeekMissIsNotCreation verifies that DeepSeek's
+// prompt_cache_miss_tokens (ordinary input tokens) are never surfaced as cache
+// creation, keeping Anthropic semantics (input, read and creation are mutually
+// exclusive).
+func TestBuildClaudeUsageCoreDeepSeekMissIsNotCreation(t *testing.T) {
+	usage := buildClaudeUsageCore(map[string]any{
+		"prompt_tokens":            float64(200),
+		"prompt_cache_hit_tokens":  float64(160),
+		"prompt_cache_miss_tokens": float64(40),
+		"completion_tokens":        float64(35),
+	})
+	// input_tokens excludes the cache-hit portion (Anthropic semantics:
+	// input, read and creation are mutually exclusive).
+	if got := usage["input_tokens"]; got != 40 {
+		t.Fatalf("input_tokens = %v, want 40", got)
+	}
+	if got := usage["output_tokens"]; got != 35 {
+		t.Fatalf("output_tokens = %v, want 35", got)
+	}
+	if got := usage["cache_read_input_tokens"]; got != 160 {
+		t.Fatalf("cache_read_input_tokens = %v, want 160", got)
+	}
+	if _, ok := usage["cache_creation_input_tokens"]; ok {
+		t.Fatalf("cache_creation_input_tokens should be absent for DeepSeek miss-only usage, got %v", usage["cache_creation_input_tokens"])
+	}
+}

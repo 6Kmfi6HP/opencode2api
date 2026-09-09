@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
 	"net"
@@ -160,7 +161,7 @@ func initProxyCoreWithSave(save bool) {
 		}
 	}
 
-	loadTokenStats()
+	stats.LoadTokenStats()
 	slog.Info("config loaded", "path", configPath)
 	initOCSession()
 	models, err := fetchModels()
