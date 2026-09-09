@@ -13,6 +13,7 @@ import (
 
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/ids"
+	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
 
@@ -404,7 +405,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	maybeLogBodySummary(r.Context(), "chat completion request body", body)
+	logging.MaybeBodySummary(r.Context(), "chat completion request body", body)
 
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -445,7 +446,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if auth.shouldUseGoEndpoint(req.Model) {
 		upstreamSurface = "go"
 	}
-	logRequestPlan(r.Context(), map[string]any{
+	logging.PlanRequest(r.Context(), map[string]any{
 		"protocol":             "chat",
 		"model_in":             modelIn,
 		"model_resolved":       req.Model,
@@ -488,7 +489,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
 		reader := bufio.NewReader(upResp)
-		stats := &streamResultStats{start: time.Now()}
+		stats := &logging.StreamStats{Start: time.Now()}
 		doneSeen := false
 		for {
 			line, err := reader.ReadString('\n')
@@ -496,13 +497,13 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				if err == io.EOF {
 					break
 				}
-				reqLogger(r.Context()).Error("stream read error", "error", err)
+				logging.FromContext(r.Context()).Error("stream read error", "error", err)
 				// 发送错误事件通知客户端
 				w.Write([]byte("data: {\"error\":\"stream read error\"}\n\n"))
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
-				stats.log(r.Context(), "chat")
+				stats.Log(r.Context(), "chat")
 				return
 			}
 			if doneSeen {
@@ -511,7 +512,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "data: [DONE]" {
 				doneSeen = true
-				stats.doneSeen = true
+				stats.DoneSeen = true
 				w.Write([]byte("data: [DONE]\n\n"))
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
@@ -525,11 +526,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 					if choices, ok := raw["choices"].([]any); ok && len(choices) > 0 {
 						if choice, ok := choices[0].(map[string]any); ok {
 							if delta, ok := choice["delta"].(map[string]any); ok {
-								stats.observeDelta(delta, keepReasoning)
+								stats.ObserveDelta(delta, keepReasoning)
 							}
 							if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
-								stats.finishReason = fr
-								stats.sawFinish = true
+								stats.FinishReason = fr
+								stats.SawFinish = true
 							}
 						}
 					}
@@ -556,7 +557,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				f.Flush()
 			}
 		}
-		stats.log(r.Context(), "chat")
+		stats.Log(r.Context(), "chat")
 		return
 	}
 
@@ -580,7 +581,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		outBody = convertedResp
 	}
-	result := summarizeChatResult(outBody)
+	result := logging.SummarizeChatResult(outBody)
 	if !keepReasoning {
 		var before map[string]any
 		if json.Unmarshal(respBody, &before) == nil {
@@ -597,7 +598,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	logRequestResult(r.Context(), result)
+	logging.LogResult(r.Context(), result)
 	// Record token usage
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {

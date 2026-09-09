@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
+	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
@@ -965,7 +966,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	maybeLogBodySummary(r.Context(), "responses request body", body)
+	logging.MaybeBodySummary(r.Context(), "responses request body", body)
 
 	var respReq ResponsesAPIRequest
 	if err := json.Unmarshal(body, &respReq); err != nil {
@@ -1167,7 +1168,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if auth.shouldUseGoEndpoint(chatReq.Model) {
 		upstreamSurface = "go"
 	}
-	logRequestPlan(r.Context(), map[string]any{
+	logging.PlanRequest(r.Context(), map[string]any{
 		"protocol":             "responses",
 		"model_in":             modelIn,
 		"model_resolved":       chatReq.Model,
@@ -1255,8 +1256,8 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		storeResponseState(responseMap, respReq)
 	}
 
-	result := summarizeChatResult(respBody)
-	logRequestResult(r.Context(), result)
+	result := logging.SummarizeChatResult(respBody)
+	logging.LogResult(r.Context(), result)
 
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
@@ -1266,7 +1267,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	maybeLogBodySummary(r.Context(), "responses response body", responsesBody)
+	logging.MaybeBodySummary(r.Context(), "responses response body", responsesBody)
 	w.Write(responsesBody)
 }
 
@@ -1295,7 +1296,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(resp.Body)
-	stats := &streamResultStats{start: time.Now()}
+	stats := &logging.StreamStats{Start: time.Now()}
 
 	responseID := "resp_" + time.Now().Format("20060102150405") + "_" + randomString(8)
 	reasoningID := "rs_" + responseID
@@ -1355,10 +1356,10 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 	}()
 
 	defer func() {
-		stats.textChars = len(fullText)
-		stats.reasoningChars = len(fullReasoning)
-		stats.toolCallCount = len(toolOrder)
-		stats.log(ctx, "responses")
+		stats.TextChars = len(fullText)
+		stats.ReasoningChars = len(fullReasoning)
+		stats.ToolCallCount = len(toolOrder)
+		stats.Log(ctx, "responses")
 	}()
 	// Reader cleanup: signal goroutine, unblock any pending read, wait for exit.
 	defer func() {
@@ -1602,11 +1603,11 @@ loop:
 			line := result.line
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
-				stats.doneSeen = true
+				stats.DoneSeen = true
 				if !finished {
 					if usageTerminalSeen && (messageStarted || reasoningStarted || len(toolCalls) > 0) {
-						stats.sawFinish = true
-						stats.finishReason = "stop"
+						stats.SawFinish = true
+						stats.FinishReason = "stop"
 						finished = true
 						break loop
 					}
@@ -1636,7 +1637,7 @@ loop:
 							emitResponseFailed(errMsg)
 							return
 						} else {
-							stats.noteChunk()
+							stats.NoteChunk()
 							ensureCreated(chunk)
 							choices, ok := chunk["choices"].([]any)
 							if !ok || len(choices) == 0 {
@@ -1651,8 +1652,8 @@ loop:
 								delta, _ := choice["delta"].(map[string]any)
 								finishReason, _ := choice["finish_reason"].(string)
 								if finishReason != "" {
-									stats.finishReason = finishReason
-									stats.sawFinish = true
+									stats.FinishReason = finishReason
+									stats.SawFinish = true
 								}
 
 								if !finished {
@@ -1700,7 +1701,7 @@ loop:
 									if contentStr == "" && !wantReasoning {
 										if rc, ok := delta["reasoning_content"].(string); ok {
 											if rc != "" {
-												stats.promotedReasoning = true
+												stats.PromotedReasoning = true
 											}
 											contentStr = rc
 										}
@@ -1854,8 +1855,8 @@ loop:
 				if pendingErr == io.EOF {
 					if !finished {
 						if usageTerminalSeen && (messageStarted || reasoningStarted || len(toolCalls) > 0) {
-							stats.sawFinish = true
-							stats.finishReason = "stop"
+							stats.SawFinish = true
+							stats.FinishReason = "stop"
 							finished = true
 							break loop
 						}
@@ -1864,7 +1865,7 @@ loop:
 					}
 					break loop
 				}
-				reqLogger(ctx).Error("stream read error", "error", pendingErr)
+				logging.FromContext(ctx).Error("stream read error", "error", pendingErr)
 				emitResponseFailed("stream read error")
 				return
 			}

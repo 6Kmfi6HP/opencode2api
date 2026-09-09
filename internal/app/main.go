@@ -1,7 +1,6 @@
 package app
 
 import (
-	"context"
 	"fmt"
 	"runtime/debug"
 	"strings"
@@ -45,19 +44,6 @@ func init() {
 
 func versionString() string {
 	return fmt.Sprintf("opencode2api %s (commit=%s, date=%s)", version, commit, date)
-}
-
-// ======================== 结构化日志 ========================
-
-type contextKey string
-
-const reqIDKey contextKey = "request_id"
-
-func getReqID(ctx context.Context) string {
-	if id, ok := ctx.Value(reqIDKey).(string); ok {
-		return id
-	}
-	return ""
 }
 
 // ======================== 管理面板认证 ========================

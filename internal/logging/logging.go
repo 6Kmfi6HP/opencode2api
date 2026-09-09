@@ -1,4 +1,4 @@
-package app
+package logging
 
 import (
 	"context"
@@ -13,24 +13,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/6Kmfi6HP/opencode2api/internal/config"
+	"github.com/6Kmfi6HP/opencode2api/internal/random"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+// Configuration globals are bound by flags in the app package (server.go) and
+// assigned directly by launch.go's configureLaunchGlobals. They are exported
+// here so the app can wire them without importing the logging internals.
 var (
-	logLevel      string
-	logFile       string
-	logStdout     bool
-	logMaxSize    int
-	logMaxBackups int
-	logMaxAge     int
-	logCompress   bool
-	logBodies     bool
+	File       string
+	Level      string
+	Stdout     bool
+	MaxSize    int
+	MaxBackups int
+	MaxAge     int
+	Compress   bool
+	Bodies     bool
+)
 
-	logLevelVar      = &slog.LevelVar{}
-	logBodiesMu      sync.RWMutex
-	logBodiesEnabled bool
-	logRotator       *lumberjack.Logger
+var (
+	levelVar      = &slog.LevelVar{}
+	bodiesMu      sync.RWMutex
+	bodiesEnabled bool
+	rotator       *lumberjack.Logger
 
 	upstreamErrDedupMu sync.Mutex
 	upstreamErrDedup   = map[string]upstreamErrDedupEntry{}
@@ -41,16 +46,38 @@ type upstreamErrDedupEntry struct {
 	suppressed int
 }
 
-func setLogBodies(enabled bool) {
-	logBodiesMu.Lock()
-	logBodiesEnabled = enabled
-	logBodiesMu.Unlock()
+// SummaryExtras carries app-provided helpers used by the request-body
+// summarizer. They are injected by the app package at startup to avoid an
+// import cycle: the helpers (thinking-state classification and cache_control
+// block counting) live in the app package, which imports this one.
+type SummaryExtras struct {
+	// ThinkingState classifies a request's "thinking" field.
+	ThinkingState func(any) string
+	// CacheControlCount counts cache_control breakpoints in a decoded body.
+	CacheControlCount func(any) int
 }
 
-func getLogBodies() bool {
-	logBodiesMu.RLock()
-	defer logBodiesMu.RUnlock()
-	return logBodiesEnabled
+var summaryExtras SummaryExtras
+
+// SetSummaryExtras installs app-provided body-summary helpers. Call once at
+// startup, before the first request is handled.
+func SetSummaryExtras(x SummaryExtras) {
+	summaryExtras = x
+}
+
+// SetBodies updates the runtime "log bodies" flag used to enable debug-level
+// body summaries.
+func SetBodies(enabled bool) {
+	bodiesMu.Lock()
+	bodiesEnabled = enabled
+	bodiesMu.Unlock()
+}
+
+// BodiesEnabled reports whether debug-level body summaries are enabled.
+func BodiesEnabled() bool {
+	bodiesMu.RLock()
+	defer bodiesMu.RUnlock()
+	return bodiesEnabled
 }
 
 func parseLogLevel(s string) slog.Level {
@@ -66,16 +93,19 @@ func parseLogLevel(s string) slog.Level {
 	}
 }
 
-func setLogLevelString(s string) {
-	logLevel = strings.ToLower(strings.TrimSpace(s))
-	if logLevel == "" {
-		logLevel = "info"
+// SetLevelString parses and applies the log level string ("debug", "info",
+// "warn", or "error") at runtime.
+func SetLevelString(s string) {
+	Level = strings.ToLower(strings.TrimSpace(s))
+	if Level == "" {
+		Level = "info"
 	}
-	logLevelVar.Set(parseLogLevel(logLevel))
+	levelVar.Set(parseLogLevel(Level))
 }
 
-func getLogLevelString() string {
-	switch logLevelVar.Level() {
+// LevelString returns the current log level as a canonical string.
+func LevelString() string {
+	switch levelVar.Level() {
 	case slog.LevelDebug:
 		return "debug"
 	case slog.LevelWarn:
@@ -131,60 +161,47 @@ func redactLogAttr(_ []string, a slog.Attr) slog.Attr {
 	return a
 }
 
-// resolvedLogPath returns the absolute path of the active log file, or
-// "(stdout)" when no file is configured. Used for user-facing status lines.
-func resolvedLogPath() string {
-	if logFile == "" {
-		return "(stdout)"
-	}
-	abs, err := filepath.Abs(logFile)
-	if err != nil {
-		return logFile
-	}
-	return abs
-}
-
-func closeLogRotator() {
-	if logRotator != nil {
-		_ = logRotator.Close()
-		logRotator = nil
+// CloseRotator closes and clears the active log rotator, if any.
+func CloseRotator() {
+	if rotator != nil {
+		_ = rotator.Close()
+		rotator = nil
 	}
 }
 
-func initLogger() *slog.Logger {
-	if debugMode && strings.EqualFold(logLevel, "info") {
-		logLevel = "debug"
-	}
-	setLogLevelString(logLevel)
-	setLogBodies(logBodies)
+// Init configures the default logger and returns it. path is the already
+// resolved log file path (empty means no file, i.e. stdout only).
+func Init(path string) *slog.Logger {
+	SetLevelString(Level)
+	SetBodies(Bodies)
 
 	var writers []io.Writer
-	if logStdout {
+	if Stdout {
 		writers = append(writers, os.Stdout)
 	}
 
 	resolvedPath := ""
-	if logFile != "" {
-		absPath, absErr := filepath.Abs(logFile)
+	if path != "" {
+		absPath, absErr := filepath.Abs(path)
 		if absErr != nil {
-			absPath = logFile
+			absPath = path
 		}
 		dir := filepath.Dir(absPath)
 		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
 			fmt.Fprintf(os.Stderr, "cannot create log directory %s: %v; falling back to stdout\n", dir, mkErr)
-			if !logStdout {
+			if !Stdout {
 				writers = append(writers, os.Stdout)
 			}
 		} else {
-			logRotator = &lumberjack.Logger{
+			rotator = &lumberjack.Logger{
 				Filename:   absPath,
-				MaxSize:    logMaxSize,
-				MaxBackups: logMaxBackups,
-				MaxAge:     logMaxAge,
-				Compress:   logCompress,
+				MaxSize:    MaxSize,
+				MaxBackups: MaxBackups,
+				MaxAge:     MaxAge,
+				Compress:   Compress,
 				LocalTime:  true,
 			}
-			writers = append(writers, logRotator)
+			writers = append(writers, rotator)
 			resolvedPath = absPath
 		}
 	}
@@ -195,20 +212,20 @@ func initLogger() *slog.Logger {
 
 	w := io.MultiWriter(writers...)
 	handler := slog.NewTextHandler(w, &slog.HandlerOptions{
-		Level:       logLevelVar,
+		Level:       levelVar,
 		ReplaceAttr: redactLogAttr,
 	})
 	logger := slog.New(handler)
 	slog.SetDefault(logger)
 
 	attrs := []any{
-		"level", getLogLevelString(),
-		"stdout", logStdout || resolvedPath == "",
-		"log_bodies", getLogBodies(),
-		"max_size_mb", logMaxSize,
-		"max_backups", logMaxBackups,
-		"max_age_days", logMaxAge,
-		"compress", logCompress,
+		"level", LevelString(),
+		"stdout", Stdout || resolvedPath == "",
+		"log_bodies", BodiesEnabled(),
+		"max_size_mb", MaxSize,
+		"max_backups", MaxBackups,
+		"max_age_days", MaxAge,
+		"compress", Compress,
 	}
 	if resolvedPath != "" {
 		attrs = append([]any{"path", resolvedPath}, attrs...)
@@ -219,8 +236,21 @@ func initLogger() *slog.Logger {
 	return logger
 }
 
-func reqLogger(ctx context.Context) *slog.Logger {
-	id := getReqID(ctx)
+type contextKey string
+
+const reqIDKey contextKey = "request_id"
+
+func requestID(ctx context.Context) string {
+	if id, ok := ctx.Value(reqIDKey).(string); ok {
+		return id
+	}
+	return ""
+}
+
+// FromContext returns the logger for the given request context, annotated with
+// the request ID when one is present.
+func FromContext(ctx context.Context) *slog.Logger {
+	id := requestID(ctx)
 	if id == "" {
 		return slog.Default()
 	}
@@ -258,19 +288,21 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
-func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
+// Middleware wraps an HTTP handler with request-ID assignment, request
+// progress logging, and request-completion logging.
+func Middleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		reqID := strings.TrimSpace(r.Header.Get("X-Request-Id"))
 		if reqID == "" {
-			reqID = randomString(12)
+			reqID = random.String(12)
 		}
 		ctx := context.WithValue(r.Context(), reqIDKey, reqID)
 		r = r.WithContext(ctx)
 		w.Header().Set("X-Request-Id", reqID)
 
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		log := reqLogger(ctx)
+		log := FromContext(ctx)
 		quiet := r.URL.Path == "/health" || r.URL.Path == "/"
 		if quiet {
 			log.Debug("request_started",
@@ -306,94 +338,57 @@ func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func authModeString(mode AuthRouteMode) string {
-	switch mode {
-	case AuthRouteGo:
-		return "go"
-	case AuthRouteZen:
-		return "zen"
-	case AuthRouteAuto:
-		return "auto"
-	default:
-		return "public"
-	}
-}
-
-func thinkingState(value any) string {
-	if value == nil {
-		return "absent"
-	}
-	if isThinkingDisabled(value) {
-		return "disabled"
-	}
-	if m, ok := value.(map[string]any); ok {
-		if t, _ := m["type"].(string); t == "adaptive" {
-			return "adaptive"
-		}
-	}
-	if isThinkingEnabled(value) {
-		return "enabled"
-	}
-	return "present"
-}
-
-func mappedReasoningEffort(in string) string {
-	if in == "" {
-		return ""
-	}
-	effortMap := config.ReasoningEffortMap()
-	if mapped, ok := effortMap[in]; ok {
-		return mapped
-	}
-	return in
-}
-
-func logRequestPlan(ctx context.Context, fields map[string]any) {
+// PlanRequest logs a request_plan record with the given structured fields.
+func PlanRequest(ctx context.Context, fields map[string]any) {
 	attrs := make([]any, 0, len(fields)*2)
 	for k, v := range fields {
 		attrs = append(attrs, k, v)
 	}
-	reqLogger(ctx).Info("request_plan", attrs...)
+	FromContext(ctx).Info("request_plan", attrs...)
 }
 
-func logRequestResult(ctx context.Context, fields map[string]any) {
+// LogResult logs a request_result record with the given structured fields.
+func LogResult(ctx context.Context, fields map[string]any) {
 	attrs := make([]any, 0, len(fields)*2)
 	for k, v := range fields {
 		attrs = append(attrs, k, v)
 	}
-	reqLogger(ctx).Info("request_result", attrs...)
+	FromContext(ctx).Info("request_result", attrs...)
 }
 
-type streamResultStats struct {
-	start             time.Time
-	firstChunkAt      time.Time
-	chunks            int
-	textChars         int
-	reasoningChars    int
-	toolCallCount     int
-	finishReason      string
-	doneSeen          bool
-	promotedReasoning bool
-	sawFinish         bool
+// StreamStats tracks per-stream accounting for the stream_result log record.
+type StreamStats struct {
+	Start             time.Time
+	FirstChunkAt      time.Time
+	Chunks            int
+	TextChars         int
+	ReasoningChars    int
+	ToolCallCount     int
+	FinishReason      string
+	DoneSeen          bool
+	PromotedReasoning bool
+	SawFinish         bool
 }
 
-func (s *streamResultStats) noteChunk() {
-	s.chunks++
-	if s.firstChunkAt.IsZero() {
-		s.firstChunkAt = time.Now()
+// NoteChunk records a new stream chunk, stamping the first-chunk time.
+func (s *StreamStats) NoteChunk() {
+	s.Chunks++
+	if s.FirstChunkAt.IsZero() {
+		s.FirstChunkAt = time.Now()
 	}
 }
 
-func (s *streamResultStats) observeDelta(delta map[string]any, keepReasoning bool) {
+// ObserveDelta folds a stream delta into the running stats.
+func (s *StreamStats) ObserveDelta(delta map[string]any, keepReasoning bool) {
 	if delta == nil {
 		return
 	}
-	s.noteChunk()
+	s.NoteChunk()
 	if c, ok := delta["content"].(string); ok {
-		s.textChars += len(c)
+		s.TextChars += len(c)
 	}
 	if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
-		s.reasoningChars += len(rc)
+		s.ReasoningChars += len(rc)
 		if !keepReasoning {
 			// Will be promoted to text by promoteMisplacedReasoning / stream handler.
 			content, _ := delta["content"].(string)
@@ -405,8 +400,8 @@ func (s *streamResultStats) observeDelta(delta map[string]any, keepReasoning boo
 				}
 			}
 			if content == "" && tcEmpty {
-				s.promotedReasoning = true
-				s.textChars += len(rc)
+				s.PromotedReasoning = true
+				s.TextChars += len(rc)
 			}
 		}
 	}
@@ -420,42 +415,60 @@ func (s *streamResultStats) observeDelta(delta map[string]any, keepReasoning boo
 			name, _ := fn["name"].(string)
 			id, _ := tc["id"].(string)
 			if name != "" || id != "" {
-				s.toolCallCount++
+				s.ToolCallCount++
 			}
 		}
 	}
 }
 
-func (s *streamResultStats) log(ctx context.Context, protocol string) {
-	if s.start.IsZero() {
-		s.start = time.Now()
+// Log emits the stream_result record for the given protocol.
+func (s *StreamStats) Log(ctx context.Context, protocol string) {
+	if s.Start.IsZero() {
+		s.Start = time.Now()
 	}
 	firstMs := int64(0)
-	if !s.firstChunkAt.IsZero() {
-		firstMs = s.firstChunkAt.Sub(s.start).Milliseconds()
+	if !s.FirstChunkAt.IsZero() {
+		firstMs = s.FirstChunkAt.Sub(s.Start).Milliseconds()
 	}
-	emptyReply := s.textChars == 0 && s.toolCallCount == 0
-	truncated := !s.doneSeen && !s.sawFinish
+	emptyReply := s.TextChars == 0 && s.ToolCallCount == 0
+	truncated := !s.DoneSeen && !s.SawFinish
 	attrs := []any{
 		"protocol", protocol,
-		"chunks", s.chunks,
+		"chunks", s.Chunks,
 		"first_chunk_ms", firstMs,
-		"duration_ms", time.Since(s.start).Milliseconds(),
-		"text_chars", s.textChars,
-		"reasoning_chars", s.reasoningChars,
-		"tool_call_count", s.toolCallCount,
-		"finish_reason", s.finishReason,
-		"done_seen", s.doneSeen,
+		"duration_ms", time.Since(s.Start).Milliseconds(),
+		"text_chars", s.TextChars,
+		"reasoning_chars", s.ReasoningChars,
+		"tool_call_count", s.ToolCallCount,
+		"finish_reason", s.FinishReason,
+		"done_seen", s.DoneSeen,
 		"truncated", truncated,
 		"empty_reply", emptyReply,
-		"promoted_reasoning", s.promotedReasoning,
+		"promoted_reasoning", s.PromotedReasoning,
 	}
-	log := reqLogger(ctx)
+	log := FromContext(ctx)
 	if emptyReply {
 		log.Warn("stream_result", attrs...)
 		return
 	}
 	log.Info("stream_result", attrs...)
+}
+
+func classifyThinking(v any) string {
+	if summaryExtras.ThinkingState != nil {
+		return summaryExtras.ThinkingState(v)
+	}
+	if v == nil {
+		return "absent"
+	}
+	return "present"
+}
+
+func countCacheControlBlocks(v any) int {
+	if summaryExtras.CacheControlCount != nil {
+		return summaryExtras.CacheControlCount(v)
+	}
+	return 0
 }
 
 func summarizeJSONBody(raw []byte, max int) map[string]any {
@@ -475,7 +488,7 @@ func summarizeJSONBody(raw []byte, max int) map[string]any {
 		}
 	}
 	if t, ok := obj["thinking"]; ok {
-		out["thinking"] = thinkingState(t)
+		out["thinking"] = classifyThinking(t)
 	}
 	if oc, ok := obj["output_config"].(map[string]any); ok {
 		if effort, _ := oc["effort"].(string); effort != "" {
@@ -485,7 +498,7 @@ func summarizeJSONBody(raw []byte, max int) map[string]any {
 	if _, ok := obj["context_management"]; ok {
 		out["context_management"] = true
 	}
-	if n := countCacheControlInValue(obj); n > 0 {
+	if n := countCacheControlBlocks(obj); n > 0 {
 		out["cache_control_blocks"] = n
 	}
 	if msgs, ok := obj["messages"].([]any); ok {
@@ -578,14 +591,18 @@ func collectBlockTypes(content any, counts map[string]int) {
 	}
 }
 
-func maybeLogBodySummary(ctx context.Context, label string, raw []byte) {
-	if !getLogBodies() || logLevelVar.Level() > slog.LevelDebug {
+// MaybeBodySummary logs a debug-level JSON body summary when body summaries
+// are enabled and the log level is debug.
+func MaybeBodySummary(ctx context.Context, label string, raw []byte) {
+	if !BodiesEnabled() || levelVar.Level() > slog.LevelDebug {
 		return
 	}
-	reqLogger(ctx).Debug(label, "summary", summarizeJSONBody(raw, 4096))
+	FromContext(ctx).Debug(label, "summary", summarizeJSONBody(raw, 4096))
 }
 
-func logUpstreamError(ctx context.Context, model string, status int, body []byte, baseURL string) {
+// UpstreamError logs an upstream error with per-model/status/base-URL
+// deduplication to keep noisy upstream failures from flooding the log.
+func UpstreamError(ctx context.Context, model string, status int, body []byte, baseURL string) {
 	key := fmt.Sprintf("%s:%d:%s", model, status, baseURL)
 	now := time.Now()
 	upstreamErrDedupMu.Lock()
@@ -595,7 +612,7 @@ func logUpstreamError(ctx context.Context, model string, status int, body []byte
 		upstreamErrDedup[key] = entry
 		suppressed := entry.suppressed
 		upstreamErrDedupMu.Unlock()
-		reqLogger(ctx).Error("upstream error",
+		FromContext(ctx).Error("upstream error",
 			"model", model,
 			"base_url", baseURL,
 			"status", status,
@@ -606,7 +623,7 @@ func logUpstreamError(ctx context.Context, model string, status int, body []byte
 	}
 	upstreamErrDedup[key] = upstreamErrDedupEntry{last: now}
 	upstreamErrDedupMu.Unlock()
-	reqLogger(ctx).Error("upstream error",
+	FromContext(ctx).Error("upstream error",
 		"model", model,
 		"base_url", baseURL,
 		"status", status,
@@ -621,7 +638,9 @@ func truncateForLog(s string, max int) string {
 	return s[:max] + "…"
 }
 
-func summarizeChatResult(body []byte) map[string]any {
+// SummarizeChatResult reduces a Chat completion response body to a compact
+// result summary for the request_result log record.
+func SummarizeChatResult(body []byte) map[string]any {
 	out := map[string]any{
 		"has_text":           false,
 		"has_reasoning":      false,
@@ -667,7 +686,9 @@ func summarizeChatResult(body []byte) map[string]any {
 	return out
 }
 
-func summarizeClaudeResult(body []byte) map[string]any {
+// SummarizeClaudeResult reduces a Claude Messages response body to a compact
+// result summary for the request_result log record.
+func SummarizeClaudeResult(body []byte) map[string]any {
 	out := map[string]any{
 		"has_text":           false,
 		"has_reasoning":      false,

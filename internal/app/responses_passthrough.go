@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
@@ -603,7 +604,7 @@ func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth Upstr
 	defer rc.Close()
 
 	rememberNativeResponsesModel(modelID)
-	reqLogger(ctx).Info("responses_probe_succeeded", "model", modelID, "stream", stream)
+	logging.FromContext(ctx).Info("responses_probe_succeeded", "model", modelID, "stream", stream)
 
 	relayResponsesToClient(ctx, w, rc, status, header, modelID, stream, req, rewrites)
 	return true

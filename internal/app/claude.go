@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
+	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
@@ -840,7 +841,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	maybeLogBodySummary(r.Context(), "claude messages request body", body)
+	logging.MaybeBodySummary(r.Context(), "claude messages request body", body)
 
 	var claudeReq ClaudeRequest
 	if err := json.Unmarshal(body, &claudeReq); err != nil {
@@ -936,7 +937,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	if len(skippedServerTools) > 0 {
 		plan["skipped_server_tools"] = skippedServerTools
 	}
-	logRequestPlan(r.Context(), plan)
+	logging.PlanRequest(r.Context(), plan)
 
 	upstreamBody := buildUpstreamBody(&chatReq)
 
@@ -991,7 +992,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	claudeRespBody := openAIToClaudeResponse(respBody, claudeReq.Model, wantReasoning)
-	result := summarizeClaudeResult(claudeRespBody)
+	result := logging.SummarizeClaudeResult(claudeRespBody)
 	if !wantReasoning {
 		var before map[string]any
 		if json.Unmarshal(respBody, &before) == nil {
@@ -1008,7 +1009,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	logRequestResult(r.Context(), result)
+	logging.LogResult(r.Context(), result)
 
 	// Record token usage
 	var usageResp map[string]any
@@ -1020,7 +1021,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	maybeLogBodySummary(r.Context(), "claude response body", claudeRespBody)
+	logging.MaybeBodySummary(r.Context(), "claude response body", claudeRespBody)
 	w.Write(claudeRespBody)
 }
 
@@ -1034,7 +1035,7 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(respBody)
-	stats := &streamResultStats{start: time.Now()}
+	stats := &logging.StreamStats{Start: time.Now()}
 
 	msgID := fmt.Sprintf("msg_%s", randomString(24))
 	blockIndex := 0
@@ -1092,8 +1093,8 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		if len(fullUsage) > 0 {
 			statsx.RecordChatUsage(model, fullUsage)
 		}
-		stats.toolCallCount = len(toolCallOrder)
-		stats.log(ctx, "claude")
+		stats.ToolCallCount = len(toolCallOrder)
+		stats.Log(ctx, "claude")
 	}()
 	// Reader cleanup: signal goroutine, unblock any pending read, wait for exit.
 	defer func() {
@@ -1165,7 +1166,7 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		if contentStr == "" {
 			return
 		}
-		stats.textChars += len(contentStr)
+		stats.TextChars += len(contentStr)
 		closeThinkingBlock()
 		if !textBlockOpen {
 			emitClaudeEvent("content_block_start", map[string]any{
@@ -1197,7 +1198,7 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		if fallback == "" {
 			return
 		}
-		stats.promotedReasoning = true
+		stats.PromotedReasoning = true
 		emitTextDelta(fallback)
 	}
 
@@ -1239,11 +1240,11 @@ loop:
 			line := result.line
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
-				stats.doneSeen = true
+				stats.DoneSeen = true
 				if !finished {
 					if usageTerminalSeen && streamProducedOutput(stats, len(toolCallOrder)) {
-						stats.sawFinish = true
-						stats.finishReason = "stop"
+						stats.SawFinish = true
+						stats.FinishReason = "stop"
 						finished = true
 						finalizeContentBlocks()
 						break loop
@@ -1290,7 +1291,7 @@ loop:
 								choice, _ := choices[0].(map[string]any)
 								delta, _ := choice["delta"].(map[string]any)
 								finishReason, _ := choice["finish_reason"].(string)
-								stats.noteChunk()
+								stats.NoteChunk()
 
 								ensureMessageStart()
 
@@ -1300,7 +1301,7 @@ loop:
 									if rc, ok := delta["reasoning_content"]; ok {
 										rcStr, _ := rc.(string)
 										if rcStr != "" {
-											stats.reasoningChars += len(rcStr)
+											stats.ReasoningChars += len(rcStr)
 											if keepReasoning {
 												reasoningFallback.WriteString(rcStr)
 												closeTextBlock()
@@ -1326,7 +1327,7 @@ loop:
 												})
 											} else {
 												// Thinking not requested: promote misplaced CoT to visible text (#37635).
-												stats.promotedReasoning = true
+												stats.PromotedReasoning = true
 												emitTextDelta(rcStr)
 											}
 										}
@@ -1394,8 +1395,8 @@ loop:
 									}
 
 									if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
-										stats.finishReason = finishReason
-										stats.sawFinish = true
+										stats.FinishReason = finishReason
+										stats.SawFinish = true
 										finished = true
 										finalizeContentBlocks()
 
@@ -1423,8 +1424,8 @@ loop:
 				if pendingErr == io.EOF {
 					if !finished {
 						if usageTerminalSeen && streamProducedOutput(stats, len(toolCallOrder)) {
-							stats.sawFinish = true
-							stats.finishReason = "stop"
+							stats.SawFinish = true
+							stats.FinishReason = "stop"
 							finished = true
 							finalizeContentBlocks()
 							break loop
@@ -1434,7 +1435,7 @@ loop:
 					}
 					break loop
 				}
-				reqLogger(ctx).Error("stream read error", "error", pendingErr)
+				logging.FromContext(ctx).Error("stream read error", "error", pendingErr)
 				emitClaudeError("stream read error")
 				return
 			}
@@ -1539,8 +1540,8 @@ func usageHasCompletion(usage map[string]any) bool {
 
 // streamProducedOutput reports whether a stream has emitted any assistant
 // content or tool calls before the terminal usage chunk.
-func streamProducedOutput(stats *streamResultStats, toolCalls int) bool {
-	return stats.textChars > 0 || stats.reasoningChars > 0 || toolCalls > 0
+func streamProducedOutput(stats *logging.StreamStats, toolCalls int) bool {
+	return stats.TextChars > 0 || stats.ReasoningChars > 0 || toolCalls > 0
 }
 
 func mergeUsageMaps(dst any, src map[string]any) map[string]any {

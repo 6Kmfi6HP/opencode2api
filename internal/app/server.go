@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -44,28 +46,32 @@ func Run() {
 	flag.StringVar(&statsFile, "stats-file", "stats.json", "统计文件路径")
 	flag.StringVar(&adminPassword, "password", "123456", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
-	flag.StringVar(&logLevel, "log-level", "info", "日志级别: debug/info/warn/error")
-	flag.StringVar(&logFile, "log-file", "opencode2api.log", "日志文件路径")
-	flag.BoolVar(&logStdout, "log-stdout", true, "是否同时写 stdout")
-	flag.IntVar(&logMaxSize, "log-max-size", 100, "单日志文件最大 MB，超过即轮换")
-	flag.IntVar(&logMaxBackups, "log-max-backups", 7, "保留的旧日志文件个数")
-	flag.IntVar(&logMaxAge, "log-max-age", 14, "旧日志保留天数")
-	flag.BoolVar(&logCompress, "log-compress", true, "轮换后 gzip 压缩")
-	flag.BoolVar(&logBodies, "log-bodies", false, "Debug 下记录截断的 body 摘要")
+	flag.StringVar(&logging.Level, "log-level", "info", "日志级别: debug/info/warn/error")
+	flag.StringVar(&logging.File, "log-file", "opencode2api.log", "日志文件路径")
+	flag.BoolVar(&logging.Stdout, "log-stdout", true, "是否同时写 stdout")
+	flag.IntVar(&logging.MaxSize, "log-max-size", 100, "单日志文件最大 MB，超过即轮换")
+	flag.IntVar(&logging.MaxBackups, "log-max-backups", 7, "保留的旧日志文件个数")
+	flag.IntVar(&logging.MaxAge, "log-max-age", 14, "旧日志保留天数")
+	flag.BoolVar(&logging.Compress, "log-compress", true, "轮换后 gzip 压缩")
+	flag.BoolVar(&logging.Bodies, "log-bodies", false, "Debug 下记录截断的 body 摘要")
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	flag.Parse()
 
 	configExplicit := flagSet("config")
 	configPath, _ = resolveConfigPath(configPath, configExplicit)
-	logFile, _ = resolveLogFilePath(logFile, flagSet("log-file"), configPath, configExplicit)
+	logging.File, _ = resolveLogFilePath(logging.File, flagSet("log-file"), configPath, configExplicit)
 	resolvedStats, _ := resolveStatsPath(statsFile, flagSet("stats-file"), configPath, configExplicit)
 	setTokenStatsPath(resolvedStats)
 	resolvedModelsDevCache, _ := resolveModelsDevCachePath(configPath, configExplicit)
 	modelsdev.SetCachePath(resolvedModelsDevCache)
 	modelsdev.SetClientGetter(getHTTPClient)
 
-	initLogger()
-	defer closeLogRotator()
+	if debugMode && strings.EqualFold(logging.Level, "info") {
+		logging.Level = "debug"
+	}
+	installLoggingHooks()
+	logging.Init(logging.File)
+	defer logging.CloseRotator()
 
 	if showVersion {
 		fmt.Println(versionString())
@@ -76,7 +82,7 @@ func Run() {
 
 	slog.Info("server starting",
 		"port", port,
-		"log_level", getLogLevelString(),
+		"log_level", logging.LevelString(),
 		"models", len(getModelIDs()),
 		"aliases", len(getModelKeywordRules()),
 	)
@@ -116,21 +122,21 @@ func sessionContextMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // buildMux constructs the HTTP mux with all route registrations.
 func buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", sessionContextMiddleware(loggingMiddleware(chatCompletionsHandler)))
-	mux.HandleFunc("/v1/responses", sessionContextMiddleware(loggingMiddleware(responsesHandler)))
-	mux.HandleFunc("/v1/messages", sessionContextMiddleware(loggingMiddleware(claudeMessagesHandler)))
-	mux.HandleFunc("/v1/messages/count_tokens", sessionContextMiddleware(loggingMiddleware(claudeCountTokensHandler)))
-	mux.HandleFunc("/v1/models", sessionContextMiddleware(loggingMiddleware(listModelsHandler)))
-	mux.HandleFunc("/login", loggingMiddleware(loginHandler))
-	mux.HandleFunc("/logout", loggingMiddleware(logoutHandler))
-	mux.HandleFunc("/api/config", loggingMiddleware(requireAuth(adminConfigHandler)))
-	mux.HandleFunc("/api/stats", loggingMiddleware(requireAuth(adminStatsHandler)))
-	mux.HandleFunc("/api/reload", loggingMiddleware(requireAuth(reloadHandler)))
-	mux.HandleFunc("/health", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/chat/completions", sessionContextMiddleware(logging.Middleware(chatCompletionsHandler)))
+	mux.HandleFunc("/v1/responses", sessionContextMiddleware(logging.Middleware(responsesHandler)))
+	mux.HandleFunc("/v1/messages", sessionContextMiddleware(logging.Middleware(claudeMessagesHandler)))
+	mux.HandleFunc("/v1/messages/count_tokens", sessionContextMiddleware(logging.Middleware(claudeCountTokensHandler)))
+	mux.HandleFunc("/v1/models", sessionContextMiddleware(logging.Middleware(listModelsHandler)))
+	mux.HandleFunc("/login", logging.Middleware(loginHandler))
+	mux.HandleFunc("/logout", logging.Middleware(logoutHandler))
+	mux.HandleFunc("/api/config", logging.Middleware(requireAuth(adminConfigHandler)))
+	mux.HandleFunc("/api/stats", logging.Middleware(requireAuth(adminStatsHandler)))
+	mux.HandleFunc("/api/reload", logging.Middleware(requireAuth(reloadHandler)))
+	mux.HandleFunc("/health", logging.Middleware(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	}))
-	mux.HandleFunc("/", loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", logging.Middleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			requireAuth(adminPageHandler)(w, r)
 			return

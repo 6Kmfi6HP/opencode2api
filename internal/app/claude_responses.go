@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
+	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
@@ -795,7 +796,7 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 	defer rc.Close()
 
 	rememberNativeResponsesModel(modelID)
-	reqLogger(ctx).Info("claude_responses_probe_succeeded", "model", modelID, "stream", stream)
+	logging.FromContext(ctx).Info("claude_responses_probe_succeeded", "model", modelID, "stream", stream)
 
 	if stream {
 		claudeResponsesStreamHandler(ctx, w, rc, modelID, wantReasoning)
@@ -806,8 +807,8 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 		return false
 	}
 	claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning)
-	result := summarizeClaudeResult(claudeBody)
-	logRequestResult(ctx, result)
+	result := logging.SummarizeClaudeResult(claudeBody)
+	logging.LogResult(ctx, result)
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
@@ -816,7 +817,7 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	maybeLogBodySummary(ctx, "claude responses response body", claudeBody)
+	logging.MaybeBodySummary(ctx, "claude responses response body", claudeBody)
 	_, _ = w.Write(claudeBody)
 	return true
 }
@@ -853,8 +854,8 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 
 	if status >= 200 && status < 300 {
 		claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning)
-		result := summarizeClaudeResult(claudeBody)
-		logRequestResult(ctx, result)
+		result := logging.SummarizeClaudeResult(claudeBody)
+		logging.LogResult(ctx, result)
 		var usageResp map[string]any
 		if json.Unmarshal(respBody, &usageResp) == nil {
 			if u, ok := usageResp["usage"].(map[string]any); ok {
@@ -863,7 +864,7 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		maybeLogBodySummary(ctx, "claude responses response body", claudeBody)
+		logging.MaybeBodySummary(ctx, "claude responses response body", claudeBody)
 		_, _ = w.Write(claudeBody)
 		return true
 	}
@@ -894,7 +895,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(rc)
-	stats := &streamResultStats{start: time.Now()}
+	stats := &logging.StreamStats{Start: time.Now()}
 
 	msgID := fmt.Sprintf("msg_%s", randomString(24))
 	blockIndex := 0
@@ -1007,7 +1008,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		if text == "" {
 			return
 		}
-		stats.textChars += len(text)
+		stats.TextChars += len(text)
 		fullTextLen += len(text)
 		producedText = true
 		startTextBlock(b)
@@ -1020,7 +1021,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		if text == "" {
 			return
 		}
-		stats.reasoningChars += len(text)
+		stats.ReasoningChars += len(text)
 		fullReasoningLen += len(text)
 		if wantReasoning {
 			reasoningFallback.WriteString(text)
@@ -1030,7 +1031,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 				"delta": map[string]any{"type": "thinking_delta", "thinking": text},
 			})
 		} else {
-			stats.promotedReasoning = true
+			stats.PromotedReasoning = true
 			emitTextDelta(b, text)
 		}
 	}
@@ -1062,8 +1063,8 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 	}
 
 	defer func() {
-		stats.toolCallCount = len(toolOrder)
-		stats.log(ctx, "claude-responses")
+		stats.ToolCallCount = len(toolOrder)
+		stats.Log(ctx, "claude-responses")
 		if len(fullUsage) > 0 {
 			pt, ct, tt := usageFromResponsesMap(fullUsage)
 			if tt > 0 {
@@ -1095,7 +1096,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		for _, dataLine := range frameData {
 			trimmed := strings.TrimSpace(dataLine)
 			if trimmed == "[DONE]" {
-				stats.doneSeen = true
+				stats.DoneSeen = true
 				if !finalized && (producedText || len(toolOrder) > 0) {
 					finished = true
 					doFinalize()
@@ -1189,8 +1190,8 @@ loop:
 					if producedText || len(toolOrder) > 0 {
 						// 上游干净 EOF 但缺 completed（如 muse-spark 系只发事件不发 DONE）：
 						// 合成正常结束，不报错。
-						stats.sawFinish = true
-						stats.finishReason = "stop"
+						stats.SawFinish = true
+						stats.FinishReason = "stop"
 						finished = true
 						doFinalize()
 					} else {
@@ -1237,7 +1238,7 @@ type claudeResponsesEmitter struct {
 	itemToOutput map[string]int
 	blocks       map[int]*claudeResponsesBlock
 	producedText *bool
-	stats        *streamResultStats
+	stats        *logging.StreamStats
 
 	getOrCreate  func(int, string) *claudeResponsesBlock
 	ensureStart  func()
@@ -1385,7 +1386,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		if delta == "" {
 			return
 		}
-		e.stats.noteChunk()
+		e.stats.NoteChunk()
 		*e.producedText = true
 		b := e.getOrCreate(oi, "text")
 		e.emitText(b, delta)
@@ -1403,7 +1404,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		if delta == "" {
 			return
 		}
-		e.stats.noteChunk()
+		e.stats.NoteChunk()
 		*e.producedText = true
 		b := e.getOrCreate(oi, "text")
 		e.emitText(b, delta)
@@ -1419,7 +1420,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		if delta == "" {
 			return
 		}
-		e.stats.noteChunk()
+		e.stats.NoteChunk()
 		b := e.getOrCreate(oi, "tool")
 		e.emitTool(b, delta)
 	case "response.reasoning_summary_text.delta":
@@ -1431,7 +1432,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		if delta == "" {
 			return
 		}
-		e.stats.noteChunk()
+		e.stats.NoteChunk()
 		b := e.getOrCreate(oi, "thinking")
 		e.emitThinking(b, delta)
 	case "response.reasoning_text.delta":
@@ -1448,7 +1449,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		if delta == "" {
 			return
 		}
-		e.stats.noteChunk()
+		e.stats.NoteChunk()
 		b := e.getOrCreate(oi, "thinking")
 		e.emitThinking(b, delta)
 	case "response.output_text.done", "response.refusal.done", "response.function_call_arguments.done", "response.reasoning_summary_part.done", "response.reasoning_summary_text.done", "response.content_part.done", "response.output_item.done":
@@ -1481,9 +1482,9 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 				e.fullUsage[k] = v
 			}
 		}
-		e.stats.sawFinish = true
-		e.stats.finishReason = "stop"
-		e.stats.doneSeen = true
+		e.stats.SawFinish = true
+		e.stats.FinishReason = "stop"
+		e.stats.DoneSeen = true
 		*e.finished = true
 	case "response.incomplete":
 		resp, _ := evt["response"].(map[string]any)
@@ -1495,9 +1496,9 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 			}
 		}
 		*e.stopReason = "max_tokens"
-		e.stats.sawFinish = true
-		e.stats.finishReason = "length"
-		e.stats.doneSeen = true
+		e.stats.SawFinish = true
+		e.stats.FinishReason = "length"
+		e.stats.DoneSeen = true
 		*e.finished = true
 	case "response.failed", "error":
 		msg := "upstream stream error"
@@ -1528,7 +1529,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 			if oi < 0 {
 				oi = outputIndexForItem(itemID, 0)
 			}
-			e.stats.noteChunk()
+			e.stats.NoteChunk()
 			*e.producedText = true
 			b := e.getOrCreate(oi, "text")
 			e.emitText(b, d)

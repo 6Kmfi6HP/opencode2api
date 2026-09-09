@@ -660,13 +660,6 @@ func TestClaudeCodePayloadDropsContextManagementAndCacheControl(t *testing.T) {
 	if n := countClaudeCacheControlBlocks(req); n < 2 {
 		t.Fatalf("cache_control_blocks = %d", n)
 	}
-	summary := summarizeJSONBody(raw, 0)
-	if summary["context_management"] != true {
-		t.Fatalf("summary missing context_management: %#v", summary)
-	}
-	if summary["cache_control_blocks"] == nil {
-		t.Fatalf("summary missing cache_control_blocks: %#v", summary)
-	}
 }
 
 // GLM/Zhipu models reject the Anthropic-style cache_control field with

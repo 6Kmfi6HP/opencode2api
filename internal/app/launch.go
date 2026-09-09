@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"log/slog"
 	"net"
@@ -102,17 +103,17 @@ func configureLaunchGlobals(f launchFlags) {
 	configPath = f.cfgPath
 	adminPassword = "" // launch mode disables the admin panel
 	debugMode = f.debug
-	logLevel = "info"
+	logging.Level = "info"
 	if f.debug {
-		logLevel = "debug"
+		logging.Level = "debug"
 	}
-	logFile, _ = resolveLogFilePath(f.logFile, f.logExplicit, configPath, f.configExplicit)
-	logStdout = false // launch mode: logs go to file only, never stdout (would corrupt the child TUI)
-	logMaxSize = 100
-	logMaxBackups = 7
-	logMaxAge = 14
-	logCompress = true
-	logBodies = false
+	logging.File, _ = resolveLogFilePath(f.logFile, f.logExplicit, configPath, f.configExplicit)
+	logging.Stdout = false // launch mode: logs go to file only, never stdout (would corrupt the child TUI)
+	logging.MaxSize = 100
+	logging.MaxBackups = 7
+	logging.MaxAge = 14
+	logging.Compress = true
+	logging.Bodies = false
 
 	resolvedStats, _ := resolveStatsPath(f.statsFile, f.statsExplicit, configPath, f.configExplicit)
 	setTokenStatsPath(resolvedStats)
@@ -120,7 +121,8 @@ func configureLaunchGlobals(f launchFlags) {
 	modelsdev.SetCachePath(resolvedModelsDevCache)
 	modelsdev.SetClientGetter(getHTTPClient)
 
-	initLogger()
+	installLoggingHooks()
+	logging.Init(logging.File)
 }
 
 // startLaunchProxy starts the local, read-only proxy config that both launch
@@ -297,7 +299,7 @@ func launchClaude(args []string) {
 	f.key = resolveLaunchKey(f.key)
 
 	configureLaunchGlobals(f)
-	defer closeLogRotator()
+	defer logging.CloseRotator()
 
 	server, listener, baseURL := startLaunchProxy(f)
 	defer func() { _ = listener.Close() }()
@@ -324,7 +326,7 @@ func launchCodex(args []string) {
 	f.key = resolveLaunchKey(f.key)
 
 	configureLaunchGlobals(f)
-	defer closeLogRotator()
+	defer logging.CloseRotator()
 
 	server, listener, baseURL := startLaunchProxy(f)
 	defer func() { _ = listener.Close() }()

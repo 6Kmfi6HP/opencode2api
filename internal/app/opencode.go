@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"github.com/6Kmfi6HP/opencode2api/internal/random"
 )
@@ -407,7 +408,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 	if useGoEndpoint {
 		surface = "go"
 	}
-	log := reqLogger(ctx)
+	log := logging.FromContext(ctx)
 
 	var lastErr error
 	var retryCount int
@@ -479,7 +480,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		}
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		resp.Body.Close()
-		logUpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL)
+		logging.UpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL)
 		nonRetryable := isNonRetryableUpstreamError(resp.StatusCode, errBody)
 		canRetry := !nonRetryable && shouldRetryUpstreamStatus(resp.StatusCode) && attempt+1 < maxAttemptsForUpstreamStatus(resp.StatusCode)
 		retryReason := ""

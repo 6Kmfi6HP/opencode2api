@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
+	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"log/slog"
 	"net/http"
@@ -78,8 +79,8 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			"cache_control_breakpoints": cacheBreakpointsRT,
 			"socks5_sticky":             socks5StickyRT,
 			"text_only_models":          textOnlyModelsRT,
-			"log_level":                 getLogLevelString(),
-			"log_bodies":                getLogBodies(),
+			"log_level":                 logging.LevelString(),
+			"log_bodies":                logging.BodiesEnabled(),
 		})
 	case http.MethodPost:
 		var payload struct {
@@ -97,10 +98,10 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		applyConfig(payload.AppConfig)
 		if payload.LogLevel != nil {
-			setLogLevelString(*payload.LogLevel)
+			logging.SetLevelString(*payload.LogLevel)
 		}
 		if payload.LogBodies != nil {
-			setLogBodies(*payload.LogBodies)
+			logging.SetBodies(*payload.LogBodies)
 		}
 		if debugMode {
 			slog.Info("config updated",
@@ -109,8 +110,8 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 				"force_disable", payload.ForceDisableThinking,
 				"max_tokens_cap", payload.MaxTokensCap,
 				"max_tokens_cap_per_model", len(payload.MaxTokensCapPerModel),
-				"log_level", getLogLevelString(),
-				"log_bodies", getLogBodies(),
+				"log_level", logging.LevelString(),
+				"log_bodies", logging.BodiesEnabled(),
 			)
 		}
 		w.Header().Set("Content-Type", "application/json")

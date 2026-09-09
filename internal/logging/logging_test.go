@@ -1,4 +1,4 @@
-package app
+package logging
 
 import (
 	"bytes"
@@ -15,6 +15,83 @@ import (
 
 	"gopkg.in/natefinch/lumberjack.v2"
 )
+
+// testThinkingEnabled/Disabled mirror the app package's thinking helpers so
+// the body-summary tests stay self-contained. The app owns the canonical
+// implementation (which is the only way to avoid an app<->logging import
+// cycle); these local stand-ins exist purely to exercise summarizing.
+func testIsThinkingEnabled(value any) bool {
+	switch v := value.(type) {
+	case map[string]any:
+		t, _ := v["type"].(string)
+		return t == "enabled" || t == "adaptive"
+	case bool:
+		return v
+	default:
+		return false
+	}
+}
+
+func testIsThinkingDisabled(value any) bool {
+	switch v := value.(type) {
+	case map[string]any:
+		t, _ := v["type"].(string)
+		return t == "disabled"
+	case bool:
+		return !v
+	default:
+		return false
+	}
+}
+
+func testThinkingState(value any) string {
+	if value == nil {
+		return "absent"
+	}
+	if testIsThinkingDisabled(value) {
+		return "disabled"
+	}
+	if m, ok := value.(map[string]any); ok {
+		if t, _ := m["type"].(string); t == "adaptive" {
+			return "adaptive"
+		}
+	}
+	if testIsThinkingEnabled(value) {
+		return "enabled"
+	}
+	return "present"
+}
+
+func testCacheControlCount(v any) int {
+	switch x := v.(type) {
+	case map[string]any:
+		n := 0
+		if _, ok := x["cache_control"]; ok {
+			n++
+		}
+		for key, child := range x {
+			if key == "input_schema" || key == "input" {
+				continue
+			}
+			n += testCacheControlCount(child)
+		}
+		return n
+	case []any:
+		n := 0
+		for _, child := range x {
+			n += testCacheControlCount(child)
+		}
+		return n
+	}
+	return 0
+}
+
+func installTestSummaryExtras() {
+	SetSummaryExtras(SummaryExtras{
+		ThinkingState:     testThinkingState,
+		CacheControlCount: testCacheControlCount,
+	})
+}
 
 func TestRedactSecret(t *testing.T) {
 	if got := redactSecret(""); got != "" {
@@ -57,6 +134,7 @@ func TestRedactLogAttrScrubsSecrets(t *testing.T) {
 }
 
 func TestSummarizeJSONBodyOmitsRawText(t *testing.T) {
+	installTestSummaryExtras()
 	raw := []byte(`{
 		"model":"m1",
 		"stream":true,
@@ -90,6 +168,31 @@ func TestSummarizeJSONBodyOmitsRawText(t *testing.T) {
 	}
 }
 
+func TestSummarizeJSONBodyClaudeCodePayload(t *testing.T) {
+	installTestSummaryExtras()
+	raw := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"max_tokens":32000,
+		"stream":true,
+		"system":[{"type":"text","text":"You are Claude Code","cache_control":{"type":"ephemeral"}}],
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"system","content":[{"type":"text","text":"mid system","cache_control":{"type":"ephemeral"}}]}
+		],
+		"tools":[{"name":"web_search","type":"web_search_20250305"}],
+		"thinking":{"type":"adaptive"},
+		"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},
+		"output_config":{"effort":"high"}
+	}`)
+	summary := summarizeJSONBody(raw, 0)
+	if summary["context_management"] != true {
+		t.Fatalf("summary missing context_management: %#v", summary)
+	}
+	if summary["cache_control_blocks"] == nil {
+		t.Fatalf("summary missing cache_control_blocks: %#v", summary)
+	}
+}
+
 func mustJSON(v map[string]any) string {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -99,8 +202,8 @@ func mustJSON(v map[string]any) string {
 }
 
 func TestLoggingMiddlewareRequestID(t *testing.T) {
-	handler := loggingMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		id := getReqID(r.Context())
+	handler := Middleware(func(w http.ResponseWriter, r *http.Request) {
+		id := requestID(r.Context())
 		if id == "" {
 			t.Fatal("missing request id in context")
 		}
@@ -127,29 +230,29 @@ func TestInitLoggerCreatesRotatingFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.log")
 
-	prevFile, prevStdout := logFile, logStdout
-	prevSize, prevBackups, prevAge := logMaxSize, logMaxBackups, logMaxAge
-	prevCompress, prevBodies, prevLevel := logCompress, logBodies, logLevel
-	prevRotator := logRotator
+	prevFile, prevStdout := File, Stdout
+	prevSize, prevBackups, prevAge := MaxSize, MaxBackups, MaxAge
+	prevCompress, prevBodies, prevLevel := Compress, Bodies, Level
+	prevRotator := rotator
 	t.Cleanup(func() {
-		closeLogRotator()
-		logFile, logStdout = prevFile, prevStdout
-		logMaxSize, logMaxBackups, logMaxAge = prevSize, prevBackups, prevAge
-		logCompress, logBodies, logLevel = prevCompress, prevBodies, prevLevel
-		logRotator = prevRotator
-		initLogger()
+		CloseRotator()
+		File, Stdout = prevFile, prevStdout
+		MaxSize, MaxBackups, MaxAge = prevSize, prevBackups, prevAge
+		Compress, Bodies, Level = prevCompress, prevBodies, prevLevel
+		rotator = prevRotator
+		Init(File)
 	})
 
-	logFile = path
-	logStdout = false
-	logMaxSize = 1
-	logMaxBackups = 3
-	logMaxAge = 1
-	logCompress = false
-	logBodies = false
-	logLevel = "info"
-	closeLogRotator()
-	initLogger()
+	File = path
+	Stdout = false
+	MaxSize = 1
+	MaxBackups = 3
+	MaxAge = 1
+	Compress = false
+	Bodies = false
+	Level = "info"
+	CloseRotator()
+	Init(File)
 
 	slog.Info("hello logging", "n", 1)
 	if _, err := os.Stat(path); err != nil {
@@ -157,20 +260,20 @@ func TestInitLoggerCreatesRotatingFile(t *testing.T) {
 	}
 
 	// Force rotation by writing through lumberjack in chunks under MaxSize.
-	if logRotator == nil {
+	if rotator == nil {
 		t.Fatal("expected lumberjack rotator")
 	}
 	chunk := bytes.Repeat([]byte("x"), 256*1024)
 	for i := 0; i < 6; i++ {
-		if _, err := logRotator.Write(chunk); err != nil {
+		if _, err := rotator.Write(chunk); err != nil {
 			t.Fatalf("write chunk %d: %v", i, err)
 		}
 	}
-	if _, err := logRotator.Write([]byte("\nafter-rotate\n")); err != nil {
+	if _, err := rotator.Write([]byte("\nafter-rotate\n")); err != nil {
 		t.Fatalf("write after rotate: %v", err)
 	}
-	_ = logRotator.Close()
-	logRotator = nil
+	_ = rotator.Close()
+	rotator = nil
 
 	deadline := time.Now().Add(2 * time.Second)
 	var foundBackup bool
@@ -203,15 +306,15 @@ func TestInitLoggerCreatesRotatingFile(t *testing.T) {
 }
 
 func TestSetLogLevelRuntime(t *testing.T) {
-	prev := getLogLevelString()
-	t.Cleanup(func() { setLogLevelString(prev) })
-	setLogLevelString("debug")
-	if getLogLevelString() != "debug" {
-		t.Fatalf("level = %s", getLogLevelString())
+	prev := LevelString()
+	t.Cleanup(func() { SetLevelString(prev) })
+	SetLevelString("debug")
+	if LevelString() != "debug" {
+		t.Fatalf("level = %s", LevelString())
 	}
-	setLogLevelString("warn")
-	if logLevelVar.Level() != slog.LevelWarn {
-		t.Fatalf("LevelVar = %v", logLevelVar.Level())
+	SetLevelString("warn")
+	if levelVar.Level() != slog.LevelWarn {
+		t.Fatalf("LevelVar = %v", levelVar.Level())
 	}
 }
 
@@ -223,7 +326,7 @@ func TestReqLoggerIncludesRequestID(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	ctx := context.WithValue(context.Background(), reqIDKey, "rid-42")
-	reqLogger(ctx).Info("ping")
+	FromContext(ctx).Info("ping")
 	if !strings.Contains(buf.String(), "request_id=rid-42") {
 		t.Fatalf("missing request_id: %s", buf.String())
 	}
