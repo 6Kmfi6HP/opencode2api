@@ -1063,6 +1063,22 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		})
 	}
 
+	emitter := &claudeResponsesEmitter{
+		finished:     &finished,
+		stopReason:   &stopReason,
+		fullUsage:    fullUsage,
+		itemToOutput: itemToOutput,
+		blocks:       blocks,
+		producedText: &producedText,
+		stats:        stats,
+		getOrCreate:  getOrCreateBlock,
+		ensureStart:  ensureStart,
+		emitText:     emitTextDelta,
+		emitThinking: emitThinkingDelta,
+		emitTool:     emitToolDelta,
+		emitError:    emitError,
+	}
+
 	defer func() {
 		stats.toolCallCount = len(toolOrder)
 		stats.log(ctx, "claude-responses")
@@ -1111,7 +1127,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 			if err := json.Unmarshal([]byte(trimmed), &evt); err != nil {
 				continue
 			}
-			handleClaudeResponsesStreamEvent(evt, frameEvent, &messageStartSent, &finished, &stopReason, fullUsage, itemToOutput, blocks, getOrCreateBlock, ensureStart, emitTextDelta, emitThinkingDelta, emitToolDelta, emitEvent, emitError, stats, &producedText)
+			emitter.handleEvent(evt, frameEvent)
 			if finished {
 				doFinalize()
 				return
@@ -1242,8 +1258,28 @@ func usageFromResponsesMap(usage map[string]any) (int64, int64, int64) {
 	return pt, ct, tt
 }
 
-// handleClaudeResponsesStreamEvent 翻译单个 Responses SSE 事件为 Claude 事件。
-func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, messageStartSent *bool, finished *bool, stopReason *string, fullUsage map[string]any, itemToOutput map[string]int, blocks map[int]*claudeResponsesBlock, getOrCreate func(int, string) *claudeResponsesBlock, ensureStart func(), emitText func(*claudeResponsesBlock, string), emitThinking func(*claudeResponsesBlock, string), emitTool func(*claudeResponsesBlock, string), emitEvent func(string, any), emitError func(string), stats *streamResultStats, producedText *bool) {
+// claudeResponsesEmitter bundles the shared state and emit callbacks used to
+// translate Responses SSE events into Claude events across a single stream.
+type claudeResponsesEmitter struct {
+	finished     *bool
+	stopReason   *string
+	fullUsage    map[string]any
+	itemToOutput map[string]int
+	blocks       map[int]*claudeResponsesBlock
+	producedText *bool
+	stats        *streamResultStats
+
+	getOrCreate  func(int, string) *claudeResponsesBlock
+	ensureStart  func()
+	emitText     func(*claudeResponsesBlock, string)
+	emitThinking func(*claudeResponsesBlock, string)
+	emitTool     func(*claudeResponsesBlock, string)
+	emitError    func(string)
+}
+
+// handleEvent translates a single Responses SSE event into Claude events.
+func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent string) {
+
 	typ, _ := evt["type"].(string)
 	if typ == "" {
 		typ = frameEvent
@@ -1258,7 +1294,7 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 		if id == "" {
 			return fallback
 		}
-		if oi, ok := itemToOutput[id]; ok {
+		if oi, ok := e.itemToOutput[id]; ok {
 			return oi
 		}
 		return fallback
@@ -1269,11 +1305,11 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 		if resp, ok := evt["response"].(map[string]any); ok {
 			if u, ok := resp["usage"].(map[string]any); ok {
 				for k, v := range u {
-					fullUsage[k] = v
+					e.fullUsage[k] = v
 				}
 			}
 		}
-		ensureStart()
+		e.ensureStart()
 	case "response.output_item.added":
 		item, _ := evt["item"].(map[string]any)
 		if item == nil {
@@ -1282,19 +1318,19 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 		itemType, _ := item["type"].(string)
 		id, _ := item["id"].(string)
 		if outputIndex >= 0 && id != "" {
-			itemToOutput[id] = outputIndex
+			e.itemToOutput[id] = outputIndex
 		}
 		switch itemType {
 		case "message":
 			// content_part 后续会创建文本块，这里仅登记映射。
 			if outputIndex >= 0 {
-				if _, ok := blocks[outputIndex]; !ok {
-					blocks[outputIndex] = &claudeResponsesBlock{claudeIndex: -1, kind: "text"}
+				if _, ok := e.blocks[outputIndex]; !ok {
+					e.blocks[outputIndex] = &claudeResponsesBlock{claudeIndex: -1, kind: "text"}
 				}
 			}
 		case "reasoning":
 			if outputIndex >= 0 {
-				b := getOrCreate(outputIndex, "thinking")
+				b := e.getOrCreate(outputIndex, "thinking")
 				_ = b
 			}
 		case "function_call", "tool_call":
@@ -1304,7 +1340,7 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 			}
 			name, _ := item["name"].(string)
 			if outputIndex >= 0 {
-				b := getOrCreate(outputIndex, "tool")
+				b := e.getOrCreate(outputIndex, "tool")
 				if b.claudeIndex < 0 {
 					// getOrCreate 已分配，这里补齐（兼容占位）。
 				}
@@ -1315,10 +1351,10 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 					b.toolName = name
 				}
 				if id != "" {
-					itemToOutput[id] = outputIndex
+					e.itemToOutput[id] = outputIndex
 				}
 				if callID != "" {
-					itemToOutput[callID] = outputIndex
+					e.itemToOutput[callID] = outputIndex
 				}
 			}
 		case "apply_patch_call", "shell_call":
@@ -1331,20 +1367,20 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 				name = "shell"
 			}
 			if outputIndex >= 0 {
-				b := getOrCreate(outputIndex, "tool")
+				b := e.getOrCreate(outputIndex, "tool")
 				if callID != "" {
 					b.toolID = callID
 				}
 				b.toolName = name
 				if id != "" {
-					itemToOutput[id] = outputIndex
+					e.itemToOutput[id] = outputIndex
 				}
 			}
 		default:
 			// 未知 item（web_search_call 等）：登记为文本占位，delta 到达时降级。
 			if outputIndex >= 0 && itemType != "" {
-				if _, ok := blocks[outputIndex]; !ok {
-					blocks[outputIndex] = &claudeResponsesBlock{claudeIndex: -1, kind: "text"}
+				if _, ok := e.blocks[outputIndex]; !ok {
+					e.blocks[outputIndex] = &claudeResponsesBlock{claudeIndex: -1, kind: "text"}
 				}
 			}
 		}
@@ -1362,7 +1398,7 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 			partType, _ = part["type"].(string)
 		}
 		// refusal 也按文本处理。
-		b := getOrCreate(oi, "text")
+		b := e.getOrCreate(oi, "text")
 		if b.claudeIndex < 0 {
 			// 占位块首次使用时分配真实序号（getOrCreate 已分配，这里无需处理）。
 		}
@@ -1379,10 +1415,10 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 		if delta == "" {
 			return
 		}
-		stats.noteChunk()
-		*producedText = true
-		b := getOrCreate(oi, "text")
-		emitText(b, delta)
+		e.stats.noteChunk()
+		*e.producedText = true
+		b := e.getOrCreate(oi, "text")
+		e.emitText(b, delta)
 	case "response.refusal.delta":
 		oi := outputIndex
 		if oi < 0 {
@@ -1397,10 +1433,10 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 		if delta == "" {
 			return
 		}
-		stats.noteChunk()
-		*producedText = true
-		b := getOrCreate(oi, "text")
-		emitText(b, delta)
+		e.stats.noteChunk()
+		*e.producedText = true
+		b := e.getOrCreate(oi, "text")
+		e.emitText(b, delta)
 	case "response.function_call_arguments.delta":
 		oi := outputIndex
 		if oi < 0 {
@@ -1413,9 +1449,9 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 		if delta == "" {
 			return
 		}
-		stats.noteChunk()
-		b := getOrCreate(oi, "tool")
-		emitTool(b, delta)
+		e.stats.noteChunk()
+		b := e.getOrCreate(oi, "tool")
+		e.emitTool(b, delta)
 	case "response.reasoning_summary_text.delta":
 		oi := outputIndex
 		if oi < 0 {
@@ -1425,9 +1461,9 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 		if delta == "" {
 			return
 		}
-		stats.noteChunk()
-		b := getOrCreate(oi, "thinking")
-		emitThinking(b, delta)
+		e.stats.noteChunk()
+		b := e.getOrCreate(oi, "thinking")
+		e.emitThinking(b, delta)
 	case "response.reasoning_text.delta":
 		oi := outputIndex
 		if oi < 0 {
@@ -1442,9 +1478,9 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 		if delta == "" {
 			return
 		}
-		stats.noteChunk()
-		b := getOrCreate(oi, "thinking")
-		emitThinking(b, delta)
+		e.stats.noteChunk()
+		b := e.getOrCreate(oi, "thinking")
+		e.emitThinking(b, delta)
 	case "response.output_text.done", "response.refusal.done", "response.function_call_arguments.done", "response.reasoning_summary_part.done", "response.reasoning_summary_text.done", "response.content_part.done", "response.output_item.done":
 		// 结束标记：统一在 completed 处关块，避免半流提前关块后同 index 又来 delta。
 		return
@@ -1453,18 +1489,18 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 		if resp != nil {
 			if u, ok := resp["usage"].(map[string]any); ok {
 				for k, v := range u {
-					fullUsage[k] = v
+					e.fullUsage[k] = v
 				}
 			}
 			if status, ok := resp["status"].(string); ok && status == "incomplete" {
-				*stopReason = "max_tokens"
+				*e.stopReason = "max_tokens"
 			}
 			// 从完整 output 推导 tool_use 终止（流式 delta 可能漏 name）。
 			if out, ok := resp["output"].([]any); ok {
 				for _, raw := range out {
 					if im, ok := raw.(map[string]any); ok {
 						if t, _ := im["type"].(string); t == "function_call" || t == "apply_patch_call" || t == "shell_call" || t == "tool_call" {
-							*stopReason = "tool_use"
+							*e.stopReason = "tool_use"
 							break
 						}
 					}
@@ -1472,27 +1508,27 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 			}
 		} else if u, ok := evt["usage"].(map[string]any); ok {
 			for k, v := range u {
-				fullUsage[k] = v
+				e.fullUsage[k] = v
 			}
 		}
-		stats.sawFinish = true
-		stats.finishReason = "stop"
-		stats.doneSeen = true
-		*finished = true
+		e.stats.sawFinish = true
+		e.stats.finishReason = "stop"
+		e.stats.doneSeen = true
+		*e.finished = true
 	case "response.incomplete":
 		resp, _ := evt["response"].(map[string]any)
 		if resp != nil {
 			if u, ok := resp["usage"].(map[string]any); ok {
 				for k, v := range u {
-					fullUsage[k] = v
+					e.fullUsage[k] = v
 				}
 			}
 		}
-		*stopReason = "max_tokens"
-		stats.sawFinish = true
-		stats.finishReason = "length"
-		stats.doneSeen = true
-		*finished = true
+		*e.stopReason = "max_tokens"
+		e.stats.sawFinish = true
+		e.stats.finishReason = "length"
+		e.stats.doneSeen = true
+		*e.finished = true
 	case "response.failed", "error":
 		msg := "upstream stream error"
 		if em, ok := evt["error"].(map[string]any); ok {
@@ -1506,13 +1542,13 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 				}
 			}
 		}
-		emitError(msg)
-		*finished = true
+		e.emitError(msg)
+		*e.finished = true
 	default:
 		// 顶层 usage 事件（部分上游直接发 usage）。
 		if u, ok := evt["usage"].(map[string]any); ok {
 			for k, v := range u {
-				fullUsage[k] = v
+				e.fullUsage[k] = v
 			}
 			return
 		}
@@ -1522,15 +1558,14 @@ func handleClaudeResponsesStreamEvent(evt map[string]any, frameEvent string, mes
 			if oi < 0 {
 				oi = outputIndexForItem(itemID, 0)
 			}
-			stats.noteChunk()
-			*producedText = true
-			b := getOrCreate(oi, "text")
-			emitText(b, d)
+			e.stats.noteChunk()
+			*e.producedText = true
+			b := e.getOrCreate(oi, "text")
+			e.emitText(b, d)
 		}
 	}
-}
 
-// finalizeClaudeResponsesStream 关闭所有已开块并发送 message_delta/stop。
+}
 func finalizeClaudeResponsesStream(emit func(string, any), blocks map[int]*claudeResponsesBlock, toolOrder []int, msgID, model string, fullUsage map[string]any, stopReason, reasoningFallback string, producedText bool) {
 	// 空回复保护：有 reasoning 但无文本/tool 时提升为文本。
 	if !producedText && len(toolOrder) == 0 && reasoningFallback != "" {
