@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -209,4 +210,22 @@ func startServer(addr string, mux *http.ServeMux) (*http.Server, net.Listener, e
 		}
 	}()
 	return server, listener, nil
+}
+
+// readJSONRequestBody enforces POST, extracts upstream auth, and reads the body
+// capped at 10 MiB. On failure it writes the HTTP error and returns ok=false.
+func readJSONRequestBody(w http.ResponseWriter, r *http.Request) (auth UpstreamAuth, body []byte, ok bool) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return auth, nil, false
+	}
+	defer r.Body.Close()
+	auth = extractUpstreamAuth(r)
+	var err error
+	body, err = io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return auth, nil, false
+	}
+	return auth, body, true
 }

@@ -958,15 +958,8 @@ func chatContentToResponsesContent(content any) ([]any, string) {
 }
 
 func responsesHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	defer r.Body.Close()
-	auth := extractUpstreamAuth(r)
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+	auth, body, ok := readJSONRequestBody(w, r)
+	if !ok {
 		return
 	}
 
