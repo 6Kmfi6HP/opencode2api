@@ -2,10 +2,15 @@
 
 ## Unreleased
 
+## v0.11.0
+
 - Text-only model detection is now driven by the models.dev catalog `modalities.input` data instead of a hardcoded `deepseek` prefix:
   - Known models reporting text-only input (e.g. `deepseek-v4-flash(-free)`, `glm-5.2`, `qwen3-coder*`, `grok-code`) now get the same `[image attached]` / `[document attached]` downgrade everywhere (Chat, Responses, Claude).
   - Multimodal models that used to be falsely caught by the `deepseek` prefix (e.g. `deepseek-v4-flash-vision-exp`) now keep their images.
   - `text_only_models` is still honored as an explicit case-insensitive prefix override on top of the catalog data; its default is now empty. Unknown models are never downgraded — with no catalog reachable, requests fail open and the upstream error remains truthful.
+- Free-tier model detection now also honours the models.dev `cost` data instead of only the `-free` name suffix:
+  - `big-pickle` (no `-free` suffix, but zero-cost upstream) now appears in `/v1/models`, the interactive launch selector, and the Codex `--model` catalog when running without an API key.
+  - The check only consults the `opencode` provider entry in the models.dev catalog, so other vendors' promotional zero-cost pricing cannot leak into the public tier.
 
 ## v0.10.3
 
