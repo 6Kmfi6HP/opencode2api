@@ -2,42 +2,31 @@ package app
 
 import "strings"
 
-// extractModelFromExtraArgs scans the extra (post-`--`) argument list for a
-// --model flag in either "--model <value>" or "--model=<value>" form. When
+// extractModelFlagFromExtraArgs scans the extra (post-`--`) argument list for
+// a model flag in either "<flag> <value>" or "<flag>=<value>" form. When
 // found, the model value is returned and the matching argument(s) are removed
-// from the slice in place. This lets users put --model after `--` alongside
-// passthrough flags like --dangerously-skip-permissions:
-//
-//	opencode2api launch claude -- --dangerously-skip-permissions --model x-preview-f
-//
-// Without this, the --model flag after `--` would be forwarded verbatim to
-// claude, and opencode2api would show the interactive TUI selector because
-// its own -model flag is empty.
-func extractModelFromExtraArgs(args []string) (model string, cleaned []string) {
+// from the slice in place (a new backing array is used).
+func extractModelFlagFromExtraArgs(args []string, flags ...string) (model string, cleaned []string) {
 	cleaned = args[:0:0] // new backing array
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if arg == "--model" {
-			if i+1 < len(args) {
-				model = strings.TrimSpace(args[i+1])
-				i++ // skip the value
+		matched := false
+		for _, flag := range flags {
+			if arg == flag {
+				if i+1 < len(args) {
+					model = strings.TrimSpace(args[i+1])
+					i++ // skip the value
+				}
+				matched = true
+				break
 			}
-			continue
-		}
-		if strings.HasPrefix(arg, "--model=") {
-			model = strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
-			continue
-		}
-		// Also handle single-dash form "-model" / "-model=".
-		if arg == "-model" {
-			if i+1 < len(args) {
-				model = strings.TrimSpace(args[i+1])
-				i++
+			if strings.HasPrefix(arg, flag+"=") {
+				model = strings.TrimSpace(strings.TrimPrefix(arg, flag+"="))
+				matched = true
+				break
 			}
-			continue
 		}
-		if strings.HasPrefix(arg, "-model=") {
-			model = strings.TrimSpace(strings.TrimPrefix(arg, "-model="))
+		if matched {
 			continue
 		}
 		cleaned = append(cleaned, arg)
@@ -45,28 +34,20 @@ func extractModelFromExtraArgs(args []string) (model string, cleaned []string) {
 	return model, cleaned
 }
 
-// extractCodexModelFromExtraArgs is the Codex equivalent of
-// extractModelFromExtraArgs. It recognizes both Codex model spellings:
+// extractModelFromExtraArgs recognizes the claude model spellings:
+// `--model <value>`, `--model=<value>`, `-model <value>`, `-model=<value>`.
+//
+//	opencode2api launch claude -- --dangerously-skip-permissions --model x-preview-f
+//
+// Without this, the --model flag after `--` would be forwarded verbatim to
+// claude, and opencode2api would show the interactive TUI selector because
+// its own -model flag is empty.
+func extractModelFromExtraArgs(args []string) (model string, cleaned []string) {
+	return extractModelFlagFromExtraArgs(args, "--model", "-model")
+}
+
+// extractCodexModelFromExtraArgs recognizes the Codex model spellings:
 // `--model <value>`, `--model=<value>`, `-m <value>`, and `-m=<value>`.
 func extractCodexModelFromExtraArgs(args []string) (model string, cleaned []string) {
-	cleaned = args[:0:0]
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case arg == "--model" || arg == "-m":
-			if i+1 < len(args) {
-				model = strings.TrimSpace(args[i+1])
-				i++
-			}
-			continue
-		case strings.HasPrefix(arg, "--model="):
-			model = strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
-			continue
-		case strings.HasPrefix(arg, "-m="):
-			model = strings.TrimSpace(strings.TrimPrefix(arg, "-m="))
-			continue
-		}
-		cleaned = append(cleaned, arg)
-	}
-	return model, cleaned
+	return extractModelFlagFromExtraArgs(args, "--model", "-m")
 }

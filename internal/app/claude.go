@@ -112,6 +112,11 @@ func claudeImageBlockToOpenAI(block map[string]any) (map[string]any, bool) {
 	return nil, false
 }
 
+// claudeDocumentBlockToOpenAI maps an Anthropic document content block to a
+// Chat Completions file content part. It supports source.type=base64
+// (media_type, default application/pdf) and source.type=url. A filename is
+// preserved from the block/title when available; no protocol ID is generated.
+// Returns (nil, false) when the document lacks a usable payload so the caller
 // can surface a structured 400 instead of serializing the wrapper as text.
 func claudeDocumentBlockToOpenAI(block map[string]any) (map[string]any, bool) {
 	source, _ := block["source"].(map[string]any)
@@ -412,6 +417,10 @@ func countAnthropicBetas(header string) int {
 	return n
 }
 
+// countCacheControlInValue counts cache_control breakpoints on content
+// blocks within system, message content, and tool_result content arrays. It
+// recurses into all values except input_schema and tool_use input, so a
+// property named cache_control inside a schema or input object is not
 // falsely counted as a breakpoint.
 func countCacheControlInValue(v any) int {
 	switch x := v.(type) {
@@ -455,6 +464,12 @@ func countClaudeCacheControlBlocks(req ClaudeRequest) int {
 	return n
 }
 
+// countClaudeThinkingSignatures counts non-empty signature fields on
+// thinking content blocks at the top level of each message's content array.
+// Only actual message content blocks are counted — not nested values inside
+// tool_use input or other objects that happen to have type:"thinking" and a
+// signature key. The signature content itself is never recorded; only the
+// count is exposed in request_plan for observability. These signatures have
 // no Chat Completions equivalent and are dropped upstream.
 func countClaudeThinkingSignatures(msgs []ClaudeMessage) int {
 	var n int
@@ -1452,15 +1467,6 @@ loop:
 	emitClaudeEvent("message_stop", map[string]any{"type": "message_stop"})
 }
 
-func indexOfInt(slice []int, val int) int {
-	for i, v := range slice {
-		if v == val {
-			return i
-		}
-	}
-	return 0
-}
-
 // ======================== Anthropic 格式兼容 ========================
 
 func isAnthropicFormat(body []byte) bool {
@@ -1517,7 +1523,6 @@ type anthropicBlockState struct {
 	stopped       bool
 }
 
-// 0). Nested maps are recursively merged. Fields absent from src are retained.
 // usageHasCompletion reports whether an upstream usage object includes output
 // token accounting, which upstreams send as the terminal chunk when
 // stream_options.include_usage is set.
@@ -1544,6 +1549,10 @@ func streamProducedOutput(stats *logging.StreamStats, toolCalls int) bool {
 	return stats.TextChars > 0 || stats.ReasoningChars > 0 || toolCalls > 0
 }
 
+// mergeUsageMaps merges src into dst. Anthropic usage values are snapshots /
+// cumulative: a field present in src always replaces the value in dst
+// (including 0). Nested maps are recursively merged. Fields absent from src
+// are retained.
 func mergeUsageMaps(dst any, src map[string]any) map[string]any {
 	if src == nil {
 		if dm, ok := dst.(map[string]any); ok {
@@ -1574,7 +1583,22 @@ func mergeUsageMaps(dst any, src map[string]any) map[string]any {
 	return result
 }
 
-// - malformed tool_use input JSON
+// parseAnthropicSSE consumes a complete Anthropic Messages SSE body and
+// returns the terminal message object plus the reconstructed content blocks.
+//
+// Accepted framing:
+//   - standard SSE: "data: <json>", "event: <name>", comment lines starting
+//     with ":" (ignored as metadata)
+//
+// Malformed/truncated conditions that return an error:
+//   - missing message_stop
+//   - error event from upstream
+//   - malformed event JSON
+//   - delta for an unknown/un-started index
+//   - content_block_stop for an unknown/un-started index
+//   - duplicate content_block_start for the same index
+//   - message_stop with unclosed (not-yet-stopped) blocks
+//   - malformed tool_use input JSON
 func parseAnthropicSSE(body []byte) (map[string]any, []map[string]any, error) {
 	lines := bytes.Split(body, []byte("\n"))
 	var anthropicMsg map[string]any

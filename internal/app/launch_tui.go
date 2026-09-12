@@ -35,7 +35,7 @@ func selectModelTTY(modelIDs []string, catalog modelsdev.Catalog) (string, error
 		return "", nil
 	}
 
-	entries := modelSelectionEntries(modelIDs, catalog)
+	entries := modelSelectionEntries(modelIDs, catalog, true)
 	if len(entries) == 0 {
 		return "", nil
 	}

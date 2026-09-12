@@ -630,14 +630,6 @@ func forwardNativeResponses(ctx context.Context, w http.ResponseWriter, auth Ups
 	return true
 }
 
-// passthroughNativeResponses 兼容别名：等价于投机探测（成功才写回并记忆）。
-// 已确认模型的转发请使用 forwardNativeResponses（保真透传上游状态码）。
-func passthroughNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool) bool {
-	var req ResponsesAPIRequest
-	_ = json.Unmarshal(rawBody, &req)
-	return probeNativeResponses(ctx, w, auth, modelID, rawBody, stream, req)
-}
-
 // relayResponsesToClient 统一负责流式与非流式的保真透传：过滤后的安全响应头、
 // 流式实时 Flush、流/非流双路 Token 统计、成功响应的会话状态保存。
 func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, header http.Header, modelID string, stream bool, req ResponsesAPIRequest, rewrites *responsesNameRewrites) {

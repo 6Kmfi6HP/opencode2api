@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"io"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,13 +19,14 @@ type launchModelSelectionEntry struct {
 }
 
 // modelSelectionEntries converts the cached model IDs into the entries shown
-// by interactive launch selectors.
+// by interactive launch selectors: deduplicated by public-facing ID, sorted by
+// context window descending, then alphabetically. With freeOnly=true, only
+// models that have a free variant (a "-free" suffix in the upstream catalog)
+// are kept, matching the default public/free launch tier.
 //
-// Only models that have a free variant (a "-free" suffix in the upstream
-// catalog) are shown, since the default launch tier is public/free. Models
-// are deduplicated by their public-facing ID, sorted by context window
-// descending, then alphabetically.
-func modelSelectionEntries(modelIDs []string, catalog modelsdev.Catalog) []launchModelSelectionEntry {
+// TODO(follow-up): internal/app/launch.go 的 buildCodexModelCatalogSpecs 与本
+// 函数约 90% 重复且免费判定规则已 drift，后续任务切到复用此 helper。
+func modelSelectionEntries(modelIDs []string, catalog modelsdev.Catalog, freeOnly bool) []launchModelSelectionEntry {
 	idSet := make(map[string]bool, len(modelIDs))
 	for _, id := range modelIDs {
 		idSet[id] = true
@@ -37,10 +39,10 @@ func modelSelectionEntries(modelIDs []string, catalog modelsdev.Catalog) []launc
 		if pub == "" || seen[pub] {
 			continue
 		}
-		seen[pub] = true
-		if !idSet[pub+"-free"] && !isFreeModel(id) {
+		if !freeOnly || !idSet[pub+"-free"] && !isFreeModel(id) {
 			continue
 		}
+		seen[pub] = true
 		entries = append(entries, launchModelSelectionEntry{
 			ID:            pub,
 			ContextWindow: modelsdev.ContextWindow(pub, catalog),
@@ -58,10 +60,19 @@ func modelSelectionEntries(modelIDs []string, catalog modelsdev.Catalog) []launc
 
 // selectModelNumbered implements the Windows launch selector: print a numbered
 // list, read a number from in, and return the matching model ID. Empty input
-// or EOF returns an empty model ID instead of crashing.
+// or EOF returns an empty model ID instead of crashing. If this process's
+// stdin is not a terminal it returns an empty model ID with a stderr hint
+// (aligned with selectModelTTY); pass an explicit *os.File to opt out.
 func selectModelNumbered(in io.Reader, out io.Writer, errOut io.Writer, entries []launchModelSelectionEntry) (string, error) {
 	if len(entries) == 0 {
 		return "", nil
+	}
+
+	if _, isFile := in.(*os.File); !isFile {
+		if fi, err := os.Stdin.Stat(); err != nil || (fi.Mode()&os.ModeCharDevice) == 0 {
+			fmt.Fprintln(errOut, "opencode2api: stdin is not a terminal; skipping model selection")
+			return "", nil
+		}
 	}
 
 	scanner := bufio.NewScanner(in)
