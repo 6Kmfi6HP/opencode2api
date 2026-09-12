@@ -66,7 +66,10 @@ func convertClaudeRequest(req ClaudeRequest) (OpenAIRequest, []string) {
 	return out, skipped
 }
 
-func convertClaudeToolChoice(choice any) any {
+// claudeToolChoiceCore 把 Claude tool_choice 转为 OpenAI 风格 tool_choice。
+// chatShape 为 true 时产 Chat Completions 形状（name 嵌套于 function 键），
+// 为 false 时产 Responses 形状（name 平铺）。未知形状原样透传，不报错。
+func claudeToolChoiceCore(choice any, chatShape bool) any {
 	m, ok := choice.(map[string]any)
 	if !ok {
 		return choice
@@ -80,10 +83,20 @@ func convertClaudeToolChoice(choice any) any {
 		return "none"
 	case "tool":
 		if name, ok := m["name"].(string); ok && name != "" {
-			return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+			if chatShape {
+				return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+			}
+			return map[string]any{"type": "function", "name": name}
+		}
+		if !chatShape {
+			return "auto"
 		}
 	}
 	return choice
+}
+
+func convertClaudeToolChoice(choice any) any {
+	return claudeToolChoiceCore(choice, true)
 }
 
 func claudeToolChoiceDisablesParallel(choice any) bool {

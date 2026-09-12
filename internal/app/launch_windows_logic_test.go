@@ -163,7 +163,7 @@ func TestModelSelectionEntriesFiltersAndSorts(t *testing.T) {
 		"model-a-free",
 		"model-c",
 		"model-c-free",
-	}, catalog)
+	}, catalog, true)
 
 	var ids []string
 	for _, e := range entries {

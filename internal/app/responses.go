@@ -227,6 +227,13 @@ func convertResponsesTools(tools []ResponsesTool) []Tool {
 	return converted
 }
 
+// convertResponsesTextToResponseFormat translates the Responses API `text`
+// parameter ({format:{type:...}, verbosity:...}) into the Chat Completions
+// `response_format` shape ({type:...}) that upstream providers require.
+//
+// Returns nil when no representable format can be built (unknown type,
+// missing required json_schema fields, or a non-object text value) so the
+// caller can omit response_format instead of sending a malformed object that
 // upstream would reject with a 400.
 func convertResponsesTextToResponseFormat(text any) any {
 	obj, ok := text.(map[string]any)
@@ -412,6 +419,8 @@ func convertResponsesToolChoice(choice any) any {
 	return choice
 }
 
+// toolResultOutputKind marks the output item types that carry a tool/function
+// output payload. tool_result is the Anthropic-style alias accepted by the
 // Responses entrypoint in addition to the standard *_call_output types.
 var toolResultOutputKind = map[string]struct{}{
 	"function_call_output":    {},
@@ -451,6 +460,12 @@ func collectFunctionOutputs(items []any) map[string]string {
 	return outputs
 }
 
+// normalizeToolResultOutput is the single helper that extracts a textual
+// output from a tool/function output item. It prefers the standard `output`
+// field; for Anthropic-style tool_result it reads `content` when `output` is
+// absent. content supports a string, a string array, or an array of
+// {type:"text"|"input_text"|"output_text", text:"..."} blocks joined by
+// newlines in original order. The boolean reports whether a payload was
 // present (an empty string is a legitimate provided output).
 func normalizeToolResultOutput(elem map[string]any) (string, bool) {
 	var text string
@@ -751,6 +766,11 @@ func validateResponsesFileItems(input any) string {
 	return ""
 }
 
+// validateResponsesFileItem validates a single top-level input item or a
+// content part within a message content array. File validation applies only
+// to official input paths: top-level input_file items and message content
+// arrays. Output/tool_result content arrays are not validated for file
+// inputs — they use text shapes only (normalizeToolResultOutput supports
 // strings and text/input_text/output_text blocks).
 func validateResponsesFileItem(item any) string {
 	elem, ok := item.(map[string]any)
@@ -1421,7 +1441,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			return
 		}
 		seq++
-		emitSSEEvent(w, flusher, "response.reasoning_summary_text.done", map[string]any{
+		writeSSEEvent(w, flusher, "response.reasoning_summary_text.done", map[string]any{
 			"type":            "response.reasoning_summary_text.done",
 			"sequence_number": seq,
 			"item_id":         reasoningID,
@@ -1430,7 +1450,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			"text":            fullReasoning,
 		})
 		seq++
-		emitSSEEvent(w, flusher, "response.reasoning_summary_part.done", map[string]any{
+		writeSSEEvent(w, flusher, "response.reasoning_summary_part.done", map[string]any{
 			"type":            "response.reasoning_summary_part.done",
 			"sequence_number": seq,
 			"item_id":         reasoningID,
@@ -1439,7 +1459,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			"part":            map[string]any{"type": "summary_text", "text": fullReasoning},
 		})
 		seq++
-		emitSSEEvent(w, flusher, "response.output_item.done", map[string]any{
+		writeSSEEvent(w, flusher, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    reasoningOutputIndex,
@@ -1454,7 +1474,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		}
 		idx := messageOutputIndex()
 		seq++
-		emitSSEEvent(w, flusher, "response.output_text.done", map[string]any{
+		writeSSEEvent(w, flusher, "response.output_text.done", map[string]any{
 			"type":            "response.output_text.done",
 			"sequence_number": seq,
 			"item_id":         msgID,
@@ -1464,7 +1484,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			"logprobs":        []any{},
 		})
 		seq++
-		emitSSEEvent(w, flusher, "response.content_part.done", map[string]any{
+		writeSSEEvent(w, flusher, "response.content_part.done", map[string]any{
 			"type":            "response.content_part.done",
 			"sequence_number": seq,
 			"item_id":         msgID,
@@ -1473,7 +1493,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			"part":            map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": fullText},
 		})
 		seq++
-		emitSSEEvent(w, flusher, "response.output_item.done", map[string]any{
+		writeSSEEvent(w, flusher, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    idx,
@@ -1488,7 +1508,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		}
 		idx := messageOutputIndex()
 		seq++
-		emitSSEEvent(w, flusher, "response.refusal.done", map[string]any{
+		writeSSEEvent(w, flusher, "response.refusal.done", map[string]any{
 			"type":            "response.refusal.done",
 			"sequence_number": seq,
 			"item_id":         msgID,
@@ -1508,7 +1528,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		name, _ := call["name"].(string)
 		args, _ := call["arguments"].(string)
 		seq++
-		emitSSEEvent(w, flusher, "response.function_call_arguments.done", map[string]any{
+		writeSSEEvent(w, flusher, "response.function_call_arguments.done", map[string]any{
 			"type":            "response.function_call_arguments.done",
 			"sequence_number": seq,
 			"item_id":         itemID,
@@ -1523,7 +1543,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		}
 		item := buildResponseToolCallItem(ToolCall{ID: callID, Function: FunctionCall{Name: name, Arguments: args}}, itemType)
 		item["status"] = itemStatus
-		emitSSEEvent(w, flusher, "response.output_item.done", map[string]any{
+		writeSSEEvent(w, flusher, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    idx,
@@ -1546,13 +1566,13 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			}
 		}
 		seq++
-		emitSSEEvent(w, flusher, "response.created", map[string]any{
+		writeSSEEvent(w, flusher, "response.created", map[string]any{
 			"type":            "response.created",
 			"sequence_number": seq,
 			"response":        map[string]any{"id": responseID, "object": "response", "created_at": createdAt, "status": "in_progress", "background": false, "error": nil, "output": []any{}},
 		})
 		seq++
-		emitSSEEvent(w, flusher, "response.in_progress", map[string]any{
+		writeSSEEvent(w, flusher, "response.in_progress", map[string]any{
 			"type":            "response.in_progress",
 			"sequence_number": seq,
 			"response":        map[string]any{"id": responseID, "object": "response", "created_at": createdAt, "status": "in_progress"},
@@ -1578,7 +1598,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		}
 		applyResponsesRequestEcho(failedResponse, originalReq)
 		seq++
-		emitSSEEvent(w, flusher, "response.failed", map[string]any{
+		writeSSEEvent(w, flusher, "response.failed", map[string]any{
 			"type":            "response.failed",
 			"sequence_number": seq,
 			"response":        failedResponse,
@@ -1663,14 +1683,14 @@ loop:
 											if !reasoningStarted {
 												reasoningOutputIndex = indexAllocator.Allocate()
 												seq++
-												emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+												writeSSEEvent(w, flusher, "response.output_item.added", map[string]any{
 													"type":            "response.output_item.added",
 													"sequence_number": seq,
 													"output_index":    reasoningOutputIndex,
 													"item":            reasoningItem("in_progress"),
 												})
 												seq++
-												emitSSEEvent(w, flusher, "response.reasoning_summary_part.added", map[string]any{
+												writeSSEEvent(w, flusher, "response.reasoning_summary_part.added", map[string]any{
 													"type":            "response.reasoning_summary_part.added",
 													"sequence_number": seq,
 													"item_id":         reasoningID,
@@ -1682,7 +1702,7 @@ loop:
 											}
 											fullReasoning += rcStr
 											seq++
-											emitSSEEvent(w, flusher, "response.reasoning_summary_text.delta", map[string]any{
+											writeSSEEvent(w, flusher, "response.reasoning_summary_text.delta", map[string]any{
 												"type":            "response.reasoning_summary_text.delta",
 												"sequence_number": seq,
 												"item_id":         reasoningID,
@@ -1713,14 +1733,14 @@ loop:
 										if !messageStarted {
 											idx := messageOutputIndex()
 											seq++
-											emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+											writeSSEEvent(w, flusher, "response.output_item.added", map[string]any{
 												"type":            "response.output_item.added",
 												"sequence_number": seq,
 												"output_index":    idx,
 												"item":            map[string]any{"id": msgID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
 											})
 											seq++
-											emitSSEEvent(w, flusher, "response.content_part.added", map[string]any{
+											writeSSEEvent(w, flusher, "response.content_part.added", map[string]any{
 												"type":            "response.content_part.added",
 												"sequence_number": seq,
 												"item_id":         msgID,
@@ -1732,7 +1752,7 @@ loop:
 										}
 										fullText += contentStr
 										seq++
-										emitSSEEvent(w, flusher, "response.output_text.delta", map[string]any{
+										writeSSEEvent(w, flusher, "response.output_text.delta", map[string]any{
 											"type":            "response.output_text.delta",
 											"sequence_number": seq,
 											"item_id":         msgID,
@@ -1749,7 +1769,7 @@ loop:
 										}
 										fullRefusal += refusalStr
 										seq++
-										emitSSEEvent(w, flusher, "response.refusal.delta", map[string]any{
+										writeSSEEvent(w, flusher, "response.refusal.delta", map[string]any{
 											"type":            "response.refusal.delta",
 											"sequence_number": seq,
 											"item_id":         msgID,
@@ -1789,7 +1809,7 @@ loop:
 											toolCalls[upstreamIndex] = call
 											toolOrder = append(toolOrder, upstreamIndex)
 											seq++
-											emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+											writeSSEEvent(w, flusher, "response.output_item.added", map[string]any{
 												"type":            "response.output_item.added",
 												"sequence_number": seq,
 												"output_index":    outputIndex,
@@ -1813,7 +1833,7 @@ loop:
 										if argDelta, _ := fn["arguments"].(string); argDelta != "" {
 											call["arguments"] = call["arguments"].(string) + argDelta
 											seq++
-											emitSSEEvent(w, flusher, "response.function_call_arguments.delta", map[string]any{
+											writeSSEEvent(w, flusher, "response.function_call_arguments.delta", map[string]any{
 												"type":            "response.function_call_arguments.delta",
 												"sequence_number": seq,
 												"item_id":         call["item_id"],
@@ -1878,14 +1898,14 @@ loop:
 	if !messageStarted && len(toolCalls) == 0 {
 		idx := messageOutputIndex()
 		seq++
-		emitSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+		writeSSEEvent(w, flusher, "response.output_item.added", map[string]any{
 			"type":            "response.output_item.added",
 			"sequence_number": seq,
 			"output_index":    idx,
 			"item":            map[string]any{"id": msgID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
 		})
 		seq++
-		emitSSEEvent(w, flusher, "response.content_part.added", map[string]any{
+		writeSSEEvent(w, flusher, "response.content_part.added", map[string]any{
 			"type":            "response.content_part.added",
 			"sequence_number": seq,
 			"item_id":         msgID,
@@ -1975,7 +1995,7 @@ loop:
 	}
 
 	seq++
-	emitSSEEvent(w, flusher, terminalEvent, map[string]any{
+	writeSSEEvent(w, flusher, terminalEvent, map[string]any{
 		"type":            terminalEvent,
 		"sequence_number": seq,
 		"response":        completedResponse,
@@ -2100,17 +2120,4 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 
 	result, _ := json.Marshal(responses)
 	return result
-}
-
-func emitSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, data map[string]any) {
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		slog.Error("marshal SSE event failed", "error", err)
-		return
-	}
-	w.Write([]byte("event: " + event + "\n"))
-	w.Write([]byte("data: " + string(jsonData) + "\n\n"))
-	if flusher != nil {
-		flusher.Flush()
-	}
 }

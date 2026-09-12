@@ -489,7 +489,7 @@ func marshalRawArguments(v any) []byte {
 }
 
 func toolCallIDHash(seed string) string {
-	sum := sha256Sum([]byte(seed))
+	sum := sha256.Sum256([]byte(seed))
 	return hex.EncodeToString(sum[:12])
 }
 
@@ -959,10 +959,4 @@ func hasRawToolFragment(text string) bool {
 		}
 	}
 	return false
-}
-
-func sha256Sum(data []byte) [32]byte {
-	// crypto/sha256 is used by the standard library's SHA-256 constructor;
-	// this indirection keeps call sites in this file compact.
-	return sha256.Sum256(data)
 }

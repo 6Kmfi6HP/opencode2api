@@ -367,27 +367,29 @@ func normalizeResponsesToolParameters(params map[string]any) map[string]any {
 	return params
 }
 
-// claudeToolChoiceToResponses 把 Claude tool_choice 转为 Responses 形状。
-// 未知形状原样透传，不报错。
+// claudeToolChoiceToResponses 把 Claude tool_choice 转为 Responses 形状的薄包装，
+// 核心逻辑在 claudeToolChoiceCore（anthropic_protocol.go）。
 func claudeToolChoiceToResponses(choice any) any {
-	m, ok := choice.(map[string]any)
-	if !ok {
-		return choice
+	return claudeToolChoiceCore(choice, false)
+}
+
+// thinkingBudgetToEffort maps an Anthropic-style thinking budget_tokens value
+// onto an OpenAI-compatible reasoning effort tier.
+// TODO(follow-up): chat.go 的 reasoningEffortFromThinking 仍内联同一阈值表，
+// 后续任务切换到复用此 helper。
+func thinkingBudgetToEffort(budget float64) string {
+	switch {
+	case budget <= 0:
+		return ""
+	case budget < 2048:
+		return "low"
+	case budget < 8192:
+		return "medium"
+	case budget < 16384:
+		return "high"
+	default:
+		return "xhigh"
 	}
-	switch m["type"] {
-	case "auto":
-		return "auto"
-	case "any":
-		return "required"
-	case "none":
-		return "none"
-	case "tool":
-		if name, ok := m["name"].(string); ok && name != "" {
-			return map[string]any{"type": "function", "name": name}
-		}
-		return "auto"
-	}
-	return choice
 }
 
 // claudeThinkingToResponsesEffort 从 thinking / output_config 推导 effort。
@@ -721,13 +723,12 @@ func responsesUsageToChat(usage map[string]any) map[string]any {
 		out["completion_tokens"] = v
 	}
 	if v, ok := usage["total_tokens"]; ok {
-		if pt, ok := numberAsFloat(out["prompt_tokens"]); ok {
-			if ct, ok := numberAsFloat(out["completion_tokens"]); ok {
-				_ = pt
-				_ = ct
-			}
-		}
 		out["total_tokens"] = v
+	} else if pt, ok := numberAsFloat(out["prompt_tokens"]); ok {
+		if ct, ok := numberAsFloat(out["completion_tokens"]); ok {
+			// 上游缺 total_tokens 时由分量合成，避免下游/统计丢总量。
+			out["total_tokens"] = pt + ct
+		}
 	}
 	// 透传缓存与细节字段，buildClaudeUsageCore 会识别标准键。
 	for _, k := range []string{"prompt_tokens_details", "completion_tokens_details", "input_tokens_details", "output_tokens_details", "cache_creation_input_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens", "server_tool_use", "service_tier"} {
@@ -768,14 +769,12 @@ func recordClaudeResponsesUsage(model string, usage map[string]any) {
 	if usage == nil {
 		return
 	}
-	u := statsx.TokenUsage{}.FromMap(usage)
+	chatUsage := responsesUsageToChat(usage)
+	u := statsx.TokenUsage{}.FromMap(chatUsage)
 	pt, ct, tt := u.PromptTokens, u.CompletionTokens, u.TotalTokens
-	if tt <= 0 && (pt > 0 || ct > 0) {
-		tt = pt + ct
-	}
 	if tt > 0 {
 		statsx.RecordTokenUsage(model, pt, ct, tt)
-		statsx.RecordCacheUsage(model, responsesUsageToChat(usage))
+		statsx.RecordCacheUsage(model, chatUsage)
 	}
 }
 
@@ -1066,10 +1065,12 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		stats.ToolCallCount = len(toolOrder)
 		stats.Log(ctx, "claude-responses")
 		if len(fullUsage) > 0 {
-			pt, ct, tt := usageFromResponsesMap(fullUsage)
+			chatUsage := responsesUsageToChat(fullUsage)
+			u := statsx.TokenUsage{}.FromMap(chatUsage)
+			pt, ct, tt := u.PromptTokens, u.CompletionTokens, u.TotalTokens
 			if tt > 0 {
 				statsx.RecordTokenUsage(model, pt, ct, tt)
-				statsx.RecordCacheUsage(model, responsesUsageToChat(fullUsage))
+				statsx.RecordCacheUsage(model, chatUsage)
 			}
 		}
 	}()
@@ -1220,6 +1221,8 @@ func indexOfToolOrder(order []int, v int) (int, bool) {
 	return -1, false
 }
 
+// usageFromResponsesMap 从 Responses usage 提取 (prompt, completion, total)。
+// total_tokens 缺失时由分量合成——与 responsesUsageToChat 同一兜底规则。
 func usageFromResponsesMap(usage map[string]any) (int64, int64, int64) {
 	u := statsx.TokenUsage{}.FromMap(usage)
 	pt, ct, tt := u.PromptTokens, u.CompletionTokens, u.TotalTokens
