@@ -32,6 +32,11 @@ func flagSet(name string) bool {
 	return found
 }
 
+// applyLogLevel propagates the effective level string into the slog LevelVar
+// so post-parse bumps (e.g. -debug) take effect even when logging was already
+// initialized.
+func applyLogLevel() { logging.SetLevelString(logging.Level) }
+
 func Run() {
 	// Launch subcommand: opencode2api launch <tool> [args...]
 	if len(os.Args) >= 2 && os.Args[1] == "launch" {
@@ -58,12 +63,13 @@ func Run() {
 	flag.Parse()
 
 	configExplicit := flagSet("config")
-	resolveAndInitRuntime(statsFile, flagSet("stats-file"), configExplicit)
-	defer logging.CloseRotator()
 
 	if debugMode && strings.EqualFold(logging.Level, "info") {
 		logging.Level = "debug"
 	}
+	applyLogLevel()
+	resolveAndInitRuntime(statsFile, flagSet("stats-file"), configExplicit)
+	defer logging.CloseRotator()
 
 	if showVersion {
 		fmt.Println(versionString())
