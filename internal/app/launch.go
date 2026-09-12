@@ -497,6 +497,9 @@ type codexModelCatalogSpec struct {
 // buildCodexModelCatalogSpecs builds the catalog model set passed to Codex.
 // When freeOnly is true (default public tier), only models with a usable
 // "-free" variant are kept, matching the interactive launch model list.
+// NOTE: the freeOnly filter/dedup/sort intentionally stays local: the shared
+// modelSelectionEntries hides -free variants even when freeOnly is false,
+// whereas the paid-tier Codex catalog (freeOnly=false) must list them.
 func buildCodexModelCatalogSpecs(catalog modelsdev.Catalog, freeOnly bool) []codexModelCatalogSpec {
 	modelIDs := append(getModelIDs(), getGoModelIDs()...)
 

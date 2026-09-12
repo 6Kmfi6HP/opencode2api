@@ -777,8 +777,10 @@ func buildUpstreamThinking(value any) map[string]any {
 	return out
 }
 
-// reasoningEffortFromThinking maps Anthropic-style budget_tokens onto an
-// OpenAI-compatible reasoning_effort when the client did not set one explicitly.
+// reasoningEffortFromThinking maps an Anthropic-style thinking object onto an
+// OpenAI-compatible reasoning_effort when the client did not set one
+// explicitly. An explicit "effort" string wins; otherwise the shared
+// thinkingBudgetToEffort tiers budget_tokens.
 func reasoningEffortFromThinking(value any) string {
 	m, ok := value.(map[string]any)
 	if !ok {
@@ -804,18 +806,7 @@ func reasoningEffortFromThinking(value any) string {
 	default:
 		return ""
 	}
-	switch {
-	case budget <= 0:
-		return ""
-	case budget < 2048:
-		return "low"
-	case budget < 8192:
-		return "medium"
-	case budget < 16384:
-		return "high"
-	default:
-		return "xhigh"
-	}
+	return thinkingBudgetToEffort(budget)
 }
 
 func wantsReasoning(req *OpenAIRequest) bool {
