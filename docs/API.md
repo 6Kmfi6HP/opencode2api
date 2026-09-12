@@ -24,6 +24,7 @@
 | `/v1/chat/completions` | `POST` | OpenAI Chat Completions 兼容入口 |
 | `/v1/responses` | `POST` | OpenAI Responses 兼容入口 |
 | `/v1/messages` | `POST` | Anthropic Messages 兼容入口 |
+| `/v1/messages/count_tokens` | `POST` | Anthropic token 计数入口：本地启发式估算，不访问上游 |
 | `/health` | `GET` | 健康检查 |
 | `/api/config` | `GET`/`POST` | 管理面板配置接口 |
 | `/api/stats` | `GET`/`DELETE` | token 统计接口 |
@@ -100,6 +101,7 @@
 ### Best-effort
 
 - Responses 会通过 Chat Completions 上游实现；内置工具被编码为函数工具后再还原。
+- 已确认只支持原生上游 `/responses` 端点的模型（静态预置、`native_responses_models` 配置项、运行时探测记忆）跳过 Chat 翻译，直接保真透传，上游 4xx/5xx 状态码与错误体原样返回。
 - 仅在上游实际返回 reasoning 时生成 reasoning output item。
 - `input` 中的 top-level item 或 message content 可使用 `input_file`；支持 flat 字段 `file_data`、`file_id`、`file_url`、`filename` 以及 nested `input_file` object，并映射为 `{type:"file",file:{...}}`。模型不支持 file 模态时上游可能拒绝。
 
