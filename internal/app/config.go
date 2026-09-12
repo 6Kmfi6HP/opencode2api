@@ -138,6 +138,12 @@ func matchKeywordRule(base string) (string, bool) {
 }
 
 func applyConfig(cfg AppConfig) {
+	// Sections are applied under separate locks (configMu for alias rules, the
+	// config snapshot, socks5Mu, ...), so a mid-flight reader can observe a
+	// mix of old and new values. Accepted on purpose for the
+	// single-administrator panel: atomic cross-section apply would need a
+	// wider lock redesign, and the mixed state self-heals after the write
+	// completes.
 	configMu.Lock()
 	modelAliasRules, compiledRules = compileKeywordRules(cfg.ModelAlias)
 	configMu.Unlock()

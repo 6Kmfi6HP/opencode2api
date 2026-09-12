@@ -103,17 +103,16 @@ func configureLaunchGlobals(f launchFlags) {
 	configPath = f.cfgPath
 	adminPassword = "" // launch mode disables the admin panel
 	debugMode = f.debug
-	logging.Level = "info"
+	logLevel := "info"
 	if f.debug {
-		logging.Level = "debug"
+		logLevel = "debug"
 	}
-	logging.File, _ = resolveLogFilePath(f.logFile, f.logExplicit, configPath, f.configExplicit)
+	activeLogFile, _ = resolveLogFilePath(f.logFile, f.logExplicit, configPath, f.configExplicit)
 	logging.Stdout = false // launch mode: logs go to file only, never stdout (would corrupt the child TUI)
 	logging.MaxSize = 100
 	logging.MaxBackups = 7
 	logging.MaxAge = 14
 	logging.Compress = true
-	logging.Bodies = false
 
 	resolvedStats, _ := resolveStatsPath(f.statsFile, f.statsExplicit, configPath, f.configExplicit)
 	setTokenStatsPath(resolvedStats)
@@ -122,7 +121,7 @@ func configureLaunchGlobals(f launchFlags) {
 	modelsdev.SetClientGetter(getHTTPClient)
 
 	installLoggingHooks()
-	logging.Init(logging.File)
+	logging.Init(activeLogFile, logLevel, false)
 }
 
 // startLaunchProxy starts the local, read-only proxy config that both launch

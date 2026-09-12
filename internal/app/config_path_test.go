@@ -2,7 +2,6 @@ package app
 
 import (
 	"encoding/json"
-	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"os"
 	"path/filepath"
@@ -14,12 +13,12 @@ func resetStatsAndLogTestState(t *testing.T) {
 
 	origStatsPointer := stats.Snapshot()
 	origStatsPath := getTokenStatsPath()
-	origLog := logging.File
+	origLog := activeLogFile
 
 	t.Cleanup(func() {
 		stats.SetSnapshot(origStatsPointer)
 		setTokenStatsPath(origStatsPath)
-		logging.File = origLog
+		activeLogFile = origLog
 	})
 }
 
@@ -387,14 +386,14 @@ func TestLaunchFlagResolution(t *testing.T) {
 	t.Setenv("OPENCODE2API_LOG_FILE", "/tmp/env-launch.log")
 	f := newLaunchFlagSet("claude", []string{"--log-file", "flag-launch.log"})
 	if f.logFile != "flag-launch.log" {
-		t.Fatalf("launch raw logging.File = %q, want flag-launch.log", f.logFile)
+		t.Fatalf("launch raw log file = %q, want flag-launch.log", f.logFile)
 	}
 	if !f.logExplicit {
 		t.Fatal("launch logExplicit = false, want true")
 	}
 	configureLaunchGlobals(f)
-	if logging.File != "/tmp/env-launch.log" {
-		t.Fatalf("configured launch logging.File = %q, want /tmp/env-launch.log", logging.File)
+	if activeLogFile != "/tmp/env-launch.log" {
+		t.Fatalf("configured launch log file = %q, want /tmp/env-launch.log", activeLogFile)
 	}
 	if err := os.Unsetenv("OPENCODE2API_LOG_FILE"); err != nil {
 		t.Fatal(err)
@@ -420,8 +419,8 @@ func TestLaunchFlagResolution(t *testing.T) {
 	if got := getTokenStatsPath(); got != filepath.Join(tmpDir, "launch-config", "stats.json") {
 		t.Fatalf("launch statsPath = %q, want config-directory stats path", got)
 	}
-	if logging.File != wantLog {
-		t.Fatalf("configured logging.File = %q, want %q", logging.File, wantLog)
+	if activeLogFile != wantLog {
+		t.Fatalf("configured log file = %q, want %q", activeLogFile, wantLog)
 	}
 
 	// The stats environment remains the highest precedence.

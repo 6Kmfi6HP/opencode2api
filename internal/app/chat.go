@@ -2,6 +2,8 @@ package app
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,9 +14,9 @@ import (
 	"time"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
-	"github.com/6Kmfi6HP/opencode2api/internal/ids"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
+	"github.com/6Kmfi6HP/opencode2api/internal/random"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
 
@@ -284,7 +286,9 @@ func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
 	}
 }
 
-// convertStreamChunkWithUsage 转换流式 chunk 并同时提取 usage，避免二次解析
+// convertStreamChunkWithUsage 转换流式 chunk，并在同一次解析中顺带返回 usage。
+// 注意：流循环（chat.go 的 stream 处理）仍会为流统计单独解析一次 chunk；
+// 这里的 "顺带提取" 只是免去了 usage 的第三次解析。
 func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[string]any) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
@@ -1095,7 +1099,14 @@ func buildUpstreamBody(req *OpenAIRequest) []byte {
 
 // same output. An empty id gets a random suffix (callers should cache).
 func deterministicResponseID(prefix, id string) string {
-	return ids.Deterministic(prefix, id)
+	if strings.HasPrefix(id, prefix) && len(id) > len(prefix) {
+		return id
+	}
+	if id == "" {
+		return prefix + random.String(24)
+	}
+	h := sha256.Sum256([]byte(id))
+	return prefix + hex.EncodeToString(h[:16])
 }
 
 // normalizeChatResponseID ensures a Chat response ID has the chatcmpl- prefix.

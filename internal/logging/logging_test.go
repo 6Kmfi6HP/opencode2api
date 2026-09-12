@@ -230,29 +230,26 @@ func TestInitLoggerCreatesRotatingFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.log")
 
-	prevFile, prevStdout := File, Stdout
+	prevStdout := Stdout
 	prevSize, prevBackups, prevAge := MaxSize, MaxBackups, MaxAge
-	prevCompress, prevBodies, prevLevel := Compress, Bodies, Level
+	prevCompress := Compress
 	prevRotator := rotator
 	t.Cleanup(func() {
 		CloseRotator()
-		File, Stdout = prevFile, prevStdout
+		Stdout = prevStdout
 		MaxSize, MaxBackups, MaxAge = prevSize, prevBackups, prevAge
-		Compress, Bodies, Level = prevCompress, prevBodies, prevLevel
+		Compress = prevCompress
 		rotator = prevRotator
-		Init(File)
+		Init("", "info", false)
 	})
 
-	File = path
 	Stdout = false
 	MaxSize = 1
 	MaxBackups = 3
 	MaxAge = 1
 	Compress = false
-	Bodies = false
-	Level = "info"
 	CloseRotator()
-	Init(File)
+	Init(path, "info", false)
 
 	slog.Info("hello logging", "n", 1)
 	if _, err := os.Stat(path); err != nil {

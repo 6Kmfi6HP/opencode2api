@@ -399,38 +399,6 @@ func ResetTokenStats() error {
 	return saveTokenStats()
 }
 
-// resetTokenStatsOnDisk clears the shared stats file and the in-memory copy.
-// Used by the admin DELETE handler.
-func resetTokenStatsOnDisk() error {
-	path := GetPath()
-	if err := ensureStatsDir(path); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		return fmt.Errorf("open stats file %s: %w", path, err)
-	}
-	defer func() { _ = f.Close() }()
-	if err := lockStatsFileExclusive(f); err != nil {
-		return fmt.Errorf("lock stats file %s: %w", path, err)
-	}
-	defer func() { _ = unlockStatsFile(f) }()
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek stats file: %w", err)
-	}
-	if err := f.Truncate(0); err != nil {
-		return fmt.Errorf("truncate stats file: %w", err)
-	}
-	out, _ := json.MarshalIndent(&TokenStatsData{Models: map[string]*ModelStats{}}, "", "  ")
-	if _, err := f.Write(out); err != nil {
-		return fmt.Errorf("write stats file: %w", err)
-	}
-	_ = f.Sync()
-
-	replaceTokenStatsSnapshot(&TokenStatsData{Models: map[string]*ModelStats{}})
-	return nil
-}
-
 // parseCacheUsage extracts cache token counts from the various usage shapes
 // seen across upstreams:
 //

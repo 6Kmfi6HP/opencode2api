@@ -46,6 +46,11 @@ func reloadHandler(w http.ResponseWriter, r *http.Request) {
 func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		// The config snapshot, modelAlias rules, and socks5 state each live
+		// under their own synchronization, so a GET can observe values from
+		// different POST generations (torn read). That is accepted on
+		// purpose: the admin panel is a single-administrator tool, and a
+		// slightly mixed view self-heals on the next refresh.
 		snap := config.Get()
 		configMu.RLock()
 		cfg := AppConfig{ModelAlias: modelAliasRules}
