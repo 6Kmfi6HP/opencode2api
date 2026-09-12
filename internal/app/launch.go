@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -497,40 +496,16 @@ type codexModelCatalogSpec struct {
 // buildCodexModelCatalogSpecs builds the catalog model set passed to Codex.
 // When freeOnly is true (default public tier), only models with a usable
 // "-free" variant are kept, matching the interactive launch model list.
-// NOTE: the freeOnly filter/dedup/sort intentionally stays local: the shared
-// modelSelectionEntries hides -free variants even when freeOnly is false,
-// whereas the paid-tier Codex catalog (freeOnly=false) must list them.
 func buildCodexModelCatalogSpecs(catalog modelsdev.Catalog, freeOnly bool) []codexModelCatalogSpec {
 	modelIDs := append(getModelIDs(), getGoModelIDs()...)
-
-	idSet := make(map[string]bool, len(modelIDs))
-	for _, id := range modelIDs {
-		idSet[id] = true
-	}
-
-	seen := make(map[string]bool, len(modelIDs))
-	var specs []codexModelCatalogSpec
-	for _, id := range modelIDs {
-		pub := publicFacingModelID(id)
-		if pub == "" || seen[pub] {
-			continue
-		}
-		if freeOnly && !idSet[pub+"-free"] && !isFreeModel(id) {
-			continue
-		}
-		seen[pub] = true
+	entries := modelSelectionEntries(modelIDs, catalog, freeOnly)
+	specs := make([]codexModelCatalogSpec, 0, len(entries))
+	for _, e := range entries {
 		specs = append(specs, codexModelCatalogSpec{
-			ID:            pub,
-			ContextWindow: modelsdev.ContextWindow(pub, catalog),
+			ID:            e.ID,
+			ContextWindow: e.ContextWindow,
 		})
 	}
-
-	sort.SliceStable(specs, func(i, j int) bool {
-		if specs[i].ContextWindow != specs[j].ContextWindow {
-			return specs[i].ContextWindow > specs[j].ContextWindow
-		}
-		return specs[i].ID < specs[j].ID
-	})
 	return specs
 }
 
