@@ -109,6 +109,16 @@ cp config.example.json config.json
 | `nemotron-3-ultra-free` | context length | 1,000,000 |
 | `nemotron-3.5-lightning-free` | context length | 1,000,000 |
 
+### `native_responses_models`
+
+上游模型 ID 列表：这些模型已知只支持原生 Responses 端点，请求会跳过 Chat 翻译，直接透传到上游 `/responses`。除配置外，代理还内置了一份静态预置列表（如 `muse-spark-1.3-contributor`），并会在运行时探测确认后动态记忆更多模型；配置值与静态预置只增不减地合并，不会清掉运行时学到的模型；静态预置与配置下发的模型不会因连续失败被剔除，运行时学到的模型连续失败 5 次后会自动剔除并回落 Chat 翻译路径。
+
+```json
+{
+  "native_responses_models": ["muse-spark-1.3-contributor"]
+}
+```
+
 ### `text_only_models`
 
 models.dev 目录数据之外，**额外强制按纯文本处理**的模型前缀列表。纯文本判定本身是数据驱动的：models.dev 报告的 `modalities.input` 只含 `text` 的已知模型（如 `deepseek-v4-flash`、`glm-5.2`、`qwen3-coder*`）会自动把消息里的图片/文档内容**静默降级**为 `["text"]` 标注后继续转发，而不是交给上游报错；`text_only_models` 用于覆盖 catalog 未收录或数据滞后的场景。

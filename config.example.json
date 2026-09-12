@@ -7,31 +7,11 @@
     "nemotron-3-ultra": "nemotron-3-ultra-free",
     "north-mini-code": "north-mini-code-free"
   },
-  "reasoning_effort_map": {
-    "high": "high",
-    "medium": "medium",
-    "minimal": "low"
-  },
-  "force_disable_thinking": false,
-  "max_tokens_cap": 131072,
   "max_tokens_cap_per_model": {
     "deepseek-v4-flash-free": 131072,
     "laguna-s-2.1-free": 262144,
     "mimo-v2.5-free": 1048576,
     "nemotron-3-ultra-free": 1000000,
     "nemotron-3.5-lightning-free": 1000000
-  },
-  "prompt_cache_retention": "24h",
-  "cache_control_breakpoints": true,
-  "text_only_models": [],
-  "socks5_sticky": true,
-  "socks5_proxies": [
-    {
-      "addr": "127.0.0.1:1080",
-      "name": "local"
-    }
-  ],
-  "upstream_base_urls": [
-    "https://opencode.ai"
-  ]
+  }
 }

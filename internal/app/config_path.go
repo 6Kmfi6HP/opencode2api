@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
 
@@ -149,4 +150,24 @@ func resolveModelsDevCachePath(configPath string, configExplicit bool) (string, 
 		configExplicit,
 		"modelsdev_cache.json",
 	)
+}
+
+// resolveAndInitRuntime resolves all runtime paths derived from the config
+// (log file, stats file, models.dev cache) and initializes logging. Callers
+// must have already finished flag/env resolution for configPath itself and
+// must set the logging globals (Level/Stdout/rotation knobs) before calling.
+//
+// TODO: launch.go configureLaunchGlobals duplicates this tail; switch it over
+// in a follow-up that owns launch.go.
+func resolveAndInitRuntime(statsFlagValue string, statsExplicit, configExplicit bool) {
+	configPath, _ = resolveConfigPath(configPath, configExplicit)
+	logging.File, _ = resolveLogFilePath(logging.File, flagSet("log-file"), configPath, configExplicit)
+	resolvedStats, _ := resolveStatsPath(statsFlagValue, statsExplicit, configPath, configExplicit)
+	setTokenStatsPath(resolvedStats)
+	resolvedModelsDevCache, _ := resolveModelsDevCachePath(configPath, configExplicit)
+	modelsdev.SetCachePath(resolvedModelsDevCache)
+	modelsdev.SetClientGetter(getHTTPClient)
+
+	installLoggingHooks()
+	logging.Init(logging.File)
 }

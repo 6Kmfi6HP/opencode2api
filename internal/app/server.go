@@ -58,20 +58,12 @@ func Run() {
 	flag.Parse()
 
 	configExplicit := flagSet("config")
-	configPath, _ = resolveConfigPath(configPath, configExplicit)
-	logging.File, _ = resolveLogFilePath(logging.File, flagSet("log-file"), configPath, configExplicit)
-	resolvedStats, _ := resolveStatsPath(statsFile, flagSet("stats-file"), configPath, configExplicit)
-	setTokenStatsPath(resolvedStats)
-	resolvedModelsDevCache, _ := resolveModelsDevCachePath(configPath, configExplicit)
-	modelsdev.SetCachePath(resolvedModelsDevCache)
-	modelsdev.SetClientGetter(getHTTPClient)
+	resolveAndInitRuntime(statsFile, flagSet("stats-file"), configExplicit)
+	defer logging.CloseRotator()
 
 	if debugMode && strings.EqualFold(logging.Level, "info") {
 		logging.Level = "debug"
 	}
-	installLoggingHooks()
-	logging.Init(logging.File)
-	defer logging.CloseRotator()
 
 	if showVersion {
 		fmt.Println(versionString())

@@ -235,16 +235,11 @@ const (
 	stickyMaxEntries     = 256
 	stickyPublicFallback = "cli://public-shared" // 无会话标识的 public 请求共用同一出口
 
-	headerClaudeSession   = "X-Claude-Code-Session-Id"
-	headerClaudeAgent     = "X-Claude-Code-Agent-Id"
-	headerClaudeParent    = "X-Claude-Code-Parent-Agent-Id"
-	headerCodexSession1   = "Session-Id"
-	headerCodexSession2   = "Session_id"
-	headerCodexThread1    = "Thread-Id"
-	headerCodexThread2    = "Thread_id"
-	headerCodexTurnMeta   = "X-Codex-Turn-Metadata"
-	headerCodexParentTID  = "X-Codex-Parent-Thread-Id"
-	headerCodexParentTID2 = "x-codex-parent-thread-id"
+	headerClaudeSession = "X-Claude-Code-Session-Id"
+	headerCodexSession1 = "Session-Id"
+	headerCodexSession2 = "Session_id"
+	headerCodexThread1  = "Thread-Id"
+	headerCodexThread2  = "Thread_id"
 )
 
 // sessionHeaderValue returns the first non-empty session header value, matching
