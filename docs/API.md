@@ -102,6 +102,7 @@
 
 - Responses 会通过 Chat Completions 上游实现；内置工具被编码为函数工具后再还原。
 - 已确认只支持原生上游 `/responses` 端点的模型（静态预置、`native_responses_models` 配置项、运行时探测记忆）跳过 Chat 翻译，直接保真透传，上游 4xx/5xx 状态码与错误体原样返回。
+  唯一例外：上游因回放的 reasoning `encrypted_content` 不属于当前发起方而 400（`was not issued to this caller`，通常发生在 sticky 出口/域名改绑之后）时，网关会剥掉 `input` 中 reasoning item 的 `id` 与 `encrypted_content` 后重发一次；可见对话内容不变，仅不再回放旧推理密文。详见 `responses-compatibility-analysis.md` §9.7。
 - 仅在上游实际返回 reasoning 时生成 reasoning output item。
 - `input` 中的 top-level item 或 message content 可使用 `input_file`；支持 flat 字段 `file_data`、`file_id`、`file_url`、`filename` 以及 nested `input_file` object，并映射为 `{type:"file",file:{...}}`。模型不支持 file 模态时上游可能拒绝。
 

@@ -412,3 +412,51 @@ Error from provider (Console): Upstream request failed: [invalid_request_error] 
 **新增测试**：4 个（`TestResponsesUnsupportedToolType_Returns400`、`TestResponsesStream_RefusalDelta`、`TestResponsesInclude_EncryptedContentOnlyWhenRequested`、`TestResponsesEcho_MissingFieldsAreEchoed`）。
 
 **验证**：`go build && go vet ./... && go test ./... -count=1 -timeout 60s` — 352 PASS, 0 FAIL。
+
+### 9.7 回放推理密文修复（foreign reasoning encrypted_content，修复上游 400）
+
+**问题**：上游把 reasoning 的 `encrypted_content` 绑定到**发起方**（账号 + 出口 IP）。
+客户端（Codex 等）在 `store:false` 多轮对话里会把上一轮收到的 reasoning item 原样回传；
+只要会话中途 sticky 出口/域名改绑（sticky TTL 过期、429/5xx 重试后的失效重绑、进程重启、
+换 key），旧密文就属于上一个发起方，上游返回：
+
+```
+Error from provider (Console): Upstream request failed: [invalid_request_error] reasoning `encrypted_content` was not issued to this caller
+```
+
+该错误一旦出现会**每轮复现**（客户端历史里始终带着旧密文），用户表现为会话卡死。
+
+**实测（真实上游 `https://opencode.ai/zen/v1/responses`，public 层）**：
+
+| 回放的 reasoning item | 上游结果 |
+|------|------|
+| `id` + 他人签发的 `encrypted_content` | 400 `reasoning encrypted_content was not issued to this caller` |
+| 只删 `id`（保留他人密文） | 同一个 400（密文仍非本发起方签发） |
+| 只删 `encrypted_content`（保留 `id`） | 400 `Referenced reasoning item '<id>' was not found or has expired` |
+| 同时删 `id` 与 `encrypted_content` | 200（保留 `summary` 等其它字段不受影响） |
+
+**修复**：`responses_passthrough.go` 新增 `callResponsesWithEchoRepair`，被
+`probeNativeResponses` 与 `forwardNativeResponses` 共用：
+
+- 仅当上游返回 **400** 且错误体同时含 `encrypted_content` 与 `was not issued to this caller`
+  （`isForeignReasoningEchoError`）时才动作，其它 400 保持标准代理语义原样透传；
+- 用 `stripReplayedReasoningEcho` 删掉 `input[].type == "reasoning"` 条目的 `id` 与
+  `encrypted_content`（其它 item、其它字段、请求级字段一律不变），随后**原样重发一次**；
+- 重发拿不到响应时回退第一次的上游错误，客户端看到的原因保持真实；
+- 请求里没有可剥离的推理回声时不做任何额外请求。
+
+可见对话（消息、工具调用、工具输出）完全不受影响，只是不再回放旧推理密文；上游会为当前
+发起方重新签发推理内容。
+
+**验证（`launch codex` + 真实 Codex CLI 0.153.4，muse-spark-1.3-contributor-free）**：
+
+- 复现：run 1 经 SOCKS5 出口 A 建立线程；run 2 换成直连出口 B `codex exec resume --last` →
+  修复前每轮 `codex exec` 都报 400（Codex 显示 `Reconnecting... 5/5` 后失败）。
+- 修复后：同一条线程同样换出口 → 网关日志出现 `responses reasoning echo repair`，
+  `request_done status=200`，Codex 正常回答（`PRIME2`）。
+- 探针路径（未记忆模型）：chat 500 → 原生 responses 400 → 修复 → 200 →
+  `responses_probe_succeeded`，客户端一次成功。
+
+**新增测试**：`responses_passthrough_test.go` 4 个（`TestIsForeignReasoningEchoError`、
+`TestStripReplayedReasoningEcho`、`TestResponsesPassthroughRepairsForeignReasoningEcho`
+（流式/非流式）、`TestResponsesPassthroughForeignReasoningEchoWithoutEchoStays400`）。

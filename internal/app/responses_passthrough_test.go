@@ -6,6 +6,7 @@ import (
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -880,5 +881,244 @@ func TestNormalizeResponsesStreamLine_RestoresShortenedNameInEvents(t *testing.T
 	textEv := []byte(`data: {"type":"response.output_text.delta","output_index":0,"delta":"` + shortened + `"}` + "\n")
 	if _, ok := normalizeResponsesStreamLine(textEv, states, mapping, rw); ok {
 		t.Fatal("output_text delta must not be rewritten")
+	}
+}
+
+// ======================== 回放推理密文修复（caller 绑定） ========================
+
+// 上游把 reasoning 密文绑定到发起方（账号 + 出口）；换出口/账号回放时固定报
+// "was not issued to this caller"。识别必须限定 400 + 两个关键词，避免把其它
+// 400（如 name 超长、effort 非法）误判成需要修复。
+func TestIsForeignReasoningEchoError(t *testing.T) {
+	foreign := []byte(`{"model":"muse-spark-1.3-contributor","error":{"param":null,"type":"invalid_request_error","message":"Error from provider (Console): Upstream request failed: [invalid_request_error] reasoning ` + "`encrypted_content`" + ` was not issued to this caller"}}`)
+
+	tests := []struct {
+		name   string
+		status int
+		body   []byte
+		want   bool
+	}{
+		{name: "foreign echo 400", status: http.StatusBadRequest, body: foreign, want: true},
+		{name: "non-400 status", status: http.StatusInternalServerError, body: foreign, want: false},
+		{name: "empty body", status: http.StatusBadRequest, body: nil, want: false},
+		{name: "other 400", status: http.StatusBadRequest, body: []byte(`{"error":{"message":"name must be at most 64 characters","type":"invalid_request_error"}}`), want: false},
+		{name: "encrypted_content without marker", status: http.StatusBadRequest, body: []byte(`{"error":{"message":"reasoning encrypted_content is invalid"}}`), want: false},
+		{name: "marker without encrypted_content", status: http.StatusBadRequest, body: []byte(`{"error":{"message":"item was not issued to this caller"}}`), want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isForeignReasoningEchoError(tc.status, tc.body); got != tc.want {
+				t.Fatalf("isForeignReasoningEchoError(%d, %s) = %v, want %v", tc.status, tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// id 与 encrypted_content 必须同时删除：只删其一会换成上游的另一个 400
+// （他人签发 / Referenced reasoning item ... not found）。
+func TestStripReplayedReasoningEcho(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		want    string // 期望结果；空字符串表示 body 不变
+		changed bool
+	}{
+		{
+			name:    "removes id and encrypted_content keeps summary",
+			body:    `{"model":"m","input":[{"type":"message","role":"user","content":"hi"},{"type":"reasoning","id":"rs_foreign","summary":[{"type":"summary_text","text":"old"}],"encrypted_content":"Zm9yZWlnbg=="},{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"}]}`,
+			want:    `{"input":[{"content":"hi","role":"user","type":"message"},{"summary":[{"text":"old","type":"summary_text"}],"type":"reasoning"},{"arguments":"{}","call_id":"c1","name":"shell","type":"function_call"}],"model":"m"}`,
+			changed: true,
+		},
+		{
+			name:    "removes encrypted_content without id",
+			body:    `{"input":[{"type":"reasoning","encrypted_content":"Zm9yZWlnbg=="}]}`,
+			want:    `{"input":[{"type":"reasoning"}]}`,
+			changed: true,
+		},
+		{
+			name:    "no reasoning items",
+			body:    `{"input":[{"type":"message","role":"user","content":"hi"}]}`,
+			changed: false,
+		},
+		{
+			name:    "input as string",
+			body:    `{"input":"hi"}`,
+			changed: false,
+		},
+		{
+			name:    "invalid json",
+			body:    `{"input":`,
+			changed: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed := stripReplayedReasoningEcho([]byte(tc.body))
+			if changed != tc.changed {
+				t.Fatalf("changed = %v, want %v (body = %s)", changed, tc.changed, got)
+			}
+			if !changed {
+				if string(got) != tc.body {
+					t.Fatalf("unchanged body must be returned verbatim, got %s", got)
+				}
+				return
+			}
+			var wantMap, gotMap map[string]any
+			if err := json.Unmarshal([]byte(tc.want), &wantMap); err != nil {
+				t.Fatalf("bad want fixture: %v", err)
+			}
+			if err := json.Unmarshal(got, &gotMap); err != nil {
+				t.Fatalf("unmarshal got: %v", err)
+			}
+			if !reflect.DeepEqual(gotMap, wantMap) {
+				t.Fatalf("repaired body = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// 会话中途 sticky 出口改绑后，客户端回放上一轮（他人签发）的 reasoning 密文：
+// 网关必须剥掉推理回声重发一次，而不是把 400 直接抛给用户。可见对话内容
+// （消息、工具调用）一个字都不能改。
+func TestResponsesPassthroughRepairsForeignReasoningEcho(t *testing.T) {
+	const requestBody = `{"model":"muse-spark-1.3-contributor","store":false,"include":["reasoning.encrypted_content"],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"reasoning","id":"rs_other_caller:rs_1","summary":[{"type":"summary_text","text":"old thinking"}],"encrypted_content":"Zm9yZWlnbg=="},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"},{"type":"message","role":"user","content":[{"type":"input_text","text":"go on"}]}]}`
+	const foreignEcho = `{"model":"muse-spark-1.3-contributor","error":{"param":null,"type":"invalid_request_error","message":"Error from provider (Console): Upstream request failed: [invalid_request_error] reasoning ` + "`encrypted_content`" + ` was not issued to this caller"}}`
+
+	for _, tc := range []struct {
+		name       string
+		stream     bool
+		retryBody  string
+		wantInBody string
+	}{
+		{
+			name:       "non-stream",
+			stream:     false,
+			retryBody:  `{"id":"resp_repaired","object":"response","status":"completed","output":[]}`,
+			wantInBody: `"resp_repaired"`,
+		},
+		{
+			name:       "stream",
+			stream:     true,
+			retryBody:  "event: response.completed\ndata: {\"id\":\"resp_repaired_stream\"}\n\n",
+			wantInBody: "resp_repaired_stream",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldModelAlias := getModelKeywordRules()
+			applyConfig(AppConfig{})
+			t.Cleanup(func() { applyConfig(AppConfig{ModelAlias: oldModelAlias}) })
+
+			transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+				{status: http.StatusBadRequest, body: foreignEcho},
+				{status: http.StatusOK, body: tc.retryBody},
+			})
+
+			body := strings.Replace(requestBody, `"store":false`, `"store":false,"stream":`+map[bool]string{true: "true", false: "false"}[tc.stream], 1)
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			responsesHandler(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (repaired retry), body = %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.wantInBody) {
+				t.Fatalf("body = %s, want %s", rec.Body.String(), tc.wantInBody)
+			}
+			if len(transport.requestedURLs) != 2 {
+				t.Fatalf("upstream calls = %#v, want exactly 2 (original + repair)", transport.requestedURLs)
+			}
+
+			repaired := transport.requestPayloads[1]
+			items, _ := repaired["input"].([]any)
+			if len(items) != 6 {
+				t.Fatalf("repaired input len = %d, want 6 (item count must not change)", len(items))
+			}
+			reasoning, _ := items[1].(map[string]any)
+			if reasoning["type"] != "reasoning" {
+				t.Fatalf("item[1] = %#v, want the reasoning item kept in place", items[1])
+			}
+			if _, ok := reasoning["id"]; ok {
+				t.Fatalf("repaired reasoning item must drop id: %#v", reasoning)
+			}
+			if _, ok := reasoning["encrypted_content"]; ok {
+				t.Fatalf("repaired reasoning item must drop encrypted_content: %#v", reasoning)
+			}
+			if summary, _ := reasoning["summary"].([]any); len(summary) != 1 {
+				t.Fatalf("summary must be preserved, got %#v", reasoning["summary"])
+			}
+			// 其它 item 与请求级字段逐字保持不变。
+			original := transport.requestPayloads[0]
+			for _, key := range []string{"model", "store", "include", "input"} {
+				wantItems, _ := original[key].([]any)
+				gotItems, _ := repaired[key].([]any)
+				if key != "input" {
+					if !reflect.DeepEqual(original[key], repaired[key]) {
+						t.Fatalf("%s changed: %v -> %v", key, original[key], repaired[key])
+					}
+					continue
+				}
+				for i := range wantItems {
+					if i == 1 {
+						continue // 唯一允许变化的就是 reasoning 回声本身
+					}
+					if !reflect.DeepEqual(wantItems[i], gotItems[i]) {
+						t.Fatalf("input[%d] changed: %v -> %v", i, wantItems[i], gotItems[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+// 没有可剥离的推理回声（或错误与发起方绑定无关）时保持标准代理语义：
+// 单次调用、400 原样透传，不制造第二次请求。
+func TestResponsesPassthroughForeignReasoningEchoWithoutEchoStays400(t *testing.T) {
+	const rememberedModel = "remembered-foreign-echo-model"
+
+	oldModelAlias := getModelKeywordRules()
+	applyConfig(AppConfig{})
+	t.Cleanup(func() { applyConfig(AppConfig{ModelAlias: oldModelAlias}) })
+	nativeResponsesModels.Lock()
+	nativeResponsesModels.ids[rememberedModel] = true
+	nativeResponsesModels.Unlock()
+	t.Cleanup(func() {
+		nativeResponsesModels.Lock()
+		delete(nativeResponsesModels.ids, rememberedModel)
+		nativeResponsesModels.Unlock()
+	})
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "no reasoning items",
+			body: `{"model":"` + rememberedModel + `","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`,
+		},
+		{
+			name: "input as string",
+			body: `{"model":"` + rememberedModel + `","input":"hi"}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+				{status: http.StatusBadRequest, body: `{"error":{"message":"reasoning ` + "`encrypted_content`" + ` was not issued to this caller"}}`},
+			})
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+			responsesHandler(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 passthrough, body = %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "was not issued to this caller") {
+				t.Fatalf("body = %s, want upstream error detail", rec.Body.String())
+			}
+			if got := len(transport.requestedURLs); got != 1 {
+				t.Fatalf("upstream calls = %d, want 1 (nothing to repair)", got)
+			}
+		})
 	}
 }

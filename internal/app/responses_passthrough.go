@@ -592,9 +592,111 @@ func sanitizeResponsesPassthroughBody(rawBody []byte, modelID string) ([]byte, *
 	return rawBody, rewrites
 }
 
+// ======================== 回放推理密文修复（发起方绑定） ========================
+//
+// 上游把 reasoning 的 encrypted_content 绑定到「发起方」（账号 + 出口）：同一段
+// 密文换一个出口/账号回放会被 400 拒绝（reasoning `encrypted_content` was not
+// issued to this caller）。客户端多轮对话会把上一轮收到的 reasoning item 原样
+// 回传，而网关的 sticky 出口/域名随时可能改绑（sticky TTL 过期、429/5xx 重试后
+// 失效重绑、进程重启），于是会话中途就会撞上该 400，且此后每一轮都会复现。
+//
+// 处理：只在该 400 出现时把回放的推理回声（id + encrypted_content）剥掉后重发
+// 一次。可见对话（消息、工具调用）完全不受影响，只是不再回放旧推理密文；上游
+// 会为当前发起方重新签发推理内容。
+
+// upstreamForeignReasoningEchoMarker 是上游拒绝他人推理密文时的固定措辞。
+const upstreamForeignReasoningEchoMarker = "was not issued to this caller"
+
+// isForeignReasoningEchoError 报告上游 400 是否由「回放的 reasoning 密文不属于
+// 当前发起方」引起。
+func isForeignReasoningEchoError(status int, body []byte) bool {
+	if status != http.StatusBadRequest || len(body) == 0 {
+		return false
+	}
+	msg := strings.ToLower(string(body))
+	return strings.Contains(msg, "encrypted_content") &&
+		strings.Contains(msg, upstreamForeignReasoningEchoMarker)
+}
+
+// stripReplayedReasoningEcho 删除请求体 input 中回放的 reasoning 回声字段。
+// id 与 encrypted_content 都绑定发起方，必须同时删除：
+//   - 只删 id：密文仍被判定为他人签发，同一个 400 不变；
+//   - 只删密文：上游改为按 id 找不到该 item（Referenced reasoning item ... 400）。
+//
+// 其它字段（如 summary）与其它 item 原样保留，请求语义不变。
+func stripReplayedReasoningEcho(rawBody []byte) ([]byte, bool) {
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return rawBody, false
+	}
+	items, ok := body["input"].([]any)
+	if !ok {
+		return rawBody, false
+	}
+	changed := false
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if itemType, _ := m["type"].(string); itemType != "reasoning" {
+			continue
+		}
+		if _, ok := m["encrypted_content"]; ok {
+			delete(m, "encrypted_content")
+			changed = true
+		}
+		if _, ok := m["id"]; ok {
+			delete(m, "id")
+			changed = true
+		}
+	}
+	if !changed {
+		return rawBody, false
+	}
+	fixed, err := json.Marshal(body)
+	if err != nil {
+		return rawBody, false
+	}
+	return fixed, true
+}
+
+// callResponsesWithEchoRepair 调用上游 responses 端点；若上游因回放的推理密文
+// 不属于当前发起方而 400，则剥掉推理回声后原样重发一次。重发拿不到响应时返回
+// 第一次的上游错误，客户端看到的失败原因保持真实。
+func callResponsesWithEchoRepair(ctx context.Context, auth UpstreamAuth, modelID string, rawBody []byte) (io.ReadCloser, int, http.Header, error) {
+	rc, status, header, err := callOpenCodeEndpoint(ctx, "responses", rawBody, modelID, auth)
+	if err != nil || status != http.StatusBadRequest {
+		return rc, status, header, err
+	}
+
+	errBody, readErr := io.ReadAll(io.LimitReader(rc, 64*1024))
+	_ = rc.Close()
+	// 未识别或无需修复时按原样回放错误体。
+	replayUpstreamError := func() io.ReadCloser { return io.NopCloser(bytes.NewReader(errBody)) }
+	if readErr != nil || !isForeignReasoningEchoError(status, errBody) {
+		return replayUpstreamError(), status, header, nil
+	}
+	repaired, changed := stripReplayedReasoningEcho(rawBody)
+	if !changed {
+		return replayUpstreamError(), status, header, nil
+	}
+
+	logging.FromContext(ctx).Info("responses reasoning echo repair",
+		"model", modelID, "reason", "foreign_encrypted_content")
+	repairedRC, repairedStatus, repairedHeader, repairedErr := callOpenCodeEndpoint(ctx, "responses", repaired, modelID, auth)
+	if repairedErr != nil {
+		if repairedRC != nil {
+			_ = repairedRC.Close()
+		}
+		return replayUpstreamError(), status, header, nil
+	}
+	return repairedRC, repairedStatus, repairedHeader, nil
+}
+
 func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool, req ResponsesAPIRequest) bool {
 	rawBody, rewrites := sanitizeResponsesPassthroughBody(rawBody, modelID)
-	rc, status, header, err := callOpenCodeEndpoint(ctx, "responses", rawBody, modelID, auth)
+	rc, status, header, err := callResponsesWithEchoRepair(ctx, auth, modelID, rawBody)
 	if err != nil || status < 200 || status >= 300 {
 		if rc != nil {
 			rc.Close()
@@ -615,7 +717,7 @@ func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth Upstr
 // 真正的传输层错误（无法拿到上游响应）时返回 false，调用方兜底写 502。
 func forwardNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool, req ResponsesAPIRequest) bool {
 	rawBody, rewrites := sanitizeResponsesPassthroughBody(rawBody, modelID)
-	rc, status, header, err := callOpenCodeEndpoint(ctx, "responses", rawBody, modelID, auth)
+	rc, status, header, err := callResponsesWithEchoRepair(ctx, auth, modelID, rawBody)
 	if err != nil {
 		markNativeResponsesFailure(modelID)
 		return false

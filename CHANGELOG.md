@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.11.2
+
+- Fix `/v1/responses` native passthrough rejecting long-running conversations with the upstream 400 `reasoning \`encrypted_content\` was not issued to this caller` (reproduced with `muse-spark-*` + Codex):
+  - The upstream binds replayed reasoning `encrypted_content` to the original caller (account + egress). When the gateway's sticky egress/domain re-binds mid-conversation (sticky TTL expiry, re-bind after a 429/5xx retry, process restart, key change), every later turn replays foreign reasoning content and fails — including Codex `exec resume` of an existing thread.
+  - The gateway now recognizes that exact 400 (`isForeignReasoningEchoError`), strips the replayed reasoning echo (`id` + `encrypted_content`, both are caller-bound) from `input`, and re-sends the request once (`callResponsesWithEchoRepair`, shared by the probe and forward paths). Visible messages, tool calls and tool outputs are unchanged; only the stale reasoning payload is dropped, and the upstream re-issues reasoning for the current caller.
+  - Other 400s keep byte-for-byte passthrough semantics, and requests without replayed reasoning echo still make exactly one upstream call.
+  - Verified with `launch codex` on `muse-spark-1.3-contributor-free`: a thread built through a SOCKS5 egress then resumed over a different egress fails before the fix (Codex `Reconnecting... 5/5`) and completes normally after it, logged as `responses reasoning echo repair`.
+
 ## v0.11.1
 
 - Internal refactor & hygiene (no user-facing protocol change):
