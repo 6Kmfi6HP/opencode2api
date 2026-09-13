@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -892,7 +891,6 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
-	reader := bufio.NewReader(rc)
 	stats := &logging.StreamStats{Start: time.Now()}
 
 	msgID := fmt.Sprintf("msg_%s", randomString(24))
@@ -1119,45 +1117,17 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 	}
 
 	// keepalive：首 token 前客户端仅能收到 ping。
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	type readResult struct {
-		line string
-		err  error
-	}
-	readCh := make(chan readResult)
-	readerDone := make(chan struct{})
-	readerExited := make(chan struct{})
-	go func() {
-		defer close(readerExited)
-		for {
-			line, err := reader.ReadString('\n')
-			select {
-			case readCh <- readResult{line: line, err: err}:
-			case <-readerDone:
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-	defer func() {
-		close(readerDone)
-		if c, ok := rc.(io.Closer); ok {
-			c.Close()
-		}
-		<-readerExited
-	}()
+	reader := newStreamReader(ctx, rc, 15*time.Second)
+	defer reader.Close()
 
 loop:
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-reader.Keepalive():
 			emitEvent("ping", map[string]any{"type": "ping"})
-		case res := <-readCh:
+		case res := <-reader.Read():
 			line := res.line
 			trimmedRight := strings.TrimRight(line, "\r\n")
 			trimmed := strings.TrimSpace(line)
