@@ -374,9 +374,8 @@ func claudeToolChoiceToResponses(choice any) any {
 }
 
 // thinkingBudgetToEffort maps an Anthropic-style thinking budget_tokens value
-// onto an OpenAI-compatible reasoning effort tier.
-// TODO(follow-up): chat.go 的 reasoningEffortFromThinking 仍内联同一阈值表，
-// 后续任务切换到复用此 helper。
+// onto an OpenAI-compatible reasoning effort tier. Shared by
+// reasoningEffortFromThinking (chat.go) and the claude->responses path.
 func thinkingBudgetToEffort(budget float64) string {
 	switch {
 	case budget <= 0:

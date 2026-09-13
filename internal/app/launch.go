@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -103,17 +102,16 @@ func configureLaunchGlobals(f launchFlags) {
 	configPath = f.cfgPath
 	adminPassword = "" // launch mode disables the admin panel
 	debugMode = f.debug
-	logging.Level = "info"
+	logLevel := "info"
 	if f.debug {
-		logging.Level = "debug"
+		logLevel = "debug"
 	}
-	logging.File, _ = resolveLogFilePath(f.logFile, f.logExplicit, configPath, f.configExplicit)
+	activeLogFile, _ = resolveLogFilePath(f.logFile, f.logExplicit, configPath, f.configExplicit)
 	logging.Stdout = false // launch mode: logs go to file only, never stdout (would corrupt the child TUI)
 	logging.MaxSize = 100
 	logging.MaxBackups = 7
 	logging.MaxAge = 14
 	logging.Compress = true
-	logging.Bodies = false
 
 	resolvedStats, _ := resolveStatsPath(f.statsFile, f.statsExplicit, configPath, f.configExplicit)
 	setTokenStatsPath(resolvedStats)
@@ -122,7 +120,7 @@ func configureLaunchGlobals(f launchFlags) {
 	modelsdev.SetClientGetter(getHTTPClient)
 
 	installLoggingHooks()
-	logging.Init(logging.File)
+	logging.Init(activeLogFile, logLevel, false)
 }
 
 // startLaunchProxy starts the local, read-only proxy config that both launch
@@ -500,35 +498,14 @@ type codexModelCatalogSpec struct {
 // "-free" variant are kept, matching the interactive launch model list.
 func buildCodexModelCatalogSpecs(catalog modelsdev.Catalog, freeOnly bool) []codexModelCatalogSpec {
 	modelIDs := append(getModelIDs(), getGoModelIDs()...)
-
-	idSet := make(map[string]bool, len(modelIDs))
-	for _, id := range modelIDs {
-		idSet[id] = true
-	}
-
-	seen := make(map[string]bool, len(modelIDs))
-	var specs []codexModelCatalogSpec
-	for _, id := range modelIDs {
-		pub := publicFacingModelID(id)
-		if pub == "" || seen[pub] {
-			continue
-		}
-		if freeOnly && !idSet[pub+"-free"] && !isFreeModel(id) {
-			continue
-		}
-		seen[pub] = true
+	entries := modelSelectionEntries(modelIDs, catalog, freeOnly)
+	specs := make([]codexModelCatalogSpec, 0, len(entries))
+	for _, e := range entries {
 		specs = append(specs, codexModelCatalogSpec{
-			ID:            pub,
-			ContextWindow: modelsdev.ContextWindow(pub, catalog),
+			ID:            e.ID,
+			ContextWindow: e.ContextWindow,
 		})
 	}
-
-	sort.SliceStable(specs, func(i, j int) bool {
-		if specs[i].ContextWindow != specs[j].ContextWindow {
-			return specs[i].ContextWindow > specs[j].ContextWindow
-		}
-		return specs[i].ID < specs[j].ID
-	})
 	return specs
 }
 

@@ -18,17 +18,15 @@ import (
 )
 
 // Configuration globals are bound by flags in the app package (server.go) and
-// assigned directly by launch.go's configureLaunchGlobals. They are exported
-// here so the app can wire them without importing the logging internals.
+// assigned directly by launch.go's configureLaunchGlobals. Only the file
+// rotation knobs stay exported; the log file path, level, and body-summary
+// flag are passed to Init as parameters instead.
 var (
-	File       string
-	Level      string
 	Stdout     bool
 	MaxSize    int
 	MaxBackups int
 	MaxAge     int
 	Compress   bool
-	Bodies     bool
 )
 
 var (
@@ -94,13 +92,9 @@ func parseLogLevel(s string) slog.Level {
 }
 
 // SetLevelString parses and applies the log level string ("debug", "info",
-// "warn", or "error") at runtime.
+// "warn", or "error") at runtime; empty or unknown values fall back to info.
 func SetLevelString(s string) {
-	Level = strings.ToLower(strings.TrimSpace(s))
-	if Level == "" {
-		Level = "info"
-	}
-	levelVar.Set(parseLogLevel(Level))
+	levelVar.Set(parseLogLevel(s))
 }
 
 // LevelString returns the current log level as a canonical string.
@@ -170,10 +164,11 @@ func CloseRotator() {
 }
 
 // Init configures the default logger and returns it. path is the already
-// resolved log file path (empty means no file, i.e. stdout only).
-func Init(path string) *slog.Logger {
-	SetLevelString(Level)
-	SetBodies(Bodies)
+// resolved log file path (empty means no file, i.e. stdout only); level and
+// bodies seed the runtime log level and body-summary flag.
+func Init(path, level string, bodies bool) *slog.Logger {
+	SetLevelString(level)
+	SetBodies(bodies)
 
 	var writers []io.Writer
 	if Stdout {

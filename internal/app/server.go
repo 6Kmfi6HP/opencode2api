@@ -35,7 +35,7 @@ func flagSet(name string) bool {
 // applyLogLevel propagates the effective level string into the slog LevelVar
 // so post-parse bumps (e.g. -debug) take effect even when logging was already
 // initialized.
-func applyLogLevel() { logging.SetLevelString(logging.Level) }
+func applyLogLevel(level string) { logging.SetLevelString(level) }
 
 func Run() {
 	// Launch subcommand: opencode2api launch <tool> [args...]
@@ -46,29 +46,31 @@ func Run() {
 
 	var showVersion bool
 	var statsFile string
+	var logLevel, logFile string
+	var logBodies bool
 	flag.StringVar(&port, "port", "8000", "服务端口")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
 	flag.StringVar(&statsFile, "stats-file", "stats.json", "统计文件路径")
 	flag.StringVar(&adminPassword, "password", "123456", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
-	flag.StringVar(&logging.Level, "log-level", "info", "日志级别: debug/info/warn/error")
-	flag.StringVar(&logging.File, "log-file", "opencode2api.log", "日志文件路径")
+	flag.StringVar(&logLevel, "log-level", "info", "日志级别: debug/info/warn/error")
+	flag.StringVar(&logFile, "log-file", "opencode2api.log", "日志文件路径")
 	flag.BoolVar(&logging.Stdout, "log-stdout", true, "是否同时写 stdout")
 	flag.IntVar(&logging.MaxSize, "log-max-size", 100, "单日志文件最大 MB，超过即轮换")
 	flag.IntVar(&logging.MaxBackups, "log-max-backups", 7, "保留的旧日志文件个数")
 	flag.IntVar(&logging.MaxAge, "log-max-age", 14, "旧日志保留天数")
 	flag.BoolVar(&logging.Compress, "log-compress", true, "轮换后 gzip 压缩")
-	flag.BoolVar(&logging.Bodies, "log-bodies", false, "Debug 下记录截断的 body 摘要")
+	flag.BoolVar(&logBodies, "log-bodies", false, "Debug 下记录截断的 body 摘要")
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	flag.Parse()
 
 	configExplicit := flagSet("config")
 
-	if debugMode && strings.EqualFold(logging.Level, "info") {
-		logging.Level = "debug"
+	if debugMode && strings.EqualFold(logLevel, "info") {
+		logLevel = "debug"
 	}
-	applyLogLevel()
-	resolveAndInitRuntime(statsFile, flagSet("stats-file"), configExplicit)
+	applyLogLevel(logLevel)
+	resolveAndInitRuntime(logFile, logLevel, logBodies, statsFile, flagSet("stats-file"), configExplicit)
 	defer logging.CloseRotator()
 
 	if showVersion {

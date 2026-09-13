@@ -2,6 +2,7 @@ package config
 
 import (
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -22,6 +23,11 @@ type Snapshot struct {
 // seeds the default snapshot on first use so startup never observes a zero
 // value.
 var snapshot atomic.Value
+
+// updateMu serializes Update's read-modify-store cycle so two concurrent
+// writers (e.g. two admin config saves) cannot interleave and lose one
+// another's changes.
+var updateMu sync.Mutex
 
 // Default returns the read-only snapshot with default field values.
 func Default() Snapshot {
@@ -46,9 +52,12 @@ func Get() Snapshot {
 }
 
 // Update applies fn to a copy of the current snapshot and stores the result.
-// fn should replace maps/slices rather than mutate their contents. It returns
-// the newly stored snapshot.
+// fn should replace maps/slices rather than mutate their contents. The whole
+// read-modify-store cycle runs under updateMu so concurrent updates are
+// atomic with respect to each other. It returns the newly stored snapshot.
 func Update(fn func(*Snapshot)) Snapshot {
+	updateMu.Lock()
+	defer updateMu.Unlock()
 	snap := Get()
 	fn(&snap)
 	snapshot.Store(snap)

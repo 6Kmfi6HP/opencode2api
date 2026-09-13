@@ -23,13 +23,6 @@ func lockStatsFileExclusive(f *os.File) error {
 	return windows.LockFileEx(h, statsLockExclusiveFlag, 0, statsLockLengthLow, statsLockLengthHigh, &overlapped)
 }
 
-// lockStatsFileShared acquires a shared cross-process advisory lock for readers.
-func lockStatsFileShared(f *os.File) error {
-	h := windows.Handle(syscall.Handle(f.Fd()))
-	var overlapped windows.Overlapped
-	return windows.LockFileEx(h, 0, 0, statsLockLengthLow, statsLockLengthHigh, &overlapped)
-}
-
 // unlockStatsFile releases a previously held advisory lock.
 func unlockStatsFile(f *os.File) error {
 	h := windows.Handle(syscall.Handle(f.Fd()))

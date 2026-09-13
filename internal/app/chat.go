@@ -2,6 +2,8 @@ package app
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,9 +14,9 @@ import (
 	"time"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
-	"github.com/6Kmfi6HP/opencode2api/internal/ids"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
+	"github.com/6Kmfi6HP/opencode2api/internal/random"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
 
@@ -284,7 +286,9 @@ func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
 	}
 }
 
-// convertStreamChunkWithUsage 转换流式 chunk 并同时提取 usage，避免二次解析
+// convertStreamChunkWithUsage 转换流式 chunk，并在同一次解析中顺带返回 usage。
+// 注意：流循环（chat.go 的 stream 处理）仍会为流统计单独解析一次 chunk；
+// 这里的 "顺带提取" 只是免去了 usage 的第三次解析。
 func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[string]any) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
@@ -773,8 +777,10 @@ func buildUpstreamThinking(value any) map[string]any {
 	return out
 }
 
-// reasoningEffortFromThinking maps Anthropic-style budget_tokens onto an
-// OpenAI-compatible reasoning_effort when the client did not set one explicitly.
+// reasoningEffortFromThinking maps an Anthropic-style thinking object onto an
+// OpenAI-compatible reasoning_effort when the client did not set one
+// explicitly. An explicit "effort" string wins; otherwise the shared
+// thinkingBudgetToEffort tiers budget_tokens.
 func reasoningEffortFromThinking(value any) string {
 	m, ok := value.(map[string]any)
 	if !ok {
@@ -800,18 +806,7 @@ func reasoningEffortFromThinking(value any) string {
 	default:
 		return ""
 	}
-	switch {
-	case budget <= 0:
-		return ""
-	case budget < 2048:
-		return "low"
-	case budget < 8192:
-		return "medium"
-	case budget < 16384:
-		return "high"
-	default:
-		return "xhigh"
-	}
+	return thinkingBudgetToEffort(budget)
 }
 
 func wantsReasoning(req *OpenAIRequest) bool {
@@ -1095,7 +1090,14 @@ func buildUpstreamBody(req *OpenAIRequest) []byte {
 
 // same output. An empty id gets a random suffix (callers should cache).
 func deterministicResponseID(prefix, id string) string {
-	return ids.Deterministic(prefix, id)
+	if strings.HasPrefix(id, prefix) && len(id) > len(prefix) {
+		return id
+	}
+	if id == "" {
+		return prefix + random.String(24)
+	}
+	h := sha256.Sum256([]byte(id))
+	return prefix + hex.EncodeToString(h[:16])
 }
 
 // normalizeChatResponseID ensures a Chat response ID has the chatcmpl- prefix.

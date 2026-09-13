@@ -18,15 +18,20 @@ func setTokenStatsPath(path string) { stats.SetPath(path) }
 // callers keep working after the stats domain moved into internal/stats.
 func getTokenStatsPath() string { return stats.GetPath() }
 
+// activeLogFile is the resolved log file path handed to logging.Init. It is
+// package state because the launch status line reports it after the path
+// left the logging package.
+var activeLogFile string
+
 // resolvedLogPath returns the absolute path of the active log file, or
 // "(stdout)" when no file is configured. Used for user-facing status lines.
 func resolvedLogPath() string {
-	if logging.File == "" {
+	if activeLogFile == "" {
 		return "(stdout)"
 	}
-	abs, err := filepath.Abs(logging.File)
+	abs, err := filepath.Abs(activeLogFile)
 	if err != nil {
-		return logging.File
+		return activeLogFile
 	}
 	return abs
 }
@@ -153,15 +158,17 @@ func resolveModelsDevCachePath(configPath string, configExplicit bool) (string, 
 }
 
 // resolveAndInitRuntime resolves all runtime paths derived from the config
-// (log file, stats file, models.dev cache) and initializes logging. Callers
-// must have already finished flag/env resolution for configPath itself and
-// must set the logging globals (Level/Stdout/rotation knobs) before calling.
+// (log file, stats file, models.dev cache), records the resolved log path in
+// activeLogFile, and initializes logging with the given log file flag value,
+// level, and body-summary flag. Callers must have already finished flag/env
+// resolution for configPath itself and set the logging rotation knobs
+// (Stdout/MaxSize/MaxBackups/MaxAge/Compress) before calling.
 //
 // TODO: launch.go configureLaunchGlobals duplicates this tail; switch it over
 // in a follow-up that owns launch.go.
-func resolveAndInitRuntime(statsFlagValue string, statsExplicit, configExplicit bool) {
+func resolveAndInitRuntime(logFileFlag, level string, bodies bool, statsFlagValue string, statsExplicit, configExplicit bool) {
 	configPath, _ = resolveConfigPath(configPath, configExplicit)
-	logging.File, _ = resolveLogFilePath(logging.File, flagSet("log-file"), configPath, configExplicit)
+	activeLogFile, _ = resolveLogFilePath(logFileFlag, flagSet("log-file"), configPath, configExplicit)
 	resolvedStats, _ := resolveStatsPath(statsFlagValue, statsExplicit, configPath, configExplicit)
 	setTokenStatsPath(resolvedStats)
 	resolvedModelsDevCache, _ := resolveModelsDevCachePath(configPath, configExplicit)
@@ -169,5 +176,5 @@ func resolveAndInitRuntime(statsFlagValue string, statsExplicit, configExplicit 
 	modelsdev.SetClientGetter(getHTTPClient)
 
 	installLoggingHooks()
-	logging.Init(logging.File)
+	logging.Init(activeLogFile, level, bodies)
 }

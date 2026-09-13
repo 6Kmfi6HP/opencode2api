@@ -19,13 +19,11 @@ type launchModelSelectionEntry struct {
 }
 
 // modelSelectionEntries converts the cached model IDs into the entries shown
-// by interactive launch selectors: deduplicated by public-facing ID, sorted by
-// context window descending, then alphabetically. With freeOnly=true, only
-// models that have a free variant (a "-free" suffix in the upstream catalog)
-// are kept, matching the default public/free launch tier.
-//
-// TODO(follow-up): internal/app/launch.go 的 buildCodexModelCatalogSpecs 与本
-// 函数约 90% 重复且免费判定规则已 drift，后续任务切到复用此 helper。
+// by interactive launch selectors: preferring a model's "-free" variant when
+// one exists, deduplicated by public-facing ID, sorted by context window
+// descending, then alphabetically. With freeOnly=true, only models that have
+// a free variant are kept, matching the default public/free launch tier. It
+// is also the shared filter/sort behind buildCodexModelCatalogSpecs.
 func modelSelectionEntries(modelIDs []string, catalog modelsdev.Catalog, freeOnly bool) []launchModelSelectionEntry {
 	idSet := make(map[string]bool, len(modelIDs))
 	for _, id := range modelIDs {
@@ -39,7 +37,10 @@ func modelSelectionEntries(modelIDs []string, catalog modelsdev.Catalog, freeOnl
 		if pub == "" || seen[pub] {
 			continue
 		}
-		if !freeOnly || !idSet[pub+"-free"] && !isFreeModel(id) {
+		if !freeOnly && idSet[pub+"-free"] && !isFreeModel(id) {
+			continue
+		}
+		if freeOnly && !idSet[pub+"-free"] && !isFreeModel(id) {
 			continue
 		}
 		seen[pub] = true
