@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## v0.11.1
+
+- Internal refactor & hygiene (no user-facing protocol change):
+  - Extract the duplicated SSE reader prelude (reader goroutine, keepalive ticker, close-wait cleanup) from the Claude / Responses / Claude-Responses stream handlers into a shared `streamReader`; add unit tests for Close-unblock and final-line-with-EOF races.
+  - Deduplicate protocol converters: reuse the shared `thinkingBudgetToEffort` helper in `chat.go`, reuse `modelSelectionEntries` (now with a `freeOnly=false` mode) in the Codex model catalog, and merge the duplicated `extractModel*FromExtraArgs` pair into one flag-parameterized helper.
+  - Synthesize `total_tokens` from `prompt_tokens + completion_tokens` when the upstream omits it, so chat-shape usage recording is no longer dropped.
+  - Delete the dead `internal/ids` package, remove self-produced `logging.File/Level/Bodies` exported vars in favour of `Init(path, level, bodies)` params, and remove uncalled `stats` file-lock variants.
+  - Serialize `config.Update`'s read-modify-store with a package mutex so concurrent admin writes cannot interleave.
+  - Restore truncated doc comments in `claude.go` / `responses.go`, delete 5 unused sticky header constants, split version vars out of `main.go` into `version.go`, and slim `config.example.json` to non-default entries only.
+- Fix `-debug` being silently ignored: `-debug` now bumps the slog level *before* logging init through a shared `applyLogLevel` helper, and an explicit `-log-level` still wins over `-debug`. Regression tests cover both directions.
+- Docs: `API.md` documents `POST /v1/messages/count_tokens`; `CONFIGURATION.md` documents `native_responses_models` semantics; `DEPLOYMENT.md` compose section collapses to a link; archived the old design plan to `docs/labs/`.
 
 ## v0.11.0
 
