@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
@@ -1315,7 +1314,6 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
-	reader := bufio.NewReader(resp.Body)
 	stats := &logging.StreamStats{Start: time.Now()}
 
 	responseID := "resp_" + time.Now().Format("20060102150405") + "_" + randomString(8)
@@ -1349,31 +1347,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 	reasoningOutputIndex := -1
 	messageIndex := -1
 
-	// --- Reader goroutine -> channel so the main loop can select on
-	// read/context without blocking, and context cancellation unblocks the
-	// reader via Close. ---
-	type readResult struct {
-		line string
-		err  error
-	}
-	readCh := make(chan readResult)
-	readerDone := make(chan struct{})
-	readerExited := make(chan struct{})
-
-	go func() {
-		defer close(readerExited)
-		for {
-			line, err := reader.ReadString('\n')
-			select {
-			case readCh <- readResult{line: line, err: err}:
-			case <-readerDone:
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
+	reader := newStreamReader(ctx, resp.Body, 0)
 
 	defer func() {
 		stats.TextChars = len(fullText)
@@ -1382,11 +1356,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		stats.Log(ctx, "responses")
 	}()
 	// Reader cleanup: signal goroutine, unblock any pending read, wait for exit.
-	defer func() {
-		close(readerDone)
-		resp.Body.Close()
-		<-readerExited
-	}()
+	defer reader.Close()
 
 	messageOutputIndex := func() int {
 		if messageIndex < 0 {
@@ -1614,7 +1584,7 @@ loop:
 		case <-ctx.Done():
 			// Client cancelled: quiet exit, no error writes.
 			return
-		case result := <-readCh:
+		case result := <-reader.Read():
 			// bufio.ReadString may return both a non-empty line and an error
 			// (e.g. the last line without a trailing newline + io.EOF). Process
 			// the line first, then handle the accompanying error via pendingErr.

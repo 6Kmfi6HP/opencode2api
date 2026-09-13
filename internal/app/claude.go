@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,6 +30,85 @@ func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, da
 	if flusher != nil {
 		flusher.Flush()
 	}
+}
+
+// streamReadResult carries one line read from an upstream SSE body. A
+// non-empty line may arrive together with a non-nil Err (e.g. a final line
+// without trailing newline + io.EOF); callers must process Line first.
+type streamReadResult struct {
+	line string
+	err  error
+}
+
+// streamReader owns the reader goroutine shared by the SSE stream handlers:
+// it reads lines off the upstream body and forwards them on readCh so the
+// handler loop can keep selecting on read/keepalive/context without
+// blocking. Lines stop flowing when ctx is done or Close has been called.
+type streamReader struct {
+	ctx           context.Context
+	body          io.Reader
+	readCh        chan streamReadResult
+	done          chan struct{}
+	exited        chan struct{}
+	keepCh        <-chan time.Time
+	stopKeepalive func()
+	closeOnce     sync.Once
+}
+
+// newStreamReader starts the reader goroutine. A keepaliveInterval <= 0
+// disables the keepalive channel (Keepalive then returns nil, which blocks
+// forever in a select case).
+func newStreamReader(ctx context.Context, body io.Reader, keepaliveInterval time.Duration) *streamReader {
+	r := &streamReader{
+		ctx:    ctx,
+		body:   body,
+		readCh: make(chan streamReadResult),
+		done:   make(chan struct{}),
+		exited: make(chan struct{}),
+	}
+	if keepaliveInterval > 0 {
+		ticker := time.NewTicker(keepaliveInterval)
+		r.keepCh = ticker.C
+		r.stopKeepalive = ticker.Stop
+	}
+	go func() {
+		defer close(r.exited)
+		reader := bufio.NewReader(body)
+		for {
+			line, err := reader.ReadString('\n')
+			select {
+			case r.readCh <- streamReadResult{line: line, err: err}:
+			case <-r.done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return r
+}
+
+// Read delivers the next line read from the upstream body.
+func (r *streamReader) Read() <-chan streamReadResult { return r.readCh }
+
+// Keepalive ticks at the configured interval, or never when keepalive is
+// disabled.
+func (r *streamReader) Keepalive() <-chan time.Time { return r.keepCh }
+
+// Close stops the reader: it signals the goroutine, unblocks any pending
+// read by closing the upstream body, and waits for the goroutine to exit.
+func (r *streamReader) Close() {
+	r.closeOnce.Do(func() {
+		close(r.done)
+		if c, ok := r.body.(io.Closer); ok {
+			c.Close()
+		}
+		if r.stopKeepalive != nil {
+			r.stopKeepalive()
+		}
+		<-r.exited
+	})
 }
 
 // ======================== Claude Messages API ========================
@@ -1049,7 +1129,6 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
-	reader := bufio.NewReader(respBody)
 	stats := &logging.StreamStats{Start: time.Now()}
 
 	msgID := fmt.Sprintf("msg_%s", randomString(24))
@@ -1071,38 +1150,11 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 	// block if the stream never produces content/tool_use (#37635).
 	reasoningFallback := strings.Builder{}
 
-	// --- Reader goroutine -> channel so the main loop can select on
-	// ticker/read/context without blocking, and so context cancellation
-	// unblocks the reader via Close. ---
-	type readResult struct {
-		line string
-		err  error
-	}
-	readCh := make(chan readResult)
-	readerDone := make(chan struct{})
-	readerExited := make(chan struct{})
-
-	go func() {
-		defer close(readerExited)
-		for {
-			line, err := reader.ReadString('\n')
-			select {
-			case readCh <- readResult{line: line, err: err}:
-			case <-readerDone:
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
 	keepaliveInterval := claudeKeepaliveInterval
 	if keepaliveInterval <= 0 {
 		keepaliveInterval = 15 * time.Second
 	}
-	ticker := time.NewTicker(keepaliveInterval)
-	defer ticker.Stop()
+	reader := newStreamReader(ctx, respBody, keepaliveInterval)
 
 	defer func() {
 		if len(fullUsage) > 0 {
@@ -1112,11 +1164,7 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 		stats.Log(ctx, "claude")
 	}()
 	// Reader cleanup: signal goroutine, unblock any pending read, wait for exit.
-	defer func() {
-		close(readerDone)
-		respBody.Close()
-		<-readerExited
-	}()
+	defer reader.Close()
 
 	emitClaudeEvent := func(event string, data any) {
 		writeSSEEvent(w, flusher, event, data)
@@ -1242,11 +1290,11 @@ loop:
 		case <-ctx.Done():
 			// Client cancelled: quiet exit, no error writes.
 			return
-		case <-ticker.C:
+		case <-reader.Keepalive():
 			// Keepalive ping — before the first upstream token this is the
 			// only thing the client receives; do NOT fake message_start.
 			emitClaudeEvent("ping", map[string]any{"type": "ping"})
-		case result := <-readCh:
+		case result := <-reader.Read():
 			// bufio.ReadString may return both a non-empty line and an error
 			// (e.g. the last line without a trailing newline + io.EOF). Process
 			// the line first, then handle the accompanying error via pendingErr.

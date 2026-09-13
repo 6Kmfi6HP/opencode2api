@@ -870,3 +870,73 @@ func TestResponsesStream_RefusalDelta(t *testing.T) {
 		t.Fatalf("response.completed message item does not include refusal content:\n%s", rec.Body.String())
 	}
 }
+
+// =====================================================================
+// Shared stream reader (extracted prelude) tests
+// =====================================================================
+
+func TestStreamReader_CloseUnblocksPendingRead(t *testing.T) {
+	slow := newSlowReader()
+	r := newStreamReader(context.Background(), slow, 0)
+	if r.Keepalive() != nil {
+		t.Fatal("Keepalive must be nil when the interval is disabled")
+	}
+	closeStarted := make(chan struct{})
+	closeReturned := make(chan struct{})
+	go func() {
+		close(closeStarted)
+		r.Close()
+		close(closeReturned)
+	}()
+	<-closeStarted
+	// Close must close the body, which unblocks the pending Read inside the
+	// reader goroutine, which lets Close return.
+	select {
+	case <-slow.closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not close the underlying body")
+	}
+	select {
+	case <-closeReturned:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after the reader goroutine exited")
+	}
+	// Close is idempotent.
+	r.Close()
+	select {
+	case res := <-r.Read():
+		t.Fatalf("no line must be delivered after Close, got %+v", res)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestStreamReader_KeepaliveAndLineWithEOF(t *testing.T) {
+	// A final line without a trailing newline arrives together with io.EOF;
+	// the line must be delivered first.
+	r := newStreamReader(context.Background(), strings.NewReader("data: tail"), 10*time.Millisecond)
+	defer r.Close()
+
+	select {
+	case <-r.Keepalive():
+	case <-time.After(time.Second):
+		t.Fatal("keepalive did not tick")
+	}
+
+	res, ok := <-r.Read()
+	if !ok {
+		t.Fatal("read channel closed before delivering the final line")
+	}
+	if res.line != "data: tail" {
+		t.Fatalf("line = %q, want %q", res.line, "data: tail")
+	}
+	if res.err != io.EOF {
+		t.Fatalf("err = %v, want io.EOF", res.err)
+	}
+
+	// After an error the goroutine exits and no further lines arrive.
+	select {
+	case extra := <-r.Read():
+		t.Fatalf("unexpected extra line after EOF: %+v", extra)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
