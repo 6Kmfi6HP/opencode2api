@@ -63,12 +63,9 @@ func TestClaudeAnthropicPassthrough_Buffered(t *testing.T) {
 		t.Fatalf("max_tokens = %#v", payload["max_tokens"])
 	}
 
-	// usage 记账（上游重试 3 次成功，统计为 3 倍）。
-	snap, err := statsx.ReadTokenStatsSnapshot()
-	if err != nil {
-		t.Fatalf("read stats: %v", err)
-	}
-	ms := snap.Models[model]
+	// usage 记账（上游重试 3 次成功，统计为 3 倍）。断言用内存态 Snapshot
+	// 而非 ReadTokenStatsSnapshot（后者读文件，写入原子替换存在落盘延迟）。
+	ms := statsx.Snapshot().Models[model]
 	if ms == nil || ms.PromptTokens < 5 || ms.CompletionTokens < 7 {
 		t.Fatalf("usage = %#v, want prompt >=5 completion >=7", ms)
 	}
