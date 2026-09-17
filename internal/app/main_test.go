@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -58,6 +59,12 @@ type fakeRetryTransport struct {
 }
 
 func (f *fakeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// models.dev 目录的异步刷新等 GET 请求没有 body,可能时序上撞进任意
+	// 正在进行的测试;io.ReadAll(nil) 会直接 panic。对这种请求直接返回
+	// 错误(上游当作刷新失败,只打 warn),不消耗响应槽位、不惊动断言。
+	if req.Body == nil {
+		return nil, errors.New("fakeRetryTransport: unexpected bodyless request to " + req.URL.String())
+	}
 	if len(f.responses) == 0 {
 		f.t.Fatalf("unexpected request to %s", req.URL.String())
 	}

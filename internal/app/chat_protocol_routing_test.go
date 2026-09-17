@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -346,6 +347,367 @@ func TestAnthropicSSEToChatStream(t *testing.T) {
 	}
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("missing [DONE]: %s", body)
+	}
+}
+
+// tool_use start 块携带 initial input 且全程无 input_json_delta 时,stop 时
+// 必须把 initial input 作为 arguments 兜底 emit 一次,否则 tool call input
+// 会整体丢失(用户在 chat 端收到的 tool_calls.function.arguments 是空)。
+func TestAnthropicSSEToChatStream_ToolUseInitialInputFallback(t *testing.T) {
+	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-x\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"f\",\"input\":{\"k\":\"v\"}}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	body := drainSSEFromHandler(func(w http.ResponseWriter) {
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+	})
+	// 首块:arguments 应为空(不等 initial,避免与后续 delta 拼接)。
+	// JSON 字段序由 map 序列化决定,这里只断言关键 token 同时存在。
+	if !strings.Contains(body, `"name":"f"`) || !strings.Contains(body, `"arguments":""`) {
+		t.Fatalf("first chunk should have name and empty arguments: %s", body)
+	}
+	// stop 兜底:initial input emit一次。
+	if !strings.Contains(body, `"arguments":"{\"k\":\"v\"}"`) {
+		t.Fatalf("stop fallback should emit initial input as arguments: %s", body)
+	}
+}
+
+// 同一 tool_use 若 start 带 initial 但 delta 也到达,不能 double-emit
+// (OpenAI chat 客户端会 concat 所有 arguments 片段)。
+func TestAnthropicSSEToChatStream_ToolUseInitialInputNotDoubledWhenDeltaArrives(t *testing.T) {
+	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-x\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"f\",\"input\":{\"k\":\"v\"}}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"other\\\":\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"1}\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	body := drainSSEFromHandler(func(w http.ResponseWriter) {
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+	})
+	// delta 到达 → initial 必须被抑制;只能看到 delta 碎片,不能出现 initial 内容。
+	if strings.Contains(body, `{\"k\":\"v\"}`) {
+		t.Fatalf("initial input leaked into arguments stream when delta was present: %s", body)
+	}
+	if !strings.Contains(body, `{\"other\":`) {
+		t.Fatalf("missing delta chunk: %s", body)
+	}
+}
+
+// 无参工具(start 块 input={} 且全程无 input_json_delta)在 stop 时必须兜底
+// 补 "{}",否则客户端 concat 出的 arguments 是空串 —— 非法 JSON,严格
+// OpenAI 客户端 json.Unmarshal 会失败;非流式 buildOpenAIResponse 语义
+// 也是 "{}"。
+func TestAnthropicSSEToChatStream_ToolUseEmptyInputFallback(t *testing.T) {
+	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-x\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"f\",\"input\":{}}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	body := drainSSEFromHandler(func(w http.ResponseWriter) {
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+	})
+	// start 块仍先流 "arguments":""(不为空 initial 单独 emit),stop 兜底补 "{}"。
+	if !strings.Contains(body, `"arguments":""`) {
+		t.Fatalf("first chunk should carry empty arguments: %s", body)
+	}
+	if !strings.Contains(body, `"arguments":"{}"`) {
+		t.Fatalf("stop fallback must emit \"{}\" for zero-argument tool: %s", body)
+	}
+}
+
+// pipeAnthropicStream 应字节级透传:CRLF 行尾不加额外 \n,事件/空行边界
+// 原样保留,客户端收到的 body 与上游 body 完全一致。
+func TestPipeAnthropicStream_ByteIdentityPassthrough(t *testing.T) {
+	upstreamBody := "event: message_start\r\ndata: {\"type\":\"message_start\"}\r\n\r\n" +
+		"event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\r\n\r\n" +
+		"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n"
+
+	// 直通上游响应需要 header,这里绕开 forwardClaudeViaAnthropic 直接调
+	// pipeAnthropicStream,用一个空 header 即可。
+	rec := httptest.NewRecorder()
+	header := http.Header{}
+	header.Set("Content-Type", "text/event-stream")
+	pipeAnthropicStream(context.Background(), rec, io.NopCloser(strings.NewReader(upstreamBody)), http.StatusOK, header, "m")
+
+	// 字节完全一致。
+	if rec.Body.String() != upstreamBody {
+		t.Fatalf("response body diverged from upstream:\nupstream: %q\ngot:      %q", upstreamBody, rec.Body.String())
+	}
+	// header 透传 + WriteHeader 状态。
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	// Content-Type 应保留 text/event-stream(直通优先级最高)。
+	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+}
+
+// flushCountingRecorder 记录 Flush 次数:httptest.ResponseRecorder.Flush 是
+// 空操作,无法暴露"只攒到 EOF 才 Flush"的流式回归,需要真实计数。
+type flushCountingRecorder struct {
+	*httptest.ResponseRecorder
+	flushes int
+}
+
+func (f *flushCountingRecorder) Flush() { f.flushes++ }
+
+// chunkedReader 每次 Read 只吐出一段预设 chunk,模拟上游 SSE 分片到达,
+// 让 io.Copy 产生与 chunk 一一对应的 Write。
+type chunkedReader struct {
+	chunks []string
+	i      int
+}
+
+func (r *chunkedReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.i])
+	r.i++
+	return n, nil
+}
+
+// 每个上游 chunk 都必须触发一次 Flush,保证事件粒度实时下发 —— 若回到
+// 只在 EOF Flush 一次,http.ResponseWriter 的缓冲会把 SSE 攒批,破坏
+// 打字机效果(responses_passthrough.go 逐行 Flush 同一约定)。
+func TestPipeAnthropicStream_FlushesEachUpstreamChunk(t *testing.T) {
+	chunk1 := "event: message_start\r\ndata: {\"type\":\"message_start\"}\r\n\r\n"
+	chunk2 := "event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n"
+	fcr := &flushCountingRecorder{ResponseRecorder: httptest.NewRecorder()}
+	header := http.Header{}
+	pipeAnthropicStream(context.Background(), fcr, &chunkedReader{chunks: []string{chunk1, chunk2}}, http.StatusOK, header, "m")
+
+	if fcr.flushes != 2 {
+		t.Fatalf("expected one flush per upstream chunk (2), got %d", fcr.flushes)
+	}
+	if got := fcr.Body.String(); got != chunk1+chunk2 {
+		t.Fatalf("byte identity broken: %q", got)
+	}
+}
+
+// interleaved thinking/thinking/text/text 应在 Responses 侧产生 3 个 output_index,
+// 每个 output_item.done 与先前 output_item.added 的 index 完全一致(这是 #3 的
+// 回归保障 —— 旧代码按 content_block_stop 递增会让 stop 时 index 与 start 时错位)。
+func TestAnthropicSSEToResponsesStream_OutputIndexPerItem(t *testing.T) {
+	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-x\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
+	rec := httptest.NewRecorder()
+	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", true)
+
+	// emitEvent 是 map marshal,这里直接解析 data 行做结构化断言;item.id
+	// 是随机生成的不写死,依赖下面对 added/done 配对与 index 单调性的检查。
+	body := rec.Body.String()
+	// added/done 的 output_index 必须与对应 itemID 匹配。
+	// 通过解析每个 data JSON 断言 item.id 与 output_index 一一对应。
+	type keyedEvent struct {
+		OutputIndex int `json:"output_index"`
+		Item        struct {
+			ID string `json:"id"`
+		} `json:"item"`
+		Type string `json:"type"`
+	}
+	addedByItemID := map[string]int{}
+	doneByItemID := map[string]int{}
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var e keyedEvent
+		if err := json.Unmarshal([]byte(line[6:]), &e); err != nil {
+			continue
+		}
+		switch e.Type {
+		case "response.output_item.added":
+			addedByItemID[e.Item.ID] = e.OutputIndex
+		case "response.output_item.done":
+			doneByItemID[e.Item.ID] = e.OutputIndex
+		}
+	}
+	if len(addedByItemID) != 2 || len(doneByItemID) != 2 {
+		t.Fatalf("expected 2 added and 2 done, got added=%d done=%d; body:\n%s",
+			len(addedByItemID), len(doneByItemID), body)
+	}
+	// thinking 是 rs_, text 是 msg_;两个都要出现。
+	var sawR, sawM bool
+	for id := range addedByItemID {
+		if strings.HasPrefix(id, "rs_") {
+			sawR = true
+		}
+		if strings.HasPrefix(id, "msg_") {
+			sawM = true
+		}
+	}
+	if !sawR || !sawM {
+		t.Fatalf("expected one rs_ and one msg_ item, got added: %+v; body:\n%s", addedByItemID, body)
+	}
+	for id, addedIdx := range addedByItemID {
+		doneIdx, ok := doneByItemID[id]
+		if !ok {
+			t.Fatalf("item %q added with index %d but never done", id, addedIdx)
+		}
+		if doneIdx != addedIdx {
+			t.Fatalf("item %q added with output_index=%d but done with output_index=%d", id, addedIdx, doneIdx)
+		}
+	}
+}
+
+// EOF 断流时 ensureTerminal 应把已流出但未关闭的 text block 内容回填进
+// completedOutput 并补 output_text.done / output_item.done。
+func TestAnthropicSSEToResponsesStream_EOFPreservesPartialText(t *testing.T) {
+	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-x\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"abc\"}}\n\n"
+	// 故意不写 content_block_stop / message_stop,直接 EOF。
+
+	rec := httptest.NewRecorder()
+	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", false)
+	body := rec.Body.String()
+	// 终结事件必须带着 partial text;否则客户端按 response.completed.output 重组会丢尾。
+	if !strings.Contains(body, `"text":"abc"`) {
+		t.Fatalf("partial text was not preserved in terminal output: %s", body)
+	}
+	if !strings.Contains(body, `"type":"response.output_text.done"`) {
+		t.Fatalf("missing output_text.done: %s", body)
+	}
+	if !strings.Contains(body, `"type":"response.output_item.done"`) {
+		t.Fatalf("missing output_item.done: %s", body)
+	}
+}
+
+// EOF 断流时 thinking 块未关闭:ensureTerminal 必须补 reasoning 的
+// output_item.done 并把 item 回填进 response.completed.output,否则客户端
+// 会永久看到一个 in_progress 的 reasoning item。
+func TestAnthropicSSEToResponsesStream_EOFClosesOpenThinking(t *testing.T) {
+	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-x\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"abc\"}}\n\n"
+	// 故意不写 content_block_stop / message_stop,直接 EOF。
+
+	rec := httptest.NewRecorder()
+	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", true)
+	body := rec.Body.String()
+
+	var addedReasoningID, doneReasoningID string
+	completedHasReasoning := false
+	for _, e := range parseSSEEvents(t, body) {
+		switch e.Name {
+		case "response.output_item.added", "response.output_item.done":
+			item, _ := e.Data["item"].(map[string]any)
+			if typ, _ := item["type"].(string); typ != "reasoning" {
+				continue
+			}
+			if e.Name == "response.output_item.added" {
+				addedReasoningID, _ = item["id"].(string)
+			} else {
+				doneReasoningID, _ = item["id"].(string)
+			}
+		case "response.completed":
+			resp, _ := e.Data["response"].(map[string]any)
+			out, _ := resp["output"].([]any)
+			for _, item := range out {
+				if m, ok := item.(map[string]any); ok && m["type"] == "reasoning" {
+					completedHasReasoning = true
+				}
+			}
+		}
+	}
+	if addedReasoningID == "" {
+		t.Fatalf("thinking block was never added: %s", body)
+	}
+	if doneReasoningID != addedReasoningID {
+		t.Fatalf("reasoning item %q added but done %q: EOF close missing: %s", addedReasoningID, doneReasoningID, body)
+	}
+	if !completedHasReasoning {
+		t.Fatalf("response.completed output missing reasoning item: %s", body)
+	}
+}
+
+// EOF 断流时 tool_use 块未关闭:已流出的 arguments 增量必须用
+// function_call_arguments.done / output_item.done 收尾,且 function_call
+// item 要进入 response.completed.output,否则部分参数凭空消失。
+func TestAnthropicSSEToResponsesStream_EOFClosesOpenToolUse(t *testing.T) {
+	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-x\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"f\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}\n\n"
+	// 故意不写 content_block_stop / message_stop,直接 EOF(arguments 半成品)。
+
+	rec := httptest.NewRecorder()
+	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", false)
+	body := rec.Body.String()
+
+	var addedCallID, doneCallID, argsDoneItemID string
+	completedHasCall := false
+	for _, e := range parseSSEEvents(t, body) {
+		switch e.Name {
+		case "response.output_item.added", "response.output_item.done":
+			item, _ := e.Data["item"].(map[string]any)
+			if typ, _ := item["type"].(string); typ != "function_call" {
+				continue
+			}
+			if e.Name == "response.output_item.added" {
+				addedCallID, _ = item["id"].(string)
+			} else {
+				doneCallID, _ = item["id"].(string)
+			}
+		case "response.function_call_arguments.done":
+			argsDoneItemID, _ = e.Data["item_id"].(string)
+		case "response.completed":
+			resp, _ := e.Data["response"].(map[string]any)
+			out, _ := resp["output"].([]any)
+			for _, item := range out {
+				if m, ok := item.(map[string]any); ok && m["type"] == "function_call" {
+					completedHasCall = true
+				}
+			}
+		}
+	}
+	if addedCallID == "" {
+		t.Fatalf("tool_use block was never added: %s", body)
+	}
+	if argsDoneItemID != addedCallID {
+		t.Fatalf("arguments.done item_id %q, want added call %q: %s", argsDoneItemID, addedCallID, body)
+	}
+	if doneCallID != addedCallID {
+		t.Fatalf("function_call %q added but done %q: EOF close missing: %s", addedCallID, doneCallID, body)
+	}
+	if !completedHasCall {
+		t.Fatalf("response.completed output missing function_call item: %s", body)
+	}
+}
+
+// 同一 index 重复 content_block_start(中间无 stop):立刻 response.failed +
+// [DONE] 终止,之后的行一律忽略 —— 任何事件(包括另一个终结帧)都不得写
+// 到 [DONE] 之后。
+func TestAnthropicSSEToResponsesStream_DuplicateBlockStartTerminates(t *testing.T) {
+	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-x\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"leaked\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
+	rec := httptest.NewRecorder()
+	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", false)
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `"type":"response.failed"`) {
+		t.Fatalf("duplicate content_block_start should fail the stream: %s", body)
+	}
+	if !strings.Contains(body, `"delta":"first"`) {
+		t.Fatalf("pre-failure content missing: %s", body)
+	}
+	if strings.Contains(body, "leaked") {
+		t.Fatalf("events after terminal frame must be suppressed: %s", body)
+	}
+	parts := strings.SplitAfter(body, "data: [DONE]\n\n")
+	if len(parts) < 2 || strings.TrimSpace(parts[1]) != "" {
+		t.Fatalf("stream emitted frames after [DONE]: %s", body)
 	}
 }
 
