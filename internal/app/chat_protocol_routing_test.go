@@ -871,3 +871,64 @@ func TestDispatch_ResponsesToAnthropicRule(t *testing.T) {
 		t.Fatalf("anthropic payload should not contain input: %#v", payload)
 	}
 }
+
+// TestResponsesSSEToChatStream_ToolArgumentsShareIndex covers the two id
+// shapes Responses uses for one tool call: output_item.added announces it by
+// call_id while function_call_arguments.delta names it by item_id, and the
+// second delta names it only by output_index. All three must resolve to the
+// same chat tool_calls index, or a client merging deltas by index sees a
+// named call with empty arguments.
+func TestResponsesSSEToChatStream_ToolArgumentsShareIndex(t *testing.T) {
+	sse := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_7\",\"model\":\"gpt-x\"}}\n\n" +
+		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_a\",\"call_id\":\"call_a\",\"name\":\"bash\"}}\n\n" +
+		"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_a\",\"delta\":\"{\\\"cmd\\\":\\\"free -h\\\"}\"}\n\n" +
+		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_b\",\"call_id\":\"call_b\",\"name\":\"bash\"}}\n\n" +
+		// no item_id here: matched by output_index
+		"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"{\\\"cmd\\\":\\\"uptime\\\"}\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_7\"}}\n\n"
+
+	body := drainSSEFromHandler(func(w http.ResponseWriter) {
+		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false)
+	})
+
+	names := map[int]string{}
+	args := map[int]string{}
+	for _, line := range strings.Split(body, "\n") {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok || payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					ToolCalls []struct {
+						Index    int `json:"index"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("chunk is not JSON: %q", payload)
+		}
+		for _, c := range chunk.Choices {
+			for _, tc := range c.Delta.ToolCalls {
+				names[tc.Index] += tc.Function.Name
+				args[tc.Index] += tc.Function.Arguments
+			}
+		}
+	}
+
+	if len(names) != 2 {
+		t.Fatalf("want 2 tool calls, got indices %v (arguments %v): %s", names, args, body)
+	}
+	if names[0] != "bash" || args[0] != `{"cmd":"free -h"}` {
+		t.Fatalf("tool call 0 = %q %q", names[0], args[0])
+	}
+	if names[1] != "bash" || args[1] != `{"cmd":"uptime"}` {
+		t.Fatalf("tool call 1 = %q %q", names[1], args[1])
+	}
+}
