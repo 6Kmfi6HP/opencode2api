@@ -958,25 +958,26 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	if claudeReq.Thinking != nil && isThinkingDisabled(claudeReq.Thinking) {
 		wantReasoningEarly = false
 	}
-	switch resolveUpstreamProtocol(claudeReq.Model) {
+	proto, protoSource := resolveUpstreamProtocolWithSource(claudeReq.Model)
+	switch proto {
 	case upstreamProtocolAnthropic:
-		slog.Info("claude anthropic passthrough (rule)",
-			"model_in", modelIn, "model", claudeReq.Model, "stream", claudeReq.Stream)
+		slog.Info("claude anthropic passthrough",
+			"model_in", modelIn, "model", claudeReq.Model, "stream", claudeReq.Stream, "via", protoSource)
 		if forwardClaudeViaAnthropic(r.Context(), w, auth, claudeReq.Model, body, claudeReq.Stream) {
 			return
 		}
 		// 仅传输层错误才会到这里（上游 4xx/5xx 已写回）。继续回落到常规
 		// chat 翻译路径，做 best-effort 二次尝试。
-		slog.Warn("claude anthropic passthrough failed, falling back to chat", "model", claudeReq.Model)
+		slog.Warn("claude anthropic passthrough failed, falling back to chat", "model", claudeReq.Model, "via", protoSource)
 	case upstreamProtocolResponses:
-		slog.Info("claude responses passthrough (remembered)",
-			"model_in", modelIn, "model", claudeReq.Model, "stream", claudeReq.Stream)
+		slog.Info("claude responses passthrough",
+			"model_in", modelIn, "model", claudeReq.Model, "stream", claudeReq.Stream, "via", protoSource)
 		if forwardClaudeViaResponses(r.Context(), w, auth, claudeReq.Model, claudeReq, claudeReq.Stream, wantReasoningEarly) {
 			return
 		}
 		// 仅传输层错误才会到这里（上游 4xx/5xx 已转换写回）。继续回落到
 		// 常规 chat 翻译路径，做 best-effort 二次尝试。
-		slog.Warn("claude remembered responses forward failed, falling back to chat", "model", claudeReq.Model)
+		slog.Warn("claude responses forward failed, falling back to chat", "model", claudeReq.Model, "via", protoSource)
 	}
 	if msg := validateClaudeDocumentBlocks(claudeReq.Messages); msg != "" {
 		writeProtocolValidation400(w, "claude", "", msg)

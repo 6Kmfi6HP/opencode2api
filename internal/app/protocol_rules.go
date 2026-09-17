@@ -163,16 +163,33 @@ func matchProtocolRule(modelID string) (upstreamProtocol, bool) {
 	return "", false
 }
 
+// upstreamProtocolSource 标识协议解析的来源,用于日志区分路由是显式规则
+// 命中、native-responses 运行时记忆,还是 chat 兜底。
+type upstreamProtocolSource string
+
+const (
+	upstreamProtocolSourceRule    upstreamProtocolSource = "rule"
+	upstreamProtocolSourceMemory  upstreamProtocolSource = "remembered"
+	upstreamProtocolSourceDefault upstreamProtocolSource = "default"
+)
+
 // resolveUpstreamProtocol 解析最终上游协议：显式规则 > native-responses 运行时
 // 记忆 > 默认 chat。用于 claude/responses 入站（这两处今天已有记忆入口分派）。
 func resolveUpstreamProtocol(modelID string) upstreamProtocol {
+	p, _ := resolveUpstreamProtocolWithSource(modelID)
+	return p
+}
+
+// resolveUpstreamProtocolWithSource 同 resolveUpstreamProtocol,同时返回
+// 命中来源,供日志区分。
+func resolveUpstreamProtocolWithSource(modelID string) (upstreamProtocol, upstreamProtocolSource) {
 	if proto, matched := matchProtocolRule(modelID); matched {
-		return proto
+		return proto, upstreamProtocolSourceRule
 	}
 	if isNativeResponsesModel(modelID) {
-		return upstreamProtocolResponses
+		return upstreamProtocolResponses, upstreamProtocolSourceMemory
 	}
-	return upstreamProtocolChat
+	return upstreamProtocolChat, upstreamProtocolSourceDefault
 }
 
 // matchProtocolRuleModelOnly 是 matchProtocolRule 的单值形态，供 switch 分派
