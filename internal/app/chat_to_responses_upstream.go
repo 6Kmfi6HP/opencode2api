@@ -489,9 +489,9 @@ type responsesToChatState struct {
 	keepReasoning bool
 	includeUsage  bool
 	sentRole      bool
-	toolIndices   map[string]int    // Responses item id/call_id → chat tool_calls index
-	toolAnnounced map[string]bool   // item id/call_id → 首 tool_calls chunk 已宣发
-	arguments     map[string]string // item id/call_id → 已下发 arguments 累计文本
+	toolIndices   map[string]int // item id/call_id/#output_index → chat tool_calls index
+	toolAnnounced map[int]bool   // chat tool_calls index → 首 tool_calls chunk 已宣发
+	arguments     map[int]string // chat tool_calls index → 已下发 arguments 累计文本
 	toolCount     int
 	sawTool       bool
 	finishReason  string // 终态 finish 原因(空 = 未定,finalize 时合成)
@@ -515,8 +515,8 @@ func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		keepReasoning: keepReasoning,
 		includeUsage:  includeUsage,
 		toolIndices:   map[string]int{},
-		toolAnnounced: map[string]bool{},
-		arguments:     map[string]string{},
+		toolAnnounced: map[int]bool{},
+		arguments:     map[int]string{},
 		fullUsage:     map[string]any{},
 	}
 	defer func() {
@@ -639,6 +639,54 @@ func (st *responsesToChatState) aliasToolKey(fromKey, toKey string) {
 	}
 }
 
+// outputIndexKey namespaces a Responses output_index inside toolIndices,
+// which is otherwise keyed by call_id / item id. It is the fallback key for
+// argument events that carry no item_id, and it is the same key
+// responses_to_anthropic.go pairs added/done events by.
+func outputIndexKey(oi int) string {
+	return fmt.Sprintf("#%d", oi)
+}
+
+// registerToolKeys allocates the chat tool_calls index for a tool call and
+// points every id shape the later events may use at it: the call_id, the item
+// id ("fc_..."), and the output_index. The index must be allocated BEFORE the
+// aliases: aliasToolKey resolves through toolIndices[callID], so aliasing
+// first is a silent no-op and the argument deltas open a new index.
+func (st *responsesToChatState) registerToolKeys(evt, item map[string]any) (callID string, toolIdx int) {
+	itemID, _ := item["id"].(string)
+	callID, _ = item["call_id"].(string)
+	if callID == "" {
+		callID = itemID
+	}
+	toolIdx = st.toolIdxFor(callID)
+	st.aliasToolKey(itemID, callID)
+	if oi, ok := evt["output_index"].(float64); ok {
+		st.aliasToolKey(outputIndexKey(int(oi)), callID)
+	}
+	return callID, toolIdx
+}
+
+// eventToolIdx resolves the chat tool_calls index an argument event refers
+// to. Responses names the item by item_id ("fc_...") — never by the call_id
+// that output_item.added announced — and may omit it entirely, leaving only
+// output_index. Both are registered by registerToolKeys.
+func (st *responsesToChatState) eventToolIdx(evt map[string]any) int {
+	itemID, _ := evt["item_id"].(string)
+	if itemID != "" {
+		if idx, ok := st.toolIndices[itemID]; ok {
+			return idx
+		}
+	}
+	if oi, ok := evt["output_index"].(float64); ok {
+		if idx, ok := st.toolIndices[outputIndexKey(int(oi))]; ok {
+			return idx
+		}
+	}
+	// Unknown item (no output_item.added seen): toolIdxFor allocates and
+	// remembers, so a later done event keeps the same slot.
+	return st.toolIdxFor(itemID)
+}
+
 func (st *responsesToChatState) handleLine(line string) {
 	payload, ok := strings.CutPrefix(line, "data: ")
 	if !ok {
@@ -692,25 +740,19 @@ func (st *responsesToChatState) handleLine(line string) {
 		switch item["type"] {
 		case "function_call", "tool_call":
 			st.sawTool = true
-			callID, _ := item["call_id"].(string)
-			if callID == "" {
-				callID, _ = item["id"].(string)
-			}
-			st.aliasToolKey(item["id"].(string), callID)
-			st.toolIdxFor(callID)
-			st.toolAnnounced[callID] = true
+			callID, toolIdx := st.registerToolKeys(evt, item)
+			st.toolAnnounced[toolIdx] = true
 			st.ensureRole()
 			st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
-				"index": st.toolIndices[callID], "id": callID, "type": "function",
+				"index": toolIdx, "id": callID, "type": "function",
 				"function": map[string]any{"name": toString(item["name"]), "arguments": ""},
 			}}}, "", nil)
 		}
 	case "response.function_call_arguments.delta", "response.tool_call_arguments.delta":
 		st.ensureRole()
-		itemID, _ := evt["item_id"].(string)
-		toolIdx := st.toolIdxFor(itemID)
+		toolIdx := st.eventToolIdx(evt)
 		if pj, _ := evt["delta"].(string); pj != "" {
-			st.arguments[itemID] += pj
+			st.arguments[toolIdx] += pj
 			st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
 				"index": toolIdx, "id": nil, "type": "function",
 				"function": map[string]any{"name": "", "arguments": pj},
@@ -718,15 +760,14 @@ func (st *responsesToChatState) handleLine(line string) {
 		}
 	case "response.function_call_arguments.done", "response.tool_call_arguments.done":
 		st.ensureRole()
-		itemID, _ := evt["item_id"].(string)
-		toolIdx := st.toolIdxFor(itemID)
+		toolIdx := st.eventToolIdx(evt)
 		// done 携带完整 arguments JSON:只补发已下发前缀之后的差量,
 		// 避免客户端 concat 后重复（对齐 sub2api resToChatHandleFuncArgsDone）。
 		if completed, _ := evt["arguments"].(string); completed != "" {
-			emitted := st.arguments[itemID]
+			emitted := st.arguments[toolIdx]
 			if completed != emitted && strings.HasPrefix(completed, emitted) {
 				remainder := completed[len(emitted):]
-				st.arguments[itemID] = completed
+				st.arguments[toolIdx] = completed
 				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
 					"index": toolIdx, "id": nil, "type": "function",
 					"function": map[string]any{"name": "", "arguments": remainder},
@@ -741,27 +782,21 @@ func (st *responsesToChatState) handleLine(line string) {
 		switch item["type"] {
 		case "function_call", "tool_call":
 			st.sawTool = true
-			callID, _ := item["call_id"].(string)
-			if callID == "" {
-				callID, _ = item["id"].(string)
-			}
-			itemID, _ := item["id"].(string)
-			st.aliasToolKey(itemID, callID)
-			st.toolIdxFor(callID)
+			callID, toolIdx := st.registerToolKeys(evt, item)
 			// 没有 add/delta 出现过（罕见）:补一次首 chunk 宣告工具调用,
 			// 并把 item 上的完整 arguments 作为单段增量发完。
-			if !st.toolAnnounced[callID] {
-				st.toolAnnounced[callID] = true
+			if !st.toolAnnounced[toolIdx] {
+				st.toolAnnounced[toolIdx] = true
 				name := toString(item["name"])
 				st.ensureRole()
 				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
-					"index": st.toolIndices[callID], "id": callID, "type": "function",
+					"index": toolIdx, "id": callID, "type": "function",
 					"function": map[string]any{"name": name, "arguments": ""},
 				}}}, "", nil)
-				if args, _ := item["arguments"].(string); args != "" && st.arguments[callID] == "" {
-					st.arguments[callID] = args
+				if args, _ := item["arguments"].(string); args != "" && st.arguments[toolIdx] == "" {
+					st.arguments[toolIdx] = args
 					st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
-						"index": st.toolIndices[callID], "id": nil, "type": "function",
+						"index": toolIdx, "id": nil, "type": "function",
 						"function": map[string]any{"name": "", "arguments": args},
 					}}}, "", nil)
 				}
