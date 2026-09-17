@@ -54,9 +54,25 @@ func forwardClaudeViaAnthropic(ctx context.Context, w http.ResponseWriter, auth 
 	return true
 }
 
-// pipeAnthropicStream 把上游 Anthropic SSE 流逐行原样转发给客户端，同时旁路
-// 解析 message_start / message_delta 中的 usage 记入 token 统计。事件序列与
-// 字节格式均不做改写（保真透传）。
+// flushWriter 在每次 Write 后立即 Flush,保证 SSE 以事件粒度实时下发;
+// http.ResponseWriter 内部带 bufio 缓冲,不显式 Flush 会把事件攒批到 EOF
+// (与 responses_passthrough.go relayResponsesStream 的逐行 Flush 同一约定)。
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if n > 0 {
+		fw.f.Flush()
+	}
+	return n, err
+}
+
+// pipeAnthropicStream 把上游 Anthropic SSE 流字节级原样转发给客户端,同时
+// 旁路 tee 解析 message_start / message_delta 中的 usage 记入 token 统计。
+// 行边界、CRLF/LF、空行均不做改写,确保下游收到与上游完全一致的字节流。
 func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, header http.Header, modelID string) {
 	filtered := filterResponseHeaders(header)
 	for k, v := range filtered {
@@ -70,7 +86,28 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 	stats := &logging.StreamStats{Start: time.Now()}
 	fullUsage := map[string]any{}
 
-	reader := newStreamReader(ctx, rc, 0)
+	// tee 管道:旁路解析走 pipeWriter,主流走 io.Copy 直透;两组无背压,
+	// io.Copy 返回(EOF、rc 读取失败、pw.Write 失败)时主动 pw.Close()
+	// 告知解析端收尾;ctx 取消则先 close 上游 rc 解锁 io.Copy,再
+	// pw.CloseWithError(ctx.Err()) 让 pr.Read 立刻返回。
+	pr, pw := io.Pipe()
+	copyDone := make(chan struct{})
+	go func() {
+		defer close(copyDone)
+		// MultiWriter 把每个 read 同步写给客户端与旁路解析端;flushWriter
+		// 让每片上游数据即时下发(不攒批)。任一侧写失败 io.Copy 立即返回,
+		// 随后 pw.Close 告知解析端收尾,最终 close(copyDone) 供主循环 join。
+		flusher, _ := w.(http.Flusher)
+		cw := io.Writer(w)
+		if flusher != nil {
+			cw = flushWriter{w: w, f: flusher}
+		}
+		_, _ = io.Copy(io.MultiWriter(cw, pw), rc)
+		_ = pw.Close()
+	}()
+
+	// tee 解析流:复用 newStreamReader 的协程,读到行就 observe,不写出。
+	reader := newStreamReader(ctx, pr, 0)
 	defer func() {
 		if len(fullUsage) > 0 {
 			statsx.RecordChatUsage(modelID, anthropicUsageToChat(fullUsage))
@@ -82,20 +119,26 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 	for {
 		select {
 		case <-ctx.Done():
-			// Client cancelled: quiet exit.
+			// 先 close 上游,让 io.Copy 立刻读到错误退出(不再卡在 w.Write),
+			// 再 close pipe 让旁路解析收尾,这样 copyDone 不会等慢客户端。
+			if c, ok := rc.(io.Closer); ok {
+				_ = c.Close()
+			}
+			_ = pw.CloseWithError(ctx.Err())
+			<-copyDone
 			return
 		case result := <-reader.Read():
 			pendingErr := result.err
 			line := result.line
 			if line != "" {
 				stats.NoteChunk()
-				w.Write([]byte(line + "\n"))
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
 				observeAnthropicStreamEvent(stats, fullUsage, line)
 			}
 			if pendingErr != nil {
+				// pr 的错误只可能来自 pw.Close(),即 copy 协程已越过 io.Copy,
+				// 此处 join 必然立即返回;保证协程不再于 handler 返回后触碰
+				// 已交还的 http.ResponseWriter(net/http 禁止这种并发使用)。
+				<-copyDone
 				return
 			}
 		}
