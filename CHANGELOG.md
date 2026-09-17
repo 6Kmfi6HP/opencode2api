@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.12.0
+
+- Add configurable upstream protocol routing (`protocol_rules`), aligned with sub2api's `OpenCodeGoProtocolRule` approach: requests are routed to the OpenCode Zen **native upstream endpoint** matching the model, instead of always translating through Chat Completions:
+  - `chat_completions` (default fallback, `/zen/v1/chat/completions`), `anthropic` (`/zen/v1/messages`), `responses` (`/zen/v1/responses`); the Go surface (`/zen/go/v1/*`) is selected by the existing catalog rules as before.
+  - Rule syntax: exact model ID or a single trailing `*` wildcard (e.g. `claude-*`, `*`), case-insensitive, declared order = priority, first match wins. Validation: ≤64 entries, pattern ≤128 chars, no whitespace, protocol enum. `[1m]`-style context suffixes are stripped before matching, so an exact rule also covers suffixed variants.
+  - Priority: explicit rule > native-responses runtime memory > default Chat Completions. **Default behavior is unchanged when no rule matches**; `/v1/chat/completions` applies only explicit rules so the existing translate→probe→passthrough fallback stays intact, while `/v1/messages` and `/v1/responses` apply the full priority (their memory dispatch already exists today).
+- New cross-protocol conversions covering every inbound × upstream combination, with streaming state machines for both directions:
+  - `/v1/messages` → anthropic: faithful body passthrough (only `model` rewritten); SSE relayed byte-for-byte with side-channel usage accounting.
+  - `/v1/chat/completions` → anthropic: system extraction, `tool_calls`↔`tool_use`/`tool_result` (consecutive same-role merging), `max_tokens` default 8192 + per-model cap, `reasoning_effort`→`thinking.budget_tokens`, Anthropic SSE→Chat chunks (content / reasoning_content / tool_calls / finish / usage / `[DONE]`).
+  - `/v1/chat/completions` → responses: `instructions`, function_call/function_call_output items, `max_output_tokens`, `reasoning.effort`; Responses SSE→Chat chunks.
+  - `/v1/responses` → anthropic: reuses the handler's converted messages (multimodal + text-only degradation preserved), Anthropic SSE→Responses events (`response.created` / `output_text.delta` / `function_call_arguments.delta` / `output_item.done` / `completed`/`incomplete`), `storeResponseState` keeps `previous_response_id` chains working.
+- Streaming, tool calls, reasoning, usage stats (incl. `cache_read`/`cache_created`) and error shapes are converted per inbound protocol; upstream HTTP status codes pass through faithfully (e.g. a Claude inbound sees Anthropic error bodies as-is, a Chat inbound gets them converted to Chat error shape).
+- Configuration, three ways, with clear precedence:
+  - `config.json` `protocol_rules` (lenient: invalid entries dropped with a warning).
+  - Admin panel POST `/api/config` (strict: any invalid entry rejects the whole request with 400 and nothing is persisted) — hot-applies to the next request.
+  - Admin UI "上游协议路由规则" table: ordered rules with move up/down, delete, and one-click presets (`claude-*`→anthropic, `gpt-*`→responses, `muse-spark-*`→responses, `qwen*`→anthropic).
+- `buildOCRequestWithSubpath` injects `anthropic-version: 2023-06-01` and switches `Accept: text/event-stream` for streaming on the `messages` subpath; all upstream calls keep the shared retry / sticky-egress / multi-domain machinery and `x-opencode-*` headers.
+- Docs: `CONFIGURATION.md` documents `protocol_rules` (syntax, priority, validation, caveats); `API.md` documents the routing behavior; `config.example.json` ships an empty `protocol_rules` example. `/v1/messages/count_tokens` remains a local heuristic and is unaffected by routing.
+- Tests: rule matching/validation/priority (incl. rule > memory > chat), config-file lenient loading, admin GET/POST round-trip + 400 protection, per-protocol request/response conversion for buffered and streamed modes, and dispatch regression pinning the no-rule default path. Verified end-to-end against the real upstream with the public key (18 checks across three subagents: responses routing, default-path invariance incl. tool calls, anthropic routing + admin hot-reload).
+
 ## v0.11.2
 
 - Fix free-tier (`Bearer public`) requests being rejected by the upstream with 403 `FreeTierError` "OpenCode's free tier can only be used from within OpenCode":
