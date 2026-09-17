@@ -133,7 +133,12 @@ func chatMessagesToAnthropic(messages []Message) (string, []map[string]any) {
 		if len(blocks) == 0 {
 			return
 		}
-		// 连续同角色合并。
+		// 连续同角色合并:Anthropic 不允许相邻同 role,且合并 tool_use 是
+		// 合法的(同 turn 可含 text+tool_use 序列)。
+		// 注:真正的非法情况是 assistant[tool_use] 之后无 user[tool_result]
+		// 直接又出现 assistant —— 那种序列本身在 chat 输入里就不规范,
+		// 上游会以 tool_use_without_result 拒绝,这里不做单独修复(超出
+		// merge 的职责)。
 		if n := len(out); n > 0 {
 			if prevRole, _ := out[n-1]["role"].(string); prevRole == role {
 				prev, _ := out[n-1]["content"].([]map[string]any)
@@ -397,9 +402,34 @@ type anthropicToChatState struct {
 	sentRole      bool
 	blocks        map[int]string // anthropic block index → "text"|"thinking"|"tool_use"
 	toolIndices   map[int]int    // anthropic block index → chat tool_calls index
-	toolCount     int
-	stopReason    string
-	fullUsage     map[string]any
+	// 每个打开中的 tool_use block 的元数据。initialInput 缓存 start 块附带的
+	// 初始 input;sawInputDelta 记录是否已有 input_json_delta —— 两者互斥,
+	// stop 时若 sawInputDelta=false 且 initialInput 非空,需要兜底 emit 一次,
+	// 否则该 tool call 的 input 会整体丢失(上游偶发场景)。
+	toolStates map[int]*anthropicToolState
+	toolCount  int
+	stopReason string
+	fullUsage  map[string]any
+}
+
+type anthropicToolState struct {
+	sawInputDelta bool
+	initialInput  any // string 或 map[string]any;空/nil 表示没有
+}
+
+// 保留提供给 chat 端 arguments 的初值;在 content_block_stop 消费。
+func (t *anthropicToolState) initialArguments() string {
+	switch v := t.initialInput.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	default:
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+		return ""
+	}
 }
 
 func anthropicSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, keepReasoning bool, includeUsage bool) {
@@ -419,6 +449,7 @@ func anthropicSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		includeUsage:  includeUsage,
 		blocks:        map[int]string{},
 		toolIndices:   map[int]int{},
+		toolStates:    map[int]*anthropicToolState{},
 		fullUsage:     map[string]any{},
 	}
 	defer func() {
@@ -515,8 +546,21 @@ func (st *anthropicToChatState) handleLine(line string) {
 			toolIdx := st.toolCount
 			st.toolCount++
 			st.toolIndices[idx] = toolIdx
+			tool := &anthropicToolState{}
+			st.toolStates[idx] = tool
 			name, _ := cb["name"].(string)
 			id, _ := cb["id"].(string)
+			// 缓存 start 块的 initial input(常见 {});不要立刻 emit 给 chat 端
+			// —— OpenAI 客户端会 concat 所有 arguments 片段,若 start 下发了
+			// initial,后续 partial_json 会拼出非法 JSON。stop 时兜底 emit:
+			// !sawInputDelta 时优先 initial,initial 为空则补 "{}"。
+			if raw, ok := cb["input"]; ok && raw != nil {
+				if s, ok := raw.(string); ok && s != "" && s != "{}" {
+					tool.initialInput = s
+				} else if m, ok := raw.(map[string]any); ok && len(m) > 0 {
+					tool.initialInput = m
+				}
+			}
 			st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
 				"index": toolIdx, "id": id, "type": "function",
 				"function": map[string]any{"name": name, "arguments": ""},
@@ -539,6 +583,9 @@ func (st *anthropicToChatState) handleLine(line string) {
 			}
 		case "input_json_delta":
 			if toolIdx, ok := st.toolIndices[idx]; ok {
+				if tool, ok := st.toolStates[idx]; ok {
+					tool.sawInputDelta = true
+				}
 				if pj, _ := d["partial_json"].(string); pj != "" {
 					st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
 						"index": toolIdx, "id": nil, "type": "function",
@@ -547,6 +594,27 @@ func (st *anthropicToChatState) handleLine(line string) {
 				}
 			}
 		}
+	case "content_block_stop":
+		idx := numberToInt(evt["index"])
+		// 若 tool_use 全程没收到 input_json_delta,在 stop 时兜底 emit 一次:
+		// 有 initial input 用 initial,否则补 "{}"。OpenAI 客户端 concat 各
+		// chunk 的 arguments 后须得到合法 JSON —— 空串会让 json.Unmarshal
+		// 失败;"{}" 对齐 buildOpenAIResponse 对 input nil/{} 的非流式语义。
+		if tool, ok := st.toolStates[idx]; ok && !tool.sawInputDelta {
+			if toolIdx, ok := st.toolIndices[idx]; ok {
+				s := tool.initialArguments()
+				if s == "" {
+					s = "{}"
+				}
+				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
+					"index": toolIdx, "id": nil, "type": "function",
+					"function": map[string]any{"name": "", "arguments": s},
+				}}}, "", nil)
+			}
+		}
+		delete(st.blocks, idx)
+		delete(st.toolIndices, idx)
+		delete(st.toolStates, idx)
 	case "message_delta":
 		if delta, ok := evt["delta"].(map[string]any); ok {
 			if sr, _ := delta["stop_reason"].(string); sr != "" {
