@@ -2,6 +2,11 @@
 
 ## v0.11.2
 
+- Fix free-tier (`Bearer public`) requests being rejected by the upstream with 403 `FreeTierError` "OpenCode's free tier can only be used from within OpenCode":
+  - Live ablation against `opencode.ai/zen/v1` shows the free tier validates the `x-opencode-session` shape: it must match `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$` (12-hex timestamp prefix + 14 base62 chars, the OpenCode client's `descending()` identifier format). The gateway's old `ses_` + 24 random chars was rejected.
+  - It also validates the client version: `User-Agent: opencode/<ver>` below 1.17.0 answers 426 `UpgradeRequired`. The npm fallback version is bumped from 1.15.3 to 1.18.31.
+  - `x-opencode-request` now mirrors the client format (`msg_` + the same 26-char ID body); the upstream does not validate it, but requests now look identical to real OpenCode client traffic.
+  - Verified end-to-end: direct upstream ablation matrix (403/426 → 200), plus gateway chat / streaming SSE / Anthropic messages / Responses all 200 with anonymous access.
 - Fix `/v1/responses` native passthrough rejecting long-running conversations with the upstream 400 `reasoning \`encrypted_content\` was not issued to this caller` (reproduced with `muse-spark-*` + Codex):
   - The upstream binds replayed reasoning `encrypted_content` to the original caller (account + egress). When the gateway's sticky egress/domain re-binds mid-conversation (sticky TTL expiry, re-bind after a 429/5xx retry, process restart, key change), every later turn replays foreign reasoning content and fails — including Codex `exec resume` of an existing thread.
   - The gateway now recognizes that exact 400 (`isForeignReasoningEchoError`), strips the replayed reasoning echo (`id` + `encrypted_content`, both are caller-bound) from `input`, and re-sends the request once (`callResponsesWithEchoRepair`, shared by the probe and forward paths). Visible messages, tool calls and tool outputs are unchanged; only the stale reasoning payload is dropped, and the upstream re-issues reasoning for the current caller.
