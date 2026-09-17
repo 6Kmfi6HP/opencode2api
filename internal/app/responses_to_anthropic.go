@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -109,17 +110,25 @@ type anthropicToResponsesState struct {
 	seq           int
 	outputIndex   int
 	fullUsage     map[string]any
-	// 当前打开的块：anthropic block index → 类型
-	blocks      map[int]string
-	itemIDs     map[int]string // anthropic block index → Responses item id
-	toolIndices map[int]int    // anthropic block index → function_call output index
-	toolCount   int
-	// 文本/推理累计（用于 output_item.done 全量回填）
-	fullText      strings.Builder
-	fullReasoning strings.Builder
+	// 按 anthropic block index 跟踪打开中的 content_block。
+	// 每个 block 一个 struct,对应 claude.go anthropicBlockState 的形状;
+	// 不再用多个平行 map(避免 cleanup 时漏删某个 map 导致串扰)。
+	blocks    map[int]*responsesBlockState
+	toolCount int
 	// 已完成的 output 汇总（message_stop 时写入 response.completed）
 	completedOutput []any
 	terminalSent    bool
+}
+
+// responsesBlockState 记录一个打开中的 content_block 的所有元数据。
+// text/thinking 共用 builder,kind 区分类型;tool_call 不需要 builder
+// (其 arguments 已通过 input_json_delta 流出)。
+type responsesBlockState struct {
+	kind        string // "text" | "thinking" | "tool_use"
+	itemID      string
+	outputIndex int
+	toolIdx     int              // 仅 tool_use 使用
+	text        *strings.Builder // kind=text → 累积 output_text;kind=thinking → 累积 reasoning summary
 }
 
 func anthropicSSEToResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, wantReasoning bool) {
@@ -136,15 +145,14 @@ func anthropicSSEToResponsesStream(ctx context.Context, w http.ResponseWriter, r
 		id:            "resp_" + randomHex(16),
 		model:         model,
 		wantReasoning: wantReasoning,
-		blocks:        map[int]string{},
-		itemIDs:       map[int]string{},
-		toolIndices:   map[int]int{},
+		blocks:        map[int]*responsesBlockState{},
 		fullUsage:     map[string]any{},
 	}
 	defer func() {
 		st.stats.ToolCallCount = st.toolCount
-		st.stats.TextChars = st.fullText.Len()
-		st.stats.ReasoningChars = st.fullReasoning.Len()
+		// TextChars/ReasoningChars 在 text_delta/thinking_delta 时即时累计,
+		// 等价于旧实现 fullText/fullReasoning 的全流长度(且覆盖 EOF 残留
+		// block 的尾部数据)。
 		if len(st.fullUsage) > 0 {
 			statsx.RecordChatUsage(model, responsesUsageToChat(st.fullUsage))
 		}
@@ -162,6 +170,11 @@ func anthropicSSEToResponsesStream(ctx context.Context, w http.ResponseWriter, r
 			if result.line != "" {
 				st.stats.NoteChunk()
 				st.handleLine(result.line)
+				// handleLine 发出终结事件(message_stop/error/重复 start 兜底)
+				// 后直接退出,不再消费上游后续行。
+				if st.terminalSent {
+					return
+				}
 			}
 			if pendingErr != nil {
 				// 上游 EOF 未发 message_stop：补 response.completed 保证客户端终止。
@@ -188,11 +201,26 @@ func (st *anthropicToResponsesState) emitEvent(event string, data map[string]any
 }
 
 // ensureTerminal 幂等写出终结事件（completed/incomplete/failed）。
+// 上游断流时仍可能有未关闭的 content_block:全部按 output_index 升序收尾
+// (补各类 done 事件并回填 completedOutput),否则以终结事件为准重组 output
+// 的客户端会丢失尾部的 text/thinking/tool_use 内容,或留下永久 in_progress
+// 的 item(added 已发而 done 未到)。
 func (st *anthropicToResponsesState) ensureTerminal(status, event string) {
 	if st.terminalSent {
 		return
 	}
 	st.terminalSent = true
+	blocks := make([]*responsesBlockState, 0, len(st.blocks))
+	for _, b := range st.blocks {
+		blocks = append(blocks, b)
+	}
+	// 按 output_index(即 start 到达序)升序,避免 map 遍历乱序导致
+	// completedOutput 顺序漂移。
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i].outputIndex < blocks[j].outputIndex })
+	for _, b := range blocks {
+		st.closeBlock(b)
+	}
+	clear(st.blocks)
 	response := map[string]any{
 		"id":      st.id,
 		"object":  "response",
@@ -214,7 +242,62 @@ func (st *anthropicToResponsesState) ensureTerminal(status, event string) {
 	st.stats.SawFinish = true
 }
 
+// closeBlock 收尾单个 content_block:补发 done 事件并把 item 回填进
+// completedOutput。正常 content_block_stop 与 ensureTerminal(上游断流
+// 兜底)共用,保证两条路径的事件形状完全一致,不会互相漂移。
+func (st *anthropicToResponsesState) closeBlock(b *responsesBlockState) {
+	switch b.kind {
+	case "thinking":
+		st.completedOutput = append(st.completedOutput, map[string]any{
+			"type": "reasoning", "id": b.itemID, "summary": []any{},
+		})
+		st.emitEvent("response.output_item.done", map[string]any{
+			"output_index": b.outputIndex,
+			"item": map[string]any{
+				"type": "reasoning", "id": b.itemID, "summary": []any{},
+			},
+		})
+	case "text":
+		text := ""
+		if b.text != nil {
+			text = b.text.String()
+		}
+		st.completedOutput = append(st.completedOutput, map[string]any{
+			"type": "message", "id": b.itemID, "role": "assistant", "status": "completed",
+			"content": []any{map[string]any{"type": "output_text", "text": text}},
+		})
+		st.emitEvent("response.output_text.done", map[string]any{
+			"item_id": b.itemID, "text": text,
+		})
+		st.emitEvent("response.output_item.done", map[string]any{
+			"output_index": b.outputIndex,
+			"item": map[string]any{
+				"type": "message", "id": b.itemID, "role": "assistant", "status": "completed",
+				"content": []any{map[string]any{"type": "output_text", "text": text}},
+			},
+		})
+	case "tool_use":
+		st.completedOutput = append(st.completedOutput, map[string]any{
+			"type": "function_call", "id": b.itemID, "status": "completed",
+		})
+		st.emitEvent("response.function_call_arguments.done", map[string]any{
+			"item_id": b.itemID, "output_index": b.toolIdx,
+		})
+		st.emitEvent("response.output_item.done", map[string]any{
+			"output_index": b.outputIndex,
+			"item": map[string]any{
+				"type": "function_call", "id": b.itemID, "status": "completed",
+			},
+		})
+	}
+}
+
 func (st *anthropicToResponsesState) handleLine(line string) {
+	// 终结事件(response.failed/completed + [DONE])已发出后,后续行一律忽略:
+	// 既不能向客户端再写事件,也不再消费 st.blocks 状态。
+	if st.terminalSent {
+		return
+	}
 	payload, ok := strings.CutPrefix(line, "data: ")
 	if !ok {
 		return
@@ -243,124 +326,110 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 		idx := numberToInt(evt["index"])
 		cb, _ := evt["content_block"].(map[string]any)
 		bt, _ := cb["type"].(string)
-		st.blocks[idx] = bt
+		// 上游若在同一 idx 上重复 start(中间无 stop),旧映射会被覆盖且产生
+		// 一个永不关闭的 output_index —— 显式拒绝,让上游错误更明显。
+		if _, dup := st.blocks[idx]; dup {
+			st.emitEvent("response.failed", map[string]any{
+				"response": map[string]any{
+					"id": st.id, "status": "failed",
+					"error": map[string]any{"message": fmt.Sprintf("duplicate content_block_start for index %d", idx)},
+				},
+			})
+			st.w.Write([]byte("data: [DONE]\n\n"))
+			if st.flusher != nil {
+				st.flusher.Flush()
+			}
+			st.terminalSent = true
+			return
+		}
+		// 在 start 时分配并记录 output_index,确保 stop 时回填的是同一个 index。
+		b := &responsesBlockState{kind: bt, outputIndex: st.outputIndex}
+		st.blocks[idx] = b
+		st.outputIndex++
 		switch bt {
 		case "thinking":
-			itemID := "rs_" + randomHex(12)
-			st.itemIDs[idx] = itemID
+			b.itemID = "rs_" + randomHex(12)
+			b.text = &strings.Builder{}
 			st.emitEvent("response.output_item.added", map[string]any{
-				"output_index": st.outputIndex,
+				"output_index": b.outputIndex,
 				"item": map[string]any{
-					"type": "reasoning", "id": itemID, "summary": []any{},
+					"type": "reasoning", "id": b.itemID, "summary": []any{},
 				},
 			})
 		case "text":
-			itemID := "msg_" + randomHex(12)
-			st.itemIDs[idx] = itemID
+			b.itemID = "msg_" + randomHex(12)
+			b.text = &strings.Builder{}
 			st.emitEvent("response.output_item.added", map[string]any{
-				"output_index": st.outputIndex,
+				"output_index": b.outputIndex,
 				"item": map[string]any{
-					"type": "message", "id": itemID, "role": "assistant",
+					"type": "message", "id": b.itemID, "role": "assistant",
 					"status": "in_progress", "content": []any{},
 				},
 			})
 			st.emitEvent("response.content_part.added", map[string]any{
-				"item_id": itemID, "output_index": st.outputIndex,
+				"item_id": b.itemID, "output_index": b.outputIndex,
 				"content_index": 0,
 				"part":          map[string]any{"type": "output_text", "text": ""},
 			})
 		case "tool_use":
-			itemID := "fc_" + randomHex(12)
-			st.itemIDs[idx] = itemID
+			b.itemID = "fc_" + randomHex(12)
+			b.toolIdx = st.toolCount
+			st.toolCount++
 			callID, _ := cb["id"].(string)
 			name, _ := cb["name"].(string)
-			st.toolIndices[idx] = st.toolCount
-			st.toolCount++
 			st.emitEvent("response.output_item.added", map[string]any{
-				"output_index": st.outputIndex,
+				"output_index": b.outputIndex,
 				"item": map[string]any{
-					"type": "function_call", "id": itemID, "call_id": callID,
+					"type": "function_call", "id": b.itemID, "call_id": callID,
 					"name": name, "arguments": "", "status": "in_progress",
 				},
 			})
 		}
 	case "content_block_delta":
 		idx := numberToInt(evt["index"])
+		b := st.blocks[idx]
+		if b == nil {
+			return
+		}
 		d, _ := evt["delta"].(map[string]any)
 		dt, _ := d["type"].(string)
 		switch dt {
 		case "text_delta":
 			if t, _ := d["text"].(string); t != "" {
-				st.fullText.WriteString(t)
+				if b.text != nil {
+					b.text.WriteString(t)
+				}
+				st.stats.TextChars += len(t)
 				st.emitEvent("response.output_text.delta", map[string]any{
-					"item_id": st.itemIDs[idx], "delta": t,
+					"item_id": b.itemID, "delta": t,
 				})
 			}
 		case "thinking_delta":
 			if st.wantReasoning {
 				if t, _ := d["thinking"].(string); t != "" {
-					st.fullReasoning.WriteString(t)
+					if b.text != nil {
+						b.text.WriteString(t)
+					}
+					st.stats.ReasoningChars += len(t)
 					st.emitEvent("response.reasoning_summary_text.delta", map[string]any{
-						"item_id": st.itemIDs[idx], "delta": t,
+						"item_id": b.itemID, "delta": t,
 					})
 				}
 			}
 		case "input_json_delta":
-			if toolIdx, ok := st.toolIndices[idx]; ok {
-				if pj, _ := d["partial_json"].(string); pj != "" {
-					st.emitEvent("response.function_call_arguments.delta", map[string]any{
-						"item_id": st.itemIDs[idx], "output_index": toolIdx, "delta": pj,
-					})
-				}
+			if pj, _ := d["partial_json"].(string); pj != "" {
+				st.emitEvent("response.function_call_arguments.delta", map[string]any{
+					"item_id": b.itemID, "output_index": b.toolIdx, "delta": pj,
+				})
 			}
 		}
 	case "content_block_stop":
 		idx := numberToInt(evt["index"])
-		bt := st.blocks[idx]
-		itemID := st.itemIDs[idx]
-		switch bt {
-		case "thinking":
-			st.completedOutput = append(st.completedOutput, map[string]any{
-				"type": "reasoning", "id": itemID, "summary": []any{},
-			})
-			st.emitEvent("response.output_item.done", map[string]any{
-				"output_index": st.outputIndex,
-				"item": map[string]any{
-					"type": "reasoning", "id": itemID, "summary": []any{},
-				},
-			})
-		case "text":
-			text := st.fullText.String()
-			st.completedOutput = append(st.completedOutput, map[string]any{
-				"type": "message", "id": itemID, "role": "assistant", "status": "completed",
-				"content": []any{map[string]any{"type": "output_text", "text": text}},
-			})
-			st.emitEvent("response.output_text.done", map[string]any{
-				"item_id": itemID, "text": text,
-			})
-			st.emitEvent("response.output_item.done", map[string]any{
-				"output_index": st.outputIndex,
-				"item": map[string]any{
-					"type": "message", "id": itemID, "role": "assistant", "status": "completed",
-					"content": []any{map[string]any{"type": "output_text", "text": text}},
-				},
-			})
-		case "tool_use":
-			toolIdx := st.toolIndices[idx]
-			st.completedOutput = append(st.completedOutput, map[string]any{
-				"type": "function_call", "id": itemID, "status": "completed",
-			})
-			st.emitEvent("response.function_call_arguments.done", map[string]any{
-				"item_id": itemID, "output_index": toolIdx,
-			})
-			st.emitEvent("response.output_item.done", map[string]any{
-				"output_index": st.outputIndex,
-				"item": map[string]any{
-					"type": "function_call", "id": itemID, "status": "completed",
-				},
-			})
+		b := st.blocks[idx]
+		if b == nil {
+			return
 		}
-		st.outputIndex++
+		st.closeBlock(b)
 		delete(st.blocks, idx)
 	case "message_delta":
 		if u, ok := evt["usage"].(map[string]any); ok {
