@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -34,6 +35,32 @@ func randomHex(n int) string {
 const (
 	headerOpencodeSession = "x-opencode-session"
 )
+
+// opencode 客户端生成的 session/request ID 是时间戳前缀的 26 字符 ID:
+// 前 12 字符为 (毫秒时间戳*0x1000+计数) 反转后的 6 字节小端 hex,
+// 后 14 字符为 base62 随机。上游对免费层校验 session 必须匹配
+// ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$,否则拒绝:
+// "OpenCode's free tier can only be used from within OpenCode"。
+const opencodeIDAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+func opencodeDescendingID() string {
+	now := time.Now().UnixMilli()
+	counter := rand.Int64N(0xFFF) + 1
+	value := ^(now*0x1000 + counter)
+	var b [14]byte
+	for i := range b {
+		b[i] = opencodeIDAlphabet[rand.IntN(len(opencodeIDAlphabet))]
+	}
+	return fmt.Sprintf("%012x", value&0xFFFFFFFFFFFF) + string(b[:])
+}
+
+func newOCSessionID() string {
+	return "ses_" + opencodeDescendingID()
+}
+
+func newOCRequestID() string {
+	return "msg_" + opencodeDescendingID()
+}
 
 type opencodeSessionContextKey struct{}
 
@@ -87,12 +114,16 @@ var (
 	ocOnce      sync.Once
 )
 
+// ocMinFreeTierVersion 是上游免费层要求的最低客户端版本;低于它时上游
+// 返回 426 UpgradeRequired("OpenCode 1.17.0 or newer is required")。
+const ocMinFreeTierVersion = "1.18.31"
+
 func fetchOCVersion() string {
 	req, _ := http.NewRequest("GET", "https://registry.npmjs.org/opencode-ai/latest", nil)
 	req.Header.Set("Accept", "application/json")
 	resp, err := getHTTPClient().Do(req)
 	if err != nil {
-		return "1.15.3"
+		return ocMinFreeTierVersion
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -102,13 +133,13 @@ func fetchOCVersion() string {
 	if json.Unmarshal(body, &info) == nil && info.Version != "" {
 		return info.Version
 	}
-	return "1.15.3"
+	return ocMinFreeTierVersion
 }
 
 func initOCSession() {
 	ocOnce.Do(func() {
 		ocClientVer = fetchOCVersion()
-		ocSessionID = "ses_" + randomString(24)
+		ocSessionID = newOCSessionID()
 		ocProjectID = randomHex(40)
 		slog.Info("opencode version", "version", ocClientVer)
 		slog.Info("session initialized", "session_id", ocSessionID)
@@ -118,7 +149,7 @@ func initOCSession() {
 
 func refreshOCSession() {
 	ocClientVer = fetchOCVersion()
-	ocSessionID = "ses_" + randomString(24)
+	ocSessionID = newOCSessionID()
 	ocProjectID = randomHex(40)
 	slog.Info("session refreshed", "version", ocClientVer, "session_id", ocSessionID)
 	// 重置 Once 以便后续 initOCSession 调用直接通过
@@ -149,7 +180,7 @@ func fetchModels() ([]ModelInfo, error) {
 		session = ocSessionID
 	}
 	if strings.TrimSpace(session) == "" {
-		session = "ses_" + randomString(24)
+		session = newOCSessionID()
 	}
 	req.Header.Set("x-opencode-session", strings.TrimSpace(session))
 	resp, err := getHTTPClient().Do(req)
@@ -182,7 +213,7 @@ func fetchGoModels() ([]ModelInfo, error) {
 		session = ocSessionID
 	}
 	if strings.TrimSpace(session) == "" {
-		session = "ses_" + randomString(24)
+		session = newOCSessionID()
 	}
 	req.Header.Set("x-opencode-session", strings.TrimSpace(session))
 	resp, err := getHTTPClient().Do(req)
@@ -360,10 +391,10 @@ func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth Upst
 		session = ocSessionID
 	}
 	if strings.TrimSpace(session) == "" {
-		session = "ses_" + randomString(24)
+		session = newOCSessionID()
 	}
 	req.Header.Set("x-opencode-session", strings.TrimSpace(session))
-	req.Header.Set("x-opencode-request", "req_"+randomString(24))
+	req.Header.Set("x-opencode-request", newOCRequestID())
 	req.Header.Set("Accept", "application/json")
 	return req, nil
 }
