@@ -36,6 +36,10 @@
 - 默认或 `zen:` 模式显示 Zen 目录。
 - `go:` 模式显示 Go 目录，并附带 public 可用的免费模型。
 
+### 上游协议路由
+
+三个入站协议（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`）默认经 Chat Completions 翻译后转发上游。配置 `protocol_rules` 后，按模型模式把请求分流到上游原生协议端点（`anthropic` → `/zen/v1/messages`、`responses` → `/zen/v1/responses`、`chat_completions` → `/zen/v1/chat/completions`），请求/响应由网关自动在入站与上游协议间转换，流式、工具调用、推理内容与 usage 统计均兼容。未命中规则时保持既有行为。规则语法、优先级与校验见 [CONFIGURATION.md](CONFIGURATION.md#protocol_rules)。
+
 ## 请求校验
 
 ### temperature

@@ -69,6 +69,14 @@ type ModelKeywordRule struct {
 	Enabled         bool             `json:"enabled"`
 }
 
+// ProtocolRule 把模型模式映射到上游原生协议。Pattern 为精确模型 ID 或单个
+// 尾部 "*" 通配（大小写不敏感），Protocol 取 chat_completions / anthropic /
+// responses。规则按声明顺序匹配，首个命中生效；未命中兜底 chat_completions。
+type ProtocolRule struct {
+	Pattern  string `json:"pattern"`
+	Protocol string `json:"protocol"`
+}
+
 type ModelAliasList []ModelKeywordRule
 
 func (m *ModelAliasList) UnmarshalJSON(data []byte) error {
@@ -150,6 +158,11 @@ type AppConfig struct {
 	// passthrough relay. Dynamic probing still learns additional models at
 	// runtime. An explicit value (even empty) replaces the built-in default.
 	NativeResponsesModels []string `json:"native_responses_models,omitempty"`
+	// ProtocolRules 按模型模式把请求路由到上游原生协议端点：
+	// chat_completions（默认兜底）、anthropic（/zen/v1/messages）、
+	// responses（/zen/v1/responses）。声明顺序即优先级，首个命中生效；
+	// 未命中时保持既有行为（native_responses_models 记忆 > Chat 翻译）。
+	ProtocolRules []ProtocolRule `json:"protocol_rules,omitempty"`
 }
 
 type Socks5Proxy struct {

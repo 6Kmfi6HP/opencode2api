@@ -386,6 +386,17 @@ func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth Upst
 	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s", ocClientVer))
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-project", ocProjectID)
+	if subpath == "messages" {
+		// Anthropic Messages 上游需要版本头；流式时 Accept 切为 SSE。
+		req.Header.Set("anthropic-version", "2023-06-01")
+		if stream, _ := bodyMap["stream"].(bool); stream {
+			req.Header.Set("Accept", "text/event-stream")
+		} else {
+			req.Header.Set("Accept", "application/json")
+		}
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
 	session := sessionFromRequestContext(nil, ocSessionID)
 	if strings.TrimSpace(session) == "" {
 		session = ocSessionID
@@ -395,7 +406,9 @@ func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth Upst
 	}
 	req.Header.Set("x-opencode-session", strings.TrimSpace(session))
 	req.Header.Set("x-opencode-request", newOCRequestID())
-	req.Header.Set("Accept", "application/json")
+	if subpath != "messages" {
+		req.Header.Set("Accept", "application/json")
+	}
 	return req, nil
 }
 
@@ -557,6 +570,13 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		return nil, 0, nil, lastErr
 	}
 	return nil, 0, nil, fmt.Errorf("upstream request failed")
+}
+
+// callOpenCodeAnthropicEndpoint 把请求发往上游原生 Anthropic Messages 端点
+// （/zen/v1/messages 或 /zen/go/v1/messages），重试/粘性出口/多域名轮换与
+// 结构化日志全部沿用 callOpenCodeEndpoint。
+func callOpenCodeAnthropicEndpoint(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
+	return callOpenCodeEndpoint(ctx, "messages", upstreamBody, modelID, auth)
 }
 
 func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) ([]byte, int, http.Header, error) {

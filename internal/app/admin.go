@@ -84,6 +84,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			"cache_control_breakpoints": cacheBreakpointsRT,
 			"socks5_sticky":             socks5StickyRT,
 			"text_only_models":          textOnlyModelsRT,
+			"protocol_rules":            getProtocolRules(),
 			"log_level":                 logging.LevelString(),
 			"log_bodies":                logging.BodiesEnabled(),
 		})
@@ -96,6 +97,15 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, `{"error":"Invalid JSON"}`, http.StatusBadRequest)
 			return
+		}
+		// protocol_rules 严格校验：任一条非法即 400，且不落盘不生效。
+		if payload.ProtocolRules != nil {
+			if _, err := validateProtocolRules(payload.ProtocolRules); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "invalid protocol_rules: " + err.Error()})
+				return
+			}
 		}
 		if err := saveConfig(configPath, payload.AppConfig); err != nil {
 			http.Error(w, `{"error":"Failed to save config"}`, http.StatusInternalServerError)

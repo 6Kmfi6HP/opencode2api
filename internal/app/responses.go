@@ -1029,8 +1029,11 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	respReq.Model = mapPublicToFreeModel(auth, respReq.Model)
 
-	// 内存记忆：该模型已确认支持上游原生 responses，直接透传，不再转换。
-	if isNativeResponsesModel(respReq.Model) {
+	// 协议路由：显式规则 > native-responses 运行时记忆 > 默认 chat。
+	// responses 分支为既有透传；anthropic 分支延迟到 chatReq 构建完成后
+	// 调用（复用 messages 转换结果）；chat 分支保持既有翻译路径。
+	upstreamProto := resolveUpstreamProtocol(respReq.Model)
+	if upstreamProto == upstreamProtocolResponses {
 		slog.Info("responses passthrough (remembered)",
 			"model_in", modelIn, "model", respReq.Model, "stream", respReq.Stream)
 		if forwardNativeResponses(r.Context(), w, auth, respReq.Model, body, respReq.Stream, respReq) {
@@ -1172,6 +1175,16 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		if respReq.Reasoning.Effort != "none" {
 			chatReq.ReasoningEffort = respReq.Reasoning.Effort
 		}
+	}
+
+	// 协议路由 anthropic 分支：chatReq（含 messages 转换/多模态/text-only 降级）
+	// 已就绪，转交 chatToAnthropicBody 走上游原生 /v1/messages。
+	if upstreamProto == upstreamProtocolAnthropic {
+		// 与下方 keepReasoning 语义一致：fixToolCallGaps/ensureReasoningContent
+		// 属于 chat 翻译路径的修补，交叉路径由 chatToAnthropicBody 自行处理。
+		wantReasoningX := !config.ForceDisableThinking()
+		forwardResponsesViaAnthropic(w, r, auth, &chatReq, wantReasoningX)
+		return
 	}
 
 	wantReasoning := !config.ForceDisableThinking()

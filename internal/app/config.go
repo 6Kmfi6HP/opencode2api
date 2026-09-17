@@ -206,6 +206,10 @@ func applyConfig(cfg AppConfig) {
 	if cfg.NativeResponsesModels != nil {
 		setNativeResponsesModels(cfg.NativeResponsesModels)
 	}
+
+	if cfg.ProtocolRules != nil {
+		setProtocolRules(compileProtocolRulesLenient(cfg.ProtocolRules))
+	}
 }
 
 // stripContextSuffix splits a model ID into its base and context suffix.

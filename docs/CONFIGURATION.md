@@ -109,6 +109,38 @@ cp config.example.json config.json
 | `nemotron-3-ultra-free` | context length | 1,000,000 |
 | `nemotron-3.5-lightning-free` | context length | 1,000,000 |
 
+### `protocol_rules`
+
+**上游协议路由规则**：按模型模式把请求分流到 OpenCode Zen 的三种原生协议端点，而不是固定走 Chat Completions 翻译。
+
+| 协议 | 上游端点 | 说明 |
+|------|---------|------|
+| `chat_completions` | `/zen/v1/chat/completions`（或 `/zen/go/v1/...`） | 默认兜底，未命中规则时使用 |
+| `anthropic` | `/zen/v1/messages`（或 `/zen/go/v1/messages`） | 上游原生 Anthropic Messages |
+| `responses` | `/zen/v1/responses` | 上游原生 OpenAI Responses |
+
+规则语法：
+
+- `pattern`：精确模型 ID 或单个尾部 `*` 通配（如 `claude-*`、`*`），**大小写不敏感**，匹配前剥离 `[1m]` 等上下文后缀（`claude-sonnet-4.6` 规则同时命中 `claude-sonnet-4.6[1m]`）。
+- `protocol`：`chat_completions` / `anthropic` / `responses` 三选一。
+- 规则按声明顺序匹配，**首个命中生效**；最多 64 条，pattern ≤128 字符且不含空白。
+
+**优先级**：显式规则 &gt; 运行时 native-responses 探测记忆 &gt; 默认 Chat Completions。未命中任何规则时行为与旧版本完全一致。`/v1/chat/completions` 入站仅应用显式规则（探测记忆仍走"翻译失败→探测→透传"回退，保证默认行为不变）；`/v1/messages` 与 `/v1/responses` 入站应用完整优先级。
+
+三种入站协议（Chat / Responses / Claude Messages）都可以路由到任意上游协议，请求与响应在网关内自动转换（流式 SSE、工具调用、推理内容、usage 统计均支持）。`/v1/messages/count_tokens` 为本地启发式，不感知协议路由。
+
+```json
+{
+  "protocol_rules": [
+    {"pattern": "claude-*", "protocol": "anthropic"},
+    {"pattern": "gpt-*", "protocol": "responses"},
+    {"pattern": "glm-5.3", "protocol": "chat_completions"}
+  ]
+}
+```
+
+规则同样可在管理面板「模型与路由 → 上游协议路由规则」中配置（支持快捷预设与排序），面板保存为严格校验：任一条非法整体拒绝（HTTP 400），配置文件加载为宽松校验（非法条目剔除并告警）。错误处理按入站协议写回对应形状（如 claude 入站收到 Anthropic 错误原样透传；chat 入站收到 Anthropic 错误转为 Chat 错误格式），上游状态码保真。
+
 ### `native_responses_models`
 
 上游模型 ID 列表：这些模型已知只支持原生 Responses 端点，请求会跳过 Chat 翻译，直接透传到上游 `/responses`。除配置外，代理还内置了一份静态预置列表（如 `muse-spark-1.3-contributor`），并会在运行时探测确认后动态记忆更多模型；配置值与静态预置只增不减地合并，不会清掉运行时学到的模型；静态预置与配置下发的模型不会因连续失败被剔除，运行时学到的模型连续失败 5 次后会自动剔除并回落 Chat 翻译路径。

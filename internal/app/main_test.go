@@ -53,6 +53,7 @@ type fakeRetryTransport struct {
 	requestedModels []string
 	requestedURLs   []string
 	requestPayloads []map[string]any
+	requestHeaders  []http.Header
 	closeIdleCalls  int
 }
 
@@ -73,6 +74,7 @@ func (f *fakeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 	f.requestedModels = append(f.requestedModels, model)
 	f.requestedURLs = append(f.requestedURLs, req.URL.String())
 	f.requestPayloads = append(f.requestPayloads, payload)
+	f.requestHeaders = append(f.requestHeaders, req.Header.Clone())
 
 	next := f.responses[0]
 	f.responses = f.responses[1:]

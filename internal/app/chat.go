@@ -432,6 +432,17 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 协议路由：显式规则命中时按上游原生协议转发。chat 入站只看规则层，
+	// 未命中保持既有路径（翻译失败后探测/记忆回退），默认行为不变。
+	switch matchProtocolRuleModelOnly(req.Model) {
+	case upstreamProtocolAnthropic:
+		forwardChatViaAnthropic(w, r, auth, &req, wantsReasoning(&req))
+		return
+	case upstreamProtocolResponses:
+		forwardChatViaResponses(w, r, auth, &req, wantsReasoning(&req))
+		return
+	}
+
 	// 多模态路由：检测到图片时转发到配置的上游
 
 	req.Messages = fixToolCallGaps(req.Messages)

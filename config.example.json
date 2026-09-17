@@ -13,5 +13,6 @@
     "mimo-v2.5-free": 1048576,
     "nemotron-3-ultra-free": 1000000,
     "nemotron-3.5-lightning-free": 1000000
-  }
+  },
+  "protocol_rules": []
 }

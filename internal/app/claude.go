@@ -950,14 +950,25 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 原生 responses 快路径：已记住模型直接走 Claude->Responses 转换，不再经过
-	// chat 翻译。此分支为 lenient 模式：不支持的 block 做降级，不返回 400，
-	// 因此跳过 validateClaudeDocumentBlocks 的严格校验。
+	// 协议路由：显式规则 > native-responses 运行时记忆 > 默认 chat。
+	// 规则命中 anthropic 时 body 直通上游原生 /v1/messages；命中 responses
+	// 时走 Claude->Responses 转换快路径（lenient，不返回 400，跳过
+	// validateClaudeDocumentBlocks 严格校验）。仅传输层错误回落 chat 翻译。
 	wantReasoningEarly := !config.ForceDisableThinking()
 	if claudeReq.Thinking != nil && isThinkingDisabled(claudeReq.Thinking) {
 		wantReasoningEarly = false
 	}
-	if isNativeResponsesModel(claudeReq.Model) {
+	switch resolveUpstreamProtocol(claudeReq.Model) {
+	case upstreamProtocolAnthropic:
+		slog.Info("claude anthropic passthrough (rule)",
+			"model_in", modelIn, "model", claudeReq.Model, "stream", claudeReq.Stream)
+		if forwardClaudeViaAnthropic(r.Context(), w, auth, claudeReq.Model, body, claudeReq.Stream) {
+			return
+		}
+		// 仅传输层错误才会到这里（上游 4xx/5xx 已写回）。继续回落到常规
+		// chat 翻译路径，做 best-effort 二次尝试。
+		slog.Warn("claude anthropic passthrough failed, falling back to chat", "model", claudeReq.Model)
+	case upstreamProtocolResponses:
 		slog.Info("claude responses passthrough (remembered)",
 			"model_in", modelIn, "model", claudeReq.Model, "stream", claudeReq.Stream)
 		if forwardClaudeViaResponses(r.Context(), w, auth, claudeReq.Model, claudeReq, claudeReq.Stream, wantReasoningEarly) {
