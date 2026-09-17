@@ -5,7 +5,7 @@ Go API gateway that proxies OpenAI Chat, Responses, and Anthropic Messages to Op
 ## Project Structure & Module Organization
 
 - `cmd/opencode2api/main.go`: binary entrypoint; keep thin.
-- `internal/app/`: all logic — `server.go`, `chat.go`, `responses*.go`, `claude*.go`, `anthropic*.go`, `config.go`, `admin.go`, `launch*.go`, `stats.go`.
+- `internal/app/`: all logic — `server.go`, `chat.go`, `responses*.go`, `claude*.go`, `anthropic*.go`, `count_tokens.go`, `config.go`, `admin.go`, `launch*.go`, `stats.go`.
 - `internal/domain/`, `internal/ids/`, `internal/random/`: shared types and helpers.
 - `docs/`: `API.md`, `CONFIGURATION.md`, `DEPLOYMENT.md`, `RELEASE.md` — update with behavior changes.
 - `scripts/`: `release.sh`, `build-release.sh`, `install.sh`; `Dockerfile`, `config.example.json` at root.

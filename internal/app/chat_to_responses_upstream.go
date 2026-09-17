@@ -118,12 +118,20 @@ func chatMessagesToResponsesInput(messages []Message) (string, []any) {
 }
 
 // chatToResponsesBody 把 Chat Completions 请求转为 Responses 请求体。
+// rawBody 可选：同 chatToAnthropicBodyWithRaw,供 resolveMaxTokens 读
+// max_completion_tokens 顶层字段。
 func chatToResponsesBody(req *OpenAIRequest, modelID string) []byte {
+	return chatToResponsesBodyWithRaw(req, modelID, nil)
+}
+
+func chatToResponsesBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[string]any) []byte {
 	instructions, input := chatMessagesToResponsesInput(req.Messages)
 	body := map[string]any{
 		"model":  modelID,
 		"input":  input,
 		"stream": req.Stream,
+		// 对零会话上游不写存储：对齐 sub2api 对无状态上游的默认行为。
+		"store": false,
 	}
 	if instructions != "" {
 		body["instructions"] = instructions
@@ -131,24 +139,18 @@ func chatToResponsesBody(req *OpenAIRequest, modelID string) []byte {
 	if req.Stream {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
-	if req.MaxTokens != nil && *req.MaxTokens > 0 {
-		v := *req.MaxTokens
-		if cap := config.MaxTokensCapFor(modelID); cap > 0 && v > cap {
-			v = cap
-		}
-		body["max_output_tokens"] = v
-	} else if cap := config.MaxTokensCapFor(modelID); cap > 0 {
-		body["max_output_tokens"] = cap
-	}
+	// max_output_tokens 统一经 resolveMaxTokens（与 chat→anthropic 同口径）：
+	// 未显式设置时不再"无 cap 就缺省",而是兜底 8192;且钳制下限 128。
+	body["max_output_tokens"] = resolveMaxTokens(rawBody, req, modelID)
 	if req.Temperature != nil {
 		body["temperature"] = *req.Temperature
 	}
 	if req.TopP != nil {
 		body["top_p"] = *req.TopP
 	}
-	if stop := extraBodyValue(req, "stop"); stop != nil {
-		body["stop"] = stop
-	}
+	// 注意：OpenAI Responses API 没有 stop 字段,Chat 侧入站的 stop 不向
+	// 该请求体透传（透传既被上游忽略也是 spec 违例;Chat→Anthropic 方向的
+	// stop_sequences 保留）。
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))
 		for _, t := range req.Tools {
@@ -178,6 +180,17 @@ func chatToResponsesBody(req *OpenAIRequest, modelID string) []byte {
 			body["reasoning"] = map[string]any{"effort": mappedReasoningEffort(effort)}
 		}
 	}
+	// 客户端 include（从 ExtraBody / rawBody 顶层）先落入 body,再与
+	// reasoning.encrypted_content 合并去重;非法形状忽略。
+	if inc, ok := rawBody["include"].([]any); ok {
+		body["include"] = inc
+	} else if inc, ok := extraBodyValue(req, "include").([]any); ok {
+		body["include"] = inc
+	}
+	// include 合并 reasoning.encrypted_content（客户端已给 include 数组时
+	// 去重追加,否则新建数组）——为未来 signature roundtrip 做准备。当前
+	// 本方向响应侧还不读 encrypted_content（槽位由 Worker C 在响应侧加）。
+	mergeResponsesIncludeKey(body, "reasoning.encrypted_content")
 	b, err := json.Marshal(body)
 	if err != nil {
 		return []byte(fmt.Sprintf(`{"model":%q,"input":[],"stream":%t}`, modelID, req.Stream))
@@ -185,11 +198,30 @@ func chatToResponsesBody(req *OpenAIRequest, modelID string) []byte {
 	return b
 }
 
+// mergeResponsesIncludeKey 把 key 合并进 Responses 请求体的顶层 include
+// 数组：存在则去重追加,不存在则新建。非法形状（非数组）视为不存在。
+func mergeResponsesIncludeKey(body map[string]any, key string) {
+	if key == "" {
+		return
+	}
+	existing, _ := body["include"].([]any)
+	for _, e := range existing {
+		if s, _ := e.(string); s == key {
+			body["include"] = existing
+			return
+		}
+	}
+	body["include"] = append(existing, key)
+}
+
 // forwardChatViaResponses 处理规则命中 responses 的 Chat 入站请求：请求转
 // Responses，响应转回 Chat 形状（流式 SSE→SSE / 非流式 JSON→JSON）。
 func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth UpstreamAuth, req *OpenAIRequest, keepReasoning bool) {
 	ctx := r.Context()
-	upstreamBody := chatToResponsesBody(req, req.Model)
+	// 请求侧归一化前置：补全 assistant.tool_calls 的 tool 响应（fixToolCallGaps
+	// 定义在 chat.go,Worker B 所有;这里只调用不修改）。
+	req.Messages = fixToolCallGaps(req.Messages)
+	upstreamBody := chatToResponsesBodyWithRaw(req, req.Model, rawRequestBodyMap(req))
 	log := logging.FromContext(ctx)
 	log.Info("chat via responses upstream", "model", req.Model, "stream", req.Stream, "keep_reasoning", keepReasoning)
 
@@ -248,7 +280,7 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
-			statsx.RecordChatUsage(req.Model, responsesUsageToChat(u))
+			statsx.RecordChatUsage(req.Model, responsesUsageToChatBridge(u))
 		}
 	}
 	result := logging.SummarizeChatResult(outBody)
@@ -365,7 +397,7 @@ func convertResponsesToChat(respBody []byte, model string, wantReasoning bool) [
 		}},
 	}
 	if u, ok := raw["usage"]; ok && u != nil {
-		resp["usage"] = responsesUsageToChat(u.(map[string]any))
+		resp["usage"] = responsesUsageToChatBridge(u.(map[string]any))
 	}
 	out, err := json.Marshal(resp)
 	if err != nil {
@@ -376,6 +408,78 @@ func convertResponsesToChat(respBody []byte, model string, wantReasoning bool) [
 
 // ======================== Responses SSE → Chat SSE 状态机 ========================
 
+// responsesUsageToChatBridge 在 claude_responses.go 的 responsesUsageToChat
+// 之上补齐 chat 桥接需要的 usage 口径:DeepSeek prompt_cache_hit/miss_tokens
+// 透传、input_tokens_details.cached_tokens → prompt_tokens_details.cached_tokens
+// 别名、output_tokens_details.reasoning_tokens/thinking_tokens 归位。
+// responsesUsageToChat 归 Worker C 的文件所有,这里包一层而非改它。
+func responsesUsageToChatBridge(usage map[string]any) map[string]any {
+	out := responsesUsageToChat(usage)
+	if out == nil {
+		return nil
+	}
+	// total 兜底合成（responsesUsageToChat 也合成;这里防调用方绕过）。
+	if _, has := out["total_tokens"]; !has {
+		if p, pok := numberAsFloat(out["prompt_tokens"]); pok {
+			if c, cok := numberAsFloat(out["completion_tokens"]); cok {
+				out["total_tokens"] = p + c
+			}
+		}
+	}
+	// DeepSeek 缓存命中/未命中键透传。
+	for _, k := range []string{"prompt_cache_hit_tokens", "prompt_cache_miss_tokens"} {
+		if v, ok := usage[k]; ok {
+			out[k] = v
+		}
+	}
+	// cached_tokens 别名:input_tokens_details.cached_tokens ↔
+	// prompt_tokens_details.cached_tokens（先有谁用谁,另一形态同步出来）。
+	cached := 0.0
+	hasCached := false
+	if d, ok := usage["input_tokens_details"].(map[string]any); ok {
+		if v, ok := numberAsFloat(d["cached_tokens"]); ok {
+			cached = v
+			hasCached = true
+		}
+	}
+	if !hasCached {
+		if d, ok := out["prompt_tokens_details"].(map[string]any); ok {
+			if v, ok := numberAsFloat(d["cached_tokens"]); ok {
+				cached = v
+				hasCached = true
+			}
+		}
+	}
+	if hasCached {
+		details, _ := out["prompt_tokens_details"].(map[string]any)
+		if details == nil {
+			details = map[string]any{}
+		}
+		details["cached_tokens"] = cached
+		out["prompt_tokens_details"] = details
+	}
+	if od, ok := usage["output_tokens_details"].(map[string]any); ok {
+		var reasoning float64
+		var hasReasoning bool
+		if v, ok := numberAsFloat(od["reasoning_tokens"]); ok {
+			reasoning, hasReasoning = v, true
+		} else if v, ok := numberAsFloat(od["thinking_tokens"]); ok {
+			reasoning, hasReasoning = v, true
+		}
+		if hasReasoning {
+			details, _ := out["completion_tokens_details"].(map[string]any)
+			if details == nil {
+				details = map[string]any{}
+			}
+			if existing, eok := numberAsFloat(details["reasoning_tokens"]); !eok || existing == 0 {
+				details["reasoning_tokens"] = reasoning
+			}
+			out["completion_tokens_details"] = details
+		}
+	}
+	return out
+}
+
 type responsesToChatState struct {
 	w             http.ResponseWriter
 	flusher       http.Flusher
@@ -385,10 +489,14 @@ type responsesToChatState struct {
 	keepReasoning bool
 	includeUsage  bool
 	sentRole      bool
-	toolIndices   map[string]int // Responses item id/call_id → chat tool_calls index
+	toolIndices   map[string]int    // Responses item id/call_id → chat tool_calls index
+	toolAnnounced map[string]bool   // item id/call_id → 首 tool_calls chunk 已宣发
+	arguments     map[string]string // item id/call_id → 已下发 arguments 累计文本
 	toolCount     int
 	sawTool       bool
+	finishReason  string // 终态 finish 原因(空 = 未定,finalize 时合成)
 	fullUsage     map[string]any
+	finalized     bool // 已写 [DONE]/终态帧（幂等）
 }
 
 func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, keepReasoning bool, includeUsage bool) {
@@ -407,12 +515,14 @@ func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		keepReasoning: keepReasoning,
 		includeUsage:  includeUsage,
 		toolIndices:   map[string]int{},
+		toolAnnounced: map[string]bool{},
+		arguments:     map[string]string{},
 		fullUsage:     map[string]any{},
 	}
 	defer func() {
 		st.stats.ToolCallCount = st.toolCount
 		if len(st.fullUsage) > 0 {
-			statsx.RecordChatUsage(model, responsesUsageToChat(st.fullUsage))
+			statsx.RecordChatUsage(model, responsesUsageToChatBridge(st.fullUsage))
 		}
 		st.stats.Log(ctx, "chat")
 	}()
@@ -430,10 +540,43 @@ func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 				st.handleLine(result.line)
 			}
 			if pendingErr != nil {
+				// EOF / 读错误兜底:response.completed 未到达时补终态
+				// finish chunk(+usage)+[DONE],保证 OpenAI SDK 不挂起
+				// （幂等:已完成路径不受影响）。
+				st.finalize()
 				return
 			}
 		}
 	}
+}
+
+// finalize 幂等地结束 chat 流:补发终态 finish chunk(incomplete → length,
+// 有 tool call → tool_calls,否则 stop)、includeUsage 时的 usage 终块与
+// [DONE]。response.completed/incomplete 正常路径与 response.failed/error/
+// EOF 兜底路径共用。
+func (st *responsesToChatState) finalize() {
+	if st.finalized {
+		return
+	}
+	st.finalized = true
+	if st.finishReason == "" {
+		st.finishReason = "stop"
+		if st.sawTool {
+			st.finishReason = "tool_calls"
+		}
+	}
+	if st.sentRole {
+		st.emitChunk(map[string]any{}, st.finishReason, nil)
+	}
+	if st.includeUsage && len(st.fullUsage) > 0 {
+		st.emitChunk(map[string]any{}, "", responsesUsageToChatBridge(st.fullUsage))
+	}
+	st.w.Write([]byte("data: [DONE]\n\n"))
+	if st.flusher != nil {
+		st.flusher.Flush()
+	}
+	st.stats.DoneSeen = true
+	st.stats.SawFinish = true
 }
 
 func (st *responsesToChatState) emitChunk(delta map[string]any, finishReason string, usage map[string]any) {
@@ -467,6 +610,33 @@ func (st *responsesToChatState) ensureRole() {
 	}
 	st.sentRole = true
 	st.emitChunk(map[string]any{"role": "assistant", "content": ""}, "", nil)
+}
+
+// toolIdxFor 解析 item id/call_id 对应的 chat tool_calls index:未知 item
+// （上游没发 output_item.added 直接发 delta/done,Observed 场景）分配新
+// index,保证后续补发首 chunk 时 index 稳定。
+func (st *responsesToChatState) toolIdxFor(itemID string) int {
+	if idx, ok := st.toolIndices[itemID]; ok {
+		return idx
+	}
+	idx := st.toolCount
+	st.toolCount++
+	if itemID != "" {
+		st.toolIndices[itemID] = idx
+	}
+	return idx
+}
+
+// aliasToolKey 把 done/delta 事件的 "另一形态" id（fc_* vs call_*）映到同一
+// index。Responses 事件里 added 用 call_id、arguments.done 常用 item.id,
+// 两方必须指向同一 chat tool_calls 槽位,否则 done 补发会落到新 index。
+func (st *responsesToChatState) aliasToolKey(fromKey, toKey string) {
+	if fromKey == "" || toKey == "" || fromKey == toKey {
+		return
+	}
+	if idx, ok := st.toolIndices[toKey]; ok {
+		st.toolIndices[fromKey] = idx
+	}
 }
 
 func (st *responsesToChatState) handleLine(line string) {
@@ -505,7 +675,11 @@ func (st *responsesToChatState) handleLine(line string) {
 			}
 		}
 	case "response.refusal.delta":
-		// refusal 增量并入正文，保持与 convertResponsesToChat 的降级一致。
+		// refusal 增量并入正文（与非流式 convertResponsesToChat 把 refusal
+		// 放 message 字段不同——chat 流式 delta 没有 refusal 槽位且
+		// content=-null 语义不完整;内联进 content 是对 OpenAI 客户端最
+		// 保真的降级,与非流式 "content 里看不到 refusal" 略不一致,详见
+		// convertResponsesToChat 的 refusal 注释）。
 		st.ensureRole()
 		if t, _ := evt["delta"].(string); t != "" {
 			st.emitChunk(map[string]any{"content": t}, "", nil)
@@ -522,34 +696,76 @@ func (st *responsesToChatState) handleLine(line string) {
 			if callID == "" {
 				callID, _ = item["id"].(string)
 			}
-			name, _ := item["name"].(string)
-			toolIdx := st.toolCount
-			st.toolCount++
-			if callID != "" {
-				st.toolIndices[callID] = toolIdx
-			}
+			st.aliasToolKey(item["id"].(string), callID)
+			st.toolIdxFor(callID)
+			st.toolAnnounced[callID] = true
 			st.ensureRole()
 			st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
-				"index": toolIdx, "id": callID, "type": "function",
-				"function": map[string]any{"name": name, "arguments": ""},
+				"index": st.toolIndices[callID], "id": callID, "type": "function",
+				"function": map[string]any{"name": toString(item["name"]), "arguments": ""},
 			}}}, "", nil)
 		}
 	case "response.function_call_arguments.delta", "response.tool_call_arguments.delta":
 		st.ensureRole()
 		itemID, _ := evt["item_id"].(string)
-		toolIdx, ok := st.toolIndices[itemID]
-		if !ok {
-			toolIdx = st.toolCount
-			st.toolCount++
-			if itemID != "" {
-				st.toolIndices[itemID] = toolIdx
-			}
-		}
+		toolIdx := st.toolIdxFor(itemID)
 		if pj, _ := evt["delta"].(string); pj != "" {
+			st.arguments[itemID] += pj
 			st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
 				"index": toolIdx, "id": nil, "type": "function",
 				"function": map[string]any{"name": "", "arguments": pj},
 			}}}, "", nil)
+		}
+	case "response.function_call_arguments.done", "response.tool_call_arguments.done":
+		st.ensureRole()
+		itemID, _ := evt["item_id"].(string)
+		toolIdx := st.toolIdxFor(itemID)
+		// done 携带完整 arguments JSON:只补发已下发前缀之后的差量,
+		// 避免客户端 concat 后重复（对齐 sub2api resToChatHandleFuncArgsDone）。
+		if completed, _ := evt["arguments"].(string); completed != "" {
+			emitted := st.arguments[itemID]
+			if completed != emitted && strings.HasPrefix(completed, emitted) {
+				remainder := completed[len(emitted):]
+				st.arguments[itemID] = completed
+				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
+					"index": toolIdx, "id": nil, "type": "function",
+					"function": map[string]any{"name": "", "arguments": remainder},
+				}}}, "", nil)
+			}
+		}
+	case "response.output_item.done":
+		item, _ := evt["item"].(map[string]any)
+		if item == nil {
+			return
+		}
+		switch item["type"] {
+		case "function_call", "tool_call":
+			st.sawTool = true
+			callID, _ := item["call_id"].(string)
+			if callID == "" {
+				callID, _ = item["id"].(string)
+			}
+			itemID, _ := item["id"].(string)
+			st.aliasToolKey(itemID, callID)
+			st.toolIdxFor(callID)
+			// 没有 add/delta 出现过（罕见）:补一次首 chunk 宣告工具调用,
+			// 并把 item 上的完整 arguments 作为单段增量发完。
+			if !st.toolAnnounced[callID] {
+				st.toolAnnounced[callID] = true
+				name := toString(item["name"])
+				st.ensureRole()
+				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
+					"index": st.toolIndices[callID], "id": callID, "type": "function",
+					"function": map[string]any{"name": name, "arguments": ""},
+				}}}, "", nil)
+				if args, _ := item["arguments"].(string); args != "" && st.arguments[callID] == "" {
+					st.arguments[callID] = args
+					st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
+						"index": st.toolIndices[callID], "id": nil, "type": "function",
+						"function": map[string]any{"name": "", "arguments": args},
+					}}}, "", nil)
+				}
+			}
 		}
 	case "response.completed", "response.incomplete":
 		if resp, ok := evt["response"].(map[string]any); ok {
@@ -557,24 +773,14 @@ func (st *responsesToChatState) handleLine(line string) {
 				mergeUsage(st.fullUsage, u)
 			}
 			if status, _ := resp["status"].(string); status == "incomplete" {
-				st.emitChunk(map[string]any{}, "length", nil)
+				st.finishReason = "length"
+			} else if st.sawTool {
+				st.finishReason = "tool_calls"
 			} else {
-				fr := "stop"
-				if st.sawTool {
-					fr = "tool_calls"
-				}
-				st.emitChunk(map[string]any{}, fr, nil)
+				st.finishReason = "stop"
 			}
 		}
-		if st.includeUsage && len(st.fullUsage) > 0 {
-			st.emitChunk(map[string]any{}, "", responsesUsageToChat(st.fullUsage))
-		}
-		st.w.Write([]byte("data: [DONE]\n\n"))
-		if st.flusher != nil {
-			st.flusher.Flush()
-		}
-		st.stats.DoneSeen = true
-		st.stats.SawFinish = true
+		st.finalize()
 	case "response.failed", "error":
 		em, _ := evt["response"].(map[string]any)
 		message := "upstream error"
@@ -588,9 +794,11 @@ func (st *responsesToChatState) handleLine(line string) {
 		if m, ok := evt["message"].(string); ok && m != "" {
 			message = m
 		}
-		st.w.Write([]byte("data: " + `{"error":{"message":` + jsonString(message) + `}}` + "\n\n"))
-		if st.flusher != nil {
-			st.flusher.Flush()
+		if !st.sentRole {
+			st.ensureRole()
 		}
+		st.w.Write([]byte("data: " + `{"error":{"message":` + jsonString(message) + `}}` + "\n\n"))
+		// 终态错误事件也补 [DONE](幂等):避免 OpenAI SDK 挂在缺哨兵的流上。
+		st.finalize()
 	}
 }

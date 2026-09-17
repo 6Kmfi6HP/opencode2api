@@ -2,8 +2,76 @@ package app
 
 import (
 	"encoding/json"
+	"log/slog"
 	"strings"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 )
+
+// defaultClaudeMaxTokens 是 Anthropic Messages schema 对必填 max_tokens 的
+// 兜底值（对齐 sub2api 的 chatcompletions_anthropic_bridge）。客户端省略时
+// 补 8192，避免上游原生 Anthropic 端点按 schema 拒绝。
+const defaultClaudeMaxTokens = 8192
+
+// minClaudeMaxTokens 是 thinking 模式下 max_tokens 的最小值（Anthropic 要求
+// 不低于 budget_tokens 下限 1024 的场景已由上游校验，这里只挡住非法小值）。
+const minClaudeMaxTokens = 128
+
+// clampMaxTokens 把 max_tokens 收敛到 [1, cap]；cap<=0 表示无上界。
+// convertRequest（chat.go）与 claudeToResponsesBody（claude_responses.go）
+// 的 cap 逻辑共用这个 helper。
+func clampMaxTokens(v, cap int) int {
+	if cap > 0 && v > cap {
+		v = cap
+	}
+	if v < 1 {
+		v = 1
+	}
+	return v
+}
+
+// clampClaudeMaxTokens 是 Anthropic 方向的 max_tokens 收敛：schema 上 128
+// 是 thinking 兼容的安全下限，先 clampMaxTokens 收 cap 再兜底 128。
+func clampClaudeMaxTokens(v, cap int) int {
+	if v = clampMaxTokens(v, cap); v < minClaudeMaxTokens {
+		v = minClaudeMaxTokens
+	}
+	return v
+}
+
+// clampAnthropicProtocolMaxTokens 是直通路径（raw body map）版本的
+// clampMaxTokens：对 bodyMap["max_tokens"]（JSON 数值）做 [128, cap] 就地
+// 收敛；缺失/非法时不改（适合 count_tokens 等不强求 max_tokens 的入口 —
+// 只降不补，"最多保持原预算"）。messages 直通的 required-schema 补默认
+// 逻辑在 forwardClaudeViaAnthropic。返回写回后的 int 值；未改返回 0。
+func clampAnthropicProtocolMaxTokens(bodyMap map[string]any, modelID string) int {
+	if bodyMap == nil {
+		return 0
+	}
+	v := 0
+	switch raw := bodyMap["max_tokens"].(type) {
+	case float64:
+		v = int(raw)
+	case int:
+		v = raw
+	case int64:
+		v = int(raw)
+	case json.Number:
+		if n, err := raw.Int64(); err == nil {
+			v = int(n)
+		}
+	default:
+		return 0
+	}
+	if v <= 0 {
+		return 0
+	}
+	clamped := clampMaxTokens(v, config.MaxTokensCapFor(modelID))
+	if clamped != v {
+		bodyMap["max_tokens"] = clamped
+	}
+	return clamped
+}
 
 // convertClaudeRequest is the request-side protocol boundary. It returns a new
 // Chat Completions request and never mutates values owned by the caller.
@@ -16,6 +84,15 @@ func convertClaudeRequest(req ClaudeRequest) (OpenAIRequest, []string) {
 		TopP: req.TopP, Tools: tools,
 		ToolChoice: convertClaudeToolChoice(req.ToolChoice),
 		Thinking:   req.Thinking,
+	}
+	// Anthropic schema 要求 max_tokens 必填：客户端省略时按 sub2api 补
+	// 8192，再按配置 cap 与 thinking 下限 128 收敛。
+	if out.MaxTokens == nil {
+		v := clampClaudeMaxTokens(defaultClaudeMaxTokens, config.MaxTokensCapFor(out.Model))
+		out.MaxTokens = &v
+	} else {
+		v := clampClaudeMaxTokens(*out.MaxTokens, config.MaxTokensCapFor(out.Model))
+		out.MaxTokens = &v
 	}
 	// Claude Code puts effort in output_config.effort (--effort / CLAUDE_CODE_EFFORT_LEVEL).
 	// Map it onto Chat Completions reasoning_effort so upstream mapping still applies.
@@ -37,6 +114,32 @@ func convertClaudeRequest(req ClaudeRequest) (OpenAIRequest, []string) {
 				}
 			}
 			out.Thinking = normalized
+		}
+	}
+	// thinking 与采样参数互斥（对齐 sub2api）：上游 Anthropic thinking 模式
+	// 与 gpt-5 族 responses 都不接受 temperature/top_p/top_k，开启 thinking
+	// 时剥离，避免上游 400。effort 经 output_config 或
+	// thinking.effort/budget 推导出来也算 thinking 生效；
+	// force_disable_thinking 时上游链路强制 thinking off，采样参数保留。
+	// req.TopK 是本地副本，剥离后置 nil，下方 top_k 透传分支据此跳过。
+	thinkingOn := !config.ForceDisableThinking() &&
+		(isThinkingEnabled(out.Thinking) || out.ReasoningEffort != "")
+	if thinkingOn {
+		stripped := 0
+		if out.Temperature != nil {
+			out.Temperature = nil
+			stripped++
+		}
+		if out.TopP != nil {
+			out.TopP = nil
+			stripped++
+		}
+		if req.TopK != nil {
+			stripped++
+			req.TopK = nil
+		}
+		if stripped > 0 {
+			slog.Debug("claude thinking enabled: stripped sampling params", "model", out.Model, "count", stripped)
 		}
 	}
 	if req.TopK != nil {

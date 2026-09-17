@@ -1,17 +1,20 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 )
 
 // ======================== Claude Messages count_tokens ========================
-//
-// POST /v1/messages/count_tokens is a local heuristic estimate of the input
-// token count. It never calls the upstream and never incurs usage; Claude Code
-// uses it for context-window management and auto-compaction, so a reasonable
-// estimate is sufficient (see docs/claude-messages-compatibility-report.md).
+// POST /v1/messages/count_tokens 默认是本地 chars/4 启发式估算，不走上游、
+// 不产生 usage；Claude Code 用它做上下文窗口管理与自动压缩，合理估计即可
+// （见 docs/claude-messages-compatibility-report.md）。protocol_rules 命中
+// anthropic 上游时改为直连 /zen/.../messages/count_tokens 透传取精确计数：
+// 上游 2xx 原样转回，任何失败/非 2xx 一律静默回落本地启发式。
 
 const (
 	// Content tokens: ~4 chars per token, matching the common BPE
@@ -27,14 +30,32 @@ const (
 	documentTokens = 3000
 )
 
+// estimateClaudeSystemTokens 估算顶层 system（string 或 block 数组）占用；
+// block 数组递归走 estimateContentTokens，cache_control/block 元数据经
+// jsonString 兜底计入。
+func estimateClaudeSystemTokens(system any) int {
+	switch v := system.(type) {
+	case nil:
+		return 0
+	case string:
+		if v == "" {
+			return 0
+		}
+		return systemOverhead + estimateTextTokens(v)
+	case []any:
+		if len(v) == 0 {
+			return 0
+		}
+		return systemOverhead + estimateContentTokens(v)
+	default:
+		return systemOverhead + estimateTextTokens(jsonString(v))
+	}
+}
+
 // estimateClaudeInputTokens returns a heuristic count of the input tokens a
 // Claude Messages request would consume. It reads req without mutating it.
 func estimateClaudeInputTokens(req ClaudeRequest) int {
-	total := 0
-	if sys := extractClaudeSystemText(req.System); sys != "" {
-		// The system block carries structural overhead of its own.
-		total = systemOverhead + estimateTextTokens(sys)
-	}
+	total := estimateClaudeSystemTokens(req.System)
 	for _, msg := range req.Messages {
 		total += messageOverhead
 		total += estimateContentTokens(msg.Content)
@@ -136,13 +157,17 @@ func estimateTextTokens(s string) int {
 	return tokens
 }
 
-// claudeCountTokensHandler serves POST /v1/messages/count_tokens with a local
-// heuristic estimate, without touching the upstream.
+// claudeCountTokensHandler serves POST /v1/messages/count_tokens:protocol_rules
+// 命中 anthropic 上游时直连 /zen/.../messages/count_tokens 透传（model 改写为
+// 解析后的上游 ID,max_tokens 收敛 [128, cap],不带 stream——计数与输出预算
+// 或流无关）,2xx 原样回写（Anthropic 端点本就只回 input_tokens）;传输错误/
+// 上游非 2xx 一律回落本地启发式。
 func claudeCountTokensHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	auth := extractUpstreamAuth(r)
 	defer r.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
@@ -167,9 +192,71 @@ func claudeCountTokensHandler(w http.ResponseWriter, r *http.Request) {
 		writeProtocolValidation400(w, "claude", "", "model is required")
 		return
 	}
+	resolvedModel := mapPublicToFreeModel(auth, resolveModelForAuth(auth, claudeReq.Model))
+
+	if proto, matched := matchProtocolRule(resolvedModel); matched && proto == upstreamProtocolAnthropic {
+		if status, respBody, ok := forwardCountTokensViaAnthropic(r.Context(), claudeReq, auth, resolvedModel); ok {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(status)
+			w.Write(respBody)
+			return
+		}
+	}
 
 	inputTokens := estimateClaudeInputTokens(claudeReq)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]int{"input_tokens": inputTokens})
+}
+
+// forwardCountTokensViaAnthropic 把 count_tokens 请求直通上游原生 Anthropic
+// count_tokens 端点。透传体只保 max_tokens 一项受限：以原请求为基准走
+// clampAnthropicProtocolMaxTokens 收敛([128, cap]),不额外收紧,即"最多保持
+// 原预算"。返回 (status, 直通体, 是否已成功写回)—— false 时调用方回落本地
+// 启发式。callCountTokensUpstream 是变量以便测试注入传输层错误。
+func forwardCountTokensViaAnthropic(ctx context.Context, claudeReq ClaudeRequest, auth UpstreamAuth, resolvedModel string) (int, []byte, bool) {
+	log := logging.FromContext(ctx)
+	var bodyMap map[string]any
+	reqBody, err := json.Marshal(claudeReq)
+	if err == nil {
+		err = json.Unmarshal(reqBody, &bodyMap)
+	}
+	if err != nil || bodyMap == nil {
+		log.Warn("count_tokens upstream forward skipped: marshal error", "model", resolvedModel, "error", err)
+		return 0, nil, false
+	}
+	bodyMap["model"] = resolvedModel
+	clampAnthropicProtocolMaxTokens(bodyMap, resolvedModel)
+	forwardBytes, err := json.Marshal(bodyMap)
+	if err == nil {
+		reqBody = forwardBytes
+	}
+
+	rc, status, _, callErr := callCountTokensUpstream(ctx, reqBody, resolvedModel, auth)
+	if callErr != nil {
+		if rc != nil {
+			rc.Close()
+		}
+		log.Warn("count_tokens upstream transport error; falling back to heuristic",
+			"model", resolvedModel, "error", callErr)
+		return 0, nil, false
+	}
+	defer rc.Close()
+	respBody, readErr := io.ReadAll(io.LimitReader(rc, 32*1024*1024))
+	if readErr != nil || status < 200 || status >= 300 {
+		if readErr == nil {
+			logging.UpstreamError(ctx, resolvedModel, status, respBody, roundRobinBaseURL())
+		} else {
+			log.Warn("count_tokens upstream read error; falling back to heuristic",
+				"model", resolvedModel, "status", status, "error", readErr)
+		}
+		return status, respBody, false
+	}
+	return status, respBody, true
+}
+
+// callCountTokensUpstream 实际发起 /zen/.../messages/count_tokens 调用;抽成
+// 变量便于测试注入传输层错误（读模型 ID 用的 transport 形态不走 URL 断言）。
+var callCountTokensUpstream = func(ctx context.Context, body []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
+	return callOpenCodeEndpoint(ctx, "messages/count_tokens", body, modelID, auth)
 }

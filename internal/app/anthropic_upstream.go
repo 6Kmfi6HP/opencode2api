@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
@@ -16,10 +17,12 @@ import (
 // ======================== Anthropic 上游直通（/v1/messages → /zen/v1/messages） ========================
 
 // forwardClaudeViaAnthropic 把 Claude Messages 请求直通上游原生 Anthropic
-// 端点：body 仅改写 model，其余字段无损；流式 SSE 原样管道转发，非流式
-// JSON 原样写回。上游 4xx/5xx 状态码与错误体保真透传（Anthropic 错误形状
-// 与入站协议天然一致）。仅传输层错误（拿不到上游响应）返回 false，调用方
-// 兜底回落 chat 翻译路径。
+// 端点：body 仅改写 model（并按 max_tokens 收敛到 [128, cap]），其余字段
+// 无损。上游 2xx 时流式 SSE 原样管道转发、非流式 JSON 原样写回；上游
+// 非 2xx 时统一 buffered 读回并以 application/json + 原状态码保真透传
+// （无论请求是否 stream，客户端侧连 SSE 流都没建立，发给它的必须是 JSON
+// 错误而不是包进 data frame 的错误 —— Claude Code 只认这个形状）。
+// 仅传输层错误（拿不到上游响应）返回 false，调用方兜底回落 chat 翻译路径。
 func forwardClaudeViaAnthropic(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool) bool {
 	log := logging.FromContext(ctx)
 	var bodyMap map[string]any
@@ -31,6 +34,12 @@ func forwardClaudeViaAnthropic(ctx context.Context, w http.ResponseWriter, auth 
 	upstreamBody := rawBody
 	if bodyMap != nil {
 		bodyMap["model"] = modelID
+		// 直通仍遵守全局 max_tokens 预算：已有值收敛 [128, cap]；缺省时
+		// Anthropic schema 要求必填,按 defaultClaudeMaxTokens 补(与
+		// convertClaudeRequest 的 chat 翻译路径一致)。
+		if clampAnthropicProtocolMaxTokens(bodyMap, modelID) == 0 {
+			bodyMap["max_tokens"] = clampMaxTokens(defaultClaudeMaxTokens, config.MaxTokensCapFor(modelID))
+		}
 		if b, err := json.Marshal(bodyMap); err == nil {
 			upstreamBody = b
 		}
@@ -46,7 +55,9 @@ func forwardClaudeViaAnthropic(ctx context.Context, w http.ResponseWriter, auth 
 	}
 	defer rc.Close()
 
-	if stream {
+	// 非 2xx 即使请求方要求 stream 也统一走 buffered JSON 错误直转
+	// （上游未建立 SSE 流，tee 会把错误 JSON 包进 data frame 破坏客户端解析）。
+	if status >= 200 && status < 300 && stream {
 		pipeAnthropicStream(ctx, w, rc, status, header, modelID)
 		return true
 	}
@@ -73,6 +84,7 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 // pipeAnthropicStream 把上游 Anthropic SSE 流字节级原样转发给客户端,同时
 // 旁路 tee 解析 message_start / message_delta 中的 usage 记入 token 统计。
 // 行边界、CRLF/LF、空行均不做改写,确保下游收到与上游完全一致的字节流。
+// 仅在上游 2xx(真 SSE)时被调用；错误响应一律走 relayAnthropicBuffered。
 func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, header http.Header, modelID string) {
 	filtered := filterResponseHeaders(header)
 	for k, v := range filtered {
@@ -177,12 +189,13 @@ func observeAnthropicStreamEvent(stats *logging.StreamStats, fullUsage map[strin
 	}
 }
 
-// relayAnthropicBuffered 非流式直通：上游 JSON 原样写回（含非 2xx 错误体与
-// 状态码保真），并解析 usage 记入 token 统计。
+// relayAnthropicBuffered 非流式直通与直通路径错误透传（含流式请求下的上游
+// 非 2xx）：buffered 读回上游体，以 application/json + 原状态码保真写回，
+// 并解析 usage 记入 token 统计；上游错误体同时记入去重日志。
 func relayAnthropicBuffered(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, header http.Header, modelID string) {
 	body, readErr := io.ReadAll(io.LimitReader(rc, 32*1024*1024))
 	if readErr != nil {
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusBadGateway)
 		json.NewEncoder(w).Encode(map[string]any{
 			"type":  "error",
@@ -194,7 +207,7 @@ func relayAnthropicBuffered(ctx context.Context, w http.ResponseWriter, rc io.Re
 	for k, v := range filtered {
 		w.Header().Set(k, v[0])
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	w.Write(body)
 
@@ -207,6 +220,8 @@ func relayAnthropicBuffered(ctx context.Context, w http.ResponseWriter, rc io.Re
 			result := logging.SummarizeClaudeResult(body)
 			logging.LogResult(ctx, result)
 		}
+	} else {
+		logging.UpstreamError(ctx, modelID, status, body, roundRobinBaseURL())
 	}
 }
 

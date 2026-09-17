@@ -115,6 +115,8 @@ type anthropicToResponsesState struct {
 	// 不再用多个平行 map(避免 cleanup 时漏删某个 map 导致串扰)。
 	blocks    map[int]*responsesBlockState
 	toolCount int
+	// 计数器：仅统计（不对外产出）
+	signatureDeltas int
 	// 已完成的 output 汇总（message_stop 时写入 response.completed）
 	completedOutput []any
 	terminalSent    bool
@@ -122,13 +124,20 @@ type anthropicToResponsesState struct {
 
 // responsesBlockState 记录一个打开中的 content_block 的所有元数据。
 // text/thinking 共用 builder,kind 区分类型;tool_call 不需要 builder
-// (其 arguments 已通过 input_json_delta 流出)。
+// (其 arguments 已通过 initialArguments + input_json_delta 流出)。
 type responsesBlockState struct {
 	kind        string // "text" | "thinking" | "tool_use"
 	itemID      string
 	outputIndex int
 	toolIdx     int              // 仅 tool_use 使用
+	callID      string           // 仅 tool_use：Anthropic tool_use id（fc_ 前缀前的原始 id）
+	name        string           // 仅 tool_use
 	text        *strings.Builder // kind=text → 累积 output_text;kind=thinking → 累积 reasoning summary
+	// tool_use:content_block_start 的初始 input 缓存；若到 content_block_stop
+	// 仍没有任何 input_json_delta,closeBlock 先补发一条 argument.delta 带完整
+	// input JSON 再发 done（否则仅有 "in_progress" 的 item 与缺参数的 done）。
+	initialArguments string
+	argDeltaSeen     bool
 }
 
 func anthropicSSEToResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, wantReasoning bool) {
@@ -277,17 +286,30 @@ func (st *anthropicToResponsesState) closeBlock(b *responsesBlockState) {
 			},
 		})
 	case "tool_use":
-		st.completedOutput = append(st.completedOutput, map[string]any{
-			"type": "function_call", "id": b.itemID, "status": "completed",
-		})
+		// closeBlock 里 tool_use 的 arguments.done / output_item.done 事件
+		// output_index 统一用 b.outputIndex（不是 b.toolIdx——后者是 per-turn
+		// 工具序号，会令 output_index 与实际 added 事件的 index 错位）。
+		// item 回填完整 {id, call_id, name, arguments, status:completed, type=function_call}。
+		if b.initialArguments != "" && !b.argDeltaSeen {
+			st.emitEvent("response.function_call_arguments.delta", map[string]any{
+				"item_id": b.itemID, "output_index": b.outputIndex, "delta": b.initialArguments,
+			})
+		}
+		arguments := b.initialArguments
+		if arguments == "" {
+			arguments = "{}"
+		}
+		item := map[string]any{
+			"type": "function_call", "id": b.itemID, "call_id": b.callID,
+			"name": b.name, "arguments": arguments, "status": "completed",
+		}
+		st.completedOutput = append(st.completedOutput, item)
 		st.emitEvent("response.function_call_arguments.done", map[string]any{
-			"item_id": b.itemID, "output_index": b.toolIdx,
+			"item_id": b.itemID, "output_index": b.outputIndex, "arguments": arguments,
 		})
 		st.emitEvent("response.output_item.done", map[string]any{
 			"output_index": b.outputIndex,
-			"item": map[string]any{
-				"type": "function_call", "id": b.itemID, "status": "completed",
-			},
+			"item":         item,
 		})
 	}
 }
@@ -377,6 +399,13 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 			st.toolCount++
 			callID, _ := cb["id"].(string)
 			name, _ := cb["name"].(string)
+			b.callID = callID
+			b.name = name
+			if inp, ok := cb["input"]; ok && inp != nil {
+				if raw, err := json.Marshal(inp); err == nil {
+					b.initialArguments = string(raw)
+				}
+			}
 			st.emitEvent("response.output_item.added", map[string]any{
 				"output_index": b.outputIndex,
 				"item": map[string]any{
@@ -401,7 +430,7 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 				}
 				st.stats.TextChars += len(t)
 				st.emitEvent("response.output_text.delta", map[string]any{
-					"item_id": b.itemID, "delta": t,
+					"item_id": b.itemID, "delta": t, "logprobs": []any{},
 				})
 			}
 		case "thinking_delta":
@@ -418,10 +447,16 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 			}
 		case "input_json_delta":
 			if pj, _ := d["partial_json"].(string); pj != "" {
+				b.argDeltaSeen = true
 				st.emitEvent("response.function_call_arguments.delta", map[string]any{
-					"item_id": b.itemID, "output_index": b.toolIdx, "delta": pj,
+					"item_id": b.itemID, "output_index": b.outputIndex, "delta": pj,
 				})
 			}
+		case "signature_delta":
+			// Anthropic thinking/redacted_thinking 的 signature_delta：仅计数，
+			// 不对下游产生任何事件（Responses 无对应概念；下游 strict 反序列化
+			// 会拒绝未知增量字段）。
+			st.signatureDeltas++
 		}
 	case "content_block_stop":
 		idx := numberToInt(evt["index"])

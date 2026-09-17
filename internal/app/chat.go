@@ -31,6 +31,9 @@ func buildOpenAIResponse(anthropicMsg map[string]any, contentBlocks []map[string
 		role = "assistant"
 	}
 	finishReason, _ := anthropicMsg["stop_reason"].(string)
+	// Anthropic 的 refusal：stop_reason 原样保留 "refusal"，并（对齐 sub2api）
+	// 把文本放进 message.refusal、content 置空。
+	isRefusal := finishReason == "refusal"
 	finishReason = normalizeFinishReason(finishReason)
 
 	var textBuilder strings.Builder
@@ -88,7 +91,12 @@ func buildOpenAIResponse(anthropicMsg map[string]any, contentBlocks []map[string
 
 	// Determine content: if only text blocks, use a string for compatibility.
 	textStr := textBuilder.String()
-	if !hasNonText {
+	if isRefusal {
+		// refusal 优先：文本进 message.refusal，content 置空（对齐 sub2api）。
+		// Chat->Chat 转换里 content 若为 parts 数组则保留现状，仅标注语义。
+		msg["content"] = nil
+		msg["refusal"] = textStr
+	} else if !hasNonText {
 		msg["content"] = textStr
 	} else {
 		if textStr != "" {
@@ -286,10 +294,35 @@ func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
 	}
 }
 
+// clientStreamUsageWanted 解析客户端原始请求体中的
+// stream_options.include_usage（顶层或 extra_body 扩展域），决定网关是否把
+// 上游 include_usage=true 产出的 usage chunk 透传给客户端。
+func clientStreamUsageWanted(body []byte) bool {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil {
+		return false
+	}
+	if so, ok := raw["stream_options"].(map[string]any); ok {
+		if v, ok := so["include_usage"].(bool); ok && v {
+			return true
+		}
+	}
+	if eb, ok := raw["extra_body"].(map[string]any); ok {
+		if so, ok := eb["stream_options"].(map[string]any); ok {
+			if v, ok := so["include_usage"].(bool); ok && v {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // convertStreamChunkWithUsage 转换流式 chunk，并在同一次解析中顺带返回 usage。
 // 注意：流循环（chat.go 的 stream 处理）仍会为流统计单独解析一次 chunk；
 // 这里的 "顺带提取" 只是免去了 usage 的第三次解析。
-func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[string]any) {
+// clientWantsUsage=false 时丢弃只含 usage 且 choices 为空的 chunk：那是网
+// 关为流统计向上游强制 include_usage=true 产出的，客户端未请求就不该收到。
+func convertStreamChunkWithUsage(line string, keepReasoning, clientWantsUsage bool) (string, map[string]any) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
 		return line, nil
@@ -312,7 +345,10 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 	choices, ok := raw["choices"].([]any)
 	if !ok || len(choices) == 0 {
 		// Chat Completions deliberately uses an empty choices array for the
-		// terminal usage chunk. It is part of the client-visible stream.
+		// terminal usage chunk. 客户端未请求 include_usage 时抑制它。
+		if usage != nil && !clientWantsUsage {
+			return "", usage
+		}
 		if id, ok := raw["id"].(string); ok && id != "" {
 			raw["id"] = normalizeChatResponseID(id)
 		}
@@ -448,6 +484,12 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	req.Messages = fixToolCallGaps(req.Messages)
 	keepReasoning := wantsReasoning(&req)
 	req.Messages = ensureReasoningContent(req.Messages, keepReasoning)
+	// 客户端 stream_options.include_usage 意图：OpenAIRequest 不持有该字
+	// 段，从原始 body 读 "stream_options":{"include_usage":bool} 或扩展域
+	// "extra_body"."stream_options".include_usage。向上游始终强制
+	// include_usage=true（下方），但向下游客户端只在它曾显式请求时才回
+	// usage chunk。
+	clientWantsUsage := clientStreamUsageWanted(body)
 	if req.Stream {
 		if req.ExtraBody == nil {
 			req.ExtraBody = map[string]any{}
@@ -507,32 +549,40 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		reader := bufio.NewReader(upResp)
 		stats := &logging.StreamStats{Start: time.Now()}
 		doneSeen := false
+		// sendDone 幂等补发 [DONE]：正常路径上游会自带；上游提前断流（EOF
+		// 而未发 DONE）时由这里兜底，保证客户端总能收到终止标记。
+		sendDone := func() {
+			if doneSeen {
+				return
+			}
+			doneSeen = true
+			stats.DoneSeen = true
+			w.Write([]byte("data: [DONE]\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				if err == io.EOF {
+					sendDone()
 					break
 				}
 				logging.FromContext(r.Context()).Error("stream read error", "error", err)
 				// 发送错误事件通知客户端
 				w.Write([]byte("data: {\"error\":\"stream read error\"}\n\n"))
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
+				sendDone()
 				stats.Log(r.Context(), "chat")
 				return
 			}
 			if doneSeen {
+				// [DONE] 已发（上游自带或兜底），后续仅腾空缓冲区。
 				continue
 			}
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "data: [DONE]" {
-				doneSeen = true
-				stats.DoneSeen = true
-				w.Write([]byte("data: [DONE]\n\n"))
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
+				sendDone()
 				continue
 			}
 
@@ -553,7 +603,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			out, usage := convertStreamChunkWithUsage(line, keepReasoning)
+			out, usage := convertStreamChunkWithUsage(line, keepReasoning, clientWantsUsage)
 			if out == "" {
 				// 空choices chunk，但可能有 usage
 				if usage != nil {
@@ -889,6 +939,12 @@ func fixToolCallGaps(messages []Message) []Message {
 	return fixed
 }
 
+// ensureReasoningContent 在 thinking 开启时为 reasoning_content==nil 的
+// assistant 消息补空串槽位。它不覆盖已有值：WeChat/DeepSeek 兼容要求带
+// tool_calls 的 assistant 消息携带产生它的推理（claudeToOpenAIMessages 只在
+// 该情况下写入 reasoning_content），空串槽位只补到没有推理文本的普通
+// assistant 轮，序列化后被 convertStreamChunkWithUsage/cleanNulls 的空串清
+// 理兜住，因此不与收窄后的写入语义冲突。
 func ensureReasoningContent(messages []Message, thinking bool) []Message {
 	if !thinking {
 		return messages
@@ -1023,14 +1079,41 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 		converted["temperature"] = *req.Temperature
 	}
 	if req.MaxTokens != nil {
-		v := *req.MaxTokens
-		if cap := config.MaxTokensCapFor(req.Model); cap > 0 && v > cap {
-			v = cap
-		}
-		converted["max_tokens"] = v
+		// clampMaxTokens 复用 anthropic_protocol.go 的 [128, cap] 收敛；
+		// chat 入站的 max_tokens 是客户端可选字段，下限收敛无害。
+		converted["max_tokens"] = clampMaxTokens(*req.MaxTokens, config.MaxTokensCapFor(req.Model))
+	}
+	if req.MaxCompletionTokens != nil {
+		converted["max_completion_tokens"] = clampMaxTokens(*req.MaxCompletionTokens, config.MaxTokensCapFor(req.Model))
 	}
 	if req.TopP != nil {
 		converted["top_p"] = *req.TopP
+	}
+	// stop/penalties/logit_bias/n：domain/types.go 已由 Worker C 加字段，
+	// 显式透传（ExtraBody 合并只补缺，不会覆盖）。
+	if req.Stop != nil {
+		converted["stop"] = req.Stop
+	}
+	if req.FrequencyPenalty != nil {
+		converted["frequency_penalty"] = *req.FrequencyPenalty
+	}
+	if req.PresencePenalty != nil {
+		converted["presence_penalty"] = *req.PresencePenalty
+	}
+	if req.LogitBias != nil {
+		converted["logit_bias"] = req.LogitBias
+	}
+	if req.N != nil {
+		converted["n"] = *req.N
+	}
+	if req.User != "" {
+		converted["user"] = req.User
+	}
+	if req.ResponseFormat != nil {
+		converted["response_format"] = req.ResponseFormat
+	}
+	if req.Seed != nil {
+		converted["seed"] = *req.Seed
 	}
 	if len(req.Tools) > 0 {
 		converted["tools"] = req.Tools

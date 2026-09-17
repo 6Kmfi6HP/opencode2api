@@ -813,10 +813,12 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 	var lastUsage map[string]any
 	var lastResponse map[string]any
 	// sawData：是否转发过至少一条 data 行；doneSeen：上游是否已发送
-	// `data: [DONE]` 哨兵；writeFailed：客户端已断开，无需再补写。
+	// `data: [DONE]` 哨兵；writeFailed：客户端已断开，无需再补写；
+	// terminalSeen：是否已见 response.completed/failed/incomplete。
 	sawData := false
 	doneSeen := false
 	writeFailed := false
+	terminalSeen := false
 
 	argStates := map[int]*argsNormState{}
 	argItemToOutput := map[string]int{}
@@ -832,6 +834,21 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 					outLine = normalized
 				}
 			}
+			trimmed := bytes.TrimSpace(outLine)
+			isDoneSentinel := bytes.Equal(trimmed, []byte("data: [DONE]")) || bytes.Equal(trimmed, []byte("[DONE]"))
+			// 吞掉中段的裸 [DONE]：上游若在 response.completed/failed/incomplete
+			// 之前误发 [DONE]，按「以 completed 判定结束」的 Rust SDK 仍在等，但不
+			// 发事件会让它读到流中断 = 失败。这里吞掉该哨兵，EOF 兜底再补正确
+			// 终结（response.incomplete + [DONE]）。
+			if isDoneSentinel && !terminalSeen {
+				if err != nil {
+					break
+				}
+				continue
+			}
+			if isDoneSentinel {
+				doneSeen = true
+			}
 			if _, werr := w.Write(outLine); werr != nil {
 				writeFailed = true
 				break
@@ -840,10 +857,6 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 			// 被及时推送，避免 io.Copy 式 32KB 缓冲卡死打字机效果。
 			if flusher != nil {
 				flusher.Flush()
-			}
-			trimmed := bytes.TrimSpace(outLine)
-			if bytes.Equal(trimmed, []byte("data: [DONE]")) || bytes.Equal(trimmed, []byte("[DONE]")) {
-				doneSeen = true
 			}
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				sawData = true
@@ -854,6 +867,9 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 				}
 				if response != nil {
 					lastResponse = response
+					if s, _ := response["status"].(string); s == "completed" || s == "failed" || s == "incomplete" {
+						terminalSeen = true
+					}
 				}
 			}
 		}
@@ -874,13 +890,29 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 		}
 	}
 
-	// 部分上游（如 muse-spark 系，见 responses.go 对 muse-spark 的容错注释）
-	// 在原生 responses 流结束时只发事件不发 `data: [DONE]` 哨兵，期望该哨兵
-	// 的客户端会报 "SSE stream ended without [DONE]"。在干净 EOF、已转发过
-	// 事件且上游未发送哨兵时补发一行：以 response.completed 判定结束的客户端
-	// 不会读到这行，以 [DONE] 为终止标志的客户端借此正常退出读循环。
-	// 客户端断开或零事件空流不补发（空流补发会掩盖上游异常）。
+	// EOF 兜底：若整个流一次终结事件都没出现（response.completed/failed/
+	// incomplete),且上游也未发 [DONE],补一条 response.incomplete 保证
+	// 客户端正常结束——既不发 completed 假信号，也补上等 [DONE] 的客户端所盼。
 	if !writeFailed && sawData && !doneSeen {
+		if !terminalSeen {
+			incomplete := map[string]any{
+				"type": "response.incomplete",
+				"response": map[string]any{
+					"object":             "response",
+					"status":             "incomplete",
+					"incomplete_details": map[string]any{"reason": "max_output_tokens"},
+					"output":             []any{},
+				},
+			}
+			if lastResponse != nil {
+				if id, _ := lastResponse["id"].(string); id != "" {
+					incomplete["response"].(map[string]any)["id"] = id
+				}
+			}
+			if b, err := json.Marshal(incomplete); err == nil {
+				_, _ = w.Write([]byte("event: response.incomplete\ndata: " + string(b) + "\n\n"))
+			}
+		}
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 		if flusher != nil {
 			flusher.Flush()

@@ -32,14 +32,72 @@ import (
 //   - top_k / cache_control / signature / context_management 等无对应物，
 //     直接丢弃并记入 request_plan 日志，不报错。
 
+// isAnthropicBillingHeader 报告 Claude Code 注入的计费头块（对齐 sub2api
+// isAnthropicBillingHeaderText）：该块只对 Anthropic 计费链路有意义，转发到
+// OpenAI Responses 上游只会浪费上下文，system/instructions 组装时滤掉。
+func isAnthropicBillingHeader(text string) bool {
+	return strings.HasPrefix(text, "x-anthropic-billing-header: ")
+}
+
+// extractClaudeSystemTextFiltered 与 extractClaudeSystemText 相同，但滤掉
+// Claude Code 注入的 x-anthropic-billing-header 文本块。本转换保持
+// system->instructions 的现状（不像 sub2api 那样转 developer item）。
+func extractClaudeSystemTextFiltered(system any) string {
+	if system == nil {
+		return ""
+	}
+	switch v := system.(type) {
+	case string:
+		if isAnthropicBillingHeader(v) {
+			return ""
+		}
+		return v
+	case []any:
+		var parts []string
+		for _, item := range v {
+			if block, ok := item.(map[string]any); ok {
+				if block["type"] == "text" {
+					if text, ok := block["text"].(string); ok && text != "" && !isAnthropicBillingHeader(text) {
+						parts = append(parts, text)
+					}
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+}
+
 // claudeMessagesToResponsesInput 把 Claude messages + system 转为
 // Responses 的 instructions + input 数组。永不返回错误。
 func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, []any) {
 	var instructionParts []string
-	if sysText := extractClaudeSystemText(system); sysText != "" {
+	if sysText := extractClaudeSystemTextFiltered(system); sysText != "" {
 		instructionParts = append(instructionParts, sysText)
 	}
 	input := []any{} // 非 nil 空数组，避免上游对 null 的严格校验
+
+	// tool_result 中的 image/document 提取为独立的 user message item（紧跟在
+	// function_call_output 之后），而不是把 "[image attached]" 字符串塞进
+	// output：sub2api 选独立 user message 而非 output parts 数组，理由是
+	// function_call_output.output 只接字符串或 input parts 数组，codex 早期
+	// 版本对 parts output 场景支持少。这里沿用同一取舍。
+	var pendingToolImages []any
+	emitToolImages := func() {
+		if len(pendingToolImages) == 0 {
+			return
+		}
+		parts := make([]any, 0, len(pendingToolImages))
+		parts = append(parts, pendingToolImages...)
+		input = append(input, map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": parts,
+		})
+		pendingToolImages = nil
+	}
 
 	flushText := func(role string, parts []any) {
 		if len(parts) == 0 {
@@ -53,9 +111,10 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 	}
 
 	for _, msg := range msgs {
-		// system role 消息并入 instructions，不产生 input item。
+		// system role 消息并入 instructions（滤掉 Claude Code 注入的
+		// x-anthropic-billing-header 块），不产生 input item。
 		if msg.Role == "system" {
-			if text := extractClaudeContentText(msg.Content); text != "" {
+			if text := extractClaudeContentText(msg.Content); text != "" && !isAnthropicBillingHeader(text) {
 				instructionParts = append(instructionParts, text)
 			}
 			continue
@@ -71,6 +130,7 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 
 		switch content := msg.Content.(type) {
 		case string:
+			emitToolImages()
 			if content == "" {
 				continue
 			}
@@ -149,6 +209,7 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 					continue
 				case "tool_use":
 					flushPending()
+					emitToolImages()
 					id, _ := block["id"].(string)
 					name, _ := block["name"].(string)
 					if name == "" {
@@ -178,14 +239,17 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 					flushPending()
 					toolUseID, _ := block["tool_use_id"].(string)
 					text := claudeToolResultToText(block)
+					if text == "" {
+						// 空 output 一律写 "(empty)"（对齐 sub2api
+						// convertToolResultOutput）：上游对空串 output 有
+						// 严格校验时不再 400，且模型能看到工具确实无输出。
+						text = "(empty)"
+					}
 					if isErr, _ := block["is_error"].(bool); isErr {
 						text = applyErrorPrefix(text)
 					}
 					if toolUseID == "" {
 						// 缺 ID 无法配对，降级为普通 user 文本，保留上下文。
-						if text == "" {
-							continue
-						}
 						input = append(input, map[string]any{
 							"type":    "message",
 							"role":    "user",
@@ -198,6 +262,14 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 						"call_id": toolUseID,
 						"output":  text,
 					})
+					// tool_result 内的 image/document part 提取为独立 user
+					// message（紧跟 function_call_output 之后），而不是塞
+					// "[image attached]" 字符串。选独立 user message 而非
+					// output parts 数组的理由与 sub2api 一致：上游对
+					// function_call_output.output 的 parts 数组场景支持少。
+					for _, part := range claudeToolResultMediaParts(block) {
+						pendingToolImages = append(pendingToolImages, part)
+					}
 				case "":
 					// 空 type：尝试按 role+content 兜底为文本。
 					if text := extractClaudeContentText([]any{block}); text != "" {
@@ -224,8 +296,10 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 				}
 			}
 			flushPending()
+			emitToolImages()
 		default:
 			// 非常规 content 形状：序列化为文本，不报错。
+			emitToolImages()
 			if content == nil {
 				continue
 			}
@@ -237,10 +311,55 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 				})
 			}
 		}
+		emitToolImages()
 	}
 
 	instructions := strings.Join(instructionParts, "\n\n")
 	return instructions, input
+}
+
+// claudeToolResultMediaParts 提取 tool_result content 数组里的
+// image/document part，转为 Responses input_image/input_file part（非法或
+// 无 source 的降级跳过——文本侧已有 "[image attached]" 标注兜底）。这些 part
+// 由调用方组装成独立的 user message item 跟在 function_call_output 之后。
+func claudeToolResultMediaParts(block map[string]any) []any {
+	c, ok := block["content"].([]any)
+	if !ok {
+		return nil
+	}
+	var parts []any
+	for _, p := range c {
+		pb, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch pb["type"] {
+		case "image":
+			// {type:image_url, image_url:{url}} -> Responses input_image
+			if part, ok := claudeImageBlockToOpenAI(pb); ok {
+				url := ""
+				if m, ok := part["image_url"].(map[string]string); ok {
+					url = m["url"]
+				} else if m, ok := part["image_url"].(map[string]any); ok {
+					url, _ = m["url"].(string)
+				}
+				if url != "" {
+					parts = append(parts, map[string]any{"type": "input_image", "image_url": url})
+				}
+			}
+		case "document":
+			if part, ok := claudeDocumentBlockToOpenAI(pb); ok {
+				if fm, ok := part["file"].(map[string]any); ok {
+					item := map[string]any{"type": "input_file"}
+					for k, v := range fm {
+						item[k] = v
+					}
+					parts = append(parts, item)
+				}
+			}
+		}
+	}
+	return parts
 }
 
 // claudeToolResultToText 提取 tool_result 的文本，图片/文档附件转为标注。
@@ -436,6 +555,13 @@ func claudeToResponsesBody(claudeReq ClaudeRequest, modelID string) []byte {
 		"model":  modelID,
 		"input":  input,
 		"stream": claudeReq.Stream,
+		// store:false 与 sub2api 一致：网关不依赖服务端会话存储，避免上游
+		// 为匿名会话堆积状态（Worker A 的 chatToResponsesBody 同样显式 false）。
+		"store": false,
+		// 索取 reasoning.encrypted_content（对齐 Worker A 的 G3 与 sub2api），
+		// 响应侧把 encrypted_content 落到 thinking block 的 signature 槽位，
+		// 供 Claude Code 下一轮原样带回。
+		"include": []string{"reasoning.encrypted_content"},
 	}
 	if instructions != "" {
 		body["instructions"] = instructions
@@ -443,17 +569,19 @@ func claudeToResponsesBody(claudeReq ClaudeRequest, modelID string) []byte {
 	if claudeReq.Stream {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
-	if claudeReq.Temperature != nil {
+	// reasoning effort 先于采样参数求值：thinking 与 temperature/top_p 互斥。
+	effort := claudeThinkingToResponsesEffort(claudeReq, modelID)
+	reasoningOn := effort != "" && effort != "none"
+	if claudeReq.Temperature != nil && !reasoningOn {
 		body["temperature"] = *claudeReq.Temperature
 	}
 	if claudeReq.MaxTokens != nil {
-		v := *claudeReq.MaxTokens
-		if cap := config.MaxTokensCapFor(modelID); cap > 0 && v > cap {
-			v = cap
-		}
+		// max_tokens -> max_output_tokens，clamp 到 [128, cap]（cap 见
+		// config.MaxTokensCapFor；min 128 由 clampClaudeMaxTokens 统一保证）。
+		v := clampClaudeMaxTokens(*claudeReq.MaxTokens, config.MaxTokensCapFor(modelID))
 		body["max_output_tokens"] = v
 	}
-	if claudeReq.TopP != nil {
+	if claudeReq.TopP != nil && !reasoningOn {
 		body["top_p"] = *claudeReq.TopP
 	}
 	if tools := claudeToResponsesTools(claudeReq.Tools, modelID); len(tools) > 0 {
@@ -462,7 +590,12 @@ func claudeToResponsesBody(claudeReq ClaudeRequest, modelID string) []byte {
 	if claudeReq.ToolChoice != nil {
 		body["tool_choice"] = claudeToolChoiceToResponses(claudeReq.ToolChoice)
 	}
-	if effort := claudeThinkingToResponsesEffort(claudeReq, modelID); effort != "" && effort != "none" {
+	// disable_parallel_tool_use 反向映射：Anthropic 的 disable 为 true 时
+	// Responses 侧写 parallel_tool_calls=false。
+	if claudeToolChoiceDisablesParallel(claudeReq.ToolChoice) {
+		body["parallel_tool_calls"] = false
+	}
+	if reasoningOn {
 		body["reasoning"] = map[string]any{"effort": effort}
 	}
 	if user := narrowClaudeMetadataUser(claudeReq.Metadata); user != "" {
@@ -477,6 +610,9 @@ func claudeToResponsesBody(claudeReq ClaudeRequest, modelID string) []byte {
 	if len(claudeReq.StopSequences) > 0 {
 		body["stop"] = append([]string(nil), claudeReq.StopSequences...)
 	}
+	// 互斥说明：Anthropic thinking 模式与 OpenAI Responses 的 gpt-5 族都
+	// 不接受 temperature/top_p 采样参数（"Unsupported parameter" 400），
+	// 因此 reasoningOn 时上面已跳过二者（对齐 sub2api AnthropicToResponses）。
 	// top_k / cache_control / signature / context_management / betas 无对应物，丢弃。
 	b, err := json.Marshal(body)
 	if err != nil {
@@ -494,7 +630,14 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 	content := []ClaudeContent{}
 	stopReason := "end_turn"
 	hasToolUse := false
-	var reasoningTexts []string
+	// reasoningTexts 由 reasoning item 的 summary 文本组成，每段带上该
+	// item 的 encrypted_content 作为 signature（仅首段）。
+	type reasoningPart struct {
+		text      string
+		signature string
+	}
+	var reasoningTexts []reasoningPart
+	var reasoningEncryptedOnly []string
 	var textParts []string
 	var refusalText string
 
@@ -515,6 +658,9 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 		typ, _ := item["type"].(string)
 		switch typ {
 		case "reasoning":
+			// encrypted_content 落到 thinking block 的 signature 槽位，供
+			// Claude Code roundtrip（对齐 sub2api 的 reasoning item 方向）。
+			sig, _ := item["encrypted_content"].(string)
 			var texts []string
 			if summary, ok := item["summary"].([]any); ok {
 				for _, s := range summary {
@@ -531,8 +677,14 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 					texts = append(texts, s)
 				}
 			}
-			if len(texts) > 0 {
-				reasoningTexts = append(reasoningTexts, texts...)
+			if len(texts) == 0 && sig != "" && wantReasoning {
+				// 无 summary 的 encrypted-only reasoning：发出带 signature
+				// 的空 thinking 槽位，保住 roundtrip（无文本可显示）。
+				reasoningEncryptedOnly = append(reasoningEncryptedOnly, sig)
+			}
+			for _, t := range texts {
+				reasoningTexts = append(reasoningTexts, reasoningPart{text: t, signature: sig})
+				sig = "" // signature 只归属第一个 thinking block
 			}
 		case "message":
 			c, _ := item["content"].([]any)
@@ -639,17 +791,28 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 
 	if wantReasoning {
 		for _, t := range reasoningTexts {
-			content = append(content, ClaudeContent{Type: "thinking", Thinking: t})
+			cc := ClaudeContent{Type: "thinking", Thinking: t.text}
+			if t.signature != "" {
+				cc.Signature = t.signature
+			}
+			content = append(content, cc)
+		}
+		for _, sig := range reasoningEncryptedOnly {
+			content = append(content, ClaudeContent{Type: "thinking", Thinking: "", Signature: sig})
 		}
 	}
 	// wantReasoning==false 时 reasoning 直接丢弃（由调用方在空回复时 promote，
 	// 与 openAIToClaudeResponse 的 keep 语义一致）；这里不提前 promote，
 	// 统一在下方空回复保护中处理。
 
+	var plainReasoning []string
+	for _, t := range reasoningTexts {
+		plainReasoning = append(plainReasoning, t.text)
+	}
 	joinedText := strings.Join(textParts, "\n")
-	if joinedText == "" && len(reasoningTexts) > 0 && len(tools) == 0 {
+	if joinedText == "" && len(plainReasoning) > 0 && len(tools) == 0 {
 		// 空回复保护：Go 网关常把正文放在 reasoning 里（#37635），提升为文本。
-		joinedText = strings.Join(reasoningTexts, "\n")
+		joinedText = strings.Join(plainReasoning, "\n")
 	}
 	if joinedText != "" {
 		content = append(content, ClaudeContent{Type: "text", Text: joinedText})
@@ -882,6 +1045,9 @@ type claudeResponsesBlock struct {
 	open        bool
 	toolID      string
 	toolName    string
+	// signature 是 reasoning item 的 encrypted_content，关 thinking block
+	// 前以 signature_delta 发出（对齐 sub2api），供 Claude Code roundtrip。
+	signature string
 }
 
 func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, wantReasoning bool) {
@@ -919,6 +1085,19 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 
 	emitEvent := func(event string, data any) {
 		writeSSEEvent(w, flusher, event, data)
+	}
+	// adoptResponseID: response.created/in_progress 的 response.id 非空时，
+	// 用 normalizeClaudeMessageID 作 message id（不再恒 msg_+random24），
+	// 与 convertResponsesToClaude 的非流式行为对齐。
+	adoptResponseID := func(evt map[string]any) {
+		if messageStartSent {
+			return
+		}
+		if resp, ok := evt["response"].(map[string]any); ok {
+			if id, _ := resp["id"].(string); id != "" {
+				msgID = normalizeClaudeMessageID(id)
+			}
+		}
 	}
 	emitError := func(msg string) {
 		emitEvent("error", map[string]any{
@@ -1043,19 +1222,20 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 	}
 
 	emitter := &claudeResponsesEmitter{
-		finished:     &finished,
-		stopReason:   &stopReason,
-		fullUsage:    fullUsage,
-		itemToOutput: itemToOutput,
-		blocks:       blocks,
-		producedText: &producedText,
-		stats:        stats,
-		getOrCreate:  getOrCreateBlock,
-		ensureStart:  ensureStart,
-		emitText:     emitTextDelta,
-		emitThinking: emitThinkingDelta,
-		emitTool:     emitToolDelta,
-		emitError:    emitError,
+		finished:        &finished,
+		stopReason:      &stopReason,
+		fullUsage:       fullUsage,
+		itemToOutput:    itemToOutput,
+		blocks:          blocks,
+		producedText:    &producedText,
+		stats:           stats,
+		getOrCreate:     getOrCreateBlock,
+		ensureStart:     ensureStart,
+		adoptResponseID: adoptResponseID,
+		emitText:        emitTextDelta,
+		emitThinking:    emitThinkingDelta,
+		emitTool:        emitToolDelta,
+		emitError:       emitError,
 	}
 
 	defer func() {
@@ -1212,12 +1392,13 @@ type claudeResponsesEmitter struct {
 	producedText *bool
 	stats        *logging.StreamStats
 
-	getOrCreate  func(int, string) *claudeResponsesBlock
-	ensureStart  func()
-	emitText     func(*claudeResponsesBlock, string)
-	emitThinking func(*claudeResponsesBlock, string)
-	emitTool     func(*claudeResponsesBlock, string)
-	emitError    func(string)
+	getOrCreate     func(int, string) *claudeResponsesBlock
+	ensureStart     func()
+	adoptResponseID func(map[string]any)
+	emitText        func(*claudeResponsesBlock, string)
+	emitThinking    func(*claudeResponsesBlock, string)
+	emitTool        func(*claudeResponsesBlock, string)
+	emitError       func(string)
 }
 
 // handleEvent translates a single Responses SSE event into Claude events.
@@ -1245,6 +1426,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 
 	switch typ {
 	case "response.created", "response.in_progress", "response.queued":
+		e.adoptResponseID(evt)
 		if resp, ok := evt["response"].(map[string]any); ok {
 			if u, ok := resp["usage"].(map[string]any); ok {
 				for k, v := range u {
@@ -1438,14 +1620,37 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 			if status, ok := resp["status"].(string); ok && status == "incomplete" {
 				*e.stopReason = "max_tokens"
 			}
-			// 从完整 output 推导 tool_use 终止（流式 delta 可能漏 name）。
+			// 从完整 output 推导 tool_use 终止（流式 delta 可能漏 name）；同时
+			// 把 reasoning item 的 encrypted_content 落到对应 thinking block 的
+			// signature（请求侧 include 了 reasoning.encrypted_content）。
 			if out, ok := resp["output"].([]any); ok {
-				for _, raw := range out {
-					if im, ok := raw.(map[string]any); ok {
-						if t, _ := im["type"].(string); t == "function_call" || t == "apply_patch_call" || t == "shell_call" || t == "tool_call" {
-							*e.stopReason = "tool_use"
-							break
+				for oi, raw := range out {
+					im, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					t, _ := im["type"].(string)
+					switch t {
+					case "function_call", "apply_patch_call", "shell_call", "tool_call":
+						*e.stopReason = "tool_use"
+					case "reasoning":
+						sig, _ := im["encrypted_content"].(string)
+						if sig == "" {
+							continue
 						}
+						if b, ok2 := e.blocks[oi]; ok2 && b.kind == "thinking" {
+							b.signature = sig
+						}
+						if id, _ := im["id"].(string); id != "" {
+							if oi2, ok2 := e.itemToOutput[id]; ok2 {
+								if b, ok3 := e.blocks[oi2]; ok3 && b.kind == "thinking" {
+									b.signature = sig
+								}
+							}
+						}
+					}
+					if *e.stopReason == "tool_use" && t != "reasoning" {
+						break
 					}
 				}
 			}
@@ -1510,9 +1715,17 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 
 }
 func finalizeClaudeResponsesStream(emit func(string, any), blocks map[int]*claudeResponsesBlock, toolOrder []int, msgID, model string, fullUsage map[string]any, stopReason, reasoningFallback string, producedText bool) {
+	// 下一个可用 claude 序号：不再用固定 9999 兜底（同流多段/大序号时可能
+	// 与既有块冲突），取当前最大序号 +1。
+	nextIndex := 0
+	for _, b := range blocks {
+		if b.claudeIndex >= nextIndex {
+			nextIndex = b.claudeIndex + 1
+		}
+	}
 	// 空回复保护：有 reasoning 但无文本/tool 时提升为文本。
 	if !producedText && len(toolOrder) == 0 && reasoningFallback != "" {
-		b := &claudeResponsesBlock{claudeIndex: 9999, kind: "text", open: false}
+		b := &claudeResponsesBlock{claudeIndex: nextIndex, kind: "text", open: false}
 		// 复用 emit 路径：直接发送一个文本块。
 		emit("content_block_start", map[string]any{
 			"type": "content_block_start", "index": b.claudeIndex,
@@ -1544,6 +1757,14 @@ func finalizeClaudeResponsesStream(emit func(string, any), blocks map[int]*claud
 		}
 	}
 	for _, e := range ordered {
+		// thinking block 带 encrypted_content 时先补 signature_delta 再关
+		// 块（对齐 sub2api）：Claude Code 下一轮可把 signature 原样带回。
+		if e.b.kind == "thinking" && e.b.signature != "" {
+			emit("content_block_delta", map[string]any{
+				"type": "content_block_delta", "index": e.b.claudeIndex,
+				"delta": map[string]any{"type": "signature_delta", "signature": e.b.signature},
+			})
+		}
 		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": e.b.claudeIndex})
 	}
 	// 占位块（claudeIndex==-1，从未真正开块）无需关闭。

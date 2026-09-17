@@ -38,7 +38,9 @@ func TestAnthropicRequestConversionPreservesProtocolSemantics(t *testing.T) {
 				t.Fatalf("tool choice = %#v, want %#v", got.ToolChoice, tt.want)
 			}
 			body := convertRequest(&got)
-			for key, want := range map[string]any{"max_tokens": 0, "temperature": 0.0, "top_p": 0.0, "top_k": 0, "stop": []string{"END"}, "user": "u-1"} {
+			// H2：max_tokens 必填，0/nil 都由 convertClaudeRequest 收敛到
+			// [128, cap]；temperature/top_p/top_k 为 0 仍透传。
+			for key, want := range map[string]any{"max_tokens": 128, "temperature": 0.0, "top_p": 0.0, "top_k": 0, "stop": []string{"END"}, "user": "u-1"} {
 				if !reflect.DeepEqual(body[key], want) {
 					t.Errorf("%s = %#v, want %#v", key, body[key], want)
 				}
@@ -201,7 +203,7 @@ func TestJSONSchemaCleaningReturnsCopyAndPreservesConstraints(t *testing.T) {
 
 func TestChatUsageOnlyChunkIsForwardedWithFullUsage(t *testing.T) {
 	line := `data: {"id":"x","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5,"completion_tokens_details":{"reasoning_tokens":2}}}`
-	got, usage := convertStreamChunkWithUsage(line, true)
+	got, usage := convertStreamChunkWithUsage(line, true, true)
 	if got == "" {
 		t.Fatal("usage-only chunk was dropped")
 	}
@@ -252,7 +254,7 @@ func TestPromoteMisplacedReasoningKeepsCoTWhenThinkingEnabled(t *testing.T) {
 
 func TestChatStreamPromotesReasoningToContentWhenThinkingDisabled(t *testing.T) {
 	line := `data: {"choices":[{"delta":{"reasoning_content":"2"},"finish_reason":null}]}`
-	got, _ := convertStreamChunkWithUsage(line, false)
+	got, _ := convertStreamChunkWithUsage(line, false, true)
 	if !strings.Contains(got, `"content":"2"`) {
 		t.Fatalf("expected promoted content:\n%s", got)
 	}

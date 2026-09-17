@@ -8,17 +8,26 @@ import (
 
 // OpenAIRequest is the canonical Chat Completions request used by the proxy.
 type OpenAIRequest struct {
-	Model           string         `json:"model"`
-	Messages        []Message      `json:"messages"`
-	Stream          bool           `json:"stream"`
-	Temperature     *float64       `json:"temperature,omitempty"`
-	MaxTokens       *int           `json:"max_tokens,omitempty"`
-	TopP            *float64       `json:"top_p,omitempty"`
-	Thinking        any            `json:"thinking,omitempty"`
-	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
-	ExtraBody       map[string]any `json:"extra_body,omitempty"`
-	Tools           []Tool         `json:"tools,omitempty"`
-	ToolChoice      any            `json:"tool_choice,omitempty"`
+	Model               string         `json:"model"`
+	Messages            []Message      `json:"messages"`
+	Stream              bool           `json:"stream"`
+	Temperature         *float64       `json:"temperature,omitempty"`
+	MaxTokens           *int           `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int           `json:"max_completion_tokens,omitempty"`
+	TopP                *float64       `json:"top_p,omitempty"`
+	Stop                any            `json:"stop,omitempty"`
+	FrequencyPenalty    *float64       `json:"frequency_penalty,omitempty"`
+	PresencePenalty     *float64       `json:"presence_penalty,omitempty"`
+	LogitBias           map[string]int `json:"logit_bias,omitempty"`
+	N                   *int           `json:"n,omitempty"`
+	User                string         `json:"user,omitempty"`
+	ResponseFormat      any            `json:"response_format,omitempty"`
+	Seed                *int           `json:"seed,omitempty"`
+	Thinking            any            `json:"thinking,omitempty"`
+	ReasoningEffort     string         `json:"reasoning_effort,omitempty"`
+	ExtraBody           map[string]any `json:"extra_body,omitempty"`
+	Tools               []Tool         `json:"tools,omitempty"`
+	ToolChoice          any            `json:"tool_choice,omitempty"`
 }
 
 type Message struct {
@@ -28,6 +37,7 @@ type Message struct {
 	ToolCallID       string     `json:"tool_call_id,omitempty"`
 	Name             string     `json:"name,omitempty"`
 	ReasoningContent *string    `json:"reasoning_content,omitempty"`
+	Refusal          *string    `json:"refusal,omitempty"`
 }
 
 type ToolCall struct {
@@ -50,6 +60,7 @@ type ToolFunction struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	Parameters  map[string]any `json:"parameters"`
+	Strict      *bool          `json:"strict,omitempty"`
 }
 
 type KeywordMatchType string
@@ -188,6 +199,7 @@ type ClaudeRequest struct {
 	Thinking          any             `json:"thinking,omitempty"`
 	OutputConfig      any             `json:"output_config,omitempty"`
 	ContextManagement any             `json:"context_management,omitempty"`
+	ServiceTier       any             `json:"service_tier,omitempty"`
 }
 
 type ClaudeMessage struct {

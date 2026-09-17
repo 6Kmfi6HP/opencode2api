@@ -152,6 +152,9 @@ func responsesInputToMessages(input any, instructions string) []Message {
 					}
 					continue
 				case "reasoning":
+					// 只保留 summary 文本（summary[*].text）作为 ReasoningContent；
+					// signature 与 encrypted_content 绑定发起方且非明文，不回放为
+					// 文本（摘要为空时即丢弃该条目，不注入任何原文 JSON）。
 					if text := extractTextFromContentParts(elem["summary"]); text != "" {
 						messages = append(messages, Message{Role: "assistant", Content: "", ReasoningContent: &text})
 					}
@@ -179,32 +182,13 @@ func responsesInputToMessages(input any, instructions string) []Message {
 					}
 					continue
 				default:
-					role := "user"
-					if r, ok := elem["role"].(string); ok && r != "" {
-						role = r
-					}
-					content := responsesContentToMessageContent(elem["content"])
-					emptyContent := false
-					switch v := content.(type) {
-					case nil:
-						emptyContent = true
-					case string:
-						emptyContent = v == ""
-					case []any:
-						emptyContent = len(v) == 0
-					}
-					if emptyContent {
-						b, err := json.Marshal(elem)
-						if err != nil {
-							continue
-						}
-						content = string(b)
-					}
-					messages = append(messages, Message{Role: role, Content: content})
+					// 未知 item 类型（含 item_reference、服务端专有 item 等）静默跳过：
+					// 不把原始 JSON 注入 role:user 文本污染上下文。
+					continue
 				}
 			default:
-				b, _ := json.Marshal(elem)
-				messages = append(messages, Message{Role: "user", Content: string(b)})
+				// 数组内裸非字符串原子（null/数字/布尔等）丢弃，不转成文本消息。
+				continue
 			}
 		}
 	default:
@@ -214,14 +198,230 @@ func responsesInputToMessages(input any, instructions string) []Message {
 	return messages
 }
 
+// convertResponsesTools 把 Responses tools 转 Chat Completions tools。
+// 服务端工具（web_search/file_search/computer_use/mcp/local_shell/custom 等）
+// 无对应 function 形状，由 responsesToolFunction 返回 ok=false，此处丢弃并
+// 日志计数；若 tool_choice 指向被丢弃的工具，由调用方 normalizeToolChoiceWithTools
+// 兜底为不传。
+// ======== tool_use/tool_result 配对归一化（Responses→Anthropic 组装前） ========
+
+// messageTextContent 从 Chat content（纯字符串或多模态 parts 数组）提取可见文本。
+// 非文本分片（image_url/file 等）在无文本时兜底为其 JSON 字符串，避免空内容消息。
+func messageTextContent(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var texts []string
+		for _, p := range v {
+			pm, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := pm["text"].(string); t != "" {
+				texts = append(texts, t)
+			}
+		}
+		return strings.Join(texts, "\n")
+	default:
+		if v == nil {
+			return ""
+		}
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+		return ""
+	}
+}
+
+// mergeConsecutiveSameRole 把相邻同 role 的 domain.Message 合并。tool（合并到
+// 前一条，保留 ToolCallID 供配对索引，后续已展开为 tool_result）与
+// system/developer/user/assistant（仅无 tool_calls 时按对话回合合并）分别处理。
+// Anthropic 要求 tool_use 与其 tool_result 之间无任意 user/assistant 文本，
+// 本归一化与 normalizeAnthropicToolPairing 配合恢复工具配对与回合交替。
+func mergeConsecutiveSameRole(msgs []Message) []Message {
+	out := make([]Message, 0, len(msgs))
+	sameContent := func(a, b any) bool {
+		ab, aerr := json.Marshal(a)
+		bb, berr := json.Marshal(b)
+		return aerr == nil && berr == nil && string(ab) == string(bb)
+	}
+	mergeContent := func(dst, src any) any {
+		switch d := dst.(type) {
+		case string:
+			if s, ok := src.(string); ok {
+				if d == "" {
+					return s
+				}
+				if s == "" {
+					return d
+				}
+				return d + "\n\n" + s
+			}
+		case []any:
+			if s, ok := src.([]any); ok {
+				return append(append([]any{}, d...), s...)
+			}
+		}
+		if ds := messageTextContent(dst); ds != "" {
+			if ss := messageTextContent(src); ss != "" {
+				return ds + "\n\n" + ss
+			}
+			return ds
+		}
+		return dst
+	}
+	for _, m := range msgs {
+		n := len(out)
+		if n == 0 {
+			out = append(out, m)
+			continue
+		}
+		last := &out[n-1]
+		switch {
+		case m.Role == "tool" && last.Role == "tool":
+			// 连续的 tool（尚未转换的 messages 形态罕见；normalize/pairing 已由
+			// chatMessagesToAnthropic 的 appendBlocks 处理为单 user 消息）。保留
+			// ToolCallID 列表进 content 无意义，此处不合并 tool。
+			out = append(out, m)
+		case last.Role == m.Role && len(last.ToolCalls) == 0 && len(m.ToolCalls) == 0 &&
+			m.Role != "tool":
+			if last.Refusal == nil {
+				last.Refusal = m.Refusal
+			}
+			if last.ReasoningContent == nil {
+				last.ReasoningContent = m.ReasoningContent
+			}
+			if m.Content != nil {
+				if last.Content == nil || (last.Content == "" && sameContent(last.Content, "")) {
+					last.Content = m.Content
+				} else {
+					last.Content = mergeContent(last.Content, m.Content)
+				}
+			}
+		default:
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// mergeAdjacentToolCallAssistants 把相邻的「纯 tool_call assistant」消息合并
+// 为单条，使 Responses 并行调用（多个 function_call）共享同一 assistant,
+// 对应随后的 tool 结果按 call 序紧邻排列（normalizeAnthropicToolPairing
+// 视为同一 assistant turn 的处理单元）。
+func mergeAdjacentToolCallAssistants(msgs []Message) []Message {
+	out := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		if len(out) > 0 {
+			prev := &out[len(out)-1]
+			// 仅当两条均为「工具调用载体」(无可见文本/refusal/reasoning) 时合并,
+			// 避免把真实文本回合错位拼接到一起。
+			if prev.Role == "assistant" && m.Role == "assistant" &&
+				len(prev.ToolCalls) > 0 && len(m.ToolCalls) > 0 &&
+				prev.Refusal == nil && m.Refusal == nil &&
+				prev.ReasoningContent == nil && m.ReasoningContent == nil &&
+				messageTextContent(prev.Content) == "" && messageTextContent(m.Content) == "" {
+				prev.ToolCalls = append(append([]ToolCall{}, prev.ToolCalls...), m.ToolCalls...)
+				continue
+			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// normalizeAnthropicToolPairing 把 Chat messages 归一化成满足 Anthropic
+// tool_use/tool_result 不变量的序列（详见 normalizeAnthropicToolPairing
+// 上层注释）：剔除未答复的 assistant.tool_calls（连同空 assistant 消息）、
+// 剔除孤儿 tool 消息，并把每个 tool 结果紧贴它的 assistant 消息后排序。
+//
+// 同时剔除 parseToolCallArguments 解析失败（`_raw` 兜底）的非法 arguments 调用
+// 及其 output —— 防上游 400 死循环（本归一化覆盖 Worker A chat_to_anthropic 的
+// `_raw` 兜底，以组装后的序列为准）。最后跑一次相邻同 role 合并恢复交替。
+func normalizeAnthropicToolPairing(messages []Message) []Message {
+	// 把相邻的「纯 tool_call assistant」合并为一条,使并行调用共享同一
+	// assistant,其 tool 结果按 call 序紧邻排列(对应 sub2api 的并行 call 归并)。
+	messages = mergeAdjacentToolCallAssistants(messages)
+	// 索引所有 tool 结果消息按 ToolCallID（后出现覆盖先前同 id）。
+	results := map[string]Message{}
+	for _, m := range messages {
+		if m.Role == "tool" && m.ToolCallID != "" {
+			results[m.ToolCallID] = m
+		}
+	}
+
+	droppedCalls := 0
+	droppedOrphans := 0
+	out := make([]Message, 0, len(messages))
+	for _, m := range messages {
+		switch m.Role {
+		case "assistant":
+			if len(m.ToolCalls) == 0 {
+				out = append(out, m)
+				continue
+			}
+			kept := make([]ToolCall, 0, len(m.ToolCalls))
+			for _, tc := range m.ToolCalls {
+				if _, ok := results[tc.ID]; !ok {
+					droppedCalls++ // 未答复的调用
+					continue
+				}
+				// 非法 arguments（parseToolCallArguments 兜底 _raw）连同其
+				// output 一并删除，防上游 400 死循环。
+				parsed := parseToolCallArguments(tc.Function.Arguments)
+				if _, raw := parsed["_raw"]; raw {
+					droppedCalls++
+					delete(results, tc.ID) // 已消费 → 不再作为孤儿再匹配
+					continue
+				}
+				kept = append(kept, tc)
+			}
+			text := messageTextContent(m.Content)
+			if len(kept) == 0 {
+				if text == "" && m.Refusal == nil && m.ReasoningContent == nil {
+					continue // 整条 assistant 消息无内容 → 删除
+				}
+				keptMsg := m
+				keptMsg.ToolCalls = nil
+				out = append(out, keptMsg)
+				continue
+			}
+			keptMsg := m
+			keptMsg.ToolCalls = kept
+			out = append(out, keptMsg)
+			for _, tc := range kept {
+				out = append(out, results[tc.ID])
+				delete(results, tc.ID) // 已消费 → 不再作为孤儿再出现
+			}
+		case "tool":
+			droppedOrphans++ // 原位置的 tool 消息（已规范到 call 旁边或孤儿）一律剔除
+		default:
+			out = append(out, m)
+		}
+	}
+	if droppedCalls > 0 || droppedOrphans > 0 {
+		slog.Info("normalizeAnthropicToolPairing",
+			"unanswered_or_invalid_calls_dropped", droppedCalls,
+			"standalone_tool_msgs_dropped", droppedOrphans)
+	}
+	return mergeConsecutiveSameRole(out)
+}
+
 func convertResponsesTools(tools []ResponsesTool) []Tool {
 	converted := make([]Tool, 0, len(tools))
+	dropped := 0
 	for _, tool := range tools {
 		fn, ok := responsesToolFunction(tool)
 		if !ok {
+			dropped++
 			continue
 		}
 		converted = append(converted, Tool{Type: "function", Function: fn})
+	}
+	if dropped > 0 {
+		slog.Info("responses tools dropped (server-side tool types unsupported on chat path)",
+			"dropped", dropped, "kept", len(converted))
 	}
 	return converted
 }
@@ -289,6 +489,9 @@ func responsesToolFunction(tool ResponsesTool) (ToolFunction, bool) {
 		}
 		if fn.Parameters == nil {
 			fn.Parameters = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		if fn.Strict == nil {
+			fn.Strict = new(bool) // 显式 false：部分上游缺省按 strict=true 校验
 		}
 		return fn, true
 	case "apply_patch":
@@ -388,6 +591,35 @@ func toolCallOutputType(name string, kinds map[string]string) string {
 	default:
 		return "function_call"
 	}
+}
+
+// normalizeToolChoiceWithTools 在 convertResponsesToolChoice 结果上兜底：
+// 当 tool_choice.name 指向的函数不在已保留的 Chat tools 里（例如对应的是被
+// 丢弃的服务端工具 web_search/file_search/computer_use/mcp/local_shell/custom），
+// 把 tool_choice 改为不传（返回 nil），避免上游因引用了不存在的工具而 400。
+func normalizeToolChoiceWithTools(choice any, tools []Tool) any {
+	m, ok := choice.(map[string]any)
+	if !ok {
+		return choice
+	}
+	// 两种形状：{type:"function", function:{name}}（Chat 已转换形状）与
+	// {type:"<kind>", name:"<n>"}（Responses 原始形状，含 function/服务端 kind）。
+	var name string
+	if fn, ok := m["function"].(map[string]any); ok {
+		name, _ = fn["name"].(string)
+	}
+	if name == "" {
+		name, _ = m["name"].(string)
+	}
+	if name == "" {
+		return choice // 非具名选择（auto/required/none 等），保留
+	}
+	for _, t := range tools {
+		if t.Function.Name == name {
+			return choice
+		}
+	}
+	return nil
 }
 
 func convertResponsesToolChoice(choice any) any {
@@ -1018,6 +1250,11 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		if respReq.ToolChoice == nil && previousState.ToolChoice != nil {
 			respReq.ToolChoice = previousState.ToolChoice
 		}
+		// 续链时若未带 instructions，回填上一轮的系统指令（与 Tools/ToolChoice
+		// 逻辑一致），保证跨轮系统提示不丢。
+		if respReq.Instructions == "" && previousState.Instructions != "" {
+			respReq.Instructions = previousState.Instructions
+		}
 	}
 	if respReq.Model == "" {
 		modelIDs := getModelIDs()
@@ -1082,7 +1319,9 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		chatReq.Tools = convertResponsesTools(respReq.Tools)
 	}
 	if respReq.ToolChoice != nil {
-		chatReq.ToolChoice = convertResponsesToolChoice(respReq.ToolChoice)
+		// normalizeToolChoiceWithTools 兜底：tool_choice 指向被丢弃的服务端
+		// 工具时改为不传，避免上游因引用不存在的 function 而 400。
+		chatReq.ToolChoice = normalizeToolChoiceWithTools(convertResponsesToolChoice(respReq.ToolChoice), chatReq.Tools)
 	}
 	if respReq.ParallelToolCalls != nil {
 		if chatReq.ExtraBody == nil {
@@ -1182,6 +1421,23 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if upstreamProto == upstreamProtocolAnthropic {
 		// 与下方 keepReasoning 语义一致：fixToolCallGaps/ensureReasoningContent
 		// 属于 chat 翻译路径的修补，交叉路径由 chatToAnthropicBody 自行处理。
+		// 组装前先做 tool_use/tool_result 配对归一化（见
+		// normalizeAnthropicToolPairing；发生在 chatMessagesToAnthropic 之前）。
+		chatReq.Messages = normalizeAnthropicToolPairing(chatReq.Messages)
+		// 转 Anthropic 时 service_tier 仅放行上游白名单（auto/standard_only）；
+		// 其余值（priority/flex 等 OpenAI 口径）丢弃，避免上游 400。
+		if respReq.ServiceTier != "" {
+			switch respReq.ServiceTier {
+			case "auto", "standard_only":
+				if chatReq.ExtraBody == nil {
+					chatReq.ExtraBody = map[string]any{}
+				}
+				chatReq.ExtraBody["service_tier"] = respReq.ServiceTier
+			default:
+				slog.Info("responses service_tier dropped for anthropic upstream",
+					"model", chatReq.Model, "service_tier", respReq.ServiceTier)
+			}
+		}
 		wantReasoningX := !config.ForceDisableThinking()
 		forwardResponsesViaAnthropic(w, r, auth, &chatReq, wantReasoningX)
 		return
@@ -2076,31 +2332,115 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		item["status"] = status
 		output = append(output, item)
 	}
+	// 空输出补一条空 message：Responses 客户端（Codex/官方 SDK）期望非空
+	// output；纯 reasoning（wantReasoning=false）+ 无内容的回合兜底空文本，
+	// 保持数组形状与 status。
+	if len(output) == 0 {
+		output = append(output, emptyAssistantMessageItem(outputID, status))
+	}
 	responses["output"] = output
 	if chat.Usage != nil {
-		usage := map[string]any{}
-		if v, ok := chat.Usage["prompt_tokens"]; ok {
-			usage["input_tokens"] = v
-		}
-		usage["input_tokens_details"] = responsesInputTokensDetails(chat.Usage["prompt_tokens_details"])
-		if v, ok := chat.Usage["completion_tokens"]; ok {
-			usage["output_tokens"] = v
-		}
-		if v, ok := chat.Usage["completion_tokens_details"]; ok {
-			usage["output_tokens_details"] = v
-		}
-		if v, ok := chat.Usage["total_tokens"]; ok {
-			usage["total_tokens"] = v
-		}
-		if v, ok := chat.Usage["input_tokens"]; ok && usage["input_tokens"] == nil {
-			usage["input_tokens"] = v
-		}
-		if v, ok := chat.Usage["output_tokens"]; ok && usage["output_tokens"] == nil {
-			usage["output_tokens"] = v
-		}
-		responses["usage"] = usage
+		responses["usage"] = chatUsageMapToResponses(chat.Usage)
 	}
 
 	result, _ := json.Marshal(responses)
 	return result
+}
+
+// emptyAssistantMessageItem 构造条 status 一致的空 output_text message。
+func emptyAssistantMessageItem(outputID, status string) map[string]any {
+	return map[string]any{
+		"id":     outputID,
+		"type":   "message",
+		"status": status,
+		"role":   "assistant",
+		"content": []any{map[string]any{
+			"type":        "output_text",
+			"text":        "",
+			"annotations": []any{},
+			"logprobs":    []any{},
+		}},
+	}
+}
+
+// chatUsageMapToResponses 把 Chat Completions usage（上游 zen/go 口径）转
+// Responses 口径：
+//   - input_tokens = prompt_tokens + 顶层 cache_read_input_tokens +
+//     cache_creation_input_tokens（anthropicUsageToChat 已把这两个顶层字段透传
+//     进 chat usage，而 prompt_tokens 是缓存感知的读数，按 Responses 口径加回）。
+//     无缓存字段时退化为原 prompt_tokens（保持既有行为）。
+//   - input_tokens_details.cached_tokens 优先取顶层 cache_read_input_tokens
+//     （未见时退回 prompt_tokens_details.cached_tokens，再兜底 0）。
+//   - output_tokens_details 从 completion_tokens_details 透传
+//     reasoning_tokens（thinking token）等细节。
+func chatUsageMapToResponses(u map[string]any) map[string]any {
+	usage := map[string]any{}
+	readInt := func(v any) int64 {
+		if n, ok := numberAsFloat(v); ok {
+			return int64(n)
+		}
+		return 0
+	}
+	// input：prompt 分量 + 顶层缓存字段
+	prompt, hasPrompt := u["prompt_tokens"]
+	cacheRead, hasCacheRead := u["cache_read_input_tokens"]
+	cacheCreation, hasCacheCreation := u["cache_creation_input_tokens"]
+	inputTotal := readInt(prompt)
+	if hasPrompt {
+		if hasCacheRead {
+			inputTotal += readInt(cacheRead)
+		}
+		if hasCacheCreation {
+			inputTotal += readInt(cacheCreation)
+		}
+		usage["input_tokens"] = inputTotal
+	}
+	// cached_tokens：优先顶层 cache_read_input_tokens，退回 prompt_tokens_details。
+	// 其余 prompt_tokens_details 字段（text_tokens 等）原样透传。
+	var detailsOut map[string]any
+	if d, ok := u["prompt_tokens_details"].(map[string]any); ok {
+		detailsOut = make(map[string]any, len(d)+1)
+		for k, v := range d {
+			detailsOut[k] = v
+		}
+	} else {
+		detailsOut = map[string]any{}
+	}
+	cached := int64(0)
+	if hasCacheRead {
+		cached = readInt(cacheRead)
+	} else if c, ok := detailsOut["cached_tokens"]; ok {
+		cached = readInt(c)
+	}
+	detailsOut["cached_tokens"] = cached
+	usage["input_tokens_details"] = detailsOut
+	if v, ok := u["completion_tokens"]; ok {
+		usage["output_tokens"] = v
+	}
+	if v, ok := u["completion_tokens_details"]; ok {
+		usage["output_tokens_details"] = v
+	} else if reasoningTokens := reasoningTokenEstimate(u); reasoningTokens > 0 {
+		usage["output_tokens_details"] = map[string]any{"reasoning_tokens": reasoningTokens}
+	}
+	if v, ok := u["total_tokens"]; ok {
+		usage["total_tokens"] = v
+	}
+	if v, ok := u["input_tokens"]; ok && usage["input_tokens"] == nil {
+		usage["input_tokens"] = v
+	}
+	if v, ok := u["output_tokens"]; ok && usage["output_tokens"] == nil {
+		usage["output_tokens"] = v
+	}
+	return usage
+}
+
+// reasoningTokenEstimate 从 usage 中提取 thinking/reasoning token 数量的兜底
+// 估算：缺 completion_tokens_details 时按已知顶层/通用键查找。
+func reasoningTokenEstimate(u map[string]any) int64 {
+	for _, k := range []string{"reasoning_tokens", "thinking_tokens"} {
+		if v, ok := numberAsFloat(u[k]); ok && v > 0 {
+			return int64(v)
+		}
+	}
+	return 0
 }

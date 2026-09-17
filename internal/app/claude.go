@@ -295,10 +295,15 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 				case "image":
 					if part, ok := claudeImageBlockToOpenAI(block); ok {
 						orderedContent = append(orderedContent, part)
+					} else {
+						// source 缺失/非法：降级为文本占位，不静默丢上下文。
+						orderedContent = append(orderedContent, map[string]any{"type": "text", "text": "[image attached]"})
 					}
 				case "document":
 					if part, ok := claudeDocumentBlockToOpenAI(block); ok {
 						orderedContent = append(orderedContent, part)
+					} else {
+						orderedContent = append(orderedContent, map[string]any{"type": "text", "text": "[document attached]"})
 					}
 				case "thinking":
 					if thinking, ok := block["thinking"].(string); ok && thinking != "" {
@@ -355,6 +360,14 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 								if part, ok := claudeDocumentBlockToOpenAI(pb); ok {
 									attachmentParts = append(attachmentParts, part)
 								}
+							default:
+								// 未知嵌套 block：兜底序列化 JSON 保留上下文
+								// （与顶层 unknown 分支一致），不静默丢。
+								if bt, _ := pb["type"].(string); bt != "" {
+									if b, err := json.Marshal(pb); err == nil {
+										parts = append(parts, string(b))
+									}
+								}
 							}
 						}
 						resultText = strings.Join(parts, "\n")
@@ -392,6 +405,17 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 						ToolCallID: toolUseID,
 						Content:    resultText,
 					})
+				default:
+					// 未知 block（server_tool_use / web_search_tool_result /
+					// redacted_thinking / 其它）：序列化成 JSON 文本 part 保
+					// 留上下文，不静默蒸发（对齐 claude_responses.go 的 default
+					// 分支与 sub2api）；计数仍由 scanClaudeUnsupportedBlocks 记
+					// 入 unsupported_blocks。
+					if blockType != "" {
+						if b, err := json.Marshal(block); err == nil {
+							orderedContent = append(orderedContent, map[string]any{"type": "text", "text": string(b)})
+						}
+					}
 				}
 			}
 			om := Message{Role: msg.Role}
@@ -400,7 +424,13 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 			} else if len(toolCalls) == 0 {
 				om.Content = ""
 			}
-			if len(reasoningParts) > 0 {
+			if len(reasoningParts) > 0 && len(toolCalls) > 0 {
+				// DeepSeek 兼容（对齐 sub2api anthropicThinkingToReasoningContent）：
+				// reasoning_content 只在携带 tool_calls 的 assistant 消息上回
+				// 放——DeepSeek 要求产生 tool call 的那条消息带回产生它的推理；
+				// 纯文本 assistant 轮的思考直接丢弃。注意 chat.go 的
+				// ensureReasoningContent 在 keepReasoning 时会为所有 assistant
+				// 消息补空串槽位，这里收窄写入不受影响（它只填 nil 槽位）。
 				rc := strings.Join(reasoningParts, "\n")
 				om.ReasoningContent = &rc
 			}

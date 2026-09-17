@@ -24,7 +24,7 @@
 | `/v1/chat/completions` | `POST` | OpenAI Chat Completions 兼容入口 |
 | `/v1/responses` | `POST` | OpenAI Responses 兼容入口 |
 | `/v1/messages` | `POST` | Anthropic Messages 兼容入口 |
-| `/v1/messages/count_tokens` | `POST` | Anthropic token 计数入口：本地启发式估算，不访问上游 |
+| `/v1/messages/count_tokens` | `POST` | Anthropic token 计数入口：命中 anthropic 规则时直连上游 `/zen/v1/messages/count_tokens`，否则本地启发式估算 |
 | `/health` | `GET` | 健康检查 |
 | `/api/config` | `GET`/`POST` | 管理面板配置接口 |
 | `/api/stats` | `GET`/`DELETE` | token 统计接口 |
@@ -138,15 +138,17 @@ curl http://127.0.0.1:8000/v1/responses \
 
 ### 准确支持
 
-- `system`（顶层）与消息内 `role=system` 合并为上游**唯一首条** system（`\n\n` 拼接，顶层在前）
-- `stop_sequences`、`temperature`（闭区间 `0..1`）/ `top_p` / `top_k`（包括显式零值）
+- `system`（顶层）与消息内 `role=system` 合并为上游**唯一首条** system（`\n\n` 拼接，顶层在前）；system 为 block 数组时启发式递归计入 token
+- `stop_sequences`、`temperature`（闭区间 `0..1`）/ `top_p` / `top_k`（包括显式零值）；开启 thinking 时这三个参数按上游 Anthropic 语义剥离（避免 400）
+- `max_tokens`：Chat/Responses 直通与翻译同样收敛 `[128, cap]`（cap 来自 `max_tokens_cap` / `max_tokens_cap_per_model`）；count_tokens 命中 anthropic 规则时只降不补
 - `metadata.user_id`：若为 JSON 串则只转发 `session_id`（避免 `device_id` 外泄）；否则原样转发
 - 文本、base64/URL image、`tool_use`、`tool_result`（包括 `is_error`）；合法的 tool result 在普通用户内容之前的顺序会被保留
-- `tool_result` 中的 image 转为紧随其后的 `role=user` + `image_url`，tool 文本保留字符串并标注 `[image attached]`；`tool_result` 中的 document 同样转为紧随其后的 user file part 并标注 `[document attached]`
+- `tool_result` 中的 image 转为紧随其后的 `role=user` + `image_url`，tool 文本保留字符串并标注 `[image attached]`；`tool_result` 中的 document 同样转为紧随其后的 user file part 并标注 `[document attached]`；orphan `tool_use`（无 matching tool_result）在翻译路径由 Worker A/B 的配对归一化处理
 - `tool_choice` 的 `auto`、`any`、`tool`、`none`；`disable_parallel_tool_use:true` 映射为上游 `parallel_tool_calls=false`
 - `output_config.effort` → 上游 `reasoning_effort`；`thinking.type=adaptive` 视为 enabled
-- JSON Schema 约束字段（包括 `additionalProperties`、`format`）
+- JSON Schema 约束字段（包括 `additionalParameters`、`format`）
 - stop reason、usage 以及流式 content block 配对
+- `/v1/messages/count_tokens`：`protocol_rules` 命中 anthropic 上游时直连 `/zen/v1/messages/count_tokens` 透传取精确计数；未命中、仅命中 chat/responses 或上游失败时回落本地启发式（chat 上游对 thinking 的采样参数互斥剥参同样生效）
 
 ### Best-effort / 显式丢弃（可观测）
 

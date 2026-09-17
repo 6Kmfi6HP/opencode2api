@@ -347,8 +347,13 @@ func launchCodex(args []string) {
 	}
 
 	codexPath := findCodex()
-	codexArgs := append(buildCodexConfigArgs(baseURL, modelID, catalogPath), extraArgs...)
-	runLaunchChild("codex", codexPath, codexArgs, buildCodexEnv(f.key), server, cleanup)
+	// The codex CLI only applies `-c key=value` overrides when they appear
+	// AFTER the `exec` subcommand; top-level `-c` is silently ignored for
+	// provider overrides in 0.154. Append ours after user-supplied extraArgs
+	// so a `launch codex exec ... -m MODEL "prompt"` line actually selects the
+	// opencode2api provider.
+	extraArgs = append(extraArgs, buildCodexConfigArgs(baseURL, modelID, catalogPath)...)
+	runLaunchChild("codex", codexPath, extraArgs, buildCodexEnv(f.key), server, cleanup)
 }
 
 // findClaude locates the claude CLI binary by checking PATH, then common

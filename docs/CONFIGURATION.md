@@ -127,7 +127,14 @@ cp config.example.json config.json
 
 **优先级**：显式规则 &gt; 运行时 native-responses 探测记忆 &gt; 默认 Chat Completions。未命中任何规则时行为与旧版本完全一致。`/v1/chat/completions` 入站仅应用显式规则（探测记忆仍走"翻译失败→探测→透传"回退，保证默认行为不变）；`/v1/messages` 与 `/v1/responses` 入站应用完整优先级。
 
-三种入站协议（Chat / Responses / Claude Messages）都可以路由到任意上游协议，请求与响应在网关内自动转换（流式 SSE、工具调用、推理内容、usage 统计均支持）。`/v1/messages/count_tokens` 为本地启发式，不感知协议路由。
+三种入站协议（Chat / Responses / Claude Messages）都可以路由到任意上游协议，请求与响应在网关内自动转换（流式 SSE、工具调用、推理内容、usage 统计均支持）。`/v1/messages/count_tokens` 命中 anthropic 规则时直连上游 `/zen/v1/messages/count_tokens` 取精确计数，未命中或上游失败回落本地启发式。
+
+本批次行为补充（仅本版起）：
+
+- `max_tokens`（Anthropic）/ `max_output_tokens`（Responses）全局与按模型上限取 `max_tokens_cap` / `max_tokens_cap_per_model`，直通与翻译路径同样收敛到 `[128, cap]`，count_tokens 直通只降不补。
+- chat 入站的 `max_completion_tokens` 优先于 `max_tokens` 指导预算（按 Worker A/B 的 OpenAI 现代字段语义），响应走的 `store:false` 且上游为 reasoning 时带 `include:["reasoning.encrypted_content"]` 由 A/B 补齐。
+- thinking 模式与 `temperature`/`top_p`/`top_k` 互斥：开启 thinking 时剥离这些采样参数（避免上游 400），同时保留 `output_config.effort` → `reasoning_effort` 映射。
+- tool_use/tool_result 配对归一：Claude 历史的 orphan tool_use（无 matching tool_result）在翻译为 chat/responses 前补占位 tool_result 或 drop，保证上游不再因序列非法 400。
 
 ```json
 {

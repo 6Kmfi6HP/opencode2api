@@ -40,9 +40,41 @@ func anthropicUsageToChat(usage map[string]any) map[string]any {
 	if v, ok := usage["output_tokens"]; ok {
 		out["completion_tokens"] = v
 	}
-	if p, pok := numberAsFloat(out["prompt_tokens"]); pok {
-		if c, cok := numberAsFloat(out["completion_tokens"]); cok {
-			out["total_tokens"] = p + c
+	// 显式 total_tokens 优先（权威）;否则由 input/output 分量合成,避免下游
+	// 与统计丢总量。顺序在字段重命名之后,保证 prompt/completion 任一来源
+	// 的分量都能被计入。
+	if _, has := out["total_tokens"]; !has {
+		if p, pok := numberAsFloat(out["prompt_tokens"]); pok {
+			if c, cok := numberAsFloat(out["completion_tokens"]); cok {
+				out["total_tokens"] = p + c
+			}
+		}
+	}
+	// Anthropic 缓存读/写 token 顶层键透传,并同时归入 chat 约定位置
+	// prompt_tokens_details.cached_tokens（对齐 sub2api 对 Chat Completions
+	// usage 的形状;原有顶层键透传保留,不改已有调用方行为）。
+	if v, ok := numberAsFloat(usage["cache_read_input_tokens"]); ok {
+		details, _ := out["prompt_tokens_details"].(map[string]any)
+		if details == nil {
+			details = map[string]any{}
+		}
+		if existing, eok := numberAsFloat(details["cached_tokens"]); !eok || existing == 0 {
+			details["cached_tokens"] = v
+		}
+		out["prompt_tokens_details"] = details
+	}
+	// 上游发 output_tokens_details.thinking_tokens 时归位到 chat 的
+	// completion_tokens_details.reasoning_tokens。
+	if outDetails, ok := usage["output_tokens_details"].(map[string]any); ok {
+		if v, ok := numberAsFloat(outDetails["thinking_tokens"]); ok && v > 0 {
+			details, _ := out["completion_tokens_details"].(map[string]any)
+			if details == nil {
+				details = map[string]any{}
+			}
+			if existing, eok := numberAsFloat(details["reasoning_tokens"]); !eok || existing == 0 {
+				details["reasoning_tokens"] = v
+			}
+			out["completion_tokens_details"] = details
 		}
 	}
 	delete(out, "input_tokens")

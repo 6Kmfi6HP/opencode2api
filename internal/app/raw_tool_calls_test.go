@@ -575,9 +575,8 @@ func TestChatStreamHandlerFakeRawDSML(t *testing.T) {
 	if !strings.Contains(body, `"name":"ls"`) || !strings.Contains(body, `"finish_reason":"tool_calls"`) {
 		t.Fatalf("converted stream missing tool_calls/finish: %s", body)
 	}
-	if !strings.Contains(body, `"total_tokens":3`) {
-		t.Fatalf("usage missing: %s", body)
-	}
+	// H6：客户端未请求 stream_options.include_usage 时网关抑制上游 usage
+	// chunk；请求时透传由 claude_bridge_test.go 的两分支覆盖。
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("DONE missing: %s", body)
 	}
