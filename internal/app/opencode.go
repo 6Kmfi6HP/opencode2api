@@ -37,7 +37,7 @@ const (
 )
 
 // opencode 客户端生成的 session/request ID 是时间戳前缀的 26 字符 ID:
-// 前 12 字符为 (毫秒时间戳*0x1000+计数) 反转后的 6 字节小端 hex,
+// 前 12 字符为 (毫秒时间戳*0x1000+计数) 反转后的 6 字节大端 hex,
 // 后 14 字符为 base62 随机。上游对免费层校验 session 必须匹配
 // ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$,否则拒绝:
 // "OpenCode's free tier can only be used from within OpenCode"。
@@ -46,7 +46,10 @@ const opencodeIDAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop
 func opencodeDescendingID() string {
 	now := time.Now().UnixMilli()
 	counter := rand.Int64N(0xFFF) + 1
-	value := ^(now*0x1000 + counter)
+	// 对应 TypeID-descending: ^(now*0x1000+counter) 的低 48 位。
+	// Go 的 ^int64 与 TS 的 ~BigInt 在该范围内对低 48 位结果一致;
+	// mask 后即为"one's complement within 48-bit", 随时间降序。
+	value := ^(now*0x1000 + counter) & 0xFFFFFFFFFFFF
 	var b [14]byte
 	for i := range b {
 		b[i] = opencodeIDAlphabet[rand.IntN(len(opencodeIDAlphabet))]
