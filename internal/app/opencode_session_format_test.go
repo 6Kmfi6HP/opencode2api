@@ -2,9 +2,7 @@ package app
 
 import (
 	"regexp"
-	"strconv"
 	"testing"
-	"time"
 )
 
 // The upstream free tier only accepts requests whose x-opencode-session
@@ -32,50 +30,24 @@ func TestOpenCode_RequestIDMatchesClientFormat(t *testing.T) {
 	}
 }
 
-// The timestamp prefix derives from the current wall clock; consecutive
-// generations must stay distinct (counter + random suffix).
-func TestOpenCode_DescendingIDUnique(t *testing.T) {
-	seen := make(map[string]bool, 1000)
+// 全随机 26 字符主体由 crypto/rand 填充;1000 次生成不得重复。
+// 原 opencodeDescendingID 的时间戳回环/排序语义随上游格式正则化被移除。
+func TestSession_IDUniqueAcrossGenerations(t *testing.T) {
+	seen := make(map[string]bool, 2000)
 	for i := 0; i < 1000; i++ {
-		id := opencodeDescendingID()
+		id := newOCSessionID()
 		if seen[id] {
-			t.Fatalf("duplicate id %q generated", id)
+			t.Fatalf("duplicate session id %q generated", id)
 		}
 		seen[id] = true
 	}
-}
-
-// The 12-hex prefix encodes ^(now*0x1000+counter) truncated to 48 bits
-// (matching TypeID's "descending" algorithm). Only the low 48 bits of
-// now*0x1000 carry through, so the recoverable timestamp domain is ms
-// mod 2^36 (~790 days). Inverting within the 48-bit domain (MASK48 - v)
-// and shifting off the 12-bit counter must recover "now mod 2^36"; a
-// regression that drops the inversion or mask would not round-trip.
-func TestOpenCode_DescendingIDTimestampRoundTrip(t *testing.T) {
-	before := time.Now().UnixMilli()
-	id := newOCSessionID()
-	after := time.Now().UnixMilli()
-
-	v, err := strconv.ParseUint(id[4:16], 16, 64)
-	if err != nil {
-		t.Fatalf("session id %q prefix is not hex: %v", id, err)
+	for i := 0; i < 1000; i++ {
+		id := newOCRequestID()
+		if seen[id] {
+			t.Fatalf("duplicate request id %q generated", id)
+		}
+		seen[id] = true
 	}
-	const domain int64 = 1 << 36
-	recovered := int64((0xFFFFFFFFFFFF - v) >> 12)
-	// Distance in the 2^36 modular domain — handles the wrap boundary too.
-	dist := (recovered - before%domain + domain) % domain
-	if dist > domain/2 {
-		dist = domain - dist
-	}
-	if dist > 5000 {
-		t.Fatalf("session id %q recovers ms≡%d (mod 2^36), want wall-clock %d±5000 (mod 2^36)",
-			id, recovered, before%domain)
-	}
-	// Counter is rand.Int64N(0xFFF)+1 per call — intra-ms ordering is not
-	// guaranteed to be monotonic (and upstream only checks the format regex,
-	// not relative order), so we skip same-ms ordering assertions. The
-	// round-trip ms check above is the load-bearing invariant.
-	_ = after
 }
 
 // buildOCRequestWithSubpath must send the client-shaped headers: UA version,
@@ -90,8 +62,15 @@ func TestOpenCode_RequestHeadersMirrorClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := req.Header.Get("User-Agent"); got != "opencode/"+ocMinFreeTierVersion {
-		t.Fatalf("User-Agent = %q, want opencode/%s", got, ocMinFreeTierVersion)
+	wantUA := "opencode/" + ocMinFreeTierVersion + " ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+	if got := req.Header.Get("User-Agent"); got != wantUA {
+		t.Fatalf("User-Agent = %q, want %q", got, wantUA)
+	}
+	if got := req.Header.Get("x-session-id"); got != ocSessionID {
+		t.Fatalf("x-session-id = %q, want %q", got, ocSessionID)
+	}
+	if got := req.Header.Get("x-session-affinity"); got != ocSessionID {
+		t.Fatalf("x-session-affinity = %q, want %q", got, ocSessionID)
 	}
 	if got := req.Header.Get("x-opencode-client"); got != "cli" {
 		t.Fatalf("x-opencode-client = %q, want cli", got)

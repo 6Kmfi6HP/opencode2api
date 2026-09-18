@@ -47,8 +47,32 @@ data: [DONE]
 			}
 
 			payload := transport.requestPayloads[1]
-			if _, ok := payload["tools"]; ok {
+			// store:false 语义红线: 重放的 messages 不得包含上一轮的
+			// tool_call 上下文(messages 长度断言在下方)。tools 字段如果
+			// 非零,只能是免费层门禁(上游 2026-09-18,按解析后的模型判定,
+			// 缺 bash/glob/grep/read 任一即 403)对免费模型请求兜底的四件
+			// 占位——这不构成 store 泄漏;客户端第二轮并未声明任何工具,
+			// 代理也未从 storedResponses 取回上一轮工具(state 中根本无
+			// 记录,见 storeResponseState 的 store 早退)。"primary-model"
+			// 在测试目录中未被标记为免费模型时 tools 应该完全为空。
+			tools, _ := payload["tools"].([]any)
+			if len(tools) != 0 && len(tools) != 4 {
 				t.Fatalf("tools leaked from store:false response: %#v", payload["tools"])
+			}
+			for _, rt := range tools {
+				tm, ok := rt.(map[string]any)
+				if !ok {
+					t.Fatalf("injected tool %v of unexpected shape", rt)
+				}
+				var name string
+				if fn, ok := tm["function"].(map[string]any); ok {
+					name, _ = fn["name"].(string)
+				} else {
+					name, _ = tm["name"].(string)
+				}
+				if name != "bash" && name != "glob" && name != "grep" && name != "read" {
+					t.Fatalf("non-free-tier tool %q leaked into store:false replay", name)
+				}
 			}
 			messages, _ := payload["messages"].([]any)
 			if len(messages) != 1 {
