@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 )
 
 var ocSessionShapeRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -89,7 +91,9 @@ func TestOCRequest_FreeTierInjectsSessionHeadersAndStream(t *testing.T) {
 	}
 }
 
-// 付费层不带免费层门禁: 不补工具、stream 保持客户端值。
+// 付费模型不套免费层门禁: 不补工具、stream 保持客户端值。
+// 注意判据是上游模型是否免费,而不是客户端 tier——sk- key + 免费模型仍会
+// 被上游要求指纹(见 TestFreeTierFingerprint_SKKeyFreeModelNoTools)。
 func TestOCRequest_PaidTierKeepsClientBody(t *testing.T) {
 	ocClientVer = "1.18.31"
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-validkey0123456789abcdef"}
@@ -114,7 +118,10 @@ func TestOCRequest_PaidTierKeepsClientBody(t *testing.T) {
 	}
 }
 
-// freeTierTools 只对完全无 tools 的请求兜底;客户端带了任一工具则原样保留。
+// 按模型判定后(与 free_tier_fingerprint_test.go 同一口径,issue #19 消融
+// 修复建议): 免费模型 + 客户端自带工具时不再整包跳过,而是保留客户端工具
+// 在前、把缺失的 bash/glob/grep/read 追加在后——上游按"有无四件"整体判定,
+// 客户端带了 weather 改变不了缺四件就 403 的事实。
 func TestOCRequest_FreeTierKeepsClientToolsWhenPresent(t *testing.T) {
 	ocClientVer = "1.18.31"
 	auth := UpstreamAuth{Mode: AuthRoutePublic}
@@ -134,9 +141,18 @@ func TestOCRequest_FreeTierKeepsClientToolsWhenPresent(t *testing.T) {
 	if err := json.Unmarshal(body, &sent); err != nil {
 		t.Fatal(err)
 	}
-	tools, _ := sent["tools"].([]any)
-	if len(tools) != 1 {
-		t.Fatalf("tools = %#v, want only client-declared weather tool (no free-tier injection on tools-bearing requests)", tools)
+	names := toolNames(t, sent)
+	if len(names) != 5 || names[0] != "weather" {
+		t.Fatalf("tools = %#v, want client weather kept first followed by the four required tools", sent["tools"])
+	}
+	seen := map[string]bool{}
+	for _, n := range names {
+		seen[n] = true
+	}
+	for _, want := range []string{"bash", "glob", "grep", "read"} {
+		if !seen[want] {
+			t.Fatalf("missing required tool %q, got %v", want, names)
+		}
 	}
 }
 
@@ -164,8 +180,11 @@ func TestOCRequest_FreeTierSkipsInjectionOnNonChatCompletions(t *testing.T) {
 
 // 免费层请求上游强制 stream:true 后,非流式入站路径必须把上游 SSE 聚合回完整
 // chat.completion JSON;且聚合发生在 isAnthropicFormat 之后,Anthropic 直发不会被
-// 误判成 OpenAI chunk。
+// 误判成 OpenAI chunk。按模型判定后(见 free_tier_fingerprint_test.go)需要把
+// "primary-model" 显式标记为免费模型,该断言的"免费层 + stream:false"前提才成立。
 func TestAggregate_callOpenCodeAPINonStreamAggregatesUpstreamSSE(t *testing.T) {
+	modelsdev.SetFreeModelsForTest("primary-model")
+	t.Cleanup(func() { modelsdev.SetFreeModelsForTest() })
 	sse := strings.Join([]string{
 		`data: {"id":"chatcmpl_x","object":"chat.completion.chunk","created":1700000000,"model":"mimo-v2.5-free","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}`,
 		`data: {"id":"chatcmpl_x","object":"chat.completion.chunk","created":1700000000,"model":"mimo-v2.5-free","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}`,

@@ -54,10 +54,55 @@ var freeTierRequiredTools = []map[string]any{
 	}},
 }
 
+// freeTierRequiredToolsAnthropic 是 Anthropic Messages / OpenAI Responses
+// 协议形状(tools[].name / input_schema)下的同一组四件占位工具。
+var freeTierRequiredToolsAnthropic = []map[string]any{
+	{"name": "bash", "description": "Run a shell command and return its output",
+		"input_schema": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"command": map[string]any{"type": "string", "description": "The shell command to execute"}},
+			"required":   []string{"command"},
+		}},
+	{"name": "glob", "description": "Find files matching a glob pattern",
+		"input_schema": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The glob pattern to match files against"}},
+			"required":   []string{"pattern"},
+		}},
+	{"name": "grep", "description": "Search file contents with a regular expression",
+		"input_schema": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The regular expression pattern to search for"}},
+			"required":   []string{"pattern"},
+		}},
+	{"name": "read", "description": "Read the contents of a file",
+		"input_schema": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"file_path": map[string]any{"type": "string", "description": "The path of the file to read"}},
+			"required":   []string{"file_path"},
+		}},
+}
+
+// freeTierToolNameOf 同时识别三种上游协议形状里的工具名:
+// OpenAI Chat(tools[].function.name)与 Anthropic Messages / OpenAI
+// Responses(tools[].name)。
+func freeTierToolNameOf(t map[string]any) string {
+	if fn, ok := t["function"].(map[string]any); ok {
+		if name, _ := fn["name"].(string); name != "" {
+			return name
+		}
+	}
+	name, _ := t["name"].(string)
+	return name
+}
+
 // ensureFreeTierTools 检查上游请求体里的 tools,把 bash/glob/grep/read 四件中
-// 缺失的补上。只在 OpenAI 风格(tools[].function.name)层面做存在性修补,不改动
-// 客户端已有的工具定义;原本就没有 tools 字段的请求会获得完整四件。
-func ensureFreeTierTools(bodyMap map[string]any) {
+// 缺失的**逐项**补上(只补缺失项、保留客户端已有工具的原始位置与形状,
+// 四件按 bash,glob,grep,read 顺序追加在后),而不是"客户端带了任一工具就整包
+// 跳过"——上游按"有无四件"整体判定,部分带齐与完全不带一样会被 403。
+// subpath == "messages" 时用 Anthropic/Responses 的裸 name 形状补齐;其它
+// (chat/completions 及转换后的 responses)沿用 OpenAI 形状。tools 已补齐时不动。
+func ensureFreeTierTools(bodyMap map[string]any, subpath string) {
 	if bodyMap == nil {
 		return
 	}
@@ -68,25 +113,63 @@ func ensureFreeTierTools(bodyMap map[string]any) {
 		if !ok {
 			continue
 		}
-		fn, ok := tm["function"].(map[string]any)
-		if !ok {
-			continue
-		}
-		if name, _ := fn["name"].(string); name != "" {
+		if name := freeTierToolNameOf(tm); name != "" {
 			existing[name] = true
 		}
 	}
 	missing := make([]any, 0, len(freeTierRequiredTools))
-	for _, tool := range freeTierRequiredTools {
-		fn := tool["function"].(map[string]any)
-		if !existing[fn["name"].(string)] {
-			missing = append(missing, tool)
+	if subpath == "messages" {
+		for _, tool := range freeTierRequiredToolsAnthropic {
+			if !existing[tool["name"].(string)] {
+				missing = append(missing, tool)
+			}
+		}
+	} else {
+		for _, tool := range freeTierRequiredTools {
+			fn := tool["function"].(map[string]any)
+			if !existing[fn["name"].(string)] {
+				missing = append(missing, tool)
+			}
 		}
 	}
 	if len(missing) == 0 {
 		return
 	}
 	bodyMap["tools"] = append(rawTools, missing...)
+}
+
+// applyFreeTierFingerprint 对"解析后的上游模型本身是免费"的请求执行免费层
+// 指纹重做(issue #19,2026-09-18 实测门禁口径:按解析后的上游模型判定,
+// 不按客户端 Authorization tier):
+//   - tools: 缺 bash/glob/grep/read 任何一件时按上游协议形状补齐缺失项;
+//   - stream: 一律强制 true(上游仅接受流式);
+//   - stream_options: chat/completions 与 responses 子路径保留客户端自定义键、
+//     仅补 include_usage=true;messages 子路径不写 stream_options(不属于
+//     Anthropic schema)。
+//
+// count_tokens 及其它非三协议子路径不套该门禁。
+func applyFreeTierFingerprint(bodyMap map[string]any, subpath, modelID string) {
+	if bodyMap == nil {
+		return
+	}
+	switch subpath {
+	case "chat/completions", "messages", "responses":
+	default:
+		return
+	}
+	if !isFreeModel(modelID) {
+		return
+	}
+	ensureFreeTierTools(bodyMap, subpath)
+	bodyMap["stream"] = true
+	if subpath == "messages" {
+		return
+	}
+	if existing, ok := bodyMap["stream_options"].(map[string]any); ok {
+		existing["include_usage"] = true
+	} else {
+		bodyMap["stream_options"] = map[string]any{"include_usage": true}
+	}
 }
 
 // ======================== 非流聚合 ========================

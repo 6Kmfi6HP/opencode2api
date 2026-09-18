@@ -452,26 +452,15 @@ func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth Ups
 
 func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string, subpath string, ocSession string) (*http.Request, error) {
 	bodyMap["model"] = modelID
-	if auth.tier() == TierFree && subpath == "chat/completions" {
-		// 上游 2026-09-18 新校验(见 lite opencode2api-lite.go L1468-1548):
-		// 免费层 chat/completions 请求必须带 bash/glob/grep/read 四件工具,
-		// 且 stream 必须为 true(stream:false 直接 403 FreeTierError);
-		// count_tokens 等计费接口不套该门禁,别污染。tools 门禁仅对"完全没带
-		// tools 的请求"兜底补齐——只要客户端已在 tools 层面给了任何工具,就
-		// 认为空白该由客户端负责,不在转换层静默改写其工具集。客户端语义上
-		// 的非流式由 callOpenCodeAPI 的本地聚合还原(见 aggregateOpenAIStream)。
-		if _, hasTools := bodyMap["tools"]; !hasTools {
-			ensureFreeTierTools(bodyMap)
-		}
-		bodyMap["stream"] = true
-		if existing, ok := bodyMap["stream_options"].(map[string]any); ok {
-			// 客户端自定义的 stream_options(如 Responses 的 event_frequency)
-			// 保留,只补 include_usage 这份残缺。
-			existing["include_usage"] = true
-		} else {
-			bodyMap["stream_options"] = map[string]any{"include_usage": true}
-		}
-	}
+	// 上游 2026-09-18 实测门禁(docs/labs/2026-09-18-fingerprint-ablation.md):
+	// 是否执行免费层指纹重做**只看解析后的上游模型是否免费**,与客户端
+	// Authorization 是 "Bearer public" 还是真实 sk- key 无关(sk- key 下
+	// 免费模型一样按同一指纹校验,muse-spark-*-contributor-free 的 500 则是
+	// 档位对 public key 整档拒,与指纹无关)。三个上游协议 subpath
+	// (chat/completions / messages / responses)统一走同一层,不再仅限
+	// chat/completions。客户端语义上的非流式由 callOpenCodeAPI 的本地聚合
+	// 还原(见 aggregateOpenAIStream)。
+	applyFreeTierFingerprint(bodyMap, subpath, modelID)
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
 		return nil, err

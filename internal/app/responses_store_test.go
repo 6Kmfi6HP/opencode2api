@@ -48,23 +48,28 @@ data: [DONE]
 
 			payload := transport.requestPayloads[1]
 			// store:false 语义红线: 重放的 messages 不得包含上一轮的
-			// tool_call 上下文(messages 长度断言在下方)。tools 字段因
-			// 上游 2026-09-18 免费层新门禁(必须带 bash/glob/grep/read
-			// 四件,缺即 403)由 buildOCRequestWithSubpath 兜底注入——这不
-			// 是 store 泄漏,客户端并未声明任何工具、代理也未从
-			// storedResponses 取回上一轮工具(state 中根本无记录,
-			// 见 storeResponseState 的 store 早退)。断言 tools 恰为四
-			// 件免费层占位工具,证明无上一轮工具穿透。
+			// tool_call 上下文(messages 长度断言在下方)。tools 字段如果
+			// 非零,只能是免费层门禁(上游 2026-09-18,按解析后的模型判定,
+			// 缺 bash/glob/grep/read 任一即 403)对免费模型请求兜底的四件
+			// 占位——这不构成 store 泄漏;客户端第二轮并未声明任何工具,
+			// 代理也未从 storedResponses 取回上一轮工具(state 中根本无
+			// 记录,见 storeResponseState 的 store 早退)。"primary-model"
+			// 在测试目录中未被标记为免费模型时 tools 应该完全为空。
 			tools, _ := payload["tools"].([]any)
-			if len(tools) != 4 {
+			if len(tools) != 0 && len(tools) != 4 {
 				t.Fatalf("tools leaked from store:false response: %#v", payload["tools"])
 			}
 			for _, rt := range tools {
-				fn, ok := rt.(map[string]any)["function"].(map[string]any)
+				tm, ok := rt.(map[string]any)
 				if !ok {
 					t.Fatalf("injected tool %v of unexpected shape", rt)
 				}
-				name, _ := fn["name"].(string)
+				var name string
+				if fn, ok := tm["function"].(map[string]any); ok {
+					name, _ = fn["name"].(string)
+				} else {
+					name, _ = tm["name"].(string)
+				}
 				if name != "bash" && name != "glob" && name != "grep" && name != "read" {
 					t.Fatalf("non-free-tier tool %q leaked into store:false replay", name)
 				}

@@ -154,11 +154,14 @@
 
 ## 6. 对仓库代码的建议（不改代码，只落证据）
 
-1. **新增** `ensureFreeTierTools`（或类似）：升级上游前对免费层请求体检查 `tools`，缺 bash/glob/grep/read 任一时追加占位（与 lite 同思路即可）。
+1. **新增** `ensureFreeTierTools`（或等价实现），但**判定键不是"tools 是否存在"，而是逐项缺什么补什么**——上游把"必须含 bash/glob/grep/read"当成整体门槛（E8/E9/F1：缺任一即 403），客户端即使在 `tools` 里只带了 `weather` 一个业务工具、缺四件中任何其一，裸发同样 403。正确语义：保留客户端已有工具的原始位置与形状，仅按其名字集合对缺失四件按 bash,glob,grep,read 顺序追加（OpenAI Chat 形状与 Anthropic Messages / Responses 原生 `tools[].name` 形状各用对应占位）。仅对"完全不带 tools"才兜底是 PR #20 `opencode.go` 里 `if _, hasTools := bodyMap["tools"]; !hasTools` 的那个一次性修复与 lite 主张共同的误判点，issue #19 的 403 之所以反复，正是被"客户端自带任一工具"这条分支漏掉的。
 2. **对上游**始终 `stream:true`，如需迁就下游非流式客户端则本地聚合（跟上一次大版本里做过的 SSE 聚合是一个套路）；因为现在 `stream:false` 一定 403。
-3. **`ocMinFreeTierVersion` 从 1.17.0 升 1.18.0**；UA 继续走 npm latest。
-4. **session 头不用改**：`x-opencode-session`（仓库现行 TypeID-descending）依然有效；是否加发 `x-session-id` 是按上游官方形态"贴近"考量，不是必需。
-5. **提示上游 `muse-spark-*-contributor-free` 500 与指纹无关**，不能把 500 归到新指纹门头上。可选：上游 500 且模型名含 `-contributor-free` 时，网关可读性提示"contributor 档位对 public 不开放"。
+3. **判定免费层按"解析后的上游模型是否免费"（`isFreeModel(resolved)`），不按客户端 Authorization tier**——上游门禁并不识别客户端带的 `Bearer public` vs 真实 `sk-` key，只要路由命中的是免费模型（`*-free` 后缀短路或 models.dev 目录零价入册），同一组 tools + stream 校验照走。用 `auth.tier()` 做开关是 PR #20 与 lite 版共同的另一处误判：一条 `Bearer sk-…` + `big-pickle` 的消息本应触发指纹重做，在 PR #20 下会被当作"付费客户端"跳过所有改写（上游一样 403）。
+4. **subpath 不能只限 `chat/completions`**：上游对 `/zen/v1/messages` 与 `/zen/v1/responses` 原生协议子路径施加同一组指纹校验（`messages` 子路径不写 `stream_options`——那不是 Anthropic schema；`tools` 在 messages 子路径用 Anthropic 形状 `tools[].name` 补齐；`count_tokens` 等计费子路径不套该门禁）。PR #20 把这条按 `subpath == "chat/completions"` 砍掉了 `messages` / `responses` 子路径，issue #19 真正涉及的 `claude.go / responses.go / anthropic_upstream.go / chat_to_responses_upstream.go / responses_to_anthropic.go` 里所有"直发上游原生协议"的路径就是因此被遗留。
+5. **`ocMinFreeTierVersion` 从 1.17.0 升 1.18.0**；UA 继续走 npm latest。
+6. **session 头不用改**：`x-opencode-session`（仓库现行 TypeID-descending / 随机同形状）依然有效；是否加发 `x-session-id` 是按上游官方形态"贴近"考量，不是必需。
+7. **提示上游 `muse-spark-*-contributor-free` 500 与指纹无关**，不能把 500 归到新指纹门头上。可选：上游 500 且模型名含 `-contributor-free` 时，网关可读性提示"contributor 档位对 public 不开放"。
+
 
 ## 7. 复现
 
