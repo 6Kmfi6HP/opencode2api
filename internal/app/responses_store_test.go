@@ -47,8 +47,27 @@ data: [DONE]
 			}
 
 			payload := transport.requestPayloads[1]
-			if _, ok := payload["tools"]; ok {
+			// store:false 语义红线: 重放的 messages 不得包含上一轮的
+			// tool_call 上下文(messages 长度断言在下方)。tools 字段因
+			// 上游 2026-09-18 免费层新门禁(必须带 bash/glob/grep/read
+			// 四件,缺即 403)由 buildOCRequestWithSubpath 兜底注入——这不
+			// 是 store 泄漏,客户端并未声明任何工具、代理也未从
+			// storedResponses 取回上一轮工具(state 中根本无记录,
+			// 见 storeResponseState 的 store 早退)。断言 tools 恰为四
+			// 件免费层占位工具,证明无上一轮工具穿透。
+			tools, _ := payload["tools"].([]any)
+			if len(tools) != 4 {
 				t.Fatalf("tools leaked from store:false response: %#v", payload["tools"])
+			}
+			for _, rt := range tools {
+				fn, ok := rt.(map[string]any)["function"].(map[string]any)
+				if !ok {
+					t.Fatalf("injected tool %v of unexpected shape", rt)
+				}
+				name, _ := fn["name"].(string)
+				if name != "bash" && name != "glob" && name != "grep" && name != "read" {
+					t.Fatalf("non-free-tier tool %q leaked into store:false replay", name)
+				}
 			}
 			messages, _ := payload["messages"].([]any)
 			if len(messages) != 1 {

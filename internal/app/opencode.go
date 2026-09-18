@@ -3,13 +3,14 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,36 +34,46 @@ func randomHex(n int) string {
 // ======================== OpenCode 会话 ========================
 
 const (
-	headerOpencodeSession = "x-opencode-session"
+	headerOpencodeSession  = "x-opencode-session"
+	headerOCSessionID      = "x-session-id"
+	headerOCSessionAffnity = "x-session-affinity"
 )
 
-// opencode 客户端生成的 session/request ID 是时间戳前缀的 26 字符 ID:
-// 前 12 字符为 (毫秒时间戳*0x1000+计数) 反转后的 6 字节大端 hex,
-// 后 14 字符为 base62 随机。上游对免费层校验 session 必须匹配
-// ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$,否则拒绝:
+// newOCSessionShapeID 生成上游免费层校验格式的 26 字符 ID 主体:
+// 12 位小写 hex + 14 位 base62（lite 版 opencode2api-lite.go L498-514）。
+// 上游对免费层校验 session 必须匹配 ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$,否则拒绝:
 // "OpenCode's free tier can only be used from within OpenCode"。
-const opencodeIDAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
-func opencodeDescendingID() string {
-	now := time.Now().UnixMilli()
-	counter := rand.Int64N(0xFFF) + 1
-	// 对应 TypeID-descending: ^(now*0x1000+counter) 的低 48 位。
-	// Go 的 ^int64 与 TS 的 ~BigInt 在该范围内对低 48 位结果一致;
-	// mask 后即为"one's complement within 48-bit", 随时间降序。
-	value := ^(now*0x1000 + counter) & 0xFFFFFFFFFFFF
-	var b [14]byte
-	for i := range b {
-		b[i] = opencodeIDAlphabet[rand.IntN(len(opencodeIDAlphabet))]
+// 取舍: 先前实现把时间戳反转编码进 hex 前缀(TypeID-descending),以贴近真实
+// 客户端的排序行为;lite 实测该字段仅做格式正则校验、不含时间语义,纯随机即可。
+// 这里按 lite 简化为全随机,不再保留 descending 版本作双头之一——真正的
+// 兼容手段是新旧 session 头(x-session-id / x-opencode-session)同时发送。
+func newOCSessionShapeID() string {
+	const hexChars = "0123456789abcdef"
+	const alnumChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	var b [26]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand 不可用时退化为时间戳混合,仍保持格式合规(长度/字符集正确)
+		var seed [8]byte
+		binary.BigEndian.PutUint64(seed[:], uint64(time.Now().UnixNano()))
+		for i := range b {
+			b[i] = seed[i%8] ^ byte(i*37)
+		}
 	}
-	return fmt.Sprintf("%012x", value&0xFFFFFFFFFFFF) + string(b[:])
+	for i := 0; i < 12; i++ {
+		b[i] = hexChars[b[i]%16]
+	}
+	for i := 12; i < 26; i++ {
+		b[i] = alnumChars[b[i]%byte(len(alnumChars))]
+	}
+	return string(b[:])
 }
 
 func newOCSessionID() string {
-	return "ses_" + opencodeDescendingID()
+	return "ses_" + newOCSessionShapeID()
 }
 
 func newOCRequestID() string {
-	return "msg_" + opencodeDescendingID()
+	return "msg_" + newOCSessionShapeID()
 }
 
 type opencodeSessionContextKey struct{}
@@ -117,16 +128,79 @@ var (
 	ocOnce      sync.Once
 )
 
-// ocMinFreeTierVersion 是上游免费层要求的最低客户端版本;低于它时上游
-// 返回 426 UpgradeRequired("OpenCode 1.17.0 or newer is required")。
-const ocMinFreeTierVersion = "1.18.31"
+const (
+	// ocMinFreeTierVersion 是上游免费层声明的最低客户端版本;低于它时上游
+	// 返回 426 UpgradeRequired("OpenCode 1.18.0 or newer is required").
+	// 取舍(2026-09-18 实测校准): lite opencode2api-lite.go L486-489 记为
+	// minOCVersion = "1.17.0",但 issue #19 的实测消融
+	// (docs/labs/2026-09-18-fingerprint-ablation.md E17/E18/U1-U5)表明
+	// 上游阈值实际已上移到 1.18.0 —— 1.17.0/1.17.9 均 426,1.18.0+ 才 200。
+	// 故下限采实测值 1.18.0 而非 lite 的 1.17.0。
+	ocMinFreeTierVersion = "1.18.0"
+	// ocDefaultFreeTierVersion 是 npm 拉取失败时的回退版本,高于下限
+	// 且贴近实测当前上游最新版(2026-09-18 npm latest = 1.18.31),留一份冗余。
+	ocDefaultFreeTierVersion = "1.18.31"
+)
+
+// normalizeOCVersion 保证 UA 版本号不低于 ocMinFreeTierVersion,
+// 避免上游对低版本 UA 返回 426 Upgrade Required(对齐 lite L516-522)。
+func normalizeOCVersion(version string) string {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return ocDefaultFreeTierVersion
+	}
+	if compareOCVersion(version, ocMinFreeTierVersion) < 0 {
+		return ocMinFreeTierVersion
+	}
+	return version
+}
+
+// compareOCVersion 逐段比较点分十进制版本号;a<b 返回 -1,相等 0,a>b 返回 1。
+// 切分容忍预发布后缀(如 1.17.0-beta 仅首段数字有效)。
+func compareOCVersion(a, b string) int {
+	an, bn := ocVersionNumbers(a), ocVersionNumbers(b)
+	for i := 0; i < len(an) || i < len(bn); i++ {
+		var av, bv int
+		if i < len(an) {
+			av = an[i]
+		}
+		if i < len(bn) {
+			bv = bn[i]
+		}
+		if av != bv {
+			if av < bv {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+func ocVersionNumbers(v string) []int {
+	parts := strings.FieldsFunc(v, func(r rune) bool {
+		return r == '.' || r == '-' || r == '+'
+	})
+	nums := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n := 0
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				break
+			}
+			n = n*10 + int(c-'0')
+		}
+		nums = append(nums, n)
+	}
+	return nums
+}
 
 func fetchOCVersion() string {
 	req, _ := http.NewRequest("GET", "https://registry.npmjs.org/opencode-ai/latest", nil)
 	req.Header.Set("Accept", "application/json")
 	resp, err := getHTTPClient().Do(req)
 	if err != nil {
-		return ocMinFreeTierVersion
+		return ocDefaultFreeTierVersion
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -134,9 +208,9 @@ func fetchOCVersion() string {
 		Version string `json:"version"`
 	}
 	if json.Unmarshal(body, &info) == nil && info.Version != "" {
-		return info.Version
+		return normalizeOCVersion(info.Version)
 	}
-	return ocMinFreeTierVersion
+	return ocDefaultFreeTierVersion
 }
 
 func initOCSession() {
@@ -178,14 +252,18 @@ var (
 func fetchModels() ([]ModelInfo, error) {
 	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
-	session := sessionFromRequestContext(nil, ocSessionID)
-	if strings.TrimSpace(session) == "" {
+	session := strings.TrimSpace(sessionFromRequestContext(nil, ocSessionID))
+	if session == "" {
 		session = ocSessionID
 	}
-	if strings.TrimSpace(session) == "" {
+	if session == "" {
 		session = newOCSessionID()
 	}
-	req.Header.Set("x-opencode-session", strings.TrimSpace(session))
+	// 新门禁头 x-session-id 与旧 x-opencode-session 同值双发,理由见
+	// buildOCRequestWithSubpath 中的取舍注释。
+	req.Header.Set("x-opencode-session", session)
+	req.Header.Set(headerOCSessionID, session)
+	req.Header.Set(headerOCSessionAffnity, session)
 	resp, err := getHTTPClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -211,14 +289,18 @@ func fetchModels() ([]ModelInfo, error) {
 func fetchGoModels() ([]ModelInfo, error) {
 	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/go/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
-	session := sessionFromRequestContext(nil, ocSessionID)
-	if strings.TrimSpace(session) == "" {
+	session := strings.TrimSpace(sessionFromRequestContext(nil, ocSessionID))
+	if session == "" {
 		session = ocSessionID
 	}
-	if strings.TrimSpace(session) == "" {
+	if session == "" {
 		session = newOCSessionID()
 	}
-	req.Header.Set("x-opencode-session", strings.TrimSpace(session))
+	// 新门禁头 x-session-id 与旧 x-opencode-session 同值双发,理由见
+	// buildOCRequestWithSubpath 中的取舍注释。
+	req.Header.Set("x-opencode-session", session)
+	req.Header.Set(headerOCSessionID, session)
+	req.Header.Set(headerOCSessionAffnity, session)
 	resp, err := getHTTPClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -370,6 +452,26 @@ func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth Ups
 
 func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string, subpath string, ocSession string) (*http.Request, error) {
 	bodyMap["model"] = modelID
+	if auth.tier() == TierFree && subpath == "chat/completions" {
+		// 上游 2026-09-18 新校验(见 lite opencode2api-lite.go L1468-1548):
+		// 免费层 chat/completions 请求必须带 bash/glob/grep/read 四件工具,
+		// 且 stream 必须为 true(stream:false 直接 403 FreeTierError);
+		// count_tokens 等计费接口不套该门禁,别污染。tools 门禁仅对"完全没带
+		// tools 的请求"兜底补齐——只要客户端已在 tools 层面给了任何工具,就
+		// 认为空白该由客户端负责,不在转换层静默改写其工具集。客户端语义上
+		// 的非流式由 callOpenCodeAPI 的本地聚合还原(见 aggregateOpenAIStream)。
+		if _, hasTools := bodyMap["tools"]; !hasTools {
+			ensureFreeTierTools(bodyMap)
+		}
+		bodyMap["stream"] = true
+		if existing, ok := bodyMap["stream_options"].(map[string]any); ok {
+			// 客户端自定义的 stream_options(如 Responses 的 event_frequency)
+			// 保留,只补 include_usage 这份残缺。
+			existing["include_usage"] = true
+		} else {
+			bodyMap["stream_options"] = map[string]any{"include_usage": true}
+		}
+	}
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
 		return nil, err
@@ -380,13 +482,21 @@ func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth Upst
 	} else {
 		upstreamURL = baseURL + "/zen/v1/" + subpath
 	}
+	// 上游偶发对无 Accept-Encoding 的 Go 默认 gzip 响应不吐 identity,
+	// 客户端拿到的会是乱码 gzip 二进制;显式 identity 避免歧义。
 	req, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(tryBody))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", auth.authorizationHeader())
-	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s", ocClientVer))
+	// UA 对齐 lite L1931: ai-sdk/runtime 后缀贴近真实 opencode 客户端。
+	uaVersion := ocClientVer
+	if strings.TrimSpace(uaVersion) == "" {
+		uaVersion = ocDefaultFreeTierVersion
+	}
+	uaVersion = normalizeOCVersion(uaVersion)
+	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", uaVersion))
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-project", ocProjectID)
 	if subpath == "messages" {
@@ -400,14 +510,23 @@ func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth Upst
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	session := sessionFromRequestContext(nil, ocSessionID)
+	session := sessionFromRequestContext(nil, ocSession)
 	if strings.TrimSpace(session) == "" {
 		session = ocSessionID
 	}
 	if strings.TrimSpace(session) == "" {
 		session = newOCSessionID()
 	}
-	req.Header.Set("x-opencode-session", strings.TrimSpace(session))
+	session = strings.TrimSpace(session)
+	// 取舍(待主代理实测裁剪): lite 注释称上游已改查 x-session-id、旧
+	// x-opencode-session 失效,且 lite 每请求发随机 id;本仓库有 sticky
+	// egress 设计(同一会话固定出口代理,靠稳定 session 维持 prompt 缓存命中),
+	// 不能逐请求随机。这里双头同值: 新 x-session-id/x-session-affinity 供新门禁,
+	// 旧 x-opencode-session 保留以兼容仍只认旧头的上游部署;两头发稳定值即可
+	// 同时满足"新头生效"与"旧部署不回归"。
+	req.Header.Set("x-opencode-session", session)
+	req.Header.Set(headerOCSessionID, session)
+	req.Header.Set(headerOCSessionAffnity, session)
 	req.Header.Set("x-opencode-request", newOCRequestID())
 	if subpath != "messages" {
 		req.Header.Set("Accept", "application/json")
@@ -469,7 +588,12 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// 仅"裸进程内回退值"才现造一次会话,避免同一请求的重试在
+		// newOCSessionID() 兜底下换 session 破坏 sticky egress。
 		ocSession := sessionFromRequestContext(ctx, ocSessionID)
+		if strings.TrimSpace(ocSession) == "" {
+			ocSession = newOCSessionID()
+		}
 		upstreamHeaders := upstreamHeadersFromContext(ctx)
 		baseURL, client := selectUpstreamTarget(auth, bodyMap, upstreamHeaders, normalizedTransportScope(ocSession))
 		lastBaseURL = baseURL
@@ -601,6 +725,10 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 	if readErr != nil {
 		return nil, 0, nil, readErr
 	}
+	// 顺序: 先判 Anthropic(含 SSE),再谈 OpenAI 聚合——免费层被强制
+	// stream:true 后上游既可能按模型返回 OpenAI SSE,也可能仍回 Anthropic
+	// 格式(部分 claude 系),前者需本地聚合,后者走既有转换,
+	// convertAnthropicToOpenAI 自带 SSE 解析,别互相污染。
 	if isAnthropicFormat(b) {
 		converted, convErr := convertAnthropicToOpenAI(b, modelID)
 		if convErr != nil {
@@ -610,6 +738,10 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 			return nil, http.StatusBadGateway, nil, convErr
 		}
 		b = converted
+	} else {
+		// OpenAI SSE(因强制 stream:true)聚合为完整 chat.completion;
+		// 已是 JSON 或空体时 aggregateOpenAIStream 原样返回,天然幂等。
+		b = aggregateOpenAIStream(b, modelID)
 	}
 	b = convertRawToolCallsInBody(b)
 	return b, status, header, nil

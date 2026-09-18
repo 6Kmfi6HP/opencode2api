@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix free-tier upstream fingerprinting for issue #19: since 2026-09-16/18 `opencode.ai/zen/v1` rejects free-tier requests unless `tools` contains bash/glob/grep/read **and** `stream:true` (else 403 `FreeTierError`); the gateway now injects the four minimal tools when the client declared none and forces upstream streaming, aggregating the SSE locally for non-streaming clients (`internal/app/opencode_fingerprint.go`). Session fingerprinting now sends `x-session-id`/`x-session-affinity` alongside the existing `x-opencode-session` (same stable value for sticky egress), and the UA template matches the real OpenCode client (`opencode/<ver> ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`) with the minimum raised from 1.17.0 to **1.18.0** (live ablation 2026-09-18; fallback `1.18.31`). Note: `x-opencode-session` was **not** retired upstream — both header names pass — and `muse-spark-*-contributor-free` 500s are a tier rejection, not fingerprinting. Evidence: `docs/labs/2026-09-18-fingerprint-ablation.md`.
+
 ## v0.12.0
 
 - Add configurable upstream protocol routing (`protocol_rules`), aligned with sub2api's `OpenCodeGoProtocolRule` approach: requests are routed to the OpenCode Zen **native upstream endpoint** matching the model, instead of always translating through Chat Completions:
