@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -276,6 +277,9 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 		writeUpstreamError(w, http.StatusBadGateway, fmt.Errorf("upstream read error"), "chat")
 		return
 	}
+	// 免费层强制 stream:true 后，Responses 上游回的是 SSE;非流式 chat 客户端
+	// 需要单个 chat.completion JSON，先聚合（幂等：已是 JSON 时原样返回）。
+	respBody = aggregateResponsesStreamToChat(respBody, req.Model, keepReasoning)
 	outBody := convertResponsesToChat(respBody, req.Model, keepReasoning)
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
@@ -288,6 +292,235 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(outBody)
+}
+
+// aggregateResponsesStreamToChat 把上游强制 stream:true 返回的 Responses SSE
+// 流聚合为一个完整的 chat.completion JSON。与 responsesSSEToChatStream 共用
+// 同一套事件解析（output_text.delta / reasoning delta / output_item 与
+// function_call_arguments、response.completed/incomplete 的 usage），只是终点
+// 是合并后的 JSON 而不是逐块转发的 chat SSE。body 不是 Responses SSE（如已
+// 是 JSON、空体或流中带 error 事件）时原样返回，交给上层既有处理（含
+// convertResponsesToChat 的 JSON 解析），因此幂等。
+func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning bool) []byte {
+	var id, outModel string
+	var contentBuilder, reasoningBuilder strings.Builder
+	var refusal string
+	type toolAcc struct {
+		callID, name, args string
+	}
+	tools := map[int]*toolAcc{}
+	toolItemToIdx := map[string]int{}
+	toolOrder := []int{}
+	finishReason := "stop"
+	var usage map[string]any
+	sawChunk := false
+
+	// toolIdxFor 解析 item id/call_id/output_index 对应的稳定 chat index。
+	toolIdxFor := func(itemID, outputIndex string) int {
+		if itemID != "" {
+			if idx, ok := toolItemToIdx[itemID]; ok {
+				return idx
+			}
+		}
+		if outputIndex != "" {
+			if idx, ok := toolItemToIdx["#"+outputIndex]; ok {
+				return idx
+			}
+		}
+		idx := len(toolOrder)
+		toolOrder = append(toolOrder, idx)
+		if itemID != "" {
+			toolItemToIdx[itemID] = idx
+		}
+		if outputIndex != "" {
+			toolItemToIdx["#"+outputIndex] = idx
+		}
+		return idx
+	}
+	ensureTool := func(itemID, outputIndex string) *toolAcc {
+		idx := toolIdxFor(itemID, outputIndex)
+		acc := tools[idx]
+		if acc == nil {
+			acc = &toolAcc{}
+			tools[idx] = acc
+		}
+		return acc
+	}
+
+	for _, rawLine := range bytes.Split(body, []byte("\n")) {
+		line := strings.TrimSpace(string(rawLine))
+		if line == "" || !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			break
+		}
+		var evt map[string]any
+		if json.Unmarshal([]byte(payload), &evt) != nil {
+			continue
+		}
+		sawChunk = true
+		if _, isErr := evt["error"]; isErr {
+			return body
+		}
+		switch typ, _ := evt["type"].(string); typ {
+		case "response.created", "response.in_progress", "response.queued":
+			if resp, ok := evt["response"].(map[string]any); ok {
+				if rid, _ := resp["id"].(string); rid != "" && id == "" {
+					id = rid
+				}
+				if m, _ := resp["model"].(string); m != "" {
+					outModel = m
+				}
+			}
+		case "response.output_text.delta":
+			if t, _ := evt["delta"].(string); t != "" {
+				contentBuilder.WriteString(t)
+			}
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			if wantReasoning {
+				if t, _ := evt["delta"].(string); t != "" {
+					reasoningBuilder.WriteString(t)
+				}
+			}
+		case "response.refusal.delta":
+			if t, _ := evt["delta"].(string); t != "" {
+				refusal += t
+			}
+		case "response.output_item.added", "response.output_item.done":
+			item, _ := evt["item"].(map[string]any)
+			if item == nil {
+				continue
+			}
+			it, _ := item["type"].(string)
+			if it != "function_call" && it != "tool_call" {
+				continue
+			}
+			callID, _ := item["call_id"].(string)
+			if callID == "" {
+				callID, _ = item["id"].(string)
+			}
+			oi, _ := item["output_index"].(float64)
+			acc := ensureTool(callID, formatOutputIndex(oi))
+			if callID != "" {
+				acc.callID = callID
+			}
+			if n, _ := item["name"].(string); n != "" {
+				acc.name = n
+			}
+			if args, _ := item["arguments"].(string); args != "" && acc.args == "" {
+				acc.args = args
+			}
+		case "response.function_call_arguments.delta", "response.tool_call_arguments.delta":
+			oi, _ := evt["output_index"].(float64)
+			itemID, _ := evt["item_id"].(string)
+			acc := ensureTool(itemID, formatOutputIndex(oi))
+			if pj, _ := evt["delta"].(string); pj != "" {
+				acc.args += pj
+			}
+		case "response.function_call_arguments.done", "response.tool_call_arguments.done":
+			oi, _ := evt["output_index"].(float64)
+			itemID, _ := evt["item_id"].(string)
+			acc := ensureTool(itemID, formatOutputIndex(oi))
+			if completed, _ := evt["arguments"].(string); completed != "" {
+				acc.args = completed
+			}
+		case "response.completed", "response.incomplete":
+			if resp, ok := evt["response"].(map[string]any); ok {
+				if u, ok := resp["usage"].(map[string]any); ok {
+					usage = u
+				}
+				if rid, _ := resp["id"].(string); rid != "" {
+					id = rid
+				}
+				if m, _ := resp["model"].(string); m != "" {
+					outModel = m
+				}
+				if status, _ := resp["status"].(string); status == "incomplete" {
+					finishReason = "length"
+				}
+			}
+		}
+	}
+	if !sawChunk {
+		return body
+	}
+	if id == "" {
+		id = "chatcmpl_" + randomString(24)
+	}
+	if outModel == "" {
+		outModel = model
+	}
+	if len(toolOrder) > 0 && finishReason == "stop" {
+		finishReason = "tool_calls"
+	}
+
+	msg := map[string]any{"role": "assistant"}
+	content := contentBuilder.String()
+	if content != "" || len(toolOrder) == 0 {
+		msg["content"] = content
+	}
+	if reasoning := reasoningBuilder.String(); reasoning != "" {
+		msg["reasoning_content"] = reasoning
+	}
+	if refusal != "" {
+		msg["refusal"] = refusal
+	}
+	if len(toolOrder) > 0 {
+		var toolCalls []map[string]any
+		for _, idx := range toolOrder {
+			acc := tools[idx]
+			if acc == nil {
+				continue
+			}
+			callID := acc.callID
+			if callID == "" {
+				callID = "call_" + randomHex(12)
+			}
+			args := acc.args
+			if args == "" {
+				args = "{}"
+			}
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   callID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      acc.name,
+					"arguments": args,
+				},
+			})
+		}
+		msg["tool_calls"] = toolCalls
+	}
+
+	resp := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   outModel,
+		"choices": []any{map[string]any{
+			"index": 0, "message": msg, "finish_reason": finishReason,
+		}},
+	}
+	if usage != nil {
+		resp["usage"] = responsesUsageToChatBridge(usage)
+	}
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// formatOutputIndex 格式化 Responses output_index（number）为稳定 key。
+// 与 item_id 一起作为 chat tool_calls index 的别名来源。
+// 缺省/非法值返回空串，不参与别名。
+func formatOutputIndex(v float64) string {
+	if v == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d", int(v))
 }
 
 // convertResponsesToChat 把上游 Responses JSON 响应转为 Chat Completions 响应。

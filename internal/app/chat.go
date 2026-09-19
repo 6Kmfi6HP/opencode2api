@@ -468,13 +468,17 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 协议路由：显式规则命中时按上游原生协议转发。chat 入站只看规则层，
-	// 未命中保持既有路径（翻译失败后探测/记忆回退），默认行为不变。
-	switch matchProtocolRuleModelOnly(req.Model) {
+	// 协议路由：显式规则与 native-responses 运行时记忆命中时按上游原生协议
+	// 转发。memory 层必须查：muse-spark-*-contributor[-free] 的 chat 通道被
+	// 上游整档 500，只能靠原生 responses 透传；漏查会让 Chat 客户端拿不到
+	// probe/记忆带来的回退。
+	proto, protoSource := resolveUpstreamProtocolWithSource(req.Model)
+	switch proto {
 	case upstreamProtocolAnthropic:
 		forwardChatViaAnthropic(w, r, auth, &req, wantsReasoning(&req))
 		return
 	case upstreamProtocolResponses:
+		slog.Info("chat dispatch via native responses", "model", req.Model, "proto_source", protoSource)
 		forwardChatViaResponses(w, r, auth, &req, wantsReasoning(&req))
 		return
 	}

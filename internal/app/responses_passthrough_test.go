@@ -724,6 +724,22 @@ func TestNativeResponsesFailureEviction(t *testing.T) {
 	if !isNativeResponsesModel("muse-spark-1.3-contributor") {
 		t.Fatal("static model must never be evicted")
 	}
+	// contributor-free 系列（上游 chat/completions 整档 500，只能走原生
+	// responses）经模式匹配命中，同样永不剔除
+	for _, m := range []string{"muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor-free"} {
+		if !isNativeResponsesModel(m) {
+			t.Fatalf("contributor-free model %q must be native via static pattern", m)
+		}
+		for range nativeResponsesEvictAfter {
+			markNativeResponsesFailure(m)
+		}
+		if !isNativeResponsesModel(m) {
+			t.Fatalf("contributor-free model %q must never be evicted", m)
+		}
+	}
+	if isNativeResponsesModel("muse-spark-1.3-contributor-preview") {
+		t.Fatal("preview suffix must NOT match the contributor pattern (different billing tier)")
+	}
 }
 
 // extractStreamEventUsage 兼容 response.completed 与裸 usage 两种形态，

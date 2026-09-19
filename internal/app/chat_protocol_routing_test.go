@@ -872,12 +872,89 @@ func TestDispatch_ResponsesToAnthropicRule(t *testing.T) {
 	}
 }
 
-// TestResponsesSSEToChatStream_ToolArgumentsShareIndex covers the two id
-// shapes Responses uses for one tool call: output_item.added announces it by
-// call_id while function_call_arguments.delta names it by item_id, and the
-// second delta names it only by output_index. All three must resolve to the
-// same chat tool_calls index, or a client merging deltas by index sees a
-// named call with empty arguments.
+// TestAggregateResponsesStreamToChat_NonStream 免费层强制 stream:true 后，
+// responses 上游回 SSE（response.created/output_text.delta/.../completed）；
+// 非流式 chat 路径必须先聚合为单个 chat.completion JSON 再透回头端，
+// 否则客户端收到的是 SSE 而非 JSON。
+func TestAggregateResponsesStreamToChat_NonStream(t *testing.T) {
+	sse := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_agg\",\"model\":\"muse-spark-1.3-contributor-free\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_agg\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
+
+	body := aggregateResponsesStreamToChat([]byte(sse), "muse-spark-1.3-contributor-free", false)
+
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("aggregate output must be valid JSON, got: %s", string(body))
+	}
+	if out["object"] != "chat.completion" {
+		t.Fatalf("object = %#v, want chat.completion", out["object"])
+	}
+	if out["id"] != "resp_agg" {
+		t.Fatalf("id = %#v, want resp_agg", out["id"])
+	}
+	choices, _ := out["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("choices = %#v", out["choices"])
+	}
+	msg, _ := choices[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "hello world" {
+		t.Fatalf("content = %#v", msg["content"])
+	}
+	if choices[0].(map[string]any)["finish_reason"] != "stop" {
+		t.Fatalf("finish_reason = %#v", choices[0].(map[string]any)["finish_reason"])
+	}
+	if usage, ok := out["usage"].(map[string]any); !ok || usage["total_tokens"] != float64(5) {
+		t.Fatalf("usage = %#v", out["usage"])
+	}
+
+	// 已是 JSON 时幂等（不二次聚合）
+	jsonBody := []byte(`{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2}}`)
+	if string(aggregateResponsesStreamToChat(jsonBody, "m", false)) != string(jsonBody) {
+		t.Fatal("JSON input must pass through unchanged")
+	}
+}
+
+// TestDispatch_ChatToResponsesMemory 记忆层命中（native-responses registry）
+// 时 chat 入站直接打 /zen/v1/responses，不再走 chat/completions + probe 回退。
+// 这是 muse-spark-*-contributor[-free] 的修复关键：chat 通道 500 整档拒，
+// 只能靠 memory 层预路由绕开。
+func TestDispatch_ChatToResponsesMemory(t *testing.T) {
+	const model = "muse-spark-1.3-contributor-free"
+	setProtocolRulesForTest(t, nil) // 无显式规则，纯记忆层命中
+	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusOK, body: `{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"via memory"}]}],"usage":{"input_tokens":1,"output_tokens":2}}`},
+	})
+
+	// forwardChatViaResponses 仅在客户端非流式时才有可能不强制 stream:true;
+	// 但当前实现对 chat→responses 上游仍强制 stream:true（免费层门禁），非流式
+	// 客户端靠 aggregateResponsesStreamToChat 把 SSE 还原成 JSON。流式客户端
+	// 走 responsesSSEToChatStream，不经过这里。为非流式 sit 起聚合路径的桩数据。
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"`+model+`","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	chatCompletionsHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.HasSuffix(transport.requestedURLs[0], "/zen/v1/responses") {
+		t.Fatalf("URL = %s, want /zen/v1/responses (memory-routed), got %#v", transport.requestedURLs[0], transport.requestedURLs)
+	}
+	// 非流式客户端应收到聚合后的 chat.completion JSON（非 SSE）
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("non-stream client must receive JSON, got: %s", rec.Body.String())
+	}
+	if out["object"] != "chat.completion" {
+		t.Fatalf("object = %#v, want chat.completion", out["object"])
+	}
+	if !strings.Contains(string(rec.Body.Bytes()), "via memory") {
+		t.Fatalf("body missing upstream text: %s", rec.Body.String())
+	}
+}
+
 func TestResponsesSSEToChatStream_ToolArgumentsShareIndex(t *testing.T) {
 	sse := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_7\",\"model\":\"gpt-x\"}}\n\n" +
 		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_a\",\"call_id\":\"call_a\",\"name\":\"bash\"}}\n\n" +

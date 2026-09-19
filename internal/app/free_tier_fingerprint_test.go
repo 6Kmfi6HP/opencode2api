@@ -150,9 +150,54 @@ func TestFreeTierFingerprint_PublicPartialClientTools(t *testing.T) {
 	}
 }
 
-// A3: Bearer sk- + muse-spark-1.3-contributor-free(目录可能未知,靠 -free 后缀短路) +
-// stream:false ⇒ 指纹完整就绪后才会打到上游(上游仍因档位 500,但网关不能再先被
-// 第一道 403 指纹门拦下)。
+// 免费层指纹补齐：走到上游 responses 子路径时，缺失的四件工具必须按
+// OpenAI Responses 形状（{"type":"function","name","parameters"}）注入；
+// Anthropic 的 ("name"+input_schema) 形状会被上游按 `did not match any
+// supported type` 拒绝。
+func TestFreeTierFingerprint_ResponsesSubpathInjectsResponsesShape(t *testing.T) {
+	auth := UpstreamAuth{Mode: AuthRoutePublic, Token: ""}
+	bodyMap := map[string]any{"input": []any{}, "stream": false}
+	req, err := buildOCRequestWithSubpath("muse-spark-1.3-contributor-free", bodyMap, auth, false, "https://opencode.ai", "responses", "ses_12345678901234567890123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(req.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := out["tools"].([]any)
+	if len(tools) != len(freeTierRequiredToolsResponses) {
+		t.Fatalf("expected all %d free-tier tools injected on responses subpath, got %d: %s",
+			len(freeTierRequiredToolsResponses), len(tools), mustJSON(out))
+	}
+	for i, raw := range tools {
+		tm, _ := raw.(map[string]any)
+		if tm["type"] != "function" {
+			t.Fatalf("tools[%d].type = %v, want function: %s", i, tm["type"], mustJSON(tm))
+		}
+		if name, _ := tm["name"].(string); name == "" {
+			t.Fatalf("tools[%d] missing top-level name: %s", i, mustJSON(tm))
+		}
+		if _, ok := tm["parameters"].(map[string]any); !ok {
+			t.Fatalf("tools[%d] missing parameters object: %s", i, mustJSON(tm))
+		}
+		if _, hasFn := tm["function"]; hasFn {
+			t.Fatalf("tools[%d] must NOT use chat nested function shape: %s", i, mustJSON(tm))
+		}
+		if _, hasInputSchema := tm["input_schema"]; hasInputSchema {
+			t.Fatalf("tools[%d] must NOT use anthropic input_schema shape: %s", i, mustJSON(tm))
+		}
+	}
+	if out["stream"] != true {
+		t.Fatalf("free-tier responses must force stream:true, got %v", out["stream"])
+	}
+}
+
+func mustJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
 func TestFreeTierFingerprint_SKKeyContributorFreeModel(t *testing.T) {
 	ocClientVer = "1.18.31"
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-realkey0123456789abcdef"}

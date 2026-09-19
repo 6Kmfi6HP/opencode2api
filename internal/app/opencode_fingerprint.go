@@ -83,6 +83,37 @@ var freeTierRequiredToolsAnthropic = []map[string]any{
 		}},
 }
 
+// freeTierRequiredToolsResponses 是 OpenAI Responses 协议形状下的同一组四件
+// 占位工具：{"type":"function","name","description","parameters"}。Anthropic
+// 的 input_schema 形状不能用于 responses 子路径（上游按 FunctionTool 校验，
+// 缺 type/parameters 报 `did not match any supported type`）。
+var freeTierRequiredToolsResponses = []map[string]any{
+	{"type": "function", "name": "bash", "description": "Run a shell command and return its output",
+		"parameters": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"command": map[string]any{"type": "string", "description": "The shell command to execute"}},
+			"required":   []string{"command"},
+		}},
+	{"type": "function", "name": "glob", "description": "Find files matching a glob pattern",
+		"parameters": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The glob pattern to match files against"}},
+			"required":   []string{"pattern"},
+		}},
+	{"type": "function", "name": "grep", "description": "Search file contents with a regular expression",
+		"parameters": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The regular expression pattern to search for"}},
+			"required":   []string{"pattern"},
+		}},
+	{"type": "function", "name": "read", "description": "Read the contents of a file",
+		"parameters": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"file_path": map[string]any{"type": "string", "description": "The path of the file to read"}},
+			"required":   []string{"file_path"},
+		}},
+}
+
 // freeTierToolNameOf 同时识别三种上游协议形状里的工具名:
 // OpenAI Chat(tools[].function.name)与 Anthropic Messages / OpenAI
 // Responses(tools[].name)。
@@ -100,8 +131,10 @@ func freeTierToolNameOf(t map[string]any) string {
 // 缺失的**逐项**补上(只补缺失项、保留客户端已有工具的原始位置与形状,
 // 四件按 bash,glob,grep,read 顺序追加在后),而不是"客户端带了任一工具就整包
 // 跳过"——上游按"有无四件"整体判定,部分带齐与完全不带一样会被 403。
-// subpath == "messages" 时用 Anthropic/Responses 的裸 name 形状补齐;其它
-// (chat/completions 及转换后的 responses)沿用 OpenAI 形状。tools 已补齐时不动。
+// subpath == "messages" 用 Anthropic 的裸 name+input_schema 形状；
+// subpath == "responses" 用 OpenAI Responses 的 type:function+parameters 形状；
+// chat/completions 沿用 OpenAI 嵌套 function 形状。tools 已补齐时不动。
+// bare name 命中检查由 freeTierToolNameOf 兼容三种形状。
 func ensureFreeTierTools(bodyMap map[string]any, subpath string) {
 	if bodyMap == nil {
 		return
@@ -118,13 +151,20 @@ func ensureFreeTierTools(bodyMap map[string]any, subpath string) {
 		}
 	}
 	missing := make([]any, 0, len(freeTierRequiredTools))
-	if subpath == "messages" {
+	switch subpath {
+	case "messages":
 		for _, tool := range freeTierRequiredToolsAnthropic {
 			if !existing[tool["name"].(string)] {
 				missing = append(missing, tool)
 			}
 		}
-	} else {
+	case "responses":
+		for _, tool := range freeTierRequiredToolsResponses {
+			if !existing[tool["name"].(string)] {
+				missing = append(missing, tool)
+			}
+		}
+	default: // chat/completions
 		for _, tool := range freeTierRequiredTools {
 			fn := tool["function"].(map[string]any)
 			if !existing[fn["name"].(string)] {

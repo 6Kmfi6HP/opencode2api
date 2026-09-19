@@ -150,7 +150,9 @@ cp config.example.json config.json
 
 ### `native_responses_models`
 
-上游模型 ID 列表：这些模型已知只支持原生 Responses 端点，请求会跳过 Chat 翻译，直接透传到上游 `/responses`。除配置外，代理还内置了一份静态预置列表（如 `muse-spark-1.3-contributor`），并会在运行时探测确认后动态记忆更多模型；配置值与静态预置只增不减地合并，不会清掉运行时学到的模型；静态预置与配置下发的模型不会因连续失败被剔除，运行时学到的模型连续失败 5 次后会自动剔除并回落 Chat 翻译路径。
+上游模型 ID 列表：这些模型已知只支持原生 Responses 端点，请求会跳过 Chat 翻译，直接透传到上游 `/responses`。除配置外，代理还内置了一份静态预置列表（`muse-spark-1.2/1.3-contributor` 及 `-free` 变体，因上游对其 `chat/completions` 通道整档 500、只剩 `/responses` 可用），并会在运行时探测确认后动态记忆更多模型；配置值与静态预置只增不减地合并，不会清掉运行时学到的模型；静态预置与配置下发的模型不会因连续失败被剔除，运行时学到的模型连续失败 5 次后会自动剔除并回落 Chat 翻译路径。
+
+> **注意**：受免费层指纹门限制，`muse-spark-*-contributor-free` 的 tools 必须是 Responses 形状（`{"type":"function","name",...}`），注入的缺失四件 bash/glob/grep/read 已自动按此形状补齐；Anthropic 形状的 `input_schema` 会被上游按 `did not match any supported type` 拒绝。
 
 ```json
 {

@@ -384,9 +384,18 @@ var nativeResponsesModels = struct {
 
 // defaultNativeResponsesModels 静态预置已知仅支持原生 responses 端点的模型，
 // 免除冷启动时“先失败重试多次再探测”的惩罚。静态模型不会被故障剔除。
+//
+// key 用 "muse-spark-*-contributor" 通配：上游（opencode console 仓
+// zen/util/handler.go）把 contributor 系列的 chat/completions 通道整档
+// 500（与指纹无关，四件齐+stream:true 仍 500），但 /zen/v1/responses 正常；
+// 付费档与 -free 档同机型同通道策略，故统一走原生 responses。
 var defaultNativeResponsesModels = map[string]bool{
-	"muse-spark-1.3-contributor": true,
+	"muse-spark-1.2-contributor":      true,
+	"muse-spark-1.3-contributor":      true,
+	"muse-spark-1.2-contributor-free": true,
+	"muse-spark-1.3-contributor-free": true,
 }
+var defaultNativeResponsesPatterns = []string{"muse-spark-*-contributor", "muse-spark-*-contributor-free"}
 
 // nativeResponsesFailures 记录动态记住模型的连续透传失败次数，用于故障自愈。
 // 只有动态学习到的模型会被剔除；静态预置模型与配置下发的模型不受影响。
@@ -428,13 +437,21 @@ func setNativeResponsesModels(models []string) {
 }
 
 // isNativeResponsesModel 报告该上游模型是否已被记住走原生 responses 透传。
+// 除逐个记住的模型 ID 外，还命中静态预置通配（如 muse-spark-*-contributor
+// 全系列：上游对 contributor 机型整档封 chat/completions，见上方注释）。
 func isNativeResponsesModel(modelID string) bool {
 	if modelID == "" {
 		return false
 	}
+	base, _ := stripContextSuffix(modelID)
+	for _, pattern := range defaultNativeResponsesPatterns {
+		if protocolPatternMatches(pattern, base) {
+			return true
+		}
+	}
 	nativeResponsesModels.RLock()
 	defer nativeResponsesModels.RUnlock()
-	return nativeResponsesModels.ids[modelID]
+	return nativeResponsesModels.ids[modelID] || nativeResponsesModels.ids[base]
 }
 
 // rememberNativeResponsesModel 记住该上游模型走原生 responses 透传。
@@ -461,6 +478,14 @@ func markNativeResponsesFailure(modelID string) {
 	}
 	if defaultNativeResponsesModels[modelID] {
 		return
+	}
+	if base, _ := stripContextSuffix(modelID); defaultNativeResponsesModels[base] {
+		return
+	}
+	for _, pattern := range defaultNativeResponsesPatterns {
+		if base, _ := stripContextSuffix(modelID); protocolPatternMatches(pattern, base) {
+			return
+		}
 	}
 	nativeResponsesFailures.Lock()
 	nativeResponsesFailures.counts[modelID]++

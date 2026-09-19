@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix `muse-spark-1.2/1.3-contributor-free` chat and streaming requests against the public free tier (upstream `500` on chat/completions, `403` on responses without tools fingerprint): the contributor tier is registered as native-responses-only by pattern (matching the opencode upstream's gating in `zen/util/handler.go`), and the free-tier tool injection now emits OpenAI `{"type":"function","name","parameters"}` shape on the `/responses` subpath instead of the Anthropic `input_schema` form. Non-stream chat clients on a forced-`stream:true` responses route get their SSE aggregated back into `chat.completion` JSON. Verified end-to-end via the live gateway on both `muse-spark-1.2-contributor-free` and `muse-spark-1.3-contributor-free`.
+
 ## v0.13.0
 
 - Harden cross-protocol conversion across all three inbound × upstream directions per the official OpenAI/Anthropic specs (Chat Completions ↔ Responses ↔ Messages). Request side:
