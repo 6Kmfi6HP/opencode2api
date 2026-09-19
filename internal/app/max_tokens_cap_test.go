@@ -106,10 +106,11 @@ func TestMaxTokensCapNilMaxTokens(t *testing.T) {
 	})
 	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
 
-	// When max_tokens is not set, it should not appear in the converted request
+	// When max_tokens is not set, the cap is injected as the upstream budget.
 	req := &OpenAIRequest{Model: "any-model", MaxTokens: nil}
 	body := convertRequest(req)
-	if _, exists := body["max_tokens"]; exists {
-		t.Fatalf("max_tokens should not be set when nil")
+	got, ok := body["max_tokens"].(int)
+	if !ok || got != 131072 {
+		t.Fatalf("max_tokens should inject cap 131072, got %#v", body["max_tokens"])
 	}
 }

@@ -6,9 +6,51 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 )
 
 // ---------- Claude -> Responses 请求转换 ----------
+
+// 缺 max_tokens 且 cap>0：max_output_tokens 注入 = cap（与 responses 直通口径一致）。
+func TestClaudeToResponsesBody_InjectsCapWhenMaxTokensMissing(t *testing.T) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
+		s.MaxTokensCap = 128000
+		s.MaxTokensCapPerModel = nil
+	})
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
+
+	claudeReq := ClaudeRequest{Model: "primary-model"}
+	body := claudeToResponsesBody(claudeReq, "primary-model")
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("responses body is not JSON: %v", err)
+	}
+	if v, ok := intFromAny(req["max_output_tokens"]); !ok || v != 128000 {
+		t.Fatalf("cap=128000 应注入 max_output_tokens=128000, got %#v", req["max_output_tokens"])
+	}
+}
+
+// 缺 max_tokens 且 cap=0：max_output_tokens 抬升到下限 128，不保持缺省。
+func TestClaudeToResponsesBody_LiftsToFloorWhenNoCap(t *testing.T) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
+		s.MaxTokensCap = 0
+		s.MaxTokensCapPerModel = nil
+	})
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
+
+	claudeReq := ClaudeRequest{Model: "primary-model"}
+	body := claudeToResponsesBody(claudeReq, "primary-model")
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("responses body is not JSON: %v", err)
+	}
+	if v, ok := intFromAny(req["max_output_tokens"]); !ok || v != 128 {
+		t.Fatalf("无 cap 时应抬到 max_output_tokens=128, got %#v", req["max_output_tokens"])
+	}
+}
 
 func TestClaudeToResponsesBody_BasicMapping(t *testing.T) {
 	var claudeReq ClaudeRequest

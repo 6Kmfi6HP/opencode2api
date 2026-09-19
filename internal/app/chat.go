@@ -1083,9 +1083,13 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 		converted["temperature"] = *req.Temperature
 	}
 	if req.MaxTokens != nil {
-		// clampMaxTokens 复用 anthropic_protocol.go 的 [128, cap] 收敛；
+		// clampMaxTokens 复用 anthropic_protocol.go 的 cap 收敛；
 		// chat 入站的 max_tokens 是客户端可选字段，下限收敛无害。
 		converted["max_tokens"] = clampMaxTokens(*req.MaxTokens, config.MaxTokensCapFor(req.Model))
+	} else if cap := config.MaxTokensCapFor(req.Model); cap > 0 {
+		// 未显式设置时注入 cap：与 responses 直通口径一致（cap 即上游默认
+		// 预算，避免上游按自身小默认截断）。
+		converted["max_tokens"] = cap
 	}
 	if req.MaxCompletionTokens != nil {
 		converted["max_completion_tokens"] = clampMaxTokens(*req.MaxCompletionTokens, config.MaxTokensCapFor(req.Model))

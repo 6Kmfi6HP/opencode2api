@@ -132,7 +132,7 @@ cp config.example.json config.json
 
 本批次行为补充（仅本版起）：
 
-- `max_tokens`（Anthropic）/ `max_output_tokens`（Responses）全局与按模型上限取 `max_tokens_cap` / `max_tokens_cap_per_model`，直通与翻译路径同样收敛到 `[128, cap]`，count_tokens 直通只降不补。
+- `max_tokens`（Anthropic/Chat）/ `max_output_tokens`（Responses）全局与按模型上限取 `max_tokens_cap` / `max_tokens_cap_per_model`。配置了 cap 时，**所有**发给上游的请求（Responses/Chat/Anthropic 的直通与翻译路径）缺省该字段都会自动注入 = cap；已设置的收敛到 `[128, cap]`。未配置 cap 时 Chat 直通保持缺省，Anthropic / Chat→Anthropic / Chat→Responses 因 max_tokens 必填兜底 8192。count_tokens 直通只降不补不注入。
 - chat 入站的 `max_completion_tokens` 优先于 `max_tokens` 指导预算（按 Worker A/B 的 OpenAI 现代字段语义），响应走的 `store:false` 且上游为 reasoning 时带 `include:["reasoning.encrypted_content"]` 由 A/B 补齐。
 - thinking 模式与 `temperature`/`top_p`/`top_k` 互斥：开启 thinking 时剥离这些采样参数（避免上游 400），同时保留 `output_config.effort` → `reasoning_effort` 映射。
 - tool_use/tool_result 配对归一：Claude 历史的 orphan tool_use（无 matching tool_result）在翻译为 chat/responses 前补占位 tool_result 或 drop，保证上游不再因序列非法 400。

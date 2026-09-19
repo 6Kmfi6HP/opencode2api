@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/domain"
 )
 
@@ -111,5 +112,20 @@ func TestPipeAnthropicStream_PreservesHeaderAndBytes(t *testing.T) {
 	}
 	if rec.Body.String() != upstreamBody {
 		t.Fatalf("body diverged:\nup:  %q\ngot: %q", upstreamBody, rec.Body.String())
+	}
+}
+
+// clampAnthropicProtocolMaxTokens：显式小值抬到 128 下限（以前只降不抬）。
+func TestClampAnthropicProtocolMaxTokens_LiftsBelowFloor(t *testing.T) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
+		s.MaxTokensCap = 128000
+		s.MaxTokensCapPerModel = nil
+	})
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
+
+	bodyMap := map[string]any{"max_tokens": float64(50)}
+	if got := clampAnthropicProtocolMaxTokens(bodyMap, "any-model"); got != 128 {
+		t.Fatalf("低于 128 应抬到 128, got %d", got)
 	}
 }

@@ -575,12 +575,18 @@ func claudeToResponsesBody(claudeReq ClaudeRequest, modelID string) []byte {
 	if claudeReq.Temperature != nil && !reasoningOn {
 		body["temperature"] = *claudeReq.Temperature
 	}
+	// max_tokens -> max_output_tokens，clamp 到 [128, cap]（cap 见
+	// config.MaxTokensCapFor；min 128 由 clampClaudeMaxTokens 统一保证）。
+	// 未显式设置时注入 cap；无 cap 则抬到 128（与 responses 直通同口径）。
+	tokenCap := config.MaxTokensCapFor(modelID)
+	v := 0
 	if claudeReq.MaxTokens != nil {
-		// max_tokens -> max_output_tokens，clamp 到 [128, cap]（cap 见
-		// config.MaxTokensCapFor；min 128 由 clampClaudeMaxTokens 统一保证）。
-		v := clampClaudeMaxTokens(*claudeReq.MaxTokens, config.MaxTokensCapFor(modelID))
-		body["max_output_tokens"] = v
+		v = *claudeReq.MaxTokens
 	}
+	if v <= 0 {
+		v = tokenCap
+	}
+	body["max_output_tokens"] = clampClaudeMaxTokens(v, tokenCap)
 	if claudeReq.TopP != nil && !reasoningOn {
 		body["top_p"] = *claudeReq.TopP
 	}

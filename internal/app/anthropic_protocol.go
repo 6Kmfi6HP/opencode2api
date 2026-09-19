@@ -18,8 +18,8 @@ const defaultClaudeMaxTokens = 8192
 const minClaudeMaxTokens = 128
 
 // clampMaxTokens 把 max_tokens 收敛到 [1, cap]；cap<=0 表示无上界。
-// convertRequest（chat.go）与 claudeToResponsesBody（claude_responses.go）
-// 的 cap 逻辑共用这个 helper。
+// convertRequest（chat.go）的 cap 逻辑与 clampClaudeMaxTokens 共用这个
+// helper。
 func clampMaxTokens(v, cap int) int {
 	if cap > 0 && v > cap {
 		v = cap
@@ -40,9 +40,9 @@ func clampClaudeMaxTokens(v, cap int) int {
 }
 
 // clampAnthropicProtocolMaxTokens 是直通路径（raw body map）版本的
-// clampMaxTokens：对 bodyMap["max_tokens"]（JSON 数值）做 [128, cap] 就地
-// 收敛；缺失/非法时不改（适合 count_tokens 等不强求 max_tokens 的入口 —
-// 只降不补，"最多保持原预算"）。messages 直通的 required-schema 补默认
+// clampClaudeMaxTokens：对 bodyMap["max_tokens"]（JSON 数值）做 [128, cap]
+// 就地收敛；缺失/非法时不改（适合 count_tokens 等不强求 max_tokens 的入口
+// —— 只降不补，"最多保持原预算"）。messages 直通的 required-schema 补默认
 // 逻辑在 forwardClaudeViaAnthropic。返回写回后的 int 值；未改返回 0。
 func clampAnthropicProtocolMaxTokens(bodyMap map[string]any, modelID string) int {
 	if bodyMap == nil {
@@ -66,7 +66,7 @@ func clampAnthropicProtocolMaxTokens(bodyMap map[string]any, modelID string) int
 	if v <= 0 {
 		return 0
 	}
-	clamped := clampMaxTokens(v, config.MaxTokensCapFor(modelID))
+	clamped := clampClaudeMaxTokens(v, config.MaxTokensCapFor(modelID))
 	if clamped != v {
 		bodyMap["max_tokens"] = clamped
 	}
