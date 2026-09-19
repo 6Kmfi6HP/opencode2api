@@ -998,25 +998,24 @@ func TestStripReplayedReasoningEcho(t *testing.T) {
 // （消息、工具调用）一个字都不能改。
 func TestResponsesPassthroughRepairsForeignReasoningEcho(t *testing.T) {
 	const requestBody = `{"model":"muse-spark-1.3-contributor","store":false,"include":["reasoning.encrypted_content"],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"reasoning","id":"rs_other_caller:rs_1","summary":[{"type":"summary_text","text":"old thinking"}],"encrypted_content":"Zm9yZWlnbg=="},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"ok"},{"type":"message","role":"user","content":[{"type":"input_text","text":"go on"}]}]}`
-	const foreignEcho = `{"model":"muse-spark-1.3-contributor","error":{"param":null,"type":"invalid_request_error","message":"Error from provider (Console): Upstream request failed: [invalid_request_error] reasoning ` + "`encrypted_content`" + ` was not issued to this caller"}}`
 
 	for _, tc := range []struct {
 		name       string
 		stream     bool
-		retryBody  string
+		okBody     string
 		wantInBody string
 	}{
 		{
 			name:       "non-stream",
 			stream:     false,
-			retryBody:  `{"id":"resp_repaired","object":"response","status":"completed","output":[]}`,
-			wantInBody: `"resp_repaired"`,
+			okBody:     `{"id":"resp_ok","object":"response","status":"completed","output":[]}`,
+			wantInBody: `"resp_ok"`,
 		},
 		{
 			name:       "stream",
 			stream:     true,
-			retryBody:  "event: response.completed\ndata: {\"id\":\"resp_repaired_stream\"}\n\n",
-			wantInBody: "resp_repaired_stream",
+			okBody:     "event: response.completed\ndata: {\"id\":\"resp_ok_stream\"}\n\ndata: [DONE]\n\n",
+			wantInBody: "resp_ok_stream",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1024,9 +1023,9 @@ func TestResponsesPassthroughRepairsForeignReasoningEcho(t *testing.T) {
 			applyConfig(AppConfig{})
 			t.Cleanup(func() { applyConfig(AppConfig{ModelAlias: oldModelAlias}) })
 
+			// 预防性剥离已生效：理论上第一次就成功，不再需要重发。
 			transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
-				{status: http.StatusBadRequest, body: foreignEcho},
-				{status: http.StatusOK, body: tc.retryBody},
+				{status: http.StatusOK, body: tc.okBody},
 			})
 
 			body := strings.Replace(requestBody, `"store":false`, `"store":false,"stream":`+map[bool]string{true: "true", false: "false"}[tc.stream], 1)
@@ -1035,52 +1034,37 @@ func TestResponsesPassthroughRepairsForeignReasoningEcho(t *testing.T) {
 			responsesHandler(rec, req)
 
 			if rec.Code != http.StatusOK {
-				t.Fatalf("status = %d, want 200 (repaired retry), body = %s", rec.Code, rec.Body.String())
+				t.Fatalf("status = %d, want 200 (first-try success), body = %s", rec.Code, rec.Body.String())
 			}
 			if !strings.Contains(rec.Body.String(), tc.wantInBody) {
 				t.Fatalf("body = %s, want %s", rec.Body.String(), tc.wantInBody)
 			}
-			if len(transport.requestedURLs) != 2 {
-				t.Fatalf("upstream calls = %#v, want exactly 2 (original + repair)", transport.requestedURLs)
+			if len(transport.requestedURLs) != 1 {
+				t.Fatalf("upstream calls = %#v, want exactly 1 (no repair retry needed)", transport.requestedURLs)
 			}
 
-			repaired := transport.requestPayloads[1]
-			items, _ := repaired["input"].([]any)
+			// 上游收到的请求：reasoning 回声已被预防性剥离，其余 item 原样。
+			sent := transport.requestPayloads[0]
+			items, _ := sent["input"].([]any)
 			if len(items) != 6 {
-				t.Fatalf("repaired input len = %d, want 6 (item count must not change)", len(items))
+				t.Fatalf("sent input len = %d, want 6 (item count must not change)", len(items))
 			}
 			reasoning, _ := items[1].(map[string]any)
 			if reasoning["type"] != "reasoning" {
 				t.Fatalf("item[1] = %#v, want the reasoning item kept in place", items[1])
 			}
 			if _, ok := reasoning["id"]; ok {
-				t.Fatalf("repaired reasoning item must drop id: %#v", reasoning)
+				t.Fatalf("reasoning id must be stripped preemptively: %#v", reasoning)
 			}
 			if _, ok := reasoning["encrypted_content"]; ok {
-				t.Fatalf("repaired reasoning item must drop encrypted_content: %#v", reasoning)
+				t.Fatalf("reasoning encrypted_content must be stripped preemptively: %#v", reasoning)
 			}
 			if summary, _ := reasoning["summary"].([]any); len(summary) != 1 {
 				t.Fatalf("summary must be preserved, got %#v", reasoning["summary"])
 			}
-			// 其它 item 与请求级字段逐字保持不变。
-			original := transport.requestPayloads[0]
-			for _, key := range []string{"model", "store", "include", "input"} {
-				wantItems, _ := original[key].([]any)
-				gotItems, _ := repaired[key].([]any)
-				if key != "input" {
-					if !reflect.DeepEqual(original[key], repaired[key]) {
-						t.Fatalf("%s changed: %v -> %v", key, original[key], repaired[key])
-					}
-					continue
-				}
-				for i := range wantItems {
-					if i == 1 {
-						continue // 唯一允许变化的就是 reasoning 回声本身
-					}
-					if !reflect.DeepEqual(wantItems[i], gotItems[i]) {
-						t.Fatalf("input[%d] changed: %v -> %v", i, wantItems[i], gotItems[i])
-					}
-				}
+			// 可见与工具调用 item 原样透传
+			if items[0].(map[string]any)["type"] != "message" || items[3].(map[string]any)["arguments"] != `{"cmd":"ls"}` {
+				t.Fatalf("neighbouring items changed: %v", items)
 			}
 		})
 	}
@@ -1136,5 +1120,159 @@ func TestResponsesPassthroughForeignReasoningEchoWithoutEchoStays400(t *testing.
 				t.Fatalf("upstream calls = %d, want 1 (nothing to repair)", got)
 			}
 		})
+	}
+}
+
+// ======================== 回放历史 arguments 归一化 ========================
+
+func TestCoalesceReplayedToolCallArgs_Cases(t *testing.T) {
+	mkBody := func(items ...any) map[string]any {
+		return map[string]any{"model": "muse-spark-1.3-contributor", "input": items}
+	}
+	cases := []struct {
+		name     string
+		items    []any
+		wantArgs []string // 与 items 等长；"" 表示不应有 arguments 键
+		changed  bool
+	}{
+		{
+			name:     "空串改 {}",
+			items:    []any{map[string]any{"type": "function_call", "call_id": "c1", "name": "multi_agent_v1", "arguments": ""}},
+			wantArgs: []string{"{}"}, changed: true,
+		},
+		{
+			// 本次事故现场形态：幻觉工具名 + 空 arguments
+			name:     "幻觉调用空参数",
+			items:    []any{map[string]any{"type": "function_call", "call_id": "c2", "name": "multi_agent_v1", "arguments": ""}},
+			wantArgs: []string{"{}"}, changed: true,
+		},
+		{
+			name:     "合法 JSON 不动",
+			items:    []any{map[string]any{"type": "function_call", "call_id": "c3", "name": "exec_command", "arguments": `{"cmd":"echo 1.0","yield_time_ms":1000.0}`}},
+			wantArgs: []string{`{"cmd":"echo 1.0","yield_time_ms":1000.0}`}, changed: false,
+		},
+		{
+			name:     "缺 arguments 不补",
+			items:    []any{map[string]any{"type": "function_call", "call_id": "c4", "name": "exec_command"}},
+			wantArgs: []string{""}, changed: false,
+		},
+		{
+			name:     "非串类型 null 改 {}",
+			items:    []any{map[string]any{"type": "function_call", "call_id": "c5", "name": "exec_command", "arguments": nil}},
+			wantArgs: []string{"{}"}, changed: true,
+		},
+		{
+			name:     "对象序列化为串",
+			items:    []any{map[string]any{"type": "custom_tool_call", "call_id": "c6", "name": "ping", "arguments": map[string]any{"a": 1.0}}},
+			wantArgs: []string{`{"a":1}`}, changed: true,
+		},
+		{
+			name: "function_call_output 与 message 不动",
+			items: []any{
+				map[string]any{"type": "function_call_output", "call_id": "c7", "output": "unsupported call: multi_agent_v1"},
+				map[string]any{"type": "message", "role": "assistant"},
+			},
+			wantArgs: []string{"", ""}, changed: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := mkBody(tc.items...)
+			got := coalesceReplayedToolCallArgs(body)
+			if got != tc.changed {
+				t.Fatalf("changed = %v, want %v", got, tc.changed)
+			}
+			items := body["input"].([]any)
+			for i, want := range tc.wantArgs {
+				m := items[i].(map[string]any)
+				if want == "" {
+					if _, exists := m["arguments"]; exists {
+						t.Fatalf("item %d: arguments 不应存在或应保持原状", i)
+					}
+					continue
+				}
+				if got := m["arguments"]; got != want {
+					t.Fatalf("item %d arguments = %#v, want %#v", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestSanitizeResponsesPassthroughBody_EmptyArgumentsMuseSpark(t *testing.T) {
+	raw := []byte(`{
+		"model": "muse-spark-1.3-contributor",
+		"input": [
+			{"type": "message", "role": "user", "content": "继续"},
+			{"type": "function_call", "call_id": "call_x", "name": "multi_agent_v1", "arguments": ""},
+			{"type": "function_call_output", "call_id": "call_x", "output": "unsupported call: multi_agent_v1"}
+		]
+	}`)
+	out, _ := sanitizeResponsesPassthroughBody(raw, "muse-spark-1.3-contributor")
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("sanitize 输出不是合法 JSON: %v", err)
+	}
+	items := got["input"].([]any)
+	if args := items[1].(map[string]any)["arguments"]; args != "{}" {
+		t.Fatalf("空 arguments 未归一化，got %#v", args)
+	}
+	// output 原样保留，不被改写
+	if out0 := items[2].(map[string]any)["output"]; out0 != "unsupported call: multi_agent_v1" {
+		t.Fatalf("function_call_output 被误改: %#v", out0)
+	}
+}
+
+func TestSanitizeResponsesPassthroughBody_NonMuseUnchanged(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5","input":[{"type":"function_call","call_id":"c1","name":"x","arguments":""}]}`)
+	out, _ := sanitizeResponsesPassthroughBody(raw, "gpt-5")
+	if string(out) != string(raw) {
+		t.Fatalf("非 muse-spark 模型请求体被改写")
+	}
+}
+
+// ======================== 预防性 reasoning 回声剥离（sanitize 路径） ========================
+
+func TestSanitizeResponsesPassthroughBody_PreemptivelyStripsReasoningEcho(t *testing.T) {
+	raw := []byte(`{
+		"model": "muse-spark-1.3-contributor",
+		"input": [
+			{"type": "message", "role": "user", "content": "hi"},
+			{"type": "reasoning", "id": "rs_foreign", "summary": [{"type": "summary_text", "text": "old"}], "encrypted_content": "Zm9yZWlnbg=="},
+			{"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"}
+		]
+	}`)
+	out, _ := sanitizeResponsesPassthroughBody(raw, "muse-spark-1.3-contributor")
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("sanitize 输出非合法 JSON: %v", err)
+	}
+	items := got["input"].([]any)
+	rs := items[1].(map[string]any)
+	if _, hasID := rs["id"]; hasID {
+		t.Fatalf("reasoning id 未被预防性剥离: %v", rs)
+	}
+	if _, hasEC := rs["encrypted_content"]; hasEC {
+		t.Fatalf("encrypted_content 未被预防性剥离: %v", rs)
+	}
+	// summary 必须保留（可见推理摘要）
+	if s, ok := rs["summary"].([]any); !ok || len(s) != 1 {
+		t.Fatalf("reasoning summary 被误删: %v", rs)
+	}
+	// message / function_call 不动
+	if items[0].(map[string]any)["type"] != "message" {
+		t.Fatalf("message item 被改动")
+	}
+	if items[2].(map[string]any)["arguments"] != "{}" {
+		t.Fatalf("合法 arguments 被误改")
+	}
+}
+
+func TestSanitizeResponsesPassthroughBody_NoReasoningEchoUnchanged(t *testing.T) {
+	// 无 echo 且无其它修正触发时原样返回（幂等）
+	raw := []byte(`{"model":"muse-spark-1.3-contributor","input":[{"type":"message","role":"user","content":"hi"}]}`)
+	out, _ := sanitizeResponsesPassthroughBody(raw, "muse-spark-1.3-contributor")
+	if string(out) != string(raw) {
+		t.Fatalf("无 echo 请求被误改")
 	}
 }

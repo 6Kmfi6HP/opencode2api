@@ -544,6 +544,61 @@ func shouldProbeNativeResponses(status int, err error) bool {
 // probeNativeResponses 专用于 chat 翻译路径失败后的投机探测：仅当上游原生
 // responses 返回 2xx 时才把响应写回客户端并记住该模型；任何失败都返回 false
 // 且不写任何响应，调用方保留原翻译路径的错误原样返回。
+// ======================== 回放历史 arguments 空串归一化 ========================
+//
+// muse-spark 偶发会发出 arguments 为空串的 function_call（幻觉工具名时尤其
+// 如此），客户端原样回放到下一轮 input，上游在服务端反序列化这段历史时按
+// `arguments` must be valid JSON 拒绝整个请求（空串/非串都不是合法 JSON
+// 文本）。可见文本与 function_call_output 完全不动（output 靠 call_id
+// 绑定，客户端 UI 不读 arguments）；合法 JSON 串原样通过，幂等。
+func coalesceReplayedToolCallArgs(body map[string]any) bool {
+	items, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, raw := range items {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		t, _ := m["type"].(string)
+		switch t {
+		case "function_call", "custom_tool_call", "local_shell_call", "mcp_call":
+		default:
+			continue
+		}
+		v, exists := m["arguments"]
+		if !exists {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			if s == "" {
+				m["arguments"] = "{}"
+				changed = true
+				continue
+			}
+			var parsed any
+			if json.Unmarshal([]byte(s), &parsed) != nil {
+				m["arguments"] = "{}"
+				changed = true
+			}
+			continue
+		}
+		switch v.(type) {
+		case map[string]any, []any:
+			if b, err := json.Marshal(v); err == nil {
+				m["arguments"] = string(b)
+				changed = true
+			}
+		default:
+			m["arguments"] = "{}"
+			changed = true
+		}
+	}
+	return changed
+}
+
 // sanitizeResponsesPassthroughBody 对原生透传体做 lenient 归一化，避免上游
 // 严格校验 400（如 required 缺 key、reasoning.effort 非法、name 超长），
 // 绝不因不支持返回 400。合法请求归一化后等价（幂等），可安全用于保真透传。
@@ -608,6 +663,15 @@ func sanitizeResponsesPassthroughBody(rawBody []byte, modelID string) ([]byte, *
 	if rwChanged := rewrites.shortenResponsesBodyNames(body); rwChanged {
 		changed = true
 	}
+	if coalesceReplayedToolCallArgs(body) {
+		changed = true
+	}
+	// 预防性剥离回放 reasoning 回声：密文绑定发起方账号+出口，sticky 出口
+	// 轮换/重启后必然 400；每轮出站前剥掉，不等上游拒绝再重发。summary 等
+	// 可见内容保留，请求语义不变。
+	if stripReplayedReasoningEchoFromBody(body) {
+		changed = true
+	}
 	if !changed {
 		return rawBody, rewrites
 	}
@@ -649,14 +713,12 @@ func isForeignReasoningEchoError(status int, body []byte) bool {
 //   - 只删密文：上游改为按 id 找不到该 item（Referenced reasoning item ... 400）。
 //
 // 其它字段（如 summary）与其它 item 原样保留，请求语义不变。
-func stripReplayedReasoningEcho(rawBody []byte) ([]byte, bool) {
-	var body map[string]any
-	if err := json.Unmarshal(rawBody, &body); err != nil {
-		return rawBody, false
-	}
+// stripReplayedReasoningEchoFromBody 在已解析 body 上原地剥离回放 reasoning
+// 回声（id + encrypted_content 成对删除）。
+func stripReplayedReasoningEchoFromBody(body map[string]any) bool {
 	items, ok := body["input"].([]any)
 	if !ok {
-		return rawBody, false
+		return false
 	}
 	changed := false
 	for _, item := range items {
@@ -671,12 +733,20 @@ func stripReplayedReasoningEcho(rawBody []byte) ([]byte, bool) {
 			delete(m, "encrypted_content")
 			changed = true
 		}
-		if _, ok := m["id"]; ok {
+		if _, ok := m["id"].(string); ok {
 			delete(m, "id")
 			changed = true
 		}
 	}
-	if !changed {
+	return changed
+}
+
+func stripReplayedReasoningEcho(rawBody []byte) ([]byte, bool) {
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return rawBody, false
+	}
+	if !stripReplayedReasoningEchoFromBody(body) {
 		return rawBody, false
 	}
 	fixed, err := json.Marshal(body)
