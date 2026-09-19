@@ -109,6 +109,7 @@ cp config.example.json config.json
 | `nemotron-3-ultra-free` | context length | 1,000,000 |
 | `nemotron-3.5-lightning-free` | context length | 1,000,000 |
 
+
 ### `protocol_rules`
 
 **上游协议路由规则**：按模型模式把请求分流到 OpenCode Zen 的三种原生协议端点，而不是固定走 Chat Completions 翻译。

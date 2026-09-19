@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
@@ -599,6 +600,21 @@ func coalesceReplayedToolCallArgs(body map[string]any) bool {
 	return changed
 }
 
+// clampPassThroughMaxTokens 把 max_output_tokens 钳制到 [128, cap]；cap>0 且
+// cap<128 时以 cap 作为硬上限（配置者显式限满须尊重）。仅 cap>0 时调用。
+func clampPassThroughMaxTokens(v, cap int) int {
+	if v > cap {
+		return cap
+	}
+	if v < 128 {
+		if cap < 128 {
+			return cap
+		}
+		return 128
+	}
+	return v
+}
+
 // sanitizeResponsesPassthroughBody 对原生透传体做 lenient 归一化，避免上游
 // 严格校验 400（如 required 缺 key、reasoning.effort 非法、name 超长），
 // 绝不因不支持返回 400。合法请求归一化后等价（幂等），可安全用于保真透传。
@@ -607,14 +623,33 @@ func coalesceReplayedToolCallArgs(body map[string]any) bool {
 // 指针，调用方恒可用。
 func sanitizeResponsesPassthroughBody(rawBody []byte, modelID string) ([]byte, *responsesNameRewrites) {
 	rewrites := newResponsesNameRewrites()
-	if !isMuseSparkModel(modelID) {
-		return rawBody, rewrites
-	}
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return rawBody, rewrites
 	}
 	changed := false
+	// max_output_tokens 钳制对全部 native passthrough 模型生效：
+	// codex 在 native responses 直连下不发 max_output_tokens（日志实测
+	// "max_tokens=<nil>"），缺省时上游按自身默认预算截断、流里没有
+	// response.completed，兜底合成 reason=max_output_tokens，客户端因而
+	// 误报 max_output_tokens。cap>0 时注入/钳到 [128, cap]。
+	if tokCap := config.MaxTokensCapFor(modelID); tokCap > 0 {
+		if v, ok := intFromAny(body["max_output_tokens"]); !ok || v <= 0 {
+			body["max_output_tokens"] = clampPassThroughMaxTokens(tokCap, tokCap)
+			changed = true
+		} else if cv := clampPassThroughMaxTokens(v, tokCap); cv != v {
+			body["max_output_tokens"] = cv
+			changed = true
+		}
+	}
+	if !isMuseSparkModel(modelID) {
+		if changed {
+			if b, err := json.Marshal(body); err == nil {
+				return b, rewrites
+			}
+		}
+		return rawBody, rewrites
+	}
 	if tools, ok := body["tools"].([]any); ok {
 		for i, t := range tools {
 			tm, ok := t.(map[string]any)
@@ -756,6 +791,19 @@ func stripReplayedReasoningEcho(rawBody []byte) ([]byte, bool) {
 	return fixed, true
 }
 
+// passthroughMaxOutputTokens 从归一化后的透传体读出 max_output_tokens，供日志
+// 观测用；未设置或非正返回 0。
+func passthroughMaxOutputTokens(rawBody []byte) int {
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return 0
+	}
+	if v, ok := intFromAny(body["max_output_tokens"]); ok && v > 0 {
+		return v
+	}
+	return 0
+}
+
 // callResponsesWithEchoRepair 调用上游 responses 端点；若上游因回放的推理密文
 // 不属于当前发起方而 400，则剥掉推理回声后原样重发一次。重发拿不到响应时返回
 // 第一次的上游错误，客户端看到的失败原因保持真实。
@@ -791,6 +839,10 @@ func callResponsesWithEchoRepair(ctx context.Context, auth UpstreamAuth, modelID
 
 func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool, req ResponsesAPIRequest) bool {
 	rawBody, rewrites := sanitizeResponsesPassthroughBody(rawBody, modelID)
+	logging.FromContext(ctx).Info("responses passthrough probe max_output_tokens",
+		"model", modelID,
+		"max_output_tokens", passthroughMaxOutputTokens(rawBody),
+	)
 	rc, status, header, err := callResponsesWithEchoRepair(ctx, auth, modelID, rawBody)
 	if err != nil || status < 200 || status >= 300 {
 		if rc != nil {
@@ -812,6 +864,12 @@ func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth Upstr
 // 真正的传输层错误（无法拿到上游响应）时返回 false，调用方兜底写 502。
 func forwardNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool, req ResponsesAPIRequest) bool {
 	rawBody, rewrites := sanitizeResponsesPassthroughBody(rawBody, modelID)
+	logging.FromContext(ctx).Info("responses passthrough max_output_tokens",
+		"model", modelID,
+		"max_output_tokens", passthroughMaxOutputTokens(rawBody),
+		"cap", config.MaxTokensCapFor(modelID),
+		"auth_source", auth.Source,
+	)
 	rc, status, header, err := callResponsesWithEchoRepair(ctx, auth, modelID, rawBody)
 	if err != nil {
 		markNativeResponsesFailure(modelID)

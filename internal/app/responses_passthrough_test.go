@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"errors"
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"net/http"
 	"net/http/httptest"
@@ -1274,5 +1275,105 @@ func TestSanitizeResponsesPassthroughBody_NoReasoningEchoUnchanged(t *testing.T)
 	out, _ := sanitizeResponsesPassthroughBody(raw, "muse-spark-1.3-contributor")
 	if string(out) != string(raw) {
 		t.Fatalf("无 echo 请求被误改")
+	}
+}
+
+// ======================== max_output_tokens 直通钳制 ========================
+
+// 全局 cap 生效且原请求缺 max_output_tokens 时注入 = cap。pre-fix 该场景下
+// 函数直接早退（非 muse-spark 模型），泄漏 = 上游拿到空值后按自身默认截
+// 断，EOF 无 terminal 事件，兜底合成 reason=max_output_tokens 误报。
+func TestSanitizeResponsesPassthroughBody_InjectsMaxOutputTokensForNonMuse(t *testing.T) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
+		s.MaxTokensCap = 128000
+		s.MaxTokensCapPerModel = nil
+	})
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
+
+	raw := []byte(`{"model":"gpt-5","input":[{"type":"message","role":"user","content":"hi"}]}`)
+	out, _ := sanitizeResponsesPassthroughBody(raw, "gpt-5")
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("sanitize 输出非合法 JSON: %v", err)
+	}
+	if v, ok := intFromAny(got["max_output_tokens"]); !ok || v != 128000 {
+		t.Fatalf("cap=128000 应注入 max_output_tokens=128000, got %#v", got["max_output_tokens"])
+	}
+}
+
+// cap 生效且原请求显式超过 cap 时钳到 cap。
+func TestSanitizeResponsesPassthroughBody_ClampsAboveCap(t *testing.T) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
+		s.MaxTokensCap = 128000
+		s.MaxTokensCapPerModel = nil
+	})
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
+
+	raw := []byte(`{"model":"gpt-5","max_output_tokens":500000,"input":[{"type":"message","role":"user","content":"hi"}]}`)
+	out, _ := sanitizeResponsesPassthroughBody(raw, "gpt-5")
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("sanitize 输出非合法 JSON: %v", err)
+	}
+	if v, ok := intFromAny(got["max_output_tokens"]); !ok || v != 128000 {
+		t.Fatalf("超过 cap 应钳到 128000, got %#v", got["max_output_tokens"])
+	}
+}
+
+// 原请求值低于下限 128 时抬到 128（与 chat→anthropic 的 resolveMaxTokens 口径一致）。
+func TestSanitizeResponsesPassthroughBody_LiftsBelowFloor(t *testing.T) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
+		s.MaxTokensCap = 128000
+		s.MaxTokensCapPerModel = nil
+	})
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
+
+	raw := []byte(`{"model":"gpt-5","max_output_tokens":50,"input":[{"type":"message","role":"user","content":"hi"}]}`)
+	out, _ := sanitizeResponsesPassthroughBody(raw, "gpt-5")
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("sanitize 输出非合法 JSON: %v", err)
+	}
+	if v, ok := intFromAny(got["max_output_tokens"]); !ok || v != 128 {
+		t.Fatalf("低于下限 128 应抬到 128, got %#v", got["max_output_tokens"])
+	}
+}
+
+// cap=0 不注入也不覆盖，保持原始行为。
+func TestSanitizeResponsesPassthroughBody_NoCapNoTouch(t *testing.T) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
+		s.MaxTokensCap = 0
+		s.MaxTokensCapPerModel = nil
+	})
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
+
+	raw := []byte(`{"model":"gpt-5","input":[{"type":"message","role":"user","content":"hi"}]}`)
+	out, _ := sanitizeResponsesPassthroughBody(raw, "gpt-5")
+	if string(out) != string(raw) {
+		t.Fatalf("cap=0 时请求体不应被改写, got %s", out)
+	}
+}
+
+// muse-spark 模型同样也注入 cap（它在原实现里走的是不同的早退分支）。
+func TestSanitizeResponsesPassthroughBody_InjectsForMuseSpark(t *testing.T) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
+		s.MaxTokensCap = 128000
+		s.MaxTokensCapPerModel = nil
+	})
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
+
+	raw := []byte(`{"model":"muse-spark-1.3-contributor","input":[{"type":"message","role":"user","content":"hi"}]}`)
+	out, _ := sanitizeResponsesPassthroughBody(raw, "muse-spark-1.3-contributor")
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("sanitize 输出非合法 JSON: %v", err)
+	}
+	if v, ok := intFromAny(got["max_output_tokens"]); !ok || v != 128000 {
+		t.Fatalf("muse-spark 模型也应注入 max_output_tokens=128000, got %#v", got["max_output_tokens"])
 	}
 }
