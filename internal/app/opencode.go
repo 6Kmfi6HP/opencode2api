@@ -706,6 +706,9 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		if err == nil {
 			err = fmt.Errorf("upstream error")
 		}
+		// 包装上游错误体，让下游 writeUpstreamError 能透出原始 message 而非
+		// 笼统 "upstream error"。
+		err = &upstreamBodyError{msg: err.Error(), body: errBody}
 		return errBody, status, header, err
 	}
 	defer rc.Close()
@@ -749,6 +752,16 @@ func (e *anthropicProtocolError) Error() string {
 	return e.message
 }
 
+// upstreamBodyError 携带上游 HTTP 错误体的 error，供 writeUpstreamError 在
+// 无类型化错误（非 anthropicProtocolError）时也能透出原始 body 中的错误信息
+// （message / type），而不是笼统的 "upstream error"。
+type upstreamBodyError struct {
+	msg  string
+	body []byte
+}
+
+func (e *upstreamBodyError) Error() string { return e.msg }
+
 // normalized to 502.
 func writeUpstreamError(w http.ResponseWriter, status int, err error, protocol string) {
 	if status < 100 || status >= 600 {
@@ -765,6 +778,18 @@ func writeUpstreamError(w http.ResponseWriter, status int, err error, protocol s
 		}
 		if ape.message != "" {
 			message = ape.message
+		}
+	}
+	// 携带上游错误体时优先提取其 message（次选 type），避免仅返回 generic
+	// "upstream error" 丢失根因（例如上游对 muse-spark contributor 档位整档
+	// 500 的具体 JSON）。
+	var ube *upstreamBodyError
+	if errors.As(err, &ube) && message == "upstream error" {
+		if msg := extractUpstreamErrorMessage(ube.body); msg != "" {
+			message = msg
+		}
+		if et := extractUpstreamErrorType(ube.body); et != "" {
+			errType = et
 		}
 	}
 
@@ -794,6 +819,47 @@ func writeUpstreamError(w http.ResponseWriter, status int, err error, protocol s
 			},
 		})
 	}
+}
+
+// extractUpstreamErrorMessage / extractUpstreamErrorType 从上游 JSON 错误体
+// 提取 message / type 字段，OpenAI ({error:{message}}) 与 Anthropic
+// ({type:"error",error:{...}}) 形状都兼容；非 JSON 或字段缺失时返回 ""。
+func extractUpstreamErrorMessage(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil {
+		return ""
+	}
+	if em, ok := raw["error"].(map[string]any); ok {
+		if m, ok := em["message"].(string); ok && m != "" {
+			return m
+		}
+	}
+	if m, ok := raw["message"].(string); ok && m != "" {
+		return m
+	}
+	return ""
+}
+
+func extractUpstreamErrorType(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil {
+		return ""
+	}
+	if em, ok := raw["error"].(map[string]any); ok {
+		if t, ok := em["type"].(string); ok && t != "" {
+			return t
+		}
+	}
+	if t, ok := raw["type"].(string); ok && t != "" && t != "error" {
+		return t
+	}
+	return ""
 }
 
 func callOpenCodeAPIStream(ctx context.Context, upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {

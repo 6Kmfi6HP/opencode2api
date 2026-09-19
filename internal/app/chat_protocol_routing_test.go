@@ -1009,3 +1009,52 @@ func TestResponsesSSEToChatStream_ToolArgumentsShareIndex(t *testing.T) {
 		t.Fatalf("tool call 1 = %q %q", names[1], args[1])
 	}
 }
+
+// TestCallOpenCodeEndpoint_UpstreamErrorBody 上游 4xx/5xx 时返回体必须携带
+// 原始错误内容（而非裸 "upstream error"），否则客户端只看到网关合成的
+// generic 错误，排查上游问题（如 muse-spark contributor 500）时拿不到
+// 具体 message。
+func TestCallOpenCodeEndpoint_UpstreamErrorBody(t *testing.T) {
+	// 400: 明确不可重试，验证 body 原样透出。
+	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusBadRequest, body: `{"type":"error","error":{"type":"error","message":"muse-spark contributor tier gated"}}`},
+	})
+
+	rc, status, _, err := callOpenCodeEndpoint(context.Background(), "chat/completions", []byte(`{"model":"x","messages":[]}`), "x", UpstreamAuth{Mode: AuthRoutePublic})
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if err != nil {
+		t.Fatalf("err must be nil when a final status is available, got %v", err)
+	}
+	body, _ := io.ReadAll(rc)
+	if rc != nil {
+		rc.Close()
+	}
+	if !strings.Contains(string(body), "muse-spark contributor tier gated") {
+		t.Fatalf("upstream error body must be preserved verbatim, got: %s", string(body))
+	}
+}
+
+// TestWriteUpstreamError_WithUpstreamBody writeUpstreamError 在拿到上
+// 游非空错误体时优先透传原始 body 内容，而不是笼统的 "upstream error"。
+func TestWriteUpstreamError_WithUpstreamBody(t *testing.T) {
+	upstreamBody := `{"type":"error","error":{"type":"error","message":"muse-spark contributor tier gated"}}`
+	rec := httptest.NewRecorder()
+	writeUpstreamError(rec, http.StatusInternalServerError, &upstreamBodyError{msg: "upstream error", body: []byte(upstreamBody)}, "chat")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response must be JSON, got %s", rec.Body.String())
+	}
+	errObj, _ := got["error"].(map[string]any)
+	if errObj["message"] != "muse-spark contributor tier gated" {
+		t.Fatalf("message = %v, want upstream text", errObj["message"])
+	}
+	if errObj["type"] != "error" {
+		t.Fatalf("type = %v, want upstream type", errObj["type"])
+	}
+}
