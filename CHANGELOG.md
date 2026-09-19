@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `POST /v1/systemone` passthrough for TypeSafe System One models (`jev-1.13*`): these evaluate `state` + typed `questions` → structured `answers` and cannot be driven by Chat/Responses/Messages, so they get a dedicated inbound endpoint that relays verbatim to upstream `/zen/v1/systemone` (body preserved except `model`). Free-tier fingerprint rewrite stays scoped to the three text protocols and does not touch `systemone` (`internal/app/systemone.go`).
+
 ## v0.13.0
 
 - Harden cross-protocol conversion across all three inbound × upstream directions per the official OpenAI/Anthropic specs (Chat Completions ↔ Responses ↔ Messages). Request side:
