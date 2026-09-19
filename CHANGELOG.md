@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.2
+
+- Fix spurious `incomplete: reason=max_output_tokens` on Native `/v1/responses` passthrough when the client omits `max_output_tokens`: codex under native-responses routing does not emit `max_output_tokens`, so the upstream fell back to its own default output budget and aborted the SSE stream without `response.completed`; the gateway's EOF guard then synthesized `response.incomplete` with `reason=max_output_tokens`, which the codex client correctly bubbles up as "stream disconnected before completion". The native passthrough path now consults the same `max_tokens_cap` / `max_tokens_cap_per_model` rules as the chat→anthropic and chat→responses translation paths, and injects / clamps `max_output_tokens` into `[128, cap]` before forwarding. Adds observability: a structured log line records the effective `max_output_tokens` and `cap` per passthrough request.
+
 ## v0.14.1
 
 - Fix muse-spark multi-turn failures on `/v1/responses` passthrough (`invalid_request_error` `` `arguments` `` must be valid JSON`): muse-spark occasionally emits `function_call` items with `arguments: ""` (typically hallucinated tool names during sub-agent dispatch). The Codex client replays the failed call verbatim into the next turn's `input`, and the upstream's strict server-side replay validation then rejects the entire request with 400 — so from the second turn the session is unrecoverable. `sanitizeResponsesPassthroughBody` now runs `coalesceReplayedToolCallArgs` on the passthrough path: history `function_call` / `custom_tool_call` / `local_shell_call` / `mcp_call` items with missing/empty/non-string `arguments` are coalesced to `"{}"` (object/array → JSON-serialized; valid JSON strings pass through unchanged, idempotent); `function_call_output` and visible text are never touched.
