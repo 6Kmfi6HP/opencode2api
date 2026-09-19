@@ -855,7 +855,9 @@ func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth Upstr
 	rememberNativeResponsesModel(modelID)
 	logging.FromContext(ctx).Info("responses_probe_succeeded", "model", modelID, "stream", stream)
 
-	relayResponsesToClient(ctx, w, rc, status, header, modelID, stream, req, rewrites)
+	relayResponsesToClient(ctx, w, rc, status, header, modelID, stream, req, rewrites, auth, rawBody, func(c context.Context, b []byte) (io.ReadCloser, int, http.Header, error) {
+		return callResponsesWithEchoRepair(c, auth, modelID, b)
+	})
 	return true
 }
 
@@ -881,20 +883,22 @@ func forwardNativeResponses(ctx context.Context, w http.ResponseWriter, auth Ups
 		markNativeResponsesFailure(modelID)
 	}
 
-	relayResponsesToClient(ctx, w, rc, status, header, modelID, stream, req, rewrites)
+	relayResponsesToClient(ctx, w, rc, status, header, modelID, stream, req, rewrites, auth, rawBody, func(c context.Context, b []byte) (io.ReadCloser, int, http.Header, error) {
+		return callResponsesWithEchoRepair(c, auth, modelID, b)
+	})
 	return true
 }
 
 // relayResponsesToClient 统一负责流式与非流式的保真透传：过滤后的安全响应头、
 // 流式实时 Flush、流/非流双路 Token 统计、成功响应的会话状态保存。
-func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, header http.Header, modelID string, stream bool, req ResponsesAPIRequest, rewrites *responsesNameRewrites) {
+func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, header http.Header, modelID string, stream bool, req ResponsesAPIRequest, rewrites *responsesNameRewrites, auth UpstreamAuth, rawBody []byte, upstreamCall func(context.Context, []byte) (io.ReadCloser, int, http.Header, error)) {
 	// 拷贝上游安全响应头（X-RateLimit-* 等），客户端可见剩余额度与重置时间。
 	for k, v := range filterResponseHeaders(header) {
 		w.Header()[k] = v
 	}
 
 	if stream && status >= 200 && status < 300 {
-		relayResponsesStream(ctx, w, rc, status, modelID, req, rewrites)
+		relayResponsesStream(ctx, w, rc, status, modelID, req, rewrites, auth, rawBody, upstreamCall)
 		return
 	}
 
@@ -949,7 +953,7 @@ func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Re
 // relayResponsesStream 逐行透传 SSE 并在每个事件行后 Flush，保证打字机效果；
 // 同时从 response.completed / usage 事件中提取 usage 做 Token 统计，并保存
 // 完整响应对象以维持 previous_response_id 会话链条。
-func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, modelID string, req ResponsesAPIRequest, rewrites *responsesNameRewrites) {
+func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, modelID string, req ResponsesAPIRequest, rewrites *responsesNameRewrites, auth UpstreamAuth, rawBody []byte, upstreamCall func(context.Context, []byte) (io.ReadCloser, int, http.Header, error)) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -962,12 +966,8 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 	}
 
 	_ = ctx
-	reader := bufio.NewReader(rc)
 	var lastUsage map[string]any
 	var lastResponse map[string]any
-	// sawData：是否转发过至少一条 data 行；doneSeen：上游是否已发送
-	// `data: [DONE]` 哨兵；writeFailed：客户端已断开，无需再补写；
-	// terminalSeen：是否已见 response.completed/failed/incomplete。
 	sawData := false
 	doneSeen := false
 	writeFailed := false
@@ -975,66 +975,220 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 
 	argStates := map[int]*argsNormState{}
 	argItemToOutput := map[string]int{}
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			outLine := line
-			// 流式参数归一化 + 超长 name 还原（仅 muse-spark）：只处理 arguments
-			// 增量与 completed，output_text 等文本增量绝不动（避免改写 echo 1.0
-			// 等可见输出）；仅 rw.inbound 中登记的缩短名会被还原，不会误伤普通文本。
-			if isMuseSparkModel(modelID) {
-				if normalized, ok := normalizeResponsesStreamLine(line, argStates, argItemToOutput, rewrites); ok {
-					outLine = normalized
+
+	// 续写状态
+	const maxContinuations = 3
+	var accumulatedOutput []any
+	var contUsage map[string]any
+	currentRC := rc.(io.ReadCloser)
+	isTruncatedByMaxTokens := false
+	// pendingTerminalLine 保存本轮的终结事件行（incomplete + max_output_tokens 时暂缓写入）
+	var pendingTerminalLine []byte
+
+	for round := 0; round <= maxContinuations && !doneSeen && !writeFailed; round++ {
+		reader := bufio.NewReader(currentRC)
+		var contLastResponse map[string]any
+		isTruncatedByMaxTokens = false
+		pendingTerminalLine = nil
+
+		for {
+			line, err := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				outLine := line
+				if isMuseSparkModel(modelID) {
+					if normalized, ok := normalizeResponsesStreamLine(line, argStates, argItemToOutput, rewrites); ok {
+						outLine = normalized
+					}
 				}
-			}
-			trimmed := bytes.TrimSpace(outLine)
-			isDoneSentinel := bytes.Equal(trimmed, []byte("data: [DONE]")) || bytes.Equal(trimmed, []byte("[DONE]"))
-			// 吞掉中段的裸 [DONE]：上游若在 response.completed/failed/incomplete
-			// 之前误发 [DONE]，按「以 completed 判定结束」的 Rust SDK 仍在等，但不
-			// 发事件会让它读到流中断 = 失败。这里吞掉该哨兵，EOF 兜底再补正确
-			// 终结（response.incomplete + [DONE]）。
-			if isDoneSentinel && !terminalSeen {
-				if err != nil {
-					break
+				trimmed := bytes.TrimSpace(outLine)
+				isDoneSentinel := bytes.Equal(trimmed, []byte("data: [DONE]")) || bytes.Equal(trimmed, []byte("[DONE]"))
+				if isDoneSentinel && !terminalSeen {
+					if err != nil {
+						break
+					}
+					continue
 				}
-				continue
-			}
-			if isDoneSentinel {
-				doneSeen = true
-			}
-			if _, werr := w.Write(outLine); werr != nil {
-				writeFailed = true
-				break
-			}
-			// 逐行 Flush：标准 SSE 用空行分隔事件，非标准单换行输出也能
-			// 被及时推送，避免 io.Copy 式 32KB 缓冲卡死打字机效果。
-			if flusher != nil {
-				flusher.Flush()
-			}
-			if bytes.HasPrefix(trimmed, []byte("data:")) {
+				if isDoneSentinel {
+					doneSeen = true
+				}
+
+				// 检测终结事件：判断是否为 incomplete + max_output_tokens
+				isTerminalLine := false
+				isIncompleteMaxTokens := false
+				if bytes.HasPrefix(trimmed, []byte("data: ")) {
+					payload := trimmed[6:]
+					if len(payload) > 0 && payload[0] == '{' {
+						var evt map[string]any
+						if json.Unmarshal(payload, &evt) == nil {
+							if typ, _ := evt["type"].(string); typ == "response.completed" || typ == "response.failed" || typ == "response.incomplete" {
+								isTerminalLine = true
+								if typ == "response.incomplete" {
+									if resp, ok := evt["response"].(map[string]any); ok {
+										if details, ok := resp["incomplete_details"].(map[string]any); ok {
+											if reason, _ := details["reason"].(string); reason == "max_output_tokens" {
+												isIncompleteMaxTokens = true
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+
+				// 终结事件：incomplete+max_output_tokens 时暂缓写入，其他直写
+				if isTerminalLine && isIncompleteMaxTokens {
+					pendingTerminalLine = outLine
+					isTruncatedByMaxTokens = true
+				} else if !isTerminalLine {
+					if _, werr := w.Write(outLine); werr != nil {
+						writeFailed = true
+						break
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+				} else {
+					// completed / failed / 其他 incomplete：直写
+					if _, werr := w.Write(outLine); werr != nil {
+						writeFailed = true
+						break
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+
 				sawData = true
-			}
-			if usage, response := extractStreamEventUsage(outLine); usage != nil || response != nil {
-				if usage != nil {
-					lastUsage = usage
-				}
-				if response != nil {
-					lastResponse = response
-					if s, _ := response["status"].(string); s == "completed" || s == "failed" || s == "incomplete" {
-						terminalSeen = true
+
+				if usage, response := extractStreamEventUsage(outLine); usage != nil || response != nil {
+					if usage != nil {
+						lastUsage = usage
+					}
+					if response != nil {
+						if round == 0 {
+							lastResponse = response
+						} else {
+							contLastResponse = response
+						}
+						if s, _ := response["status"].(string); s == "completed" || s == "failed" || s == "incomplete" {
+							terminalSeen = true
+						}
 					}
 				}
 			}
+			if err != nil {
+				break
+			}
 		}
-		if err != nil {
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_ = currentRC.Close()
+
+		if round == 0 {
+			// 首回合：保存 output 供后续续写引用
+			if lastResponse != nil {
+				if output, ok := lastResponse["output"].([]any); ok {
+					accumulatedOutput = output
+				}
+				if usage, ok := lastResponse["usage"].(map[string]any); ok {
+					contUsage = usage
+				}
+			}
+			if !isTruncatedByMaxTokens {
+				// 未截断（completed/failed/其他 incomplete）：正常结束
+				break
+			}
+			// 截断：不发 incomplete，续写
+		} else {
+			// 续写轮
+			if contLastResponse != nil {
+				if output, ok := contLastResponse["output"].([]any); ok && len(output) > 0 {
+					accumulatedOutput = append(accumulatedOutput, output...)
+				}
+				if usage, ok := contLastResponse["usage"].(map[string]any); ok {
+					contUsage = usage
+				}
+			}
+			// 补发被暂缓的终结事件（用新的 response 对象）
+			if pendingTerminalLine != nil {
+				// 解析 pendingTerminalLine 中的 response 对象
+				trimmed := bytes.TrimSpace(pendingTerminalLine)
+				if bytes.HasPrefix(trimmed, []byte("data: ")) {
+					payload := trimmed[6:]
+					var evt map[string]any
+					if json.Unmarshal(payload, &evt) == nil {
+						if resp, ok := evt["response"].(map[string]any); ok {
+							// 替换 response 的 output / status / incomplete_details / usage
+							resp["output"] = accumulatedOutput
+							resp["status"] = "completed"
+							resp["incomplete_details"] = nil
+							if contUsage != nil {
+								resp["usage"] = contUsage
+							}
+							evt["type"] = "response.completed"
+							evt["response"] = resp
+							if b, merr := json.Marshal(evt); merr == nil {
+								_, _ = w.Write([]byte("event: response.completed\ndata: " + string(b) + "\n\n"))
+								if flusher != nil {
+									flusher.Flush()
+								}
+							}
+						}
+					}
+				}
+			}
 			break
 		}
-	}
-	if flusher != nil {
-		flusher.Flush()
+
+		// 达到最大续写次数仍截断
+		if round == maxContinuations {
+			logging.FromContext(ctx).Warn("max continuations reached, sending incomplete", "model", modelID)
+			// 补发被暂缓的 incomplete（原始内容）
+			if pendingTerminalLine != nil {
+				_, _ = w.Write(pendingTerminalLine)
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			break
+		}
+
+		// 发起续写请求
+		contBody, contErr := buildContinuationBody(rawBody, accumulatedOutput, modelID)
+		if contErr != nil {
+			logging.FromContext(ctx).Warn("failed to build continuation body", "error", contErr)
+			if pendingTerminalLine != nil {
+				_, _ = w.Write(pendingTerminalLine)
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			break
+		}
+		newRC, newStatus, _, contCallErr := upstreamCall(ctx, contBody)
+		if contCallErr != nil || newStatus < 200 || newStatus >= 300 {
+			if newRC != nil {
+				_ = newRC.Close()
+			}
+			logging.FromContext(ctx).Warn("continuation request failed", "round", round+1, "status", newStatus)
+			if pendingTerminalLine != nil {
+				_, _ = w.Write(pendingTerminalLine)
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			break
+		}
+		currentRC = newRC
+		terminalSeen = false
 	}
 
-	if lastUsage != nil {
+	// 用量只记录一次：优先续写轮的合并值，否则为首轮值
+	if contUsage != nil {
+		recordResponsesUsage(modelID, contUsage)
+	} else if lastUsage != nil {
 		recordResponsesUsage(modelID, lastUsage)
 	}
 	if lastResponse != nil {
@@ -1071,6 +1225,40 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 			flusher.Flush()
 		}
 	}
+}
+
+// buildContinuationBody 构造续写请求：input 设为已收到的 output 数组，
+// max_output_tokens 保持 cap，其余字段从原始请求复制。
+func buildContinuationBody(rawBody []byte, accumulatedOutput []any, modelID string) ([]byte, error) {
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return nil, err
+	}
+	// Responses API 续写语义：input = 原始 input + 已生成 output（assistant 已说的话）
+	// 见 https://platform.openai.com/docs/api-reference/responses/object#responses/object-previous_response_id
+	// 上游要求 input 非空；后续 item 追加在末尾作为续写上下文。
+	originalInput := body["input"]
+	if originalInput == nil {
+		originalInput = ""
+	}
+	items := []any{}
+	if arr, ok := originalInput.([]any); ok {
+		items = append(items, arr...)
+	} else if s, ok := originalInput.(string); ok && s != "" {
+		items = append(items, map[string]any{"role": "user", "content": s})
+	}
+	// 把已生成的 output（reasoning + message + tool_calls）追加为续写上下文
+	items = append(items, accumulatedOutput...)
+	// 末尾加一个续写提示，让模型继续未完成的内容
+	// 必须在 output 之后追加，避免 undoing 已有 output 的 sequence_number 连续性
+	items = append(items, map[string]any{"role": "user", "content": "Please continue."})
+	body["input"] = items
+	tokCap := config.MaxTokensCapFor(modelID)
+	if tokCap > 0 {
+		body["max_output_tokens"] = tokCap
+	}
+	body["stream"] = true
+	return json.Marshal(body)
 }
 
 // normalizeResponsesStreamLine 归一化单行 SSE data 事件中的 function_call 参数，

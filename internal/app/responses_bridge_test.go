@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -437,7 +439,9 @@ func TestAnthropicSSE_EOFClosedIdempotently(t *testing.T) {
 func driveRelayResponsesStream(t *testing.T, sse string) string {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	relayResponsesStream(context.Background(), rec, strings.NewReader(sse), http.StatusOK, "m", ResponsesAPIRequest{}, newResponsesNameRewrites())
+	relayResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), http.StatusOK, "m", ResponsesAPIRequest{}, newResponsesNameRewrites(), UpstreamAuth{}, nil, func(context.Context, []byte) (io.ReadCloser, int, http.Header, error) {
+		return nil, 0, nil, errors.New("no upstream")
+	})
 	return rec.Body.String()
 }
 
