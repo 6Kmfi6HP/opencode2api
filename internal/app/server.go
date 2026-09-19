@@ -126,6 +126,7 @@ func buildMux() *http.ServeMux {
 	mux.HandleFunc("/v1/responses", sessionContextMiddleware(logging.Middleware(responsesHandler)))
 	mux.HandleFunc("/v1/messages", sessionContextMiddleware(logging.Middleware(claudeMessagesHandler)))
 	mux.HandleFunc("/v1/messages/count_tokens", sessionContextMiddleware(logging.Middleware(claudeCountTokensHandler)))
+	mux.HandleFunc("/v1/systemone", sessionContextMiddleware(logging.Middleware(systemoneHandler)))
 	mux.HandleFunc("/v1/models", sessionContextMiddleware(logging.Middleware(listModelsHandler)))
 	mux.HandleFunc("/login", logging.Middleware(loginHandler))
 	mux.HandleFunc("/logout", logging.Middleware(logoutHandler))

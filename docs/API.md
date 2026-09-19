@@ -25,6 +25,7 @@
 | `/v1/responses` | `POST` | OpenAI Responses 兼容入口 |
 | `/v1/messages` | `POST` | Anthropic Messages 兼容入口 |
 | `/v1/messages/count_tokens` | `POST` | Anthropic token 计数入口：命中 anthropic 规则时直连上游 `/zen/v1/messages/count_tokens`，否则本地启发式估算 |
+| `/v1/systemone` | `POST` | TypeSafe System One 协议入口（`state` + typed `questions` → structured `answers`），直通上游 `/zen/v1/systemone`；仅 jev 系列模型可用——该模型不做文本生成，无法用 Chat / Responses / Messages 任何一条协议驱动。body 除 `model` 外原样透传，不走协议路由/协议转换，也不套用免费层指纹重做（该门禁只作用于 chat/completions/messages/responses 三个上游子路径） |
 | `/health` | `GET` | 健康检查 |
 | `/api/config` | `GET`/`POST` | 管理面板配置接口 |
 | `/api/stats` | `GET`/`DELETE` | token 统计接口 |
