@@ -2,10 +2,7 @@ package app
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/bridge"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
@@ -21,300 +19,52 @@ import (
 )
 
 // Claude roundtrip; convertResponse strips it before responding to clients.
+// 纯核已迁入 bridge.BuildOpenAIResponse；本壳注入 now/idGen 并包装类型化
+// 错误为 anthropicProtocolError。
 func buildOpenAIResponse(anthropicMsg map[string]any, contentBlocks []map[string]any, modelID string) ([]byte, error) {
-	if anthropicMsg == nil {
-		return nil, fmt.Errorf("no Anthropic message to convert")
-	}
-	now := time.Now().Unix()
-	role, _ := anthropicMsg["role"].(string)
-	if role == "" {
-		role = "assistant"
-	}
-	finishReason, _ := anthropicMsg["stop_reason"].(string)
-	// Anthropic 的 refusal：stop_reason 原样保留 "refusal"，并（对齐 sub2api）
-	// 把文本放进 message.refusal、content 置空。
-	isRefusal := finishReason == "refusal"
-	finishReason = normalizeFinishReason(finishReason)
-
-	var textBuilder strings.Builder
-	var reasoningContent string
-	var toolCalls []map[string]any
-	hasNonText := false
-
-	for _, blk := range contentBlocks {
-		bt, _ := blk["type"].(string)
-		switch bt {
-		case "text":
-			if t, ok := blk["text"].(string); ok {
-				textBuilder.WriteString(t)
-			}
-		case "thinking":
-			hasNonText = true
-			if t, ok := blk["thinking"].(string); ok {
-				if reasoningContent != "" {
-					reasoningContent += "\n"
-				}
-				reasoningContent += t
-			}
-		case "redacted_thinking":
-			hasNonText = true
-		case "tool_use":
-			hasNonText = true
-			input := blk["input"]
-			if input == nil {
-				input = map[string]any{}
-			}
-			argsJSON, _ := json.Marshal(input)
-			toolID, _ := blk["id"].(string)
-			if toolID == "" {
-				toolID = "toolu_" + randomString(12)
-				blk["id"] = toolID
-			}
-			toolName, _ := blk["name"].(string)
-			toolCalls = append(toolCalls, map[string]any{
-				"id":   toolID,
-				"type": "function",
-				"function": map[string]any{
-					"name":      toolName,
-					"arguments": string(argsJSON),
-				},
-			})
-		default:
-			// Unknown non-empty block type: preserve for private roundtrip.
-			if bt != "" {
-				hasNonText = true
-			}
-		}
-	}
-
-	msg := map[string]any{"role": role}
-
-	// Determine content: if only text blocks, use a string for compatibility.
-	textStr := textBuilder.String()
-	if isRefusal {
-		// refusal 优先：文本进 message.refusal，content 置空（对齐 sub2api）。
-		// Chat->Chat 转换里 content 若为 parts 数组则保留现状，仅标注语义。
-		msg["content"] = nil
-		msg["refusal"] = textStr
-	} else if !hasNonText {
-		msg["content"] = textStr
-	} else {
-		if textStr != "" {
-			msg["content"] = textStr
-		} else {
-			msg["content"] = nil
-		}
-	}
-
-	if reasoningContent != "" {
-		msg["reasoning_content"] = reasoningContent
-	}
-
-	if len(toolCalls) > 0 {
-		msg["tool_calls"] = toolCalls
-	}
-
-	// Private field for Claude roundtrip: preserves original ordered blocks
-	// whenever any non-text native block exists (thinking, redacted_thinking,
-	// tool_use). Generated tool IDs are written back to the blocks so that
-	// Claude roundtrip associations are consistent.
-	if hasNonText {
-		privateBlocks := make([]map[string]any, 0, len(contentBlocks))
-		for _, blk := range contentBlocks {
-			privateBlocks = append(privateBlocks, blk)
-		}
-		msg["_opencode2api_anthropic_content"] = privateBlocks
-	}
-
-	choice := map[string]any{
-		"index":         0,
-		"message":       msg,
-		"finish_reason": finishReason,
-	}
-
-	resp := map[string]any{
-		"id":      normalizeChatResponseID(toString(anthropicMsg["id"])),
-		"object":  "chat.completion",
-		"created": now,
-		"model":   modelID,
-		"choices": []map[string]any{choice},
-	}
-	if usage, ok := anthropicMsg["usage"].(map[string]any); ok {
-		resp["usage"] = anthropicUsageToChat(usage)
-	}
-	result, err := json.Marshal(resp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal Chat response: %w", err)
-	}
-	return result, nil
+	out, err := bridge.BuildOpenAIResponse(time.Now().Unix, randomIDGen, anthropicMsg, contentBlocks, modelID)
+	return out, wrapBridgeProtocolError(err)
 }
 
 // (non-streaming) to Chat Completions format. Returns an error on malformed input.
+// 纯核已迁入 bridge.ConvertAnthropicMessageToOpenAI；薄壳注入 now/idGen。
 func convertAnthropicMessageToOpenAI(msg map[string]any, modelID string) ([]byte, error) {
-	if msg == nil {
-		return nil, fmt.Errorf("no Anthropic message to convert")
-	}
-	if msg["model"] == nil {
-		msg["model"] = modelID
-	}
-	// Direct non-stream message requires a content array.
-	content, ok := msg["content"].([]any)
-	if !ok {
-		return nil, fmt.Errorf("anthropic message missing content array")
-	}
-	var contentBlocks []map[string]any
-	for _, c := range content {
-		block, ok := c.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("anthropic message content contains non-object block")
-		}
-		bt, _ := block["type"].(string)
-		switch bt {
-		case "text", "thinking", "redacted_thinking":
-			// Supported types.
-		case "tool_use":
-			// tool_use must have a non-empty name.
-			name, _ := block["name"].(string)
-			if name == "" {
-				return nil, fmt.Errorf("tool_use block missing non-empty name")
-			}
-			// tool_use input must be JSON-marshalable.
-			if input, exists := block["input"]; exists && input != nil {
-				if _, err := json.Marshal(input); err != nil {
-					return nil, fmt.Errorf("tool_use input not JSON-marshalable: %w", err)
-				}
-			}
-		default:
-			if bt == "" {
-				return nil, fmt.Errorf("anthropic message content block missing type")
-			}
-			// Unknown non-empty block type: keep in private blocks for
-			// potential roundtrip; public Chat ignores it.
-		}
-		contentBlocks = append(contentBlocks, block)
-	}
-	// Direct non-stream message requires a non-empty stop_reason.
-	stopReason, _ := msg["stop_reason"].(string)
-	if stopReason == "" {
-		return nil, fmt.Errorf("anthropic message missing stop_reason")
-	}
-	return buildOpenAIResponse(msg, contentBlocks, modelID)
+	out, err := bridge.ConvertAnthropicMessageToOpenAI(time.Now().Unix, randomIDGen, msg, modelID)
+	return out, wrapBridgeProtocolError(err)
 }
 
 // Returns an error if the body is malformed, truncated, or contains an error event.
+// 纯核已迁入 bridge.ConvertAnthropicToOpenAI；薄壳注入 now/idGen 并包装
+// 类型化错误为 anthropicProtocolError。
 func convertAnthropicToOpenAI(body []byte, modelID string) ([]byte, error) {
-	var singleMsg map[string]any
-	if json.Unmarshal(body, &singleMsg) == nil {
-		if typ, _ := singleMsg["type"].(string); typ == "message" {
-			return convertAnthropicMessageToOpenAI(singleMsg, modelID)
-		}
-		// Could be a single error object.
-		if typ, _ := singleMsg["type"].(string); typ == "error" {
-			errType := "api_error"
-			errMsg := "upstream Anthropic error"
-			if errMap, ok := singleMsg["error"].(map[string]any); ok {
-				if t, ok := errMap["type"].(string); ok && t != "" {
-					errType = t
-				}
-				if m, ok := errMap["message"].(string); ok && m != "" {
-					errMsg = m
-				}
-			}
-			return nil, &anthropicProtocolError{errType: errType, message: errMsg}
-		}
-	}
-	msg, contentBlocks, err := parseAnthropicSSE(body)
-	if err != nil {
-		return nil, err
-	}
-	if msg["model"] == nil {
-		msg["model"] = modelID
-	}
-	return buildOpenAIResponse(msg, contentBlocks, modelID)
+	out, err := bridge.ConvertAnthropicToOpenAI(time.Now().Unix, randomIDGen, body, modelID)
+	return out, wrapBridgeProtocolError(err)
 }
 
 // ======================== 响应清理 ========================
 
+// 纯核已迁入 bridge.CleanNulls；薄壳转发。
 func cleanNulls(m map[string]any) {
-	for k, v := range m {
-		if v == nil {
-			delete(m, k)
-			continue
-		}
-		if s, ok := v.(string); ok && s == "" {
-			delete(m, k)
-		}
-	}
+	bridge.CleanNulls(m)
 }
 
 // precedes tool calls is left alone when keepReasoning is true.
+// 纯核已迁入 bridge.PromoteMisplacedReasoning；薄壳转发。
 func promoteMisplacedReasoning(fields map[string]any, keepReasoning bool) bool {
-	rc, _ := fields["reasoning_content"].(string)
-	if rc == "" {
-		return false
-	}
-	if raw, ok := fields["tool_calls"]; ok && raw != nil {
-		if arr, ok := raw.([]any); ok && len(arr) > 0 {
-			return false
-		}
-	}
-	content, _ := fields["content"].(string)
-	if content != "" {
-		return false
-	}
-	if keepReasoning {
-		// Preserve CoT for thinking blocks / clients that read reasoning_content.
-		return false
-	}
-	fields["content"] = rc
-	delete(fields, "reasoning_content")
-	return true
+	return bridge.PromoteMisplacedReasoning(fields, keepReasoning)
 }
 
+// 纯核已迁入 bridge.CleanStreamDelta；薄壳转发。
 func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
-	_ = promoteMisplacedReasoning(delta, keepReasoning)
-	if v, ok := delta["content"]; ok && v == nil {
-		delete(delta, "content")
-	}
-	if s, ok := delta["content"].(string); ok && s == "" {
-		delete(delta, "content")
-	}
-	if !keepReasoning {
-		delete(delta, "reasoning_content")
-	} else {
-		if v, ok := delta["reasoning_content"]; ok && v == nil {
-			delete(delta, "reasoning_content")
-		}
-		if s, ok := delta["reasoning_content"].(string); ok && s == "" {
-			delete(delta, "reasoning_content")
-		}
-	}
-	if s, ok := delta["role"].(string); ok && s == "" {
-		delete(delta, "role")
-	}
+	bridge.CleanStreamDelta(delta, keepReasoning)
 }
 
 // clientStreamUsageWanted 解析客户端原始请求体中的
 // stream_options.include_usage（顶层或 extra_body 扩展域），决定网关是否把
 // 上游 include_usage=true 产出的 usage chunk 透传给客户端。
+// 纯核已迁入 bridge.ClientStreamUsageWanted；薄壳转发。
 func clientStreamUsageWanted(body []byte) bool {
-	var raw map[string]any
-	if json.Unmarshal(body, &raw) != nil {
-		return false
-	}
-	if so, ok := raw["stream_options"].(map[string]any); ok {
-		if v, ok := so["include_usage"].(bool); ok && v {
-			return true
-		}
-	}
-	if eb, ok := raw["extra_body"].(map[string]any); ok {
-		if so, ok := eb["stream_options"].(map[string]any); ok {
-			if v, ok := so["include_usage"].(bool); ok && v {
-				return true
-			}
-		}
-	}
-	return false
+	return bridge.ClientStreamUsageWanted(body)
 }
 
 // convertStreamChunkWithUsage 转换流式 chunk，并在同一次解析中顺带返回 usage。
@@ -322,120 +72,15 @@ func clientStreamUsageWanted(body []byte) bool {
 // 这里的 "顺带提取" 只是免去了 usage 的第三次解析。
 // clientWantsUsage=false 时丢弃只含 usage 且 choices 为空的 chunk：那是网
 // 关为流统计向上游强制 include_usage=true 产出的，客户端未请求就不该收到。
+// 纯核已迁入 bridge.ConvertStreamChunkWithUsage；薄壳注入 idGen。
 func convertStreamChunkWithUsage(line string, keepReasoning, clientWantsUsage bool) (string, map[string]any) {
-	trimmed := strings.TrimSpace(line)
-	if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
-		return line, nil
-	}
-	if !strings.HasPrefix(line, "data: ") {
-		return line, nil
-	}
-	data := line[6:]
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(data), &raw); err != nil {
-		return line, nil
-	}
-
-	// 提取 usage
-	var usage map[string]any
-	if u, ok := raw["usage"].(map[string]any); ok {
-		usage = u
-	}
-
-	choices, ok := raw["choices"].([]any)
-	if !ok || len(choices) == 0 {
-		// Chat Completions deliberately uses an empty choices array for the
-		// terminal usage chunk. 客户端未请求 include_usage 时抑制它。
-		if usage != nil && !clientWantsUsage {
-			return "", usage
-		}
-		if id, ok := raw["id"].(string); ok && id != "" {
-			raw["id"] = normalizeChatResponseID(id)
-		}
-		delete(raw, "cost")
-		converted, err := json.Marshal(raw)
-		if err != nil {
-			return line, usage
-		}
-		return "data: " + string(converted), usage
-	}
-	for i, c := range choices {
-		choice, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if delta, ok := choice["delta"].(map[string]any); ok {
-			cleanStreamDelta(delta, keepReasoning)
-			choice["delta"] = delta
-		}
-		if msg, ok := choice["message"].(map[string]any); ok {
-			cleanNulls(msg)
-			promoteMisplacedReasoning(msg, keepReasoning)
-			if !keepReasoning {
-				delete(msg, "reasoning_content")
-			}
-			delete(msg, "_opencode2api_anthropic_content")
-			choice["message"] = msg
-		}
-		if v, ok := choice["logprobs"]; ok && v == nil {
-			delete(choice, "logprobs")
-		}
-		if v, ok := choice["finish_reason"]; ok && v == nil {
-			delete(choice, "finish_reason")
-		}
-		if s, ok := choice["finish_reason"].(string); ok && s == "" {
-			delete(choice, "finish_reason")
-		}
-		choices[i] = choice
-	}
-	raw["choices"] = choices
-	if v, ok := raw["usage"]; ok && v == nil {
-		delete(raw, "usage")
-	}
-	if id, ok := raw["id"].(string); ok && id != "" {
-		raw["id"] = normalizeChatResponseID(id)
-	}
-	delete(raw, "cost")
-	converted, err := json.Marshal(raw)
-	if err != nil {
-		return line, usage
-	}
-	return "data: " + string(converted), usage
+	return bridge.ConvertStreamChunkWithUsage(randomIDGen, line, keepReasoning, clientWantsUsage)
 }
 
+// 纯核已迁入 bridge.ConvertResponse；薄壳注入 idGen。原实现对反序列化失败
+// 仅 slog.Warn 后原样返回，纯层静默透传（保持一致的字节级行为）。
 func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		slog.Warn("convertResponse unmarshal failed", "error", err)
-		return data, nil
-	}
-	if id, ok := raw["id"].(string); ok && id != "" {
-		raw["id"] = normalizeChatResponseID(id)
-	}
-	if choices, ok := raw["choices"].([]any); ok {
-		for i, c := range choices {
-			if choice, ok := c.(map[string]any); ok {
-				if msg, ok := choice["message"].(map[string]any); ok {
-					cleanNulls(msg)
-					promoteMisplacedReasoning(msg, keepReasoning)
-					if !keepReasoning {
-						delete(msg, "reasoning_content")
-					}
-					// Strip private Anthropic roundtrip field so it never
-					// leaks to Chat Completions consumers.
-					delete(msg, "_opencode2api_anthropic_content")
-					choice["message"] = msg
-				}
-				if v, ok := choice["logprobs"]; ok && v == nil {
-					delete(choice, "logprobs")
-				}
-				choices[i] = choice
-			}
-		}
-		raw["choices"] = choices
-	}
-	delete(raw, "cost")
-	return json.Marshal(raw)
+	return bridge.ConvertResponse(randomIDGen, data, keepReasoning)
 }
 
 // ======================== Chat Completions Handler ========================
@@ -790,157 +435,55 @@ func replaceModelIDsWithAliases(models []ModelInfo, aliases map[string]string) [
 }
 
 // ======================== Thinking/Reasoning 判断 ========================
+// 纯判定逻辑已迁入 internal/bridge；以下为同名薄壳，config 相关取值在 app 侧
+// 读取后注入，保证 *_test.go 无需修改。
 
-func isThinkingEnabled(value any) bool {
-	switch v := value.(type) {
-	case map[string]any:
-		t, _ := v["type"].(string)
-		// Claude Code sends adaptive thinking with --effort / CLAUDE_CODE_EFFORT_LEVEL.
-		return t == "enabled" || t == "adaptive"
-	case bool:
-		return v
-	default:
-		return false
-	}
-}
+func isThinkingEnabled(value any) bool { return bridge.IsThinkingEnabled(value) }
 
 // effortFromOutputConfig reads Claude Code's output_config.effort
 // (set by --effort / CLAUDE_CODE_EFFORT_LEVEL).
-func effortFromOutputConfig(value any) string {
-	m, ok := value.(map[string]any)
-	if !ok {
-		return ""
-	}
-	effort, _ := m["effort"].(string)
-	return strings.TrimSpace(effort)
-}
+func effortFromOutputConfig(value any) string { return bridge.EffortFromOutputConfig(value) }
 
-func isThinkingDisabled(value any) bool {
-	switch v := value.(type) {
-	case map[string]any:
-		t, _ := v["type"].(string)
-		return t == "disabled"
-	case bool:
-		return !v
-	default:
-		return false
-	}
-}
+func isThinkingDisabled(value any) bool { return bridge.IsThinkingDisabled(value) }
 
 // buildUpstreamThinking preserves budget_tokens / effort fields when present.
-func buildUpstreamThinking(value any) map[string]any {
-	out := map[string]any{"type": "enabled"}
-	m, ok := value.(map[string]any)
-	if !ok {
-		return out
-	}
-	for _, key := range []string{"budget_tokens", "effort"} {
-		if v, exists := m[key]; exists && v != nil {
-			out[key] = v
-		}
-	}
-	return out
-}
+func buildUpstreamThinking(value any) map[string]any { return bridge.BuildUpstreamThinking(value) }
 
 // reasoningEffortFromThinking maps an Anthropic-style thinking object onto an
 // OpenAI-compatible reasoning_effort when the client did not set one
 // explicitly. An explicit "effort" string wins; otherwise the shared
 // thinkingBudgetToEffort tiers budget_tokens.
-func reasoningEffortFromThinking(value any) string {
-	m, ok := value.(map[string]any)
-	if !ok {
-		return ""
-	}
-	if effort, ok := m["effort"].(string); ok && effort != "" {
-		return effort
-	}
-	var budget float64
-	switch v := m["budget_tokens"].(type) {
-	case float64:
-		budget = v
-	case int:
-		budget = float64(v)
-	case int64:
-		budget = float64(v)
-	case json.Number:
-		f, err := v.Float64()
-		if err != nil {
-			return ""
-		}
-		budget = f
-	default:
-		return ""
-	}
-	return thinkingBudgetToEffort(budget)
-}
+func reasoningEffortFromThinking(value any) string { return bridge.ReasoningEffortFromThinking(value) }
 
 func wantsReasoning(req *OpenAIRequest) bool {
-	if config.ForceDisableThinking() {
-		return false
+	return bridge.WantsReasoning(config.ForceDisableThinking(), req)
+}
+
+// bridgeConfigViewFor 按 model 解析一份 bridge.ConfigView 快照并注入纯核。
+// 每个配置取值与原实现一致（各自 config.Get() 快照）——保持逐项读取而非单次
+// 合并快照，行为逐一等价。per-model 的 MaxTokensCap/TextOnly/RejectsCacheControl
+// 按 modelID 解析。
+func bridgeConfigViewFor(modelID string) bridge.ConfigView {
+	return bridge.ConfigView{
+		MaxTokensCap:         config.MaxTokensCapFor(modelID),
+		ForceDisableThinking: config.ForceDisableThinking(),
+		ReasoningEffortMap:   config.ReasoningEffortMap(),
+		PromptCacheRetention: config.PromptCacheRetention(),
+		CacheBreakpoints:     config.CacheBreakpoints(),
+		RejectsCacheControl:  rejectsCacheControl(modelID),
+		TextOnly:             modelIsTextOnly(modelID),
 	}
-	if isThinkingDisabled(req.Thinking) {
-		return false
-	}
-	if isThinkingEnabled(req.Thinking) {
-		return true
-	}
-	if req.ExtraBody != nil {
-		if isThinkingDisabled(req.ExtraBody["thinking"]) {
-			return false
-		}
-		if isThinkingEnabled(req.ExtraBody["thinking"]) {
-			return true
-		}
-	}
-	return true
 }
 
 // 能力协商由 opencode 客户端 + 上游负责；这里既不"硬降级"也不"补全"。
+// 薄壳转发到 bridge。
 func normalizeContent(content any) any {
-	if content == nil {
-		return nil
-	}
-	if s, ok := content.(string); ok {
-		return s
-	}
-	if arr, ok := content.([]any); ok {
-		return arr
-	}
-	b, err := json.Marshal(content)
-	if err != nil {
-		return nil
-	}
-	return string(b)
+	return bridge.NormalizeContent(content)
 }
 
+// fixToolCallGaps 补全 assistant.tool_calls 缺失的 tool 响应。薄壳转发到 bridge。
 func fixToolCallGaps(messages []Message) []Message {
-	toolResponses := map[string]*Message{}
-	for i := range messages {
-		if messages[i].Role == "tool" && messages[i].ToolCallID != "" {
-			toolResponses[messages[i].ToolCallID] = &messages[i]
-		}
-	}
-	fixed := make([]Message, 0, len(messages)+len(messages)/4)
-	emitted := map[string]bool{}
-	for _, msg := range messages {
-		if msg.Role == "tool" && msg.ToolCallID != "" {
-			if emitted[msg.ToolCallID] {
-				continue
-			}
-		}
-		fixed = append(fixed, msg)
-		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			for _, tc := range msg.ToolCalls {
-				if resp, found := toolResponses[tc.ID]; found {
-					fixed = append(fixed, *resp)
-				} else {
-					fixed = append(fixed, Message{Role: "tool", ToolCallID: tc.ID, Content: "Tool call result not available"})
-				}
-				emitted[tc.ID] = true
-			}
-		}
-	}
-	return fixed
+	return bridge.FixToolCallGaps(messages)
 }
 
 // ensureReasoningContent 在 thinking 开启时为 reasoning_content==nil 的
@@ -948,27 +491,19 @@ func fixToolCallGaps(messages []Message) []Message {
 // tool_calls 的 assistant 消息携带产生它的推理（claudeToOpenAIMessages 只在
 // 该情况下写入 reasoning_content），空串槽位只补到没有推理文本的普通
 // assistant 轮，序列化后被 convertStreamChunkWithUsage/cleanNulls 的空串清
-// 理兜住，因此不与收窄后的写入语义冲突。
+// 理兜住，因此不与收窄后的写入语义冲突。薄壳转发到 bridge。
 func ensureReasoningContent(messages []Message, thinking bool) []Message {
-	if !thinking {
-		return messages
-	}
-	for i := range messages {
-		if messages[i].Role == "assistant" && messages[i].ReasoningContent == nil {
-			empty := ""
-			messages[i].ReasoningContent = &empty
-		}
-	}
-	return messages
+	return bridge.EnsureReasoningContent(messages, thinking)
 }
 
 // multimodalAttachedLabel is the text annotation that replaces multimodal
 // image/document parts when the resolved upstream model only accepts text.
 // It matches the label the Claude converter already uses for tool_result
 // attachments, so tool images and message images degrade identically.
+// 常量定义已迁入 bridge；此处为同包别名，保持 app 内引用不变。
 const (
-	multimodalAttachedLabel = "[image attached]"
-	multimodalDocumentLabel = "[document attached]"
+	multimodalAttachedLabel = bridge.MultimodalAttachedLabel
+	multimodalDocumentLabel = bridge.MultimodalDocumentLabel
 )
 
 // modelIsTextOnly reports whether the resolved upstream model should receive
@@ -976,32 +511,19 @@ const (
 // (input modalities containing only "text"); the configured text_only_models
 // prefixes act as an explicit manual override on top. Unknown models are not
 // downgraded so the upstream error stays truthful.
+//
+// 该判定读取 config.IsTextOnlyModel 与 modelsdev 目录（带缓存的 process 级
+// 读取），按纯度契约留在 app 侧；产出的布尔经 ConfigView.TextOnly /
+// textOnly 参数注入 bridge 纯核。
 func modelIsTextOnly(model string) bool {
 	return config.IsTextOnlyModel(model) ||
 		modelsdev.IsTextOnly(model, modelsdev.GetCachedModalities())
 }
 
 // countMultimodalParts returns the number of image/document content parts in
-// a request, for observability (request_plan).
+// a request, for observability (request_plan). 薄壳转发到 bridge。
 func countMultimodalParts(messages []Message) int {
-	n := 0
-	for _, msg := range messages {
-		arr, ok := msg.Content.([]any)
-		if !ok {
-			continue
-		}
-		for _, part := range arr {
-			pm, ok := part.(map[string]any)
-			if !ok {
-				continue
-			}
-			switch pm["type"] {
-			case "image_url", "file":
-				n++
-			}
-		}
-	}
-	return n
+	return bridge.CountMultimodalParts(messages)
 }
 
 // downgradeMultimodalContent replaces image_url ("[image attached]") and file
@@ -1009,197 +531,48 @@ func countMultimodalParts(messages []Message) int {
 // text-only upstream models (e.g. DeepSeek) keep working instead of failing
 // with "image not supported". Text and all other parts are preserved, as is
 // the relative order. Returns the original slice unchanged when model is not
-// text-only or there is nothing to downgrade.
+// text-only or there is nothing to downgrade. 薄壳转发到 bridge。
 func downgradeMultimodalContent(content []any, textOnly bool) any {
-	if !textOnly {
-		return content
-	}
-	out := make([]any, 0, len(content))
-	downgraded := false
-	for _, part := range content {
-		pm, ok := part.(map[string]any)
-		if !ok {
-			out = append(out, part)
-			continue
-		}
-		switch pm["type"] {
-		case "image_url":
-			downgraded = true
-			out = append(out, map[string]any{"type": "text", "text": multimodalAttachedLabel})
-		case "file":
-			downgraded = true
-			out = append(out, map[string]any{"type": "text", "text": multimodalDocumentLabel})
-		default:
-			out = append(out, part)
-		}
-	}
-	if !downgraded {
-		return content
-	}
-	return out
+	return bridge.DowngradeMultimodalContent(content, textOnly)
 }
 
+// convertMessagesForUpstream 序列化 Chat messages 为上游 messages 数组。
+// 薄壳转发到 bridge。
 func convertMessagesForUpstream(messages []Message, textOnly bool) []map[string]any {
-	converted := make([]map[string]any, 0, len(messages))
-	for _, msg := range messages {
-		clean := map[string]any{}
-		if msg.Role != "" {
-			clean["role"] = msg.Role
-		}
-		content := normalizeContent(msg.Content)
-		if arr, ok := content.([]any); ok {
-			content = downgradeMultimodalContent(arr, textOnly)
-		}
-		reasoningContent := msg.ReasoningContent
-		if content != nil {
-			clean["content"] = content
-		}
-		if reasoningContent != nil {
-			clean["reasoning_content"] = *reasoningContent
-		}
-		if len(msg.ToolCalls) > 0 {
-			clean["tool_calls"] = msg.ToolCalls
-		}
-		if msg.ToolCallID != "" {
-			clean["tool_call_id"] = msg.ToolCallID
-		}
-		if msg.Name != "" {
-			clean["name"] = msg.Name
-		}
-		converted = append(converted, clean)
-	}
-	return converted
+	return bridge.ConvertMessagesForUpstream(messages, textOnly)
 }
 
 // ======================== 完整请求转换（含 thinking/reasoning_effort/ExtraBody） ========================
 
+// convertRequest 把 Chat Completions 请求转为 OpenCode 上游请求体 map。纯核已
+// 迁入 bridge.ConvertRequest；本壳按 req.Model 解析 ConfigView 快照注入。
 func convertRequest(req *OpenAIRequest) map[string]any {
-	converted := map[string]any{
-		"model":    req.Model,
-		"messages": convertMessagesForUpstream(req.Messages, modelIsTextOnly(req.Model)),
-		"stream":   req.Stream,
-	}
-	if req.Temperature != nil {
-		converted["temperature"] = *req.Temperature
-	}
-	if req.MaxTokens != nil {
-		// clampMaxTokens 复用 anthropic_protocol.go 的 cap 收敛；
-		// chat 入站的 max_tokens 是客户端可选字段，下限收敛无害。
-		converted["max_tokens"] = clampMaxTokens(*req.MaxTokens, config.MaxTokensCapFor(req.Model))
-	} else if cap := config.MaxTokensCapFor(req.Model); cap > 0 {
-		// 未显式设置时注入 cap：与 responses 直通口径一致（cap 即上游默认
-		// 预算，避免上游按自身小默认截断）。
-		converted["max_tokens"] = cap
-	}
-	if req.MaxCompletionTokens != nil {
-		converted["max_completion_tokens"] = clampMaxTokens(*req.MaxCompletionTokens, config.MaxTokensCapFor(req.Model))
-	}
-	if req.TopP != nil {
-		converted["top_p"] = *req.TopP
-	}
-	// stop/penalties/logit_bias/n：domain/types.go 已由 Worker C 加字段，
-	// 显式透传（ExtraBody 合并只补缺，不会覆盖）。
-	if req.Stop != nil {
-		converted["stop"] = req.Stop
-	}
-	if req.FrequencyPenalty != nil {
-		converted["frequency_penalty"] = *req.FrequencyPenalty
-	}
-	if req.PresencePenalty != nil {
-		converted["presence_penalty"] = *req.PresencePenalty
-	}
-	if req.LogitBias != nil {
-		converted["logit_bias"] = req.LogitBias
-	}
-	if req.N != nil {
-		converted["n"] = *req.N
-	}
-	if req.User != "" {
-		converted["user"] = req.User
-	}
-	if req.ResponseFormat != nil {
-		converted["response_format"] = req.ResponseFormat
-	}
-	if req.Seed != nil {
-		converted["seed"] = *req.Seed
-	}
-	if len(req.Tools) > 0 {
-		converted["tools"] = req.Tools
-	}
-	if req.ToolChoice != nil {
-		converted["tool_choice"] = req.ToolChoice
-	}
-	// 处理思维模式 — 仅当用户显式指定时才发送，避免 MiniMax 等模型报错
-	if config.ForceDisableThinking() || isThinkingDisabled(req.Thinking) {
-		converted["thinking"] = map[string]string{"type": "disabled"}
-	} else if req.Thinking != nil && isThinkingEnabled(req.Thinking) {
-		converted["thinking"] = buildUpstreamThinking(req.Thinking)
-	} else if req.ExtraBody != nil {
-		if isThinkingDisabled(req.ExtraBody["thinking"]) {
-			converted["thinking"] = map[string]string{"type": "disabled"}
-		} else if isThinkingEnabled(req.ExtraBody["thinking"]) {
-			converted["thinking"] = buildUpstreamThinking(req.ExtraBody["thinking"])
-		}
-	}
-	// 处理 reasoning_effort（含从 thinking.budget_tokens 推导）
-	effort := req.ReasoningEffort
-	if effort == "" && !isThinkingDisabled(req.Thinking) {
-		effort = reasoningEffortFromThinking(req.Thinking)
-	}
-	if !config.ForceDisableThinking() && effort != "" {
-		effortMap := config.ReasoningEffortMap()
-		if mapped, ok := effortMap[effort]; ok {
-			converted["reasoning_effort"] = mapped
-		} else {
-			converted["reasoning_effort"] = effort
-		}
-	}
-	// 合并 ExtraBody
-	if req.ExtraBody != nil {
-		for k, v := range req.ExtraBody {
-			if _, exists := converted[k]; !exists {
-				converted[k] = v
-			}
-		}
-	}
-	// 缓存增强:向 zen 上游显式声明 prompt 前缀缓存的保留时长。
-	// 上游默认约 5 分钟(in_memory),agent 任务间歇易过期,导致缓存难命中;
-	// 注入 retention 后拉长到 24h。客户端显式传入的值(extra_body)优先。
-	if retention := config.PromptCacheRetention(); retention != "" && retention != "off" {
-		if _, exists := converted["prompt_cache_retention"]; !exists {
-			converted["prompt_cache_retention"] = retention
-		}
-	}
-	// Anthropic 风格 cache_control 断点:对接受该字段的模型(排除 GLM/Zhipu)
-	// 显式标记缓存断点并拉长 TTL。对不支持的上游,zen 网关负责剥离;
-	// DeepSeek 等自动前缀缓存不受影响(实测追加字段后命中率一致)。
-	if config.CacheBreakpoints() && !rejectsCacheControl(req.Model) {
-		if _, exists := converted["cache_control"]; !exists {
-			converted["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
-		}
-	}
-	return converted
+	return bridge.ConvertRequest(bridgeConfigViewFor(req.Model), req)
 }
 
 func buildUpstreamBody(req *OpenAIRequest) []byte {
-	converted := convertRequest(req)
-	b, err := json.Marshal(converted)
+	b, err := bridge.MarshalUpstreamBody(bridgeConfigViewFor(req.Model), req)
 	if err != nil {
 		slog.Error("marshal upstream body failed", "error", err)
 	}
 	return b
 }
 
-// same output. An empty id gets a random suffix (callers should cache).
+// randomIDGen 是 bridge ID 生成注入的生产实现，转发到 internal/random。
+// bridge 的 idGen 约定为 func(prefix string, n int) string；random.String 已
+// 满足 n 位随机小写字母/数字的语义，prefix 形参仅作占位（与签名对齐）。
+func randomIDGen(_ string, n int) string { return random.String(n) }
+
+// randomHexIDGen 是 bridge hex ID 生成注入的生产实现，转发到 internal/random。
+// random.Hex 满足 n 位随机 hex（0-9a-f）的语义，与原 randomHex 一致。
+func randomHexIDGen(_ string, n int) string { return random.Hex(n) }
+
+// deterministicResponseID 把任意上游 id 归一到 prefix 命名空间：已带 prefix
+// 的 id 原样返回；空 id 取随机后缀（调用方应缓存）；其余经 sha256[0:16] 做
+// 确定性映射并以前缀隔离（claude client 不得泄漏 chatcmpl_/resp_ 形态）。
+// 薄壳转发到 bridge。
 func deterministicResponseID(prefix, id string) string {
-	if strings.HasPrefix(id, prefix) && len(id) > len(prefix) {
-		return id
-	}
-	if id == "" {
-		return prefix + random.String(24)
-	}
-	h := sha256.Sum256([]byte(id))
-	return prefix + hex.EncodeToString(h[:16])
+	return bridge.DeterministicResponseID(randomIDGen, prefix, id)
 }
 
 // normalizeChatResponseID ensures a Chat response ID has the chatcmpl- prefix.

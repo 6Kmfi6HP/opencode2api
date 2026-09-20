@@ -3,83 +3,20 @@ package app
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/bridge"
 	"github.com/6Kmfi6HP/opencode2api/internal/util"
 	"math"
 	"net/http"
-	"strings"
 )
 
 // normalizeFinishReason maps Anthropic stop reasons onto the closed set used
-// by Chat Completions.
+// by Chat Completions. Thin shell forwarding to bridge.
 func normalizeFinishReason(reason string) string {
-	switch reason {
-	case "end_turn", "stop_sequence", "stop":
-		return "stop"
-	case "max_tokens", "length":
-		return "length"
-	case "tool_use", "tool_calls", "function_call":
-		return "tool_calls"
-	case "refusal", "content_filter":
-		return "content_filter"
-	default:
-		return reason
-	}
+	return bridge.NormalizeFinishReason(reason)
 }
 
 func anthropicUsageToChat(usage map[string]any) map[string]any {
-	if usage == nil {
-		return nil
-	}
-	out := make(map[string]any, len(usage)+3)
-	for k, v := range usage {
-		out[k] = v
-	}
-	if v, ok := usage["input_tokens"]; ok {
-		out["prompt_tokens"] = v
-	}
-	if v, ok := usage["output_tokens"]; ok {
-		out["completion_tokens"] = v
-	}
-	// 显式 total_tokens 优先（权威）;否则由 input/output 分量合成,避免下游
-	// 与统计丢总量。顺序在字段重命名之后,保证 prompt/completion 任一来源
-	// 的分量都能被计入。
-	if _, has := out["total_tokens"]; !has {
-		if p, pok := numberAsFloat(out["prompt_tokens"]); pok {
-			if c, cok := numberAsFloat(out["completion_tokens"]); cok {
-				out["total_tokens"] = p + c
-			}
-		}
-	}
-	// Anthropic 缓存读/写 token 顶层键透传,并同时归入 chat 约定位置
-	// prompt_tokens_details.cached_tokens（对齐 sub2api 对 Chat Completions
-	// usage 的形状;原有顶层键透传保留,不改已有调用方行为）。
-	if v, ok := numberAsFloat(usage["cache_read_input_tokens"]); ok {
-		details, _ := out["prompt_tokens_details"].(map[string]any)
-		if details == nil {
-			details = map[string]any{}
-		}
-		if existing, eok := numberAsFloat(details["cached_tokens"]); !eok || existing == 0 {
-			details["cached_tokens"] = v
-		}
-		out["prompt_tokens_details"] = details
-	}
-	// 上游发 output_tokens_details.thinking_tokens 时归位到 chat 的
-	// completion_tokens_details.reasoning_tokens。
-	if outDetails, ok := usage["output_tokens_details"].(map[string]any); ok {
-		if v, ok := numberAsFloat(outDetails["thinking_tokens"]); ok && v > 0 {
-			details, _ := out["completion_tokens_details"].(map[string]any)
-			if details == nil {
-				details = map[string]any{}
-			}
-			if existing, eok := numberAsFloat(details["reasoning_tokens"]); !eok || existing == 0 {
-				details["reasoning_tokens"] = v
-			}
-			out["completion_tokens_details"] = details
-		}
-	}
-	delete(out, "input_tokens")
-	delete(out, "output_tokens")
-	return out
+	return bridge.AnthropicUsageToChat(usage)
 }
 
 func numberAsFloat(v any) (float64, bool) { return util.NumberAsFloat(v) }
@@ -145,11 +82,5 @@ func validateRequestTemperature(w http.ResponseWriter, t *float64, protocol stri
 
 // applyErrorPrefix prepends the stable "Error: " marker used by both the
 // Anthropic Messages and Responses request paths when a tool_result carries
-// is_error:true. It avoids producing a duplicate prefix when the output text
-// already starts with "Error:" (e.g. an upstream that echoes the error).
-func applyErrorPrefix(text string) string {
-	if strings.HasPrefix(text, "Error:") {
-		return text
-	}
-	return "Error: " + text
-}
+// is_error:true. Thin shell forwarding to bridge.
+func applyErrorPrefix(text string) string { return bridge.ApplyErrorPrefix(text) }

@@ -2,19 +2,15 @@ package app
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"github.com/6Kmfi6HP/opencode2api/internal/bridge"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -113,391 +109,43 @@ func (r *streamReader) Close() {
 
 // ======================== Claude Messages API ========================
 
+// extractClaudeSystemText 提取 Claude system 字段的纯文本。薄壳转发到 bridge。
 func extractClaudeSystemText(system any) string {
-	if system == nil {
-		return ""
-	}
-	switch v := system.(type) {
-	case string:
-		return v
-	case []any:
-		var parts []string
-		for _, item := range v {
-			if block, ok := item.(map[string]any); ok {
-				if block["type"] == "text" {
-					if text, ok := block["text"].(string); ok {
-						parts = append(parts, text)
-					}
-				}
-			}
-		}
-		return strings.Join(parts, "\n")
-	default:
-		b, _ := json.Marshal(v)
-		return string(b)
-	}
+	return bridge.ExtractClaudeSystemText(system)
 }
 
+// cleanJsonSchema 递归清理 JSON Schema（剥注解键）。薄壳转发到 bridge。
 func cleanJsonSchema(schema any) any {
-	m, ok := schema.(map[string]any)
-	if !ok {
-		return schema
-	}
-	clean := make(map[string]any, len(m))
-	for k, v := range m {
-		// Annotation-only keys are omitted for upstream compatibility. Constraint
-		// keys such as additionalProperties and format are preserved.
-		if k == "$schema" || k == "title" || k == "examples" {
-			continue
-		}
-		switch child := v.(type) {
-		case map[string]any:
-			clean[k] = cleanJsonSchema(child)
-		case []any:
-			copyArray := make([]any, len(child))
-			for i, elem := range child {
-				copyArray[i] = cleanJsonSchema(elem)
-			}
-			clean[k] = copyArray
-		default:
-			clean[k] = v
-		}
-	}
-	return clean
+	return bridge.CleanJSONSchema(schema)
 }
 
+// claudeImageBlockToOpenAI 把 Anthropic image block 转为 Chat image_url part。
+// 薄壳转发到 bridge。
 func claudeImageBlockToOpenAI(block map[string]any) (map[string]any, bool) {
-	source, _ := block["source"].(map[string]any)
-	if source == nil {
-		return nil, false
-	}
-	srcType, _ := source["type"].(string)
-	mediaType, _ := source["media_type"].(string)
-	data, _ := source["data"].(string)
-	url, _ := source["url"].(string)
-	if srcType == "url" && url != "" {
-		return map[string]any{"type": "image_url", "image_url": map[string]string{"url": url}}, true
-	}
-	if srcType == "base64" && data != "" {
-		if mediaType == "" {
-			mediaType = "image/png"
-		}
-		return map[string]any{
-			"type": "image_url",
-			"image_url": map[string]string{
-				"url": "data:" + mediaType + ";base64," + data,
-			},
-		}, true
-	}
-	return nil, false
+	return bridge.ClaudeImageBlockToOpenAI(block)
 }
 
 // claudeDocumentBlockToOpenAI maps an Anthropic document content block to a
-// Chat Completions file content part. It supports source.type=base64
-// (media_type, default application/pdf) and source.type=url. A filename is
-// preserved from the block/title when available; no protocol ID is generated.
-// Returns (nil, false) when the document lacks a usable payload so the caller
-// can surface a structured 400 instead of serializing the wrapper as text.
+// Chat Completions file content part. Thin shell forwarding to bridge.
 func claudeDocumentBlockToOpenAI(block map[string]any) (map[string]any, bool) {
-	source, _ := block["source"].(map[string]any)
-	if source == nil {
-		return nil, false
-	}
-	srcType, _ := source["type"].(string)
-	mediaType, _ := source["media_type"].(string)
-	if mediaType == "" {
-		mediaType = "application/pdf"
-	}
-	data, _ := source["data"].(string)
-	url, _ := source["url"].(string)
-
-	file := map[string]any{}
-	if filename, ok := block["filename"].(string); ok && filename != "" {
-		file["filename"] = filename
-	} else if title, ok := block["title"].(string); ok && title != "" {
-		file["filename"] = title
-	}
-
-	switch srcType {
-	case "base64":
-		if data == "" {
-			return nil, false
-		}
-		file["file_data"] = "data:" + mediaType + ";base64," + data
-		return map[string]any{"type": "file", "file": file}, true
-	case "url":
-		if url == "" {
-			return nil, false
-		}
-		file["file_data"] = url
-		return map[string]any{"type": "file", "file": file}, true
-	}
-	return nil, false
+	return bridge.ClaudeDocumentBlockToOpenAI(block)
 }
 
+// extractClaudeContentText 提取任意 Claude content 的纯文本。薄壳转发到 bridge。
 func extractClaudeContentText(content any) string {
-	switch c := content.(type) {
-	case string:
-		return c
-	case []any:
-		var parts []string
-		for _, item := range c {
-			block, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			if block["type"] == "text" {
-				if text, ok := block["text"].(string); ok && text != "" {
-					parts = append(parts, text)
-				}
-			}
-		}
-		return strings.Join(parts, "\n")
-	default:
-		return ""
-	}
+	return bridge.ExtractClaudeContentText(content)
 }
 
+// claudeToOpenAIMessages 把 Claude messages + system 转为 Chat messages。
+// 薄壳转发到 bridge。
 func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
-	var systemParts []string
-	if sysText := extractClaudeSystemText(system); sysText != "" {
-		systemParts = append(systemParts, sysText)
-	}
-
-	var body []Message
-	for _, msg := range claudeMsgs {
-		if msg.Role == "system" {
-			if text := extractClaudeContentText(msg.Content); text != "" {
-				systemParts = append(systemParts, text)
-			}
-			continue
-		}
-		switch content := msg.Content.(type) {
-		case string:
-			body = append(body, Message{Role: msg.Role, Content: content})
-		case []any:
-			var orderedContent []any
-			var reasoningParts []string
-			var toolCalls []ToolCall
-			var toolResults []Message
-			var followupAttachments []any
-			for _, item := range content {
-				block, ok := item.(map[string]any)
-				if !ok {
-					continue
-				}
-				blockType, _ := block["type"].(string)
-				switch blockType {
-				case "text":
-					if text, ok := block["text"].(string); ok && text != "" {
-						orderedContent = append(orderedContent, map[string]any{"type": "text", "text": text})
-					}
-				case "image":
-					if part, ok := claudeImageBlockToOpenAI(block); ok {
-						orderedContent = append(orderedContent, part)
-					} else {
-						// source 缺失/非法：降级为文本占位，不静默丢上下文。
-						orderedContent = append(orderedContent, map[string]any{"type": "text", "text": "[image attached]"})
-					}
-				case "document":
-					if part, ok := claudeDocumentBlockToOpenAI(block); ok {
-						orderedContent = append(orderedContent, part)
-					} else {
-						orderedContent = append(orderedContent, map[string]any{"type": "text", "text": "[document attached]"})
-					}
-				case "thinking":
-					if thinking, ok := block["thinking"].(string); ok && thinking != "" {
-						reasoningParts = append(reasoningParts, thinking)
-					}
-				case "tool_use":
-					id, _ := block["id"].(string)
-					name, _ := block["name"].(string)
-					var args string
-					switch input := block["input"].(type) {
-					case string:
-						args = input
-					default:
-						if input != nil {
-							b, _ := json.Marshal(input)
-							args = string(b)
-						}
-					}
-					if args == "" {
-						args = "{}"
-					}
-					toolCalls = append(toolCalls, ToolCall{
-						ID:   id,
-						Type: "function",
-						Function: FunctionCall{
-							Name:      name,
-							Arguments: args,
-						},
-					})
-				case "tool_result":
-					toolUseID, _ := block["tool_use_id"].(string)
-					var resultText string
-					var attachmentParts []any // local per-block image/document parts in original order
-					switch c := block["content"].(type) {
-					case string:
-						resultText = c
-					case []any:
-						var parts []string
-						for _, p := range c {
-							pb, ok := p.(map[string]any)
-							if !ok {
-								continue
-							}
-							switch pb["type"] {
-							case "text":
-								if t, ok := pb["text"].(string); ok {
-									parts = append(parts, t)
-								}
-							case "image":
-								if part, ok := claudeImageBlockToOpenAI(pb); ok {
-									attachmentParts = append(attachmentParts, part)
-								}
-							case "document":
-								if part, ok := claudeDocumentBlockToOpenAI(pb); ok {
-									attachmentParts = append(attachmentParts, part)
-								}
-							default:
-								// 未知嵌套 block：兜底序列化 JSON 保留上下文
-								// （与顶层 unknown 分支一致），不静默丢。
-								if bt, _ := pb["type"].(string); bt != "" {
-									if b, err := json.Marshal(pb); err == nil {
-										parts = append(parts, string(b))
-									}
-								}
-							}
-						}
-						resultText = strings.Join(parts, "\n")
-					default:
-						if c != nil {
-							b, _ := json.Marshal(c)
-							resultText = string(b)
-						}
-					}
-					// Annotate based on this block's own attachments, not a
-					// global accumulator, so parallel tool_results are labeled
-					// independently.
-					if len(attachmentParts) > 0 {
-						if resultText != "" {
-							resultText += "\n"
-						}
-						var labels []string
-						for _, ap := range attachmentParts {
-							if m, ok := ap.(map[string]any); ok {
-								if m["type"] == "image_url" {
-									labels = append(labels, "[image attached]")
-								} else if m["type"] == "file" {
-									labels = append(labels, "[document attached]")
-								}
-							}
-						}
-						resultText += strings.Join(labels, "\n")
-						followupAttachments = append(followupAttachments, attachmentParts...)
-					}
-					if isError, _ := block["is_error"].(bool); isError {
-						resultText = applyErrorPrefix(resultText)
-					}
-					toolResults = append(toolResults, Message{
-						Role:       "tool",
-						ToolCallID: toolUseID,
-						Content:    resultText,
-					})
-				default:
-					// 未知 block（server_tool_use / web_search_tool_result /
-					// redacted_thinking / 其它）：序列化成 JSON 文本 part 保
-					// 留上下文，不静默蒸发（对齐 claude_responses.go 的 default
-					// 分支与 sub2api）；计数仍由 scanClaudeUnsupportedBlocks 记
-					// 入 unsupported_blocks。
-					if blockType != "" {
-						if b, err := json.Marshal(block); err == nil {
-							orderedContent = append(orderedContent, map[string]any{"type": "text", "text": string(b)})
-						}
-					}
-				}
-			}
-			om := Message{Role: msg.Role}
-			if len(orderedContent) > 0 {
-				om.Content = orderedContent
-			} else if len(toolCalls) == 0 {
-				om.Content = ""
-			}
-			if len(reasoningParts) > 0 && len(toolCalls) > 0 {
-				// DeepSeek 兼容（对齐 sub2api anthropicThinkingToReasoningContent）：
-				// reasoning_content 只在携带 tool_calls 的 assistant 消息上回
-				// 放——DeepSeek 要求产生 tool call 的那条消息带回产生它的推理；
-				// 纯文本 assistant 轮的思考直接丢弃。注意 chat.go 的
-				// ensureReasoningContent 在 keepReasoning 时会为所有 assistant
-				// 消息补空串槽位，这里收窄写入不受影响（它只填 nil 槽位）。
-				rc := strings.Join(reasoningParts, "\n")
-				om.ReasoningContent = &rc
-			}
-			if len(toolCalls) > 0 {
-				om.ToolCalls = toolCalls
-			}
-			// Anthropic requires tool_result blocks to precede ordinary user
-			// content. Preserve that order when translating them to Chat
-			// Completions' separate tool messages.
-			if msg.Role == "user" {
-				body = append(body, toolResults...)
-				if len(followupAttachments) > 0 {
-					body = append(body, Message{Role: "user", Content: followupAttachments})
-				}
-			}
-			if len(orderedContent) > 0 || len(reasoningParts) > 0 || len(toolCalls) > 0 || len(toolResults) == 0 {
-				body = append(body, om)
-			}
-			if msg.Role != "user" {
-				body = append(body, toolResults...)
-				if len(followupAttachments) > 0 {
-					body = append(body, Message{Role: "user", Content: followupAttachments})
-				}
-			}
-		default:
-			b, _ := json.Marshal(content)
-			body = append(body, Message{Role: msg.Role, Content: string(b)})
-		}
-	}
-
-	var messages []Message
-	if len(systemParts) > 0 {
-		messages = append(messages, Message{Role: "system", Content: strings.Join(systemParts, "\n\n")})
-	}
-	messages = append(messages, body...)
-	return messages
+	return bridge.ClaudeToOpenAIMessages(claudeMsgs, system)
 }
 
+// claudeToOpenAITools 把 Claude tools 转为 Chat function tools（server tools
+// 跳过并记入 skipped）。薄壳转发到 bridge。
 func claudeToOpenAITools(claudeTools []ClaudeTool) ([]Tool, []string) {
-	tools := make([]Tool, 0, len(claudeTools))
-	var skipped []string
-	for _, ct := range claudeTools {
-		// Server tools (web_search_*, etc.) carry a vendor type and no client schema.
-		// Emitting them as empty function tools would invite bogus model calls.
-		if ct.Type != "" && ct.InputSchema == nil {
-			skipped = append(skipped, ct.Name)
-			continue
-		}
-		params := ct.InputSchema
-		if params == nil {
-			params = map[string]any{"type": "object", "properties": map[string]any{}}
-		}
-		params = cleanJsonSchema(params)
-		paramsMap, ok := params.(map[string]any)
-		if !ok {
-			paramsMap = map[string]any{"type": "object", "properties": map[string]any{}}
-		}
-		tools = append(tools, Tool{
-			Type: "function",
-			Function: ToolFunction{
-				Name:        ct.Name,
-				Description: ct.Description,
-				Parameters:  paramsMap,
-			},
-		})
-	}
-	return tools, skipped
+	return bridge.ClaudeToOpenAITools(claudeTools)
 }
 
 func countClaudeSystemParts(msgs []ClaudeMessage, system any) int {
@@ -648,182 +296,14 @@ func scanClaudeUnsupportedBlocks(msgs []ClaudeMessage) map[string]int {
 	return counts
 }
 
+// 纯核已迁入 bridge.OpenAIToClaudeResponse；薄壳注入 randomIDGen。原实现对
+// 顶层反序列化失败仅 slog.Warn 后继续，纯层静默透传（保持一致的字节行为）。
 func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) []byte {
-	var chat struct {
-		ID      string `json:"id"`
-		Model   string `json:"model"`
-		Created int64  `json:"created"`
-		Choices []struct {
-			Message struct {
-				Content          string     `json:"content"`
-				ReasoningContent string     `json:"reasoning_content"`
-				ToolCalls        []ToolCall `json:"tool_calls"`
-			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
-		Usage map[string]any `json:"usage"`
-	}
-	if err := json.Unmarshal(chatBody, &chat); err != nil {
-		slog.Warn("openAIToClaudeResponse unmarshal failed", "error", err)
-	}
-
-	content := []ClaudeContent{}
-	stopReason := "end_turn"
-
-	if len(chat.Choices) > 0 {
-		msg := chat.Choices[0].Message
-		fr := chat.Choices[0].FinishReason
-
-		// Try to read private ordered Anthropic content blocks first.
-		var rawMsg map[string]any
-		privateBlocks := []map[string]any(nil)
-		if json.Unmarshal(chatBody, &rawMsg) == nil {
-			if choices, ok := rawMsg["choices"].([]any); ok && len(choices) > 0 {
-				if choice, ok := choices[0].(map[string]any); ok {
-					if m, ok := choice["message"].(map[string]any); ok {
-						if pb, ok := m["_opencode2api_anthropic_content"].([]any); ok {
-							for _, item := range pb {
-								if blk, ok := item.(map[string]any); ok {
-									privateBlocks = append(privateBlocks, blk)
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-
-		if len(privateBlocks) > 0 {
-			// Consume private ordered blocks in array order.
-			for _, blk := range privateBlocks {
-				bt, _ := blk["type"].(string)
-				switch bt {
-				case "text":
-					text, _ := blk["text"].(string)
-					content = append(content, ClaudeContent{
-						Type: "text",
-						Text: text,
-					})
-				case "thinking":
-					if wantReasoning {
-						thinking, _ := blk["thinking"].(string)
-						cc := ClaudeContent{
-							Type:     "thinking",
-							Thinking: thinking,
-						}
-						if sig, ok := blk["signature"].(string); ok && sig != "" {
-							cc.Signature = sig
-						}
-						content = append(content, cc)
-					}
-				case "redacted_thinking":
-					if wantReasoning {
-						cc := ClaudeContent{
-							Type: "redacted_thinking",
-						}
-						if d, ok := blk["data"].(string); ok && d != "" {
-							cc.Data = d
-						}
-						content = append(content, cc)
-					}
-				case "tool_use":
-					id, _ := blk["id"].(string)
-					name, _ := blk["name"].(string)
-					input := blk["input"]
-					if input == nil {
-						input = map[string]any{}
-					}
-					content = append(content, ClaudeContent{
-						Type:  "tool_use",
-						ID:    id,
-						Name:  name,
-						Input: input,
-					})
-				}
-			}
-		} else {
-			// Fallback: string content + reasoning_content + tool_calls.
-			if wantReasoning && msg.ReasoningContent != "" {
-				content = append(content, ClaudeContent{
-					Type:     "thinking",
-					Thinking: msg.ReasoningContent,
-				})
-			}
-			text := msg.Content
-			// #37635: Go gateway often puts the whole answer in reasoning_content.
-			// Promote to text when content is empty so Claude Code does not see an
-			// empty end_turn and exit the agent loop.
-			if text == "" && msg.ReasoningContent != "" && len(msg.ToolCalls) == 0 {
-				text = msg.ReasoningContent
-			}
-			if text != "" {
-				content = append(content, ClaudeContent{
-					Type: "text",
-					Text: text,
-				})
-			}
-			for _, tc := range msg.ToolCalls {
-				var input any
-				json.Unmarshal([]byte(tc.Function.Arguments), &input)
-				if input == nil {
-					input = map[string]any{}
-				}
-				content = append(content, ClaudeContent{
-					Type:  "tool_use",
-					ID:    tc.ID,
-					Name:  tc.Function.Name,
-					Input: input,
-				})
-			}
-		}
-
-		switch fr {
-		case "stop":
-			stopReason = "end_turn"
-		case "length":
-			stopReason = "max_tokens"
-		case "tool_calls", "function_call":
-			stopReason = "tool_use"
-		case "content_filter":
-			stopReason = "refusal"
-		}
-	}
-
-	if len(content) == 0 {
-		content = append(content, ClaudeContent{Type: "text", Text: ""})
-	}
-
-	// Response ID: keep upstream ID only if it is a valid msg_ ID;
-	// otherwise generate a new msg_ ID. Never leak chatcmpl/resp IDs.
-	respID := normalizeClaudeMessageID(chat.ID)
-
-	resp := ClaudeResponse{
-		ID:           respID,
-		Type:         "message",
-		Role:         "assistant",
-		Content:      content,
-		Model:        model,
-		StopReason:   stopReason,
-		StopSequence: nil,
-	}
-	if chat.Usage != nil {
-		resp.Usage = buildClaudeMessageUsage(chat.Usage)
-	}
-	result, _ := json.Marshal(resp)
-	return result
+	return bridge.OpenAIToClaudeResponse(randomIDGen, chatBody, model, wantReasoning)
 }
 
 func toFloat64(v any) float64 {
-	switch n := v.(type) {
-	case float64:
-		return n
-	case int:
-		return float64(n)
-	case int64:
-		return float64(n)
-	default:
-		return 0
-	}
+	return bridge.ToFloat64(v)
 }
 
 func usageIntField(fields map[string]any, key string) (int, bool) {
@@ -850,114 +330,15 @@ func usageMapField(fields map[string]any, key string) (map[string]any, bool) {
 }
 
 func buildClaudeUsageCore(upstreamUsage map[string]any) ClaudeUsage {
-	if len(upstreamUsage) == 0 {
-		return nil
-	}
-
-	usage := ClaudeUsage{}
-	// readFromSplit marks cache_read sourced from DeepSeek/OpenAI-style
-	// counters (prompt_cache_hit_tokens / prompt_tokens_details.cached_tokens),
-	// whose prompt_tokens includes the hit portion. An Anthropic-style
-	// cache_read_input_tokens is already exclusive of input_tokens and must
-	// not be subtracted.
-	readFromSplit := false
-	if value, ok := usageIntField(upstreamUsage, "prompt_tokens"); ok {
-		usage["input_tokens"] = value
-	}
-	if value, ok := usageIntField(upstreamUsage, "input_tokens"); ok {
-		if _, exists := usage["input_tokens"]; !exists {
-			usage["input_tokens"] = value
-		}
-	}
-	if value, ok := usageIntField(upstreamUsage, "completion_tokens"); ok {
-		usage["output_tokens"] = value
-	}
-	if value, ok := usageIntField(upstreamUsage, "output_tokens"); ok {
-		if _, exists := usage["output_tokens"]; !exists {
-			usage["output_tokens"] = value
-		}
-	}
-	if value, ok := usageIntField(upstreamUsage, "cache_creation_input_tokens"); ok {
-		usage["cache_creation_input_tokens"] = value
-	}
-	if value, ok := usageIntField(upstreamUsage, "cache_read_input_tokens"); ok {
-		usage["cache_read_input_tokens"] = value
-	} else if promptDetails, ok := usageMapField(upstreamUsage, "prompt_tokens_details"); ok {
-		if value, ok := usageIntField(promptDetails, "cached_tokens"); ok {
-			usage["cache_read_input_tokens"] = value
-			readFromSplit = true
-		}
-	}
-	// DeepSeek-style counters split the prompt into hit (read) and miss
-	// (ordinary input). Miss is not a cache write, so it is intentionally
-	// left out of the Claude cache fields.
-	if _, exists := usage["cache_read_input_tokens"]; !exists {
-		if value, ok := usageIntField(upstreamUsage, "prompt_cache_hit_tokens"); ok {
-			usage["cache_read_input_tokens"] = value
-			readFromSplit = true
-		}
-	}
-	// Anthropic semantics: input_tokens excludes cache reads (input, read and
-	// creation are mutually exclusive). prompt_tokens from DeepSeek/OpenAI
-	// includes the hit portion, so subtract it here; otherwise a client that
-	// prices input and cache reads separately would bill the hit tokens twice.
-	if readFromSplit {
-		if read, ok := usage["cache_read_input_tokens"].(int); ok && read > 0 {
-			if input, ok := usage["input_tokens"].(int); ok {
-				if read >= input {
-					usage["input_tokens"] = 0
-				} else {
-					usage["input_tokens"] = input - read
-				}
-			}
-		}
-	}
-	if outputDetails, ok := usageMapField(upstreamUsage, "output_tokens_details"); ok {
-		usage["output_tokens_details"] = outputDetails
-	} else if outputDetails, ok := usageMapField(upstreamUsage, "completion_tokens_details"); ok {
-		usage["output_tokens_details"] = outputDetails
-	}
-	if serverToolUse, ok := usageMapField(upstreamUsage, "server_tool_use"); ok {
-		usage["server_tool_use"] = serverToolUse
-	}
-	if len(usage) == 0 {
-		return nil
-	}
-	return usage
+	return bridge.BuildClaudeUsageCore(upstreamUsage)
 }
 
 func buildClaudeMessageUsage(upstreamUsage map[string]any) ClaudeUsage {
-	usage := buildClaudeUsageCore(upstreamUsage)
-	if usage == nil {
-		usage = ClaudeUsage{}
-	}
-	if cacheCreation, ok := usageMapField(upstreamUsage, "cache_creation"); ok {
-		usage["cache_creation"] = cacheCreation
-	}
-	if serviceTier, ok := upstreamUsage["service_tier"].(string); ok && serviceTier != "" {
-		usage["service_tier"] = serviceTier
-	}
-	if inferenceGeo, ok := upstreamUsage["inference_geo"].(string); ok && inferenceGeo != "" {
-		usage["inference_geo"] = inferenceGeo
-	}
-	if _, exists := usage["input_tokens"]; !exists {
-		usage["input_tokens"] = 0
-	}
-	if _, exists := usage["output_tokens"]; !exists {
-		usage["output_tokens"] = 0
-	}
-	return usage
+	return bridge.BuildClaudeMessageUsage(upstreamUsage)
 }
 
 func buildClaudeDeltaUsage(upstreamUsage map[string]any) ClaudeUsage {
-	usage := buildClaudeUsageCore(upstreamUsage)
-	if usage == nil {
-		usage = ClaudeUsage{}
-	}
-	if _, exists := usage["output_tokens"]; !exists {
-		usage["output_tokens"] = 0
-	}
-	return usage
+	return bridge.BuildClaudeDeltaUsage(upstreamUsage)
 }
 
 func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
@@ -1171,160 +552,59 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
-	stats := &logging.StreamStats{Start: time.Now()}
 
-	msgID := fmt.Sprintf("msg_%s", randomString(24))
-	blockIndex := 0
-	thinkingBlockOpen := false
-	textBlockOpen := false
-	toolCallAccumulator := map[int]map[string]string{}
-	toolBlockIndices := map[int]int{}
-	toolCallOrder := []int{}
-	messageStartSent := false
-	finished := false
-	stopReason := "end_turn"
-	// Some upstreams (e.g. muse-spark-1.2-contributor-free) terminate a stream
-	// with a usage-only chunk but no finish_reason and no [DONE]. When the turn
-	// produced output and we saw a terminal usage chunk, synthesize stop.
-	usageTerminalSeen := false
-	fullUsage := map[string]any{}
-	// Accumulates reasoning when keepReasoning so we can fall back to a text
-	// block if the stream never produces content/tool_use (#37635).
-	reasoningFallback := strings.Builder{}
+	// 纯核 Chat SSE -> Claude SSE 状态机已迁入 bridge.ChatToClaudeStream
+	// (internal/bridge/chat_to_claude_stream.go)。原闭包 ensureMessageStart /
+	// emitTextDelta / closeThinkingBlock / closeTextBlock / emitEmptyTextFallback /
+	// finalizeContentBlocks / emitClaudeError 与全部状态 (msgID/blockIndex/
+	// toolCallAccumulator/toolBlockIndices/toolCallOrder/messageStartSent/finished/
+	// stopReason/usageTerminalSeen/fullUsage/reasoningFallback) 入 struct;产物为
+	// bridge.OutEvent(Raw 即原 writeSSEEvent 写出的 `event: ...\ndata: ...\n\n`
+	// 字节,逐字节等价)。streamProducedOutput 由依赖 *logging.StreamStats 改为纯
+	// (textChars,reasoningChars,toolCalls)->bool。本壳保留全部副作用:HTTP 头与
+	// WriteHeader、writeSSEEvent 序列化+w.Write+flusher.Flush、streamReader/
+	// keepalive 循环、logging.FromContext(ctx).Error(读错误)、deferred stats 上报。
+	st := bridge.NewChatToClaudeStream(randomIDGen, model, keepReasoning)
+
+	stats := &logging.StreamStats{Start: time.Now()}
+	defer func() {
+		c := st.Counters()
+		stats.TextChars = c.TextChars
+		stats.ReasoningChars = c.ReasoningChars
+		stats.PromotedReasoning = c.PromotedReasoning
+		stats.ToolCallCount = c.ToolCallCount
+		stats.FinishReason = c.FinishReason
+		stats.SawFinish = c.SawFinish
+		stats.DoneSeen = c.DoneSeen
+		if fu := st.Usage(); len(fu) > 0 {
+			statsx.RecordChatUsage(model, fu)
+		}
+		stats.Log(ctx, "claude")
+	}()
 
 	keepaliveInterval := claudeKeepaliveInterval
 	if keepaliveInterval <= 0 {
 		keepaliveInterval = 15 * time.Second
 	}
 	reader := newStreamReader(ctx, respBody, keepaliveInterval)
-
-	defer func() {
-		if len(fullUsage) > 0 {
-			statsx.RecordChatUsage(model, fullUsage)
-		}
-		stats.ToolCallCount = len(toolCallOrder)
-		stats.Log(ctx, "claude")
-	}()
-	// Reader cleanup: signal goroutine, unblock any pending read, wait for exit.
 	defer reader.Close()
 
-	emitClaudeEvent := func(event string, data any) {
-		writeSSEEvent(w, flusher, event, data)
+	writeAll := func(evs []bridge.OutEvent) {
+		for _, ev := range evs {
+			if len(ev.Raw) > 0 {
+				w.Write(ev.Raw)
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
 	}
 
-	emitClaudeError := func(msg string) {
-		emitClaudeEvent("error", map[string]any{
-			"type": "error",
-			"error": map[string]any{
-				"type":    "api_error",
-				"message": msg,
-			},
-		})
-	}
-
-	closeThinkingBlock := func() {
-		if !thinkingBlockOpen {
-			return
-		}
-		emitClaudeEvent("content_block_stop", map[string]any{
-			"type":          "content_block_stop",
-			"index":         blockIndex - 1,
-			"content_block": map[string]any{"type": "thinking"},
-		})
-		thinkingBlockOpen = false
-	}
-
-	closeTextBlock := func() {
-		if !textBlockOpen {
-			return
-		}
-		emitClaudeEvent("content_block_stop", map[string]any{
-			"type":          "content_block_stop",
-			"index":         blockIndex - 1,
-			"content_block": map[string]any{"type": "text"},
-		})
-		textBlockOpen = false
-	}
-
-	ensureMessageStart := func() {
-		if messageStartSent {
-			return
-		}
-		messageStartSent = true
-		emitClaudeEvent("message_start", map[string]any{
-			"type": "message_start",
-			"message": map[string]any{
-				"id":            msgID,
-				"type":          "message",
-				"role":          "assistant",
-				"content":       []any{},
-				"model":         model,
-				"stop_reason":   nil,
-				"stop_sequence": nil,
-				"usage":         buildClaudeMessageUsage(fullUsage),
-			},
-		})
-		emitClaudeEvent("ping", map[string]any{"type": "ping"})
-	}
-
-	emitTextDelta := func(contentStr string) {
-		if contentStr == "" {
-			return
-		}
-		stats.TextChars += len(contentStr)
-		closeThinkingBlock()
-		if !textBlockOpen {
-			emitClaudeEvent("content_block_start", map[string]any{
-				"type":  "content_block_start",
-				"index": blockIndex,
-				"content_block": map[string]any{
-					"type": "text",
-					"text": "",
-				},
-			})
-			textBlockOpen = true
-			blockIndex++
-		}
-		emitClaudeEvent("content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": blockIndex - 1,
-			"delta": map[string]any{
-				"type": "text_delta",
-				"text": contentStr,
-			},
-		})
-	}
-
-	emitEmptyTextFallback := func() {
-		if textBlockOpen || len(toolCallOrder) > 0 {
-			return
-		}
-		fallback := reasoningFallback.String()
-		if fallback == "" {
-			return
-		}
-		stats.PromotedReasoning = true
-		emitTextDelta(fallback)
-	}
-
-	finalizeContentBlocks := func() {
-		emitEmptyTextFallback()
-		closeThinkingBlock()
-		closeTextBlock()
-		for _, idx := range toolCallOrder {
-			acc := toolCallAccumulator[idx]
-			emitClaudeEvent("content_block_stop", map[string]any{
-				"type":  "content_block_stop",
-				"index": toolBlockIndices[idx],
-				"content_block": map[string]any{
-					"type":  "tool_use",
-					"id":    acc["id"],
-					"name":  acc["name"],
-					"input": map[string]any{},
-				},
-			})
-		}
-	}
+	// statsChunks tracks how many choice-bearing chunks have been noted so the
+	// shell can call stats.NoteChunk exactly when the state machine consumes one
+	// (matching the original, which noted a chunk only on choice-bearing lines,
+	// not on usage-only trailing chunks or [DONE]).
+	statsChunks := 0
 
 loop:
 	for {
@@ -1333,344 +613,91 @@ loop:
 			// Client cancelled: quiet exit, no error writes.
 			return
 		case <-reader.Keepalive():
-			// Keepalive ping — before the first upstream token this is the
-			// only thing the client receives; do NOT fake message_start.
-			emitClaudeEvent("ping", map[string]any{"type": "ping"})
+			// Keepalive ping — before the first upstream token this is the only
+			// thing the client receives; it does NOT fake message_start.
+			writeAll([]bridge.OutEvent{st.PingEvent()})
 		case result := <-reader.Read():
 			// bufio.ReadString may return both a non-empty line and an error
 			// (e.g. the last line without a trailing newline + io.EOF). Process
 			// the line first, then handle the accompanying error via pendingErr.
 			pendingErr := result.err
 
-			line := result.line
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
-				stats.DoneSeen = true
-				if !finished {
-					if usageTerminalSeen && streamProducedOutput(stats, len(toolCallOrder)) {
-						stats.SawFinish = true
-						stats.FinishReason = "stop"
-						finished = true
-						finalizeContentBlocks()
-						break loop
-					}
-					emitClaudeError("stream ended with [DONE] but no finish_reason")
-					return
+			if line := result.line; line != "" {
+				out, breakLoop := st.Handle(bridge.LineEvent{RawLine: line})
+				// Note a chunk exactly when the state machine did (choice-bearing
+				// lines only), preserving the original FirstChunkAt/Chunks timing.
+				for cc := st.ChunkCount(); statsChunks < cc; statsChunks++ {
+					stats.NoteChunk()
 				}
-				break loop
-			}
-			if strings.HasPrefix(line, "data: ") {
-				payload := line[6:]
-				if strings.TrimSpace(payload) != "" {
-					var chunk map[string]any
-					if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-						emitClaudeError("stream received malformed JSON data")
-						return
-					} else {
-						// In-band error from upstream.
-						if errVal, ok := chunk["error"]; ok && errVal != nil {
-							errMsg := "upstream stream error"
-							if errMap, ok := errVal.(map[string]any); ok {
-								if m, ok := errMap["message"].(string); ok && m != "" {
-									errMsg = m
-								}
-							} else if errStr, ok := errVal.(string); ok && errStr != "" {
-								errMsg = errStr
-							}
-							emitClaudeError(errMsg)
-							return
-						} else {
-
-							if usage, ok := chunk["usage"].(map[string]any); ok {
-								fullUsage = mergeUsageMaps(fullUsage, usage)
-							}
-
-							usageChunk, _ := chunk["usage"].(map[string]any)
-							choices, ok := chunk["choices"].([]any)
-							if !ok || len(choices) == 0 {
-								// Usage-only trailing chunk (OpenAI stream_options.include_usage).
-								if usageHasCompletion(usageChunk) {
-									usageTerminalSeen = true
-								}
-							} else {
-								choice, _ := choices[0].(map[string]any)
-								delta, _ := choice["delta"].(map[string]any)
-								finishReason, _ := choice["finish_reason"].(string)
-								stats.NoteChunk()
-
-								ensureMessageStart()
-
-								// After finish_reason, ignore further content deltas but keep reading
-								// so a later usage-only chunk can populate fullUsage.
-								if !finished {
-									if rc, ok := delta["reasoning_content"]; ok {
-										rcStr, _ := rc.(string)
-										if rcStr != "" {
-											stats.ReasoningChars += len(rcStr)
-											if keepReasoning {
-												reasoningFallback.WriteString(rcStr)
-												closeTextBlock()
-												if !thinkingBlockOpen {
-													emitClaudeEvent("content_block_start", map[string]any{
-														"type":  "content_block_start",
-														"index": blockIndex,
-														"content_block": map[string]any{
-															"type":     "thinking",
-															"thinking": "",
-														},
-													})
-													thinkingBlockOpen = true
-													blockIndex++
-												}
-												emitClaudeEvent("content_block_delta", map[string]any{
-													"type":  "content_block_delta",
-													"index": blockIndex - 1,
-													"delta": map[string]any{
-														"type":     "thinking_delta",
-														"thinking": rcStr,
-													},
-												})
-											} else {
-												// Thinking not requested: promote misplaced CoT to visible text (#37635).
-												stats.PromotedReasoning = true
-												emitTextDelta(rcStr)
-											}
-										}
-									}
-
-									if c, ok := delta["content"]; ok && c != nil {
-										contentStr, _ := c.(string)
-										if contentStr != "" {
-											emitTextDelta(contentStr)
-										}
-									}
-
-									if rawToolCalls, ok := delta["tool_calls"].([]any); ok {
-										for _, rawTC := range rawToolCalls {
-											tc, ok := rawTC.(map[string]any)
-											if !ok {
-												continue
-											}
-											idxFloat, _ := tc["index"].(float64)
-											upstreamIndex := int(idxFloat)
-
-											closeThinkingBlock()
-											closeTextBlock()
-
-											if _, exists := toolCallAccumulator[upstreamIndex]; !exists {
-												callID, _ := tc["id"].(string)
-												if callID == "" {
-													callID = "toolu_" + randomString(12)
-												}
-												fn, _ := tc["function"].(map[string]any)
-												name, _ := fn["name"].(string)
-												toolCallAccumulator[upstreamIndex] = map[string]string{
-													"id":   callID,
-													"name": name,
-													"args": "",
-												}
-												toolCallOrder = append(toolCallOrder, upstreamIndex)
-												toolBlockIndices[upstreamIndex] = blockIndex
-												emitClaudeEvent("content_block_start", map[string]any{
-													"type":  "content_block_start",
-													"index": blockIndex,
-													"content_block": map[string]any{
-														"type":  "tool_use",
-														"id":    callID,
-														"name":  name,
-														"input": map[string]any{},
-													},
-												})
-												blockIndex++
-											}
-
-											fn, _ := tc["function"].(map[string]any)
-											if argDelta, ok := fn["arguments"].(string); ok && argDelta != "" {
-												toolCallAccumulator[upstreamIndex]["args"] += argDelta
-												emitClaudeEvent("content_block_delta", map[string]any{
-													"type":  "content_block_delta",
-													"index": toolBlockIndices[upstreamIndex],
-													"delta": map[string]any{
-														"type":         "input_json_delta",
-														"partial_json": argDelta,
-													},
-												})
-											}
-										}
-									}
-
-									if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
-										stats.FinishReason = finishReason
-										stats.SawFinish = true
-										finished = true
-										finalizeContentBlocks()
-
-										stopReason = "end_turn"
-										switch finishReason {
-										case "length":
-											stopReason = "max_tokens"
-										case "tool_calls", "function_call":
-											stopReason = "tool_use"
-										case "content_filter":
-											stopReason = "refusal"
-										}
-										// Do not emit message_delta/stop yet: OpenAI-compatible upstreams often
-										// send the usage-only chunk after finish_reason when include_usage=true.
-									}
-								}
-							}
-						}
+				writeAll(out)
+				if breakLoop {
+					// [DONE] / in-band error / malformed JSON reached. Emit the
+					// message_delta/message_stop trailer only when a valid finish
+					// (or the synthesized usage-terminal stop) was seen AND no error
+					// frame went out; an error returns without the trailer.
+					if st.Finished() && !st.Errored() {
+						writeAll(st.Finalize())
 					}
+					break loop
 				}
 			}
 
 			// Now handle a pending error from the read.
 			if pendingErr != nil {
 				if pendingErr == io.EOF {
-					if !finished {
-						if usageTerminalSeen && streamProducedOutput(stats, len(toolCallOrder)) {
-							stats.SawFinish = true
-							stats.FinishReason = "stop"
-							finished = true
-							finalizeContentBlocks()
-							break loop
-						}
-						emitClaudeError("stream ended without finish_reason")
-						return
+					out := st.HandleEOF()
+					// Emit the trailer only on a clean/synthesized stop (finished and
+					// no error). EOF without finish_reason emits only the error frame
+					// from HandleEOF, no trailer.
+					if st.Finished() && !st.Errored() {
+						writeAll(out)
+						writeAll(st.Finalize())
+					} else {
+						writeAll(out)
 					}
-					break loop
+					return
 				}
 				logging.FromContext(ctx).Error("stream read error", "error", pendingErr)
-				emitClaudeError("stream read error")
+				writeAll([]bridge.OutEvent{st.ReadErrorEvent()})
 				return
 			}
 		}
 	}
-
-	// Reached only when finished is true (valid finish_reason seen).
-	ensureMessageStart()
-	emitClaudeEvent("message_delta", map[string]any{
-		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-		"usage": buildClaudeDeltaUsage(fullUsage),
-	})
-	emitClaudeEvent("message_stop", map[string]any{"type": "message_stop"})
 }
 
 // ======================== Anthropic 格式兼容 ========================
 
+// 纯核已迁入 bridge.IsAnthropicFormat；薄壳转发。
 func isAnthropicFormat(body []byte) bool {
-	var obj map[string]any
-	if json.Unmarshal(body, &obj) == nil {
-		if typ, _ := obj["type"].(string); typ == "message" {
-			return true
-		}
-	}
-	lines := bytes.Split(body, []byte("\n"))
-	for _, line := range lines {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		// Support "data: " prefixed SSE lines.
-		if bytes.HasPrefix(line, []byte("data: ")) {
-			line = bytes.TrimSpace(line[6:])
-		} else if bytes.HasPrefix(line, []byte("data:")) {
-			line = bytes.TrimSpace(line[5:])
-		}
-		if len(line) == 0 {
-			continue
-		}
-		var event map[string]any
-		if err := json.Unmarshal(line, &event); err != nil {
-			continue
-		}
-		typ, _ := event["type"].(string)
-		switch typ {
-		case "message_start", "content_block_start", "content_block_delta",
-			"content_block_stop", "message_delta", "message_stop", "ping",
-			"error":
-			return true
-		}
-		return false
-	}
-	return false
+	return bridge.IsAnthropicFormat(body)
 }
 
 // anthropicBlockState tracks per-index content block reconstruction.
-type anthropicBlockState struct {
-	blockType     string
-	id            string
-	name          string
-	signature     string
-	data          string
-	textBuilder   strings.Builder
-	thinkBuilder  strings.Builder
-	jsonBuilder   strings.Builder
-	initialInput  any
-	sawInputDelta bool
-	started       bool
-	stopped       bool
-}
+// 纯核已迁入 bridge.AnthropicBlockState；薄壳别名转发。
+type anthropicBlockState = bridge.AnthropicBlockState
 
 // usageHasCompletion reports whether an upstream usage object includes output
 // token accounting, which upstreams send as the terminal chunk when
 // stream_options.include_usage is set.
+// 纯核已迁入 bridge.UsageHasCompletion；薄壳转发。
 func usageHasCompletion(usage map[string]any) bool {
-	if len(usage) == 0 {
-		return false
-	}
-	if v, ok := usage["completion_tokens"]; ok {
-		if n, ok := v.(float64); ok && n >= 0 {
-			return true
-		}
-	}
-	if v, ok := usage["output_tokens"]; ok {
-		if n, ok := v.(float64); ok && n >= 0 {
-			return true
-		}
-	}
-	return false
+	return bridge.UsageHasCompletion(usage)
 }
 
 // streamProducedOutput reports whether a stream has emitted any assistant
-// content or tool calls before the terminal usage chunk.
-func streamProducedOutput(stats *logging.StreamStats, toolCalls int) bool {
-	return stats.TextChars > 0 || stats.ReasoningChars > 0 || toolCalls > 0
+// content or tool calls before the terminal usage chunk. 薄壳转发到 bridge;
+// 纯形式 (textChars,reasoningChars,toolCalls)->bool,不再依赖
+// *logging.StreamStats。保留同名同包薄壳以兼容既有调用方/测试。
+func streamProducedOutput(textChars, reasoningChars, toolCalls int) bool {
+	return bridge.StreamProducedOutput(textChars, reasoningChars, toolCalls)
 }
 
 // mergeUsageMaps merges src into dst. Anthropic usage values are snapshots /
 // cumulative: a field present in src always replaces the value in dst
 // (including 0). Nested maps are recursively merged. Fields absent from src
-// are retained.
+// are retained. 薄壳转发到 bridge。
 func mergeUsageMaps(dst any, src map[string]any) map[string]any {
-	if src == nil {
-		if dm, ok := dst.(map[string]any); ok {
-			return dm
-		}
-		return nil
-	}
-	var result map[string]any
-	if dm, ok := dst.(map[string]any); ok {
-		result = make(map[string]any, len(dm))
-		for k, v := range dm {
-			result[k] = v
-		}
-	} else {
-		result = map[string]any{}
-	}
-	for k, v := range src {
-		if existing, ok := result[k]; ok {
-			if srcMap, ok := v.(map[string]any); ok {
-				if existing != nil {
-					result[k] = mergeUsageMaps(existing, srcMap)
-					continue
-				}
-			}
-		}
-		result[k] = v
-	}
-	return result
+	return bridge.MergeUsageMaps(dst, src)
 }
 
 // parseAnthropicSSE consumes a complete Anthropic Messages SSE body and
@@ -1689,352 +716,16 @@ func mergeUsageMaps(dst any, src map[string]any) map[string]any {
 //   - duplicate content_block_start for the same index
 //   - message_stop with unclosed (not-yet-stopped) blocks
 //   - malformed tool_use input JSON
+//
+// 纯核已迁入 bridge.ParseAnthropicSSE；薄壳转发并包装类型化错误为
+// anthropicProtocolError。
 func parseAnthropicSSE(body []byte) (map[string]any, []map[string]any, error) {
-	lines := bytes.Split(body, []byte("\n"))
-	var anthropicMsg map[string]any
-	blocks := map[int]*anthropicBlockState{}
-	sawMessageStop := false
-	messageStartCount := 0
-
-	for _, rawLine := range lines {
-		line := bytes.TrimSpace(rawLine)
-		if len(line) == 0 {
-			continue
-		}
-		// Standard SSE metadata lines: "event: ...", "id: ...", comment ": ..."
-		if bytes.HasPrefix(line, []byte("event:")) ||
-			bytes.HasPrefix(line, []byte("id:")) ||
-			bytes.HasPrefix(line, []byte(":")) {
-			continue
-		}
-		// Support "data: " prefixed SSE lines.
-		if bytes.HasPrefix(line, []byte("data: ")) {
-			line = bytes.TrimSpace(line[6:])
-		} else if bytes.HasPrefix(line, []byte("data:")) {
-			line = bytes.TrimSpace(line[5:])
-		}
-		if len(line) == 0 {
-			continue
-		}
-		var event map[string]any
-		if err := json.Unmarshal(line, &event); err != nil {
-			return nil, nil, fmt.Errorf("malformed SSE event JSON: %w", err)
-		}
-		typ, _ := event["type"].(string)
-
-		// After message_stop, only ping events and comment/metadata lines
-		// are allowed. Comment/metadata lines are already filtered above.
-		// Any other event is an error.
-		if sawMessageStop && typ != "ping" {
-			return nil, nil, fmt.Errorf("unexpected event %q after message_stop", typ)
-		}
-
-		switch typ {
-		case "message_start":
-			messageStartCount++
-			if messageStartCount > 1 {
-				return nil, nil, fmt.Errorf("multiple message_start events in SSE stream")
-			}
-			m, ok := event["message"].(map[string]any)
-			if !ok || m == nil {
-				return nil, nil, fmt.Errorf("message_start missing non-nil message object")
-			}
-			anthropicMsg = m
-		case "content_block_start":
-			if messageStartCount == 0 {
-				return nil, nil, fmt.Errorf("content_block_start before message_start")
-			}
-			idx, ok := extractBlockIndex(event)
-			if !ok {
-				return nil, nil, fmt.Errorf("content_block_start missing valid non-negative integer index")
-			}
-			if existing, ok := blocks[idx]; ok && existing.started {
-				return nil, nil, fmt.Errorf("duplicate content_block_start for index %d", idx)
-			}
-			cb, _ := event["content_block"].(map[string]any)
-			cbType, _ := cb["type"].(string)
-			if cbType == "" {
-				return nil, nil, fmt.Errorf("content_block_start missing content_block type")
-			}
-			if cbType != "text" && cbType != "thinking" && cbType != "redacted_thinking" && cbType != "tool_use" {
-				return nil, nil, fmt.Errorf("content_block_start unsupported type %q", cbType)
-			}
-			st := &anthropicBlockState{blockType: cbType, started: true}
-			if cb != nil {
-				if id, ok := cb["id"].(string); ok {
-					st.id = id
-				}
-				if name, ok := cb["name"].(string); ok {
-					st.name = name
-				}
-				// tool_use must have a non-empty name.
-				if cbType == "tool_use" && st.name == "" {
-					return nil, nil, fmt.Errorf("tool_use content_block_start missing non-empty name")
-				}
-				if sig, ok := cb["signature"].(string); ok {
-					st.signature = sig
-				}
-				if d, ok := cb["data"].(string); ok {
-					st.data = d
-				}
-				// Preserve initial text if provided.
-				if t, ok := cb["text"].(string); ok && t != "" {
-					st.textBuilder.WriteString(t)
-				}
-				if t, ok := cb["thinking"].(string); ok && t != "" {
-					st.thinkBuilder.WriteString(t)
-				}
-				// Preserve initial input if provided as a non-empty value.
-				// In Anthropic SSE, content_block_start.input is typically {}
-				// and the actual input arrives via input_json_delta partials.
-				// Store separately so initial input and partial deltas are not
-				// concatenated into invalid JSON.
-				if input, ok := cb["input"]; ok && input != nil {
-					if inputStr, ok := input.(string); ok && inputStr != "" {
-						st.initialInput = inputStr
-					} else if m, ok := input.(map[string]any); ok && len(m) > 0 {
-						st.initialInput = input
-					}
-				}
-			}
-			blocks[idx] = st
-		case "content_block_delta":
-			if messageStartCount == 0 {
-				return nil, nil, fmt.Errorf("content_block_delta before message_start")
-			}
-			idx, ok := extractBlockIndex(event)
-			if !ok {
-				return nil, nil, fmt.Errorf("content_block_delta missing valid non-negative integer index")
-			}
-			st, ok := blocks[idx]
-			if !ok || !st.started {
-				return nil, nil, fmt.Errorf("content_block_delta for unknown index %d", idx)
-			}
-			if st.stopped {
-				return nil, nil, fmt.Errorf("content_block_delta for already-stopped index %d", idx)
-			}
-			delta, ok := event["delta"].(map[string]any)
-			if !ok || delta == nil {
-				return nil, nil, fmt.Errorf("content_block_delta for index %d missing delta object", idx)
-			}
-			dt, _ := delta["type"].(string)
-			if dt == "" {
-				return nil, nil, fmt.Errorf("content_block_delta for index %d missing delta type", idx)
-			}
-			switch dt {
-			case "text_delta":
-				if t, ok := delta["text"].(string); ok {
-					st.textBuilder.WriteString(t)
-				}
-			case "thinking_delta":
-				if t, ok := delta["thinking"].(string); ok {
-					st.thinkBuilder.WriteString(t)
-				}
-			case "signature_delta":
-				if sig, ok := delta["signature"].(string); ok {
-					st.signature += sig
-				}
-			case "input_json_delta":
-				if partial, ok := delta["partial_json"].(string); ok {
-					st.jsonBuilder.WriteString(partial)
-					st.sawInputDelta = true
-				}
-			default:
-				// Unknown delta type: ignore.
-			}
-		case "content_block_stop":
-			if messageStartCount == 0 {
-				return nil, nil, fmt.Errorf("content_block_stop before message_start")
-			}
-			idx, ok := extractBlockIndex(event)
-			if !ok {
-				return nil, nil, fmt.Errorf("content_block_stop missing valid non-negative integer index")
-			}
-			st, ok := blocks[idx]
-			if !ok || !st.started {
-				return nil, nil, fmt.Errorf("content_block_stop for unknown index %d", idx)
-			}
-			if st.stopped {
-				return nil, nil, fmt.Errorf("duplicate content_block_stop for index %d", idx)
-			}
-			st.stopped = true
-		case "message_delta":
-			if messageStartCount == 0 {
-				return nil, nil, fmt.Errorf("message_delta before message_start")
-			}
-			if anthropicMsg == nil {
-				anthropicMsg = map[string]any{}
-			}
-			if delta, ok := event["delta"].(map[string]any); ok {
-				if stop, ok := delta["stop_reason"].(string); ok {
-					anthropicMsg["stop_reason"] = stop
-				}
-			}
-			// message_delta usage is at the event top level (Anthropic spec).
-			if usage, ok := event["usage"].(map[string]any); ok {
-				anthropicMsg["usage"] = mergeUsageMaps(anthropicMsg["usage"], usage)
-			} else if delta, ok := event["delta"].(map[string]any); ok {
-				if usage, ok := delta["usage"].(map[string]any); ok {
-					anthropicMsg["usage"] = mergeUsageMaps(anthropicMsg["usage"], usage)
-				}
-			}
-		case "message_stop":
-			// Validate at message_stop time: must have message_start,
-			// all blocks stopped, and non-empty stop_reason.
-			if messageStartCount == 0 {
-				return nil, nil, fmt.Errorf("message_stop before message_start")
-			}
-			for idx, st := range blocks {
-				if st != nil && st.started && !st.stopped {
-					return nil, nil, fmt.Errorf("message_stop with unclosed block at index %d", idx)
-				}
-			}
-			stopReason, _ := anthropicMsg["stop_reason"].(string)
-			if stopReason == "" {
-				return nil, nil, fmt.Errorf("message_stop without stop_reason")
-			}
-			sawMessageStop = true
-		case "error":
-			errType := "api_error"
-			errMsg := "upstream Anthropic error"
-			if errMap, ok := event["error"].(map[string]any); ok {
-				if t, ok := errMap["type"].(string); ok && t != "" {
-					errType = t
-				}
-				if m, ok := errMap["message"].(string); ok && m != "" {
-					errMsg = m
-				}
-			}
-			return nil, nil, &anthropicProtocolError{errType: errType, message: errMsg}
-		default:
-			// Unknown event type: ignore.
-		}
-	}
-
-	if messageStartCount == 0 {
-		return nil, nil, fmt.Errorf("anthropic SSE stream missing message_start")
-	}
-	if !sawMessageStop {
-		return nil, nil, fmt.Errorf("anthropic SSE stream ended without message_stop")
-	}
-
-	// Build ordered content blocks sorted by numeric index ascending.
-	indices := make([]int, 0, len(blocks))
-	for idx := range blocks {
-		indices = append(indices, idx)
-	}
-	sort.Ints(indices)
-
-	var contentBlocks []map[string]any
-	for _, idx := range indices {
-		st := blocks[idx]
-		if st == nil {
-			continue
-		}
-		switch st.blockType {
-		case "text":
-			contentBlocks = append(contentBlocks, map[string]any{
-				"type": "text",
-				"text": st.textBuilder.String(),
-			})
-		case "thinking":
-			blk := map[string]any{
-				"type":     "thinking",
-				"thinking": st.thinkBuilder.String(),
-			}
-			if st.signature != "" {
-				blk["signature"] = st.signature
-			}
-			contentBlocks = append(contentBlocks, blk)
-		case "redacted_thinking":
-			blk := map[string]any{
-				"type": "redacted_thinking",
-			}
-			if st.data != "" {
-				blk["data"] = st.data
-			}
-			contentBlocks = append(contentBlocks, blk)
-		case "tool_use":
-			var input any
-			if st.sawInputDelta {
-				// Parse accumulated partial JSON deltas.
-				inputStr := st.jsonBuilder.String()
-				if inputStr != "" {
-					var parsed any
-					if err := json.Unmarshal([]byte(inputStr), &parsed); err != nil {
-						return nil, nil, fmt.Errorf("malformed tool_use input JSON for index %d: %w", idx, err)
-					}
-					input = parsed
-				} else {
-					input = map[string]any{}
-				}
-			} else if st.initialInput != nil {
-				// Use initial input from content_block_start.
-				if inputStr, ok := st.initialInput.(string); ok {
-					var parsed any
-					if err := json.Unmarshal([]byte(inputStr), &parsed); err != nil {
-						return nil, nil, fmt.Errorf("malformed tool_use initial input for index %d: %w", idx, err)
-					}
-					input = parsed
-				} else {
-					input = st.initialInput
-				}
-			} else {
-				input = map[string]any{}
-			}
-			blk := map[string]any{
-				"type":  "tool_use",
-				"input": input,
-			}
-			if st.id != "" {
-				blk["id"] = st.id
-			}
-			if st.name != "" {
-				blk["name"] = st.name
-			}
-			contentBlocks = append(contentBlocks, blk)
-		default:
-			// Unknown block type: skip.
-		}
-	}
-
-	if anthropicMsg == nil {
-		anthropicMsg = map[string]any{}
-	}
-	return anthropicMsg, contentBlocks, nil
+	msg, blocks, err := bridge.ParseAnthropicSSE(body)
+	return msg, blocks, wrapBridgeProtocolError(err)
 }
 
 // undefined/saturating behavior on overflow.
+// 纯核已迁入 bridge.ExtractBlockIndex；薄壳转发。
 func extractBlockIndex(event map[string]any) (int, bool) {
-	rawIdx, ok := event["index"]
-	if !ok || rawIdx == nil {
-		return 0, false
-	}
-	f, ok := rawIdx.(float64)
-	if !ok {
-		return 0, false
-	}
-	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return 0, false
-	}
-	if math.Trunc(f) != f || f < 0 {
-		return 0, false
-	}
-	// Check platform int range BEFORE converting, to avoid overflow.
-	// On 64-bit: maxInt = 2^63-1; on 32-bit: maxInt = 2^31-1.
-	// float64 can't represent all int64 values, so also cap at 2^53
-	// (where all integers are exactly representable as float64).
-	maxInt := float64(1<<(strconv.IntSize-1) - 1)
-	if f > maxInt {
-		return 0, false
-	}
-	// Also reject values above the float64 exact-integer upper bound.
-	if f > float64(1<<53) {
-		return 0, false
-	}
-	idx := int(f)
-	if float64(idx) != f {
-		return 0, false
-	}
-	return idx, true
+	return bridge.ExtractBlockIndex(event)
 }

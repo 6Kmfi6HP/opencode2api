@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/bridge"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 )
 
@@ -135,12 +136,9 @@ func estimateContentTokens(content any) int {
 }
 
 // jsonString serializes any value to a JSON string, falling back to "" on
-// error. Used only for token estimation.
+// error. Used only for token estimation. Thin shell forwarding to bridge.
 func jsonString(v any) string {
-	if b, err := json.Marshal(v); err == nil {
-		return string(b)
-	}
-	return ""
+	return bridge.JSONString(v)
 }
 
 // estimateTextTokens counts runes rather than bytes so multibyte text is not

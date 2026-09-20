@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/bridge"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
@@ -226,10 +227,9 @@ func relayAnthropicBuffered(ctx context.Context, w http.ResponseWriter, rc io.Re
 }
 
 // mergeUsage 把增量 usage 合并进累计表（新值覆盖旧值，保留未知键）。
+// 薄壳转发到 bridge。
 func mergeUsage(full map[string]any, delta map[string]any) {
-	for k, v := range delta {
-		full[k] = v
-	}
+	bridge.MergeUsage(full, delta)
 }
 
 // parseAnthropicErrorBody 把上游 Anthropic 错误体转为 anthropicProtocolError，

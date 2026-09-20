@@ -1,6 +1,7 @@
 package app
 
 import (
+	"github.com/6Kmfi6HP/opencode2api/internal/bridge"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 )
@@ -51,14 +52,8 @@ func thinkingState(value any) string {
 }
 
 // mappedReasoningEffort returns the configured reasoning-effort mapping for
-// in, or in unchanged when no mapping is configured.
+// in, or in unchanged when no mapping is configured. config 侧取值在 app 读取
+// 后注入，薄壳转发到 bridge。
 func mappedReasoningEffort(in string) string {
-	if in == "" {
-		return ""
-	}
-	effortMap := config.ReasoningEffortMap()
-	if mapped, ok := effortMap[in]; ok {
-		return mapped
-	}
-	return in
+	return bridge.MappedReasoningEffort(config.ReasoningEffortMap(), in)
 }

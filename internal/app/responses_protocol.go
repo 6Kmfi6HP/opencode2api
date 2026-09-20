@@ -1,31 +1,23 @@
 package app
 
-// responseOutcome is shared by streaming and non-streaming builders so their
-// top-level and item statuses cannot drift apart.
-type responseOutcome struct {
-	Status            string
-	Event             string
-	IncompleteDetails any
-}
+import (
+	"github.com/6Kmfi6HP/opencode2api/internal/bridge"
+)
 
+// responseOutcome is shared by streaming and non-streaming builders so their
+// top-level and item statuses cannot drift apart. Thin alias forwarding to bridge.
+type responseOutcome = bridge.ResponseOutcome
+
+// responsesOutcome maps a finish reason onto the Responses terminal outcome.
+// Thin shell forwarding to bridge.
 func responsesOutcome(finishReason string) responseOutcome {
-	if finishReason == "length" {
-		return responseOutcome{Status: "incomplete", Event: "response.incomplete", IncompleteDetails: map[string]any{"reason": "max_output_tokens"}}
-	}
-	return responseOutcome{Status: "completed", Event: "response.completed"}
+	return bridge.ResponsesOutcome(finishReason)
 }
 
 // outputIndexAllocator assigns indices by first appearance. It deliberately
 // does not derive one item's index from whether another item happened to exist.
-type outputIndexAllocator struct{ next int }
-
-func (a *outputIndexAllocator) Allocate() int {
-	index := a.next
-	a.next++
-	return index
-}
-
-func (a *outputIndexAllocator) Len() int { return a.next }
+// Thin alias forwarding to bridge.
+type outputIndexAllocator = bridge.OutputIndexAllocator
 
 func applyResponsesRequestEcho(response map[string]any, req ResponsesAPIRequest) {
 	if req.Metadata != nil {

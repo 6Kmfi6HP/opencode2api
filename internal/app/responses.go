@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"github.com/6Kmfi6HP/opencode2api/internal/bridge"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
@@ -16,186 +17,7 @@ import (
 // ======================== Responses API ========================
 
 func responsesInputToMessages(input any, instructions string) []Message {
-	var messages []Message
-	if instructions != "" {
-		messages = append(messages, Message{Role: "system", Content: instructions})
-	}
-	switch v := input.(type) {
-	case string:
-		messages = append(messages, Message{Role: "user", Content: v})
-	case []any:
-		functionOutputs := collectFunctionOutputs(v)
-		// Pre-collect call IDs present in this input array so output items
-		// whose matching call is also present are not independently appended
-		// (the call branch emits the paired tool message). Standalone outputs
-		// (e.g. previous-response-id replay) have no matching call and still
-		// append independently. Uses the same call-ID extraction rule as the
-		// call branch: call_id → id → nested tool_use.id.
-		callIDsPresent := map[string]bool{}
-		for _, item := range v {
-			elem, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			switch elem["type"] {
-			case "function_call", "tool_call", "apply_patch_call", "shell_call":
-				cid, _ := elem["call_id"].(string)
-				if cid == "" {
-					cid, _ = elem["id"].(string)
-				}
-				if cid == "" {
-					if tu, ok := elem["tool_use"].(map[string]any); ok {
-						cid, _ = tu["id"].(string)
-					}
-				}
-				if cid != "" {
-					callIDsPresent[cid] = true
-				}
-			}
-		}
-		for _, item := range v {
-			switch elem := item.(type) {
-			case string:
-				messages = append(messages, Message{Role: "user", Content: elem})
-			case map[string]any:
-				itemType, _ := elem["type"].(string)
-				switch itemType {
-				case "function_call", "tool_call", "apply_patch_call", "shell_call":
-					callID, _ := elem["call_id"].(string)
-					if callID == "" {
-						callID, _ = elem["id"].(string)
-					}
-					name, _ := elem["name"].(string)
-					if name == "" {
-						switch itemType {
-						case "apply_patch_call":
-							name = "apply_patch"
-						case "shell_call":
-							name = "shell"
-						}
-					}
-					args, _ := elem["arguments"].(string)
-					if name == "" {
-						if tu, ok := elem["tool_use"].(map[string]any); ok {
-							name, _ = tu["name"].(string)
-							callID, _ = tu["id"].(string)
-							if a, ok := tu["arguments"].(string); ok {
-								args = a
-							} else if inp, ok := tu["input"]; ok {
-								b, _ := json.Marshal(inp)
-								args = string(b)
-							}
-						}
-					}
-					if args == "" {
-						args = buildBuiltInToolCallArguments(itemType, elem)
-					}
-					if args == "" {
-						args = "{}"
-					}
-					messages = append(messages, Message{
-						Role:    "assistant",
-						Content: "",
-						ToolCalls: []ToolCall{{
-							ID:   callID,
-							Type: "function",
-							Function: FunctionCall{
-								Name:      name,
-								Arguments: args,
-							},
-						}},
-					})
-					if callID != "" {
-						// Map presence (not value=="") decides whether a payload
-						// was provided: an empty string is a legitimate output.
-						output, hasOutput := functionOutputs[callID]
-						if !hasOutput {
-							output = "[tool output missing]"
-						}
-						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
-					}
-				case "function_call_output", "tool_result", "apply_patch_call_output", "shell_call_output":
-					callID, _ := elem["call_id"].(string)
-					if callID == "" {
-						callID, _ = elem["tool_use_id"].(string)
-					}
-					if callID != "" {
-						// If the matching call item is also present in this
-						// input array, skip independent emission — the call
-						// branch will emit the paired assistant+tool messages,
-						// preventing a leading duplicate tool message when
-						// output precedes call. Standalone outputs (no matching
-						// call, e.g. previous-response-id replay) still append
-						// independently.
-						if callIDsPresent[callID] {
-							continue
-						}
-						// Map presence (not value=="") decides whether a payload
-						// was provided: an empty string is a legitimate output.
-						output, hasOutput := functionOutputs[callID]
-						if !hasOutput {
-							// Fallback for items not collected (e.g. output
-							// field absent on a standard *_call_output). Use
-							// the single normalizer so Anthropic-style content
-							// is honored and the raw tool_result wrapper JSON
-							// is never emitted.
-							text, present := normalizeToolResultOutput(elem)
-							if present {
-								output = text
-								hasOutput = true
-							}
-						}
-						if !hasOutput {
-							output = "[tool output missing]"
-						}
-						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
-					}
-					continue
-				case "reasoning":
-					// 只保留 summary 文本（summary[*].text）作为 ReasoningContent；
-					// signature 与 encrypted_content 绑定发起方且非明文，不回放为
-					// 文本（摘要为空时即丢弃该条目，不注入任何原文 JSON）。
-					if text := extractTextFromContentParts(elem["summary"]); text != "" {
-						messages = append(messages, Message{Role: "assistant", Content: "", ReasoningContent: &text})
-					}
-					continue
-				case "message", "":
-					role := "user"
-					if r, ok := elem["role"].(string); ok && r != "" {
-						role = r
-					}
-					if role == "developer" {
-						role = "system"
-					}
-					content := responsesContentToMessageContent(elem["content"])
-					messages = append(messages, Message{Role: role, Content: content})
-				case "input_file":
-					// Top-level input_file item (file upload). Map to a user
-					// message carrying a structured file part. Malformed items
-					// (no payload) are rejected earlier by the handler, so a
-					// failure here is dropped rather than serialized as text.
-					if file, ok := responsesInputFileToFile(elem); ok {
-						messages = append(messages, Message{
-							Role:    "user",
-							Content: []any{map[string]any{"type": "file", "file": file}},
-						})
-					}
-					continue
-				default:
-					// 未知 item 类型（含 item_reference、服务端专有 item 等）静默跳过：
-					// 不把原始 JSON 注入 role:user 文本污染上下文。
-					continue
-				}
-			default:
-				// 数组内裸非字符串原子（null/数字/布尔等）丢弃，不转成文本消息。
-				continue
-			}
-		}
-	default:
-		b, _ := json.Marshal(v)
-		messages = append(messages, Message{Role: "user", Content: string(b)})
-	}
-	return messages
+	return bridge.ResponsesInputToMessages(input, instructions)
 }
 
 // convertResponsesTools 把 Responses tools 转 Chat Completions tools。
@@ -207,32 +29,7 @@ func responsesInputToMessages(input any, instructions string) []Message {
 
 // messageTextContent 从 Chat content（纯字符串或多模态 parts 数组）提取可见文本。
 // 非文本分片（image_url/file 等）在无文本时兜底为其 JSON 字符串，避免空内容消息。
-func messageTextContent(content any) string {
-	switch v := content.(type) {
-	case string:
-		return v
-	case []any:
-		var texts []string
-		for _, p := range v {
-			pm, ok := p.(map[string]any)
-			if !ok {
-				continue
-			}
-			if t, _ := pm["text"].(string); t != "" {
-				texts = append(texts, t)
-			}
-		}
-		return strings.Join(texts, "\n")
-	default:
-		if v == nil {
-			return ""
-		}
-		if b, err := json.Marshal(v); err == nil {
-			return string(b)
-		}
-		return ""
-	}
-}
+func messageTextContent(content any) string { return bridge.MessageTextContent(content) }
 
 // mergeConsecutiveSameRole 把相邻同 role 的 domain.Message 合并。tool（合并到
 // 前一条，保留 ToolCallID 供配对索引，后续已展开为 tool_result）与
@@ -240,70 +37,7 @@ func messageTextContent(content any) string {
 // Anthropic 要求 tool_use 与其 tool_result 之间无任意 user/assistant 文本，
 // 本归一化与 normalizeAnthropicToolPairing 配合恢复工具配对与回合交替。
 func mergeConsecutiveSameRole(msgs []Message) []Message {
-	out := make([]Message, 0, len(msgs))
-	sameContent := func(a, b any) bool {
-		ab, aerr := json.Marshal(a)
-		bb, berr := json.Marshal(b)
-		return aerr == nil && berr == nil && string(ab) == string(bb)
-	}
-	mergeContent := func(dst, src any) any {
-		switch d := dst.(type) {
-		case string:
-			if s, ok := src.(string); ok {
-				if d == "" {
-					return s
-				}
-				if s == "" {
-					return d
-				}
-				return d + "\n\n" + s
-			}
-		case []any:
-			if s, ok := src.([]any); ok {
-				return append(append([]any{}, d...), s...)
-			}
-		}
-		if ds := messageTextContent(dst); ds != "" {
-			if ss := messageTextContent(src); ss != "" {
-				return ds + "\n\n" + ss
-			}
-			return ds
-		}
-		return dst
-	}
-	for _, m := range msgs {
-		n := len(out)
-		if n == 0 {
-			out = append(out, m)
-			continue
-		}
-		last := &out[n-1]
-		switch {
-		case m.Role == "tool" && last.Role == "tool":
-			// 连续的 tool（尚未转换的 messages 形态罕见；normalize/pairing 已由
-			// chatMessagesToAnthropic 的 appendBlocks 处理为单 user 消息）。保留
-			// ToolCallID 列表进 content 无意义，此处不合并 tool。
-			out = append(out, m)
-		case last.Role == m.Role && len(last.ToolCalls) == 0 && len(m.ToolCalls) == 0 &&
-			m.Role != "tool":
-			if last.Refusal == nil {
-				last.Refusal = m.Refusal
-			}
-			if last.ReasoningContent == nil {
-				last.ReasoningContent = m.ReasoningContent
-			}
-			if m.Content != nil {
-				if last.Content == nil || (last.Content == "" && sameContent(last.Content, "")) {
-					last.Content = m.Content
-				} else {
-					last.Content = mergeContent(last.Content, m.Content)
-				}
-			}
-		default:
-			out = append(out, m)
-		}
-	}
-	return out
+	return bridge.MergeConsecutiveSameRole(msgs)
 }
 
 // mergeAdjacentToolCallAssistants 把相邻的「纯 tool_call assistant」消息合并
@@ -311,24 +45,7 @@ func mergeConsecutiveSameRole(msgs []Message) []Message {
 // 对应随后的 tool 结果按 call 序紧邻排列（normalizeAnthropicToolPairing
 // 视为同一 assistant turn 的处理单元）。
 func mergeAdjacentToolCallAssistants(msgs []Message) []Message {
-	out := make([]Message, 0, len(msgs))
-	for _, m := range msgs {
-		if len(out) > 0 {
-			prev := &out[len(out)-1]
-			// 仅当两条均为「工具调用载体」(无可见文本/refusal/reasoning) 时合并,
-			// 避免把真实文本回合错位拼接到一起。
-			if prev.Role == "assistant" && m.Role == "assistant" &&
-				len(prev.ToolCalls) > 0 && len(m.ToolCalls) > 0 &&
-				prev.Refusal == nil && m.Refusal == nil &&
-				prev.ReasoningContent == nil && m.ReasoningContent == nil &&
-				messageTextContent(prev.Content) == "" && messageTextContent(m.Content) == "" {
-				prev.ToolCalls = append(append([]ToolCall{}, prev.ToolCalls...), m.ToolCalls...)
-				continue
-			}
-		}
-		out = append(out, m)
-	}
-	return out
+	return bridge.MergeAdjacentToolCallAssistants(msgs)
 }
 
 // normalizeAnthropicToolPairing 把 Chat messages 归一化成满足 Anthropic
@@ -340,85 +57,17 @@ func mergeAdjacentToolCallAssistants(msgs []Message) []Message {
 // 及其 output —— 防上游 400 死循环（本归一化覆盖 Worker A chat_to_anthropic 的
 // `_raw` 兜底，以组装后的序列为准）。最后跑一次相邻同 role 合并恢复交替。
 func normalizeAnthropicToolPairing(messages []Message) []Message {
-	// 把相邻的「纯 tool_call assistant」合并为一条,使并行调用共享同一
-	// assistant,其 tool 结果按 call 序紧邻排列(对应 sub2api 的并行 call 归并)。
-	messages = mergeAdjacentToolCallAssistants(messages)
-	// 索引所有 tool 结果消息按 ToolCallID（后出现覆盖先前同 id）。
-	results := map[string]Message{}
-	for _, m := range messages {
-		if m.Role == "tool" && m.ToolCallID != "" {
-			results[m.ToolCallID] = m
-		}
-	}
-
-	droppedCalls := 0
-	droppedOrphans := 0
-	out := make([]Message, 0, len(messages))
-	for _, m := range messages {
-		switch m.Role {
-		case "assistant":
-			if len(m.ToolCalls) == 0 {
-				out = append(out, m)
-				continue
-			}
-			kept := make([]ToolCall, 0, len(m.ToolCalls))
-			for _, tc := range m.ToolCalls {
-				if _, ok := results[tc.ID]; !ok {
-					droppedCalls++ // 未答复的调用
-					continue
-				}
-				// 非法 arguments（parseToolCallArguments 兜底 _raw）连同其
-				// output 一并删除，防上游 400 死循环。
-				parsed := parseToolCallArguments(tc.Function.Arguments)
-				if _, raw := parsed["_raw"]; raw {
-					droppedCalls++
-					delete(results, tc.ID) // 已消费 → 不再作为孤儿再匹配
-					continue
-				}
-				kept = append(kept, tc)
-			}
-			text := messageTextContent(m.Content)
-			if len(kept) == 0 {
-				if text == "" && m.Refusal == nil && m.ReasoningContent == nil {
-					continue // 整条 assistant 消息无内容 → 删除
-				}
-				keptMsg := m
-				keptMsg.ToolCalls = nil
-				out = append(out, keptMsg)
-				continue
-			}
-			keptMsg := m
-			keptMsg.ToolCalls = kept
-			out = append(out, keptMsg)
-			for _, tc := range kept {
-				out = append(out, results[tc.ID])
-				delete(results, tc.ID) // 已消费 → 不再作为孤儿再出现
-			}
-		case "tool":
-			droppedOrphans++ // 原位置的 tool 消息（已规范到 call 旁边或孤儿）一律剔除
-		default:
-			out = append(out, m)
-		}
-	}
+	out, droppedCalls, droppedOrphans := bridge.NormalizeAnthropicToolPairing(messages)
 	if droppedCalls > 0 || droppedOrphans > 0 {
 		slog.Info("normalizeAnthropicToolPairing",
 			"unanswered_or_invalid_calls_dropped", droppedCalls,
 			"standalone_tool_msgs_dropped", droppedOrphans)
 	}
-	return mergeConsecutiveSameRole(out)
+	return out
 }
 
 func convertResponsesTools(tools []ResponsesTool) []Tool {
-	converted := make([]Tool, 0, len(tools))
-	dropped := 0
-	for _, tool := range tools {
-		fn, ok := responsesToolFunction(tool)
-		if !ok {
-			dropped++
-			continue
-		}
-		converted = append(converted, Tool{Type: "function", Function: fn})
-	}
+	converted, dropped := bridge.ConvertResponsesTools(tools)
 	if dropped > 0 {
 		slog.Info("responses tools dropped (server-side tool types unsupported on chat path)",
 			"dropped", dropped, "kept", len(converted))
@@ -435,162 +84,24 @@ func convertResponsesTools(tools []ResponsesTool) []Tool {
 // caller can omit response_format instead of sending a malformed object that
 // upstream would reject with a 400.
 func convertResponsesTextToResponseFormat(text any) any {
-	obj, ok := text.(map[string]any)
-	if !ok {
-		return nil
-	}
-	format, ok := obj["format"].(map[string]any)
-	if !ok {
-		// Only verbosity was provided (no format) — nothing to map.
-		return nil
-	}
-	typ, _ := format["type"].(string)
-	switch typ {
-	case "text", "json_object":
-		return map[string]any{"type": typ}
-	case "json_schema":
-		jsonSchema := map[string]any{}
-		if name, ok := format["name"].(string); ok && name != "" {
-			jsonSchema["name"] = name
-		}
-		if desc, ok := format["description"].(string); ok {
-			jsonSchema["description"] = desc
-		}
-		if schema, ok := format["schema"]; ok {
-			jsonSchema["schema"] = schema
-		}
-		if strict, ok := format["strict"]; ok {
-			jsonSchema["strict"] = strict
-		}
-		// name and schema are required by both APIs; without them upstream
-		// would reject the object, so drop the format entirely.
-		if _, hasName := jsonSchema["name"]; !hasName {
-			return nil
-		}
-		if _, hasSchema := jsonSchema["schema"]; !hasSchema {
-			return nil
-		}
-		return map[string]any{"type": "json_schema", "json_schema": jsonSchema}
-	default:
-		return nil
-	}
+	return bridge.ConvertResponsesTextToResponseFormat(text)
 }
 
 func responsesToolFunction(tool ResponsesTool) (ToolFunction, bool) {
-	switch tool.Type {
-	case "function":
-		fn := ToolFunction{
-			Name:        tool.Name,
-			Description: tool.Description,
-			Parameters:  tool.Parameters,
-		}
-		if tool.Function != nil {
-			fn = *tool.Function
-		}
-		if fn.Parameters == nil {
-			fn.Parameters = map[string]any{"type": "object", "properties": map[string]any{}}
-		}
-		if fn.Strict == nil {
-			fn.Strict = new(bool) // 显式 false：部分上游缺省按 strict=true 校验
-		}
-		return fn, true
-	case "apply_patch":
-		return ToolFunction{
-			Name:        "apply_patch",
-			Description: "Create, update, or delete files using a structured patch operation or unified diff.",
-			Parameters: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"input": map[string]any{
-						"type":        "string",
-						"description": "Patch diff or patch instructions to apply.",
-					},
-					"operation": map[string]any{
-						"type":        "object",
-						"description": "Structured patch operation, including file action and diff payload.",
-					},
-				},
-			},
-		}, true
-	case "shell":
-		return ToolFunction{
-			Name:        "shell",
-			Description: "Run a shell command in the local workspace and return stdout, stderr, and exit details.",
-			Parameters: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"command": map[string]any{
-						"type":        "string",
-						"description": "Shell command to execute.",
-					},
-					"timeout_ms": map[string]any{
-						"type":        "integer",
-						"description": "Optional timeout in milliseconds.",
-					},
-					"working_directory": map[string]any{
-						"type":        "string",
-						"description": "Optional working directory for the command.",
-					},
-					"max_output_tokens": map[string]any{
-						"type":        "integer",
-						"description": "Optional output budget hint.",
-					},
-				},
-				"required": []string{"command"},
-			},
-		}, true
-	default:
-		return ToolFunction{}, false
-	}
+	return bridge.ResponsesToolFunction(tool)
 }
 
-func responsesToolName(tool ResponsesTool) string {
-	switch tool.Type {
-	case "function":
-		if tool.Function != nil && tool.Function.Name != "" {
-			return tool.Function.Name
-		}
-		return tool.Name
-	case "apply_patch":
-		return "apply_patch"
-	case "shell":
-		return "shell"
-	default:
-		return ""
-	}
-}
+func responsesToolName(tool ResponsesTool) string { return bridge.ResponsesToolName(tool) }
 
 func responsesToolKindMap(tools []ResponsesTool) map[string]string {
-	kinds := make(map[string]string, len(tools))
-	for _, tool := range tools {
-		name := responsesToolName(tool)
-		if name == "" {
-			continue
-		}
-		kinds[name] = tool.Type
-	}
-	return kinds
+	return bridge.ResponsesToolKindMap(tools)
 }
 
 // includeHas reports whether the include array contains the given key.
-func includeHas(include []string, key string) bool {
-	for _, v := range include {
-		if v == key {
-			return true
-		}
-	}
-	return false
-}
+func includeHas(include []string, key string) bool { return bridge.IncludeHas(include, key) }
 
 func toolCallOutputType(name string, kinds map[string]string) string {
-	switch kinds[name] {
-	case "apply_patch":
-		return "apply_patch_call"
-	case "shell":
-		return "shell_call"
-	default:
-		return "function_call"
-	}
+	return bridge.ToolCallOutputType(name, kinds)
 }
 
 // normalizeToolChoiceWithTools 在 convertResponsesToolChoice 结果上兜底：
@@ -598,97 +109,15 @@ func toolCallOutputType(name string, kinds map[string]string) string {
 // 丢弃的服务端工具 web_search/file_search/computer_use/mcp/local_shell/custom），
 // 把 tool_choice 改为不传（返回 nil），避免上游因引用了不存在的工具而 400。
 func normalizeToolChoiceWithTools(choice any, tools []Tool) any {
-	m, ok := choice.(map[string]any)
-	if !ok {
-		return choice
-	}
-	// 两种形状：{type:"function", function:{name}}（Chat 已转换形状）与
-	// {type:"<kind>", name:"<n>"}（Responses 原始形状，含 function/服务端 kind）。
-	var name string
-	if fn, ok := m["function"].(map[string]any); ok {
-		name, _ = fn["name"].(string)
-	}
-	if name == "" {
-		name, _ = m["name"].(string)
-	}
-	if name == "" {
-		return choice // 非具名选择（auto/required/none 等），保留
-	}
-	for _, t := range tools {
-		if t.Function.Name == name {
-			return choice
-		}
-	}
-	return nil
+	return bridge.NormalizeToolChoiceWithTools(choice, tools)
 }
 
 func convertResponsesToolChoice(choice any) any {
-	if choice == nil {
-		return nil
-	}
-	choiceMap, ok := choice.(map[string]any)
-	if !ok {
-		return choice
-	}
-	if choiceMap["type"] == "function" {
-		if name, ok := choiceMap["name"].(string); ok && name != "" {
-			return map[string]any{
-				"type":     "function",
-				"function": map[string]any{"name": name},
-			}
-		}
-	}
-	if choiceType, ok := choiceMap["type"].(string); ok {
-		switch choiceType {
-		case "apply_patch", "shell":
-			return map[string]any{
-				"type":     "function",
-				"function": map[string]any{"name": choiceType},
-			}
-		}
-	}
-	return choice
-}
-
-// toolResultOutputKind marks the output item types that carry a tool/function
-// output payload. tool_result is the Anthropic-style alias accepted by the
-// Responses entrypoint in addition to the standard *_call_output types.
-var toolResultOutputKind = map[string]struct{}{
-	"function_call_output":    {},
-	"apply_patch_call_output": {},
-	"shell_call_output":       {},
-	"tool_result":             {},
+	return bridge.ConvertResponsesToolChoice(choice)
 }
 
 func collectFunctionOutputs(items []any) map[string]string {
-	outputs := map[string]string{}
-	for _, item := range items {
-		elem, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		itemType, _ := elem["type"].(string)
-		if _, ok := toolResultOutputKind[itemType]; !ok {
-			continue
-		}
-		// Standard Responses items use call_id; Anthropic-style tool_result
-		// uses tool_use_id when call_id is absent.
-		callID, _ := elem["call_id"].(string)
-		if callID == "" {
-			callID, _ = elem["tool_use_id"].(string)
-		}
-		if callID == "" {
-			continue
-		}
-		text, present := normalizeToolResultOutput(elem)
-		if present {
-			outputs[callID] = text
-		}
-		// When no payload is present, the key is left absent so the caller
-		// surfaces "[tool output missing]" — the raw wrapper JSON is never
-		// stored as the output.
-	}
-	return outputs
+	return bridge.CollectFunctionOutputs(items)
 }
 
 // normalizeToolResultOutput is the single helper that extracts a textual
@@ -699,163 +128,23 @@ func collectFunctionOutputs(items []any) map[string]string {
 // newlines in original order. The boolean reports whether a payload was
 // present (an empty string is a legitimate provided output).
 func normalizeToolResultOutput(elem map[string]any) (string, bool) {
-	var text string
-	present := false
-	// Standard `output` field takes priority.
-	if v, ok := elem["output"]; ok && v != nil {
-		switch s := v.(type) {
-		case string:
-			text = s
-		default:
-			b, _ := json.Marshal(v)
-			text = string(b)
-		}
-		present = true
-	} else if c, ok := elem["content"]; ok && c != nil {
-		// Anthropic-style tool_result uses `content`.
-		text = joinToolResultContent(c)
-		present = true
-	}
-	if !present {
-		return "", false
-	}
-	// Apply is_error prefix here so the collected map already carries error
-	// semantics, independent of call/output ordering in the array.
-	if isError, _ := elem["is_error"].(bool); isError {
-		text = applyErrorPrefix(text)
-	}
-	return text, true
+	return bridge.NormalizeToolResultOutput(elem)
 }
 
 // joinToolResultContent renders an Anthropic tool_result content value to text.
-func joinToolResultContent(content any) string {
-	switch c := content.(type) {
-	case string:
-		return c
-	case []any:
-		var parts []string
-		for _, p := range c {
-			pb, ok := p.(map[string]any)
-			if !ok {
-				if s, ok := p.(string); ok {
-					parts = append(parts, s)
-				}
-				continue
-			}
-			switch pb["type"] {
-			case "text", "input_text", "output_text":
-				if t, ok := pb["text"].(string); ok {
-					parts = append(parts, t)
-				}
-			}
-		}
-		return strings.Join(parts, "\n")
-	default:
-		if c != nil {
-			b, _ := json.Marshal(c)
-			return string(b)
-		}
-		return ""
-	}
-}
+func joinToolResultContent(content any) string { return bridge.JoinToolResultContent(content) }
 
-func parseJSONString(input string) any {
-	var parsed any
-	if input == "" {
-		return nil
-	}
-	if err := json.Unmarshal([]byte(input), &parsed); err != nil {
-		return nil
-	}
-	return parsed
-}
+func parseJSONString(input string) any { return bridge.ParseJSONString(input) }
 
 func buildBuiltInToolCallArguments(itemType string, elem map[string]any) string {
-	if arguments, ok := elem["arguments"].(string); ok && arguments != "" {
-		return arguments
-	}
-
-	payload := map[string]any{}
-	switch itemType {
-	case "apply_patch_call":
-		if input, ok := elem["input"].(string); ok && input != "" {
-			payload["input"] = input
-		}
-		if operation, ok := elem["operation"]; ok && operation != nil {
-			payload["operation"] = operation
-		}
-	case "shell_call":
-		for _, key := range []string{"command", "timeout_ms", "working_directory", "max_output_tokens"} {
-			if value, ok := elem[key]; ok && value != nil {
-				payload[key] = value
-			}
-		}
-	}
-	if len(payload) == 0 {
-		payload = elem
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return "{}"
-	}
-	return string(encoded)
+	return bridge.BuildBuiltInToolCallArguments(itemType, elem)
 }
 
 func buildResponseToolCallItem(tc ToolCall, outputType string) map[string]any {
-	switch outputType {
-	case "apply_patch_call":
-		item := map[string]any{
-			"id":      "apc_" + tc.ID,
-			"type":    outputType,
-			"status":  "completed",
-			"call_id": tc.ID,
-		}
-		if parsed, ok := parseJSONString(tc.Function.Arguments).(map[string]any); ok {
-			for key, value := range parsed {
-				item[key] = value
-			}
-		} else if tc.Function.Arguments != "" {
-			item["arguments"] = tc.Function.Arguments
-		}
-		return item
-	case "shell_call":
-		item := map[string]any{
-			"id":      "shc_" + tc.ID,
-			"type":    outputType,
-			"status":  "completed",
-			"call_id": tc.ID,
-		}
-		if parsed, ok := parseJSONString(tc.Function.Arguments).(map[string]any); ok {
-			for key, value := range parsed {
-				item[key] = value
-			}
-		} else if tc.Function.Arguments != "" {
-			item["arguments"] = tc.Function.Arguments
-		}
-		return item
-	default:
-		return map[string]any{
-			"id":        "fc_" + tc.ID,
-			"type":      "function_call",
-			"status":    "completed",
-			"arguments": tc.Function.Arguments,
-			"call_id":   tc.ID,
-			"name":      tc.Function.Name,
-		}
-	}
+	return bridge.BuildResponseToolCallItem(tc, outputType)
 }
 
-func cloneJSONValue[T any](value T) T {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return value
-	}
-	var cloned T
-	if err := json.Unmarshal(encoded, &cloned); err != nil {
-		return value
-	}
-	return cloned
-}
+func cloneJSONValue[T any](value T) T { return bridge.CloneJSONValue(value) }
 
 func storeResponseState(response map[string]any, req ResponsesAPIRequest) {
 	if req.Store != nil && !*req.Store {
@@ -888,327 +177,34 @@ func loadResponseState(responseID string) (StoredResponseState, bool) {
 }
 
 func extractTextFromContentParts(content any) string {
-	parts, ok := content.([]any)
-	if !ok {
-		if s, ok := content.(string); ok {
-			return s
-		}
-		return ""
-	}
-	var texts []string
-	for _, p := range parts {
-		if part, ok := p.(map[string]any); ok {
-			if part["type"] == "input_text" || part["type"] == "output_text" {
-				if t, ok := part["text"].(string); ok {
-					texts = append(texts, t)
-				}
-			}
-		}
-	}
-	return strings.Join(texts, "\n")
+	return bridge.ExtractTextFromContentParts(content)
 }
 
 func convertResponsesContentPart(part map[string]any) (map[string]any, bool) {
-	partType, _ := part["type"].(string)
-	switch partType {
-	case "input_text", "output_text", "text":
-		text, _ := part["text"].(string)
-		if text == "" {
-			return nil, false
-		}
-		return map[string]any{
-			"type": "text",
-			"text": text,
-		}, true
-	case "input_image":
-		imageURL, _ := part["image_url"].(string)
-		if imageURL == "" {
-			return nil, false
-		}
-		imageURLValue := map[string]any{
-			"url": imageURL,
-		}
-		if detail, ok := part["detail"].(string); ok && detail != "" {
-			imageURLValue["detail"] = detail
-		}
-		return map[string]any{
-			"type":      "image_url",
-			"image_url": imageURLValue,
-		}, true
-	case "input_file":
-		file, ok := responsesInputFileToFile(part)
-		if !ok {
-			return nil, false
-		}
-		return map[string]any{"type": "file", "file": file}, true
-	default:
-		return nil, false
-	}
+	return bridge.ConvertResponsesContentPart(part)
 }
 
 // into tool_use input, document source, schemas, or arbitrary domain data.
 func validateClaudeDocumentBlocks(msgs []ClaudeMessage) string {
-	for _, msg := range msgs {
-		if m := validateClaudeDocumentBlocksContent(msg.Content); m != "" {
-			return m
-		}
-	}
-	return ""
-}
-
-// tool_use input or other arbitrary map values.
-func validateClaudeDocumentBlocksContent(content any) string {
-	blocks, ok := content.([]any)
-	if !ok {
-		return ""
-	}
-	for _, item := range blocks {
-		block, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		bt, _ := block["type"].(string)
-		if bt == "document" {
-			if _, ok := claudeDocumentBlockToOpenAI(block); !ok {
-				return "document is missing a usable source payload"
-			}
-		}
-		if bt == "tool_result" {
-			// tool_result content is itself a content array that may contain
-			// document blocks. Recurse into it, but not into any other fields.
-			if m := validateClaudeDocumentBlocksContent(block["content"]); m != "" {
-				return m
-			}
-		}
-	}
-	return ""
+	return bridge.ValidateClaudeDocumentBlocks(msgs)
 }
 
 // when a malformed file item is found.
 func validateResponsesFileItems(input any) string {
-	switch v := input.(type) {
-	case []any:
-		for _, item := range v {
-			if msg := validateResponsesFileItem(item); msg != "" {
-				return msg
-			}
-		}
-	}
-	return ""
-}
-
-// validateResponsesFileItem validates a single top-level input item or a
-// content part within a message content array. File validation applies only
-// to official input paths: top-level input_file items and message content
-// arrays. Output/tool_result content arrays are not validated for file
-// inputs — they use text shapes only (normalizeToolResultOutput supports
-// strings and text/input_text/output_text blocks).
-func validateResponsesFileItem(item any) string {
-	elem, ok := item.(map[string]any)
-	if !ok {
-		return ""
-	}
-	itemType, _ := elem["type"].(string)
-	// Top-level input_file item or input_file content part.
-	if itemType == "input_file" {
-		if _, ok := responsesInputFileToFile(elem); !ok {
-			return "input_file is missing file_data, file_id, and file_url"
-		}
-		return ""
-	}
-	// For message items, recurse into the content array (content parts).
-	if itemType == "message" || itemType == "" {
-		if content, ok := elem["content"].([]any); ok {
-			for _, part := range content {
-				if msg := validateResponsesFileItem(part); msg != "" {
-					return msg
-				}
-			}
-		}
-		return ""
-	}
-	// All other item types (function_call, tool_call, tool_result,
-	// apply_patch_call, shell_call, reasoning, *_call_output, etc.) are not
-	// inspected — their arguments/input/content fields are not file inputs.
-	return ""
+	return bridge.ValidateResponsesFileItems(input)
 }
 
 // Returns (file, true) when a usable payload exists; (nil, false) otherwise.
 func responsesInputFileToFile(part map[string]any) (map[string]any, bool) {
-	file := map[string]any{}
-
-	// Helper: read a non-empty string from a map by key.
-	nonEmptyStr := func(m map[string]any, key string) (string, bool) {
-		if v, ok := m[key].(string); ok && v != "" {
-			return v, true
-		}
-		return "", false
-	}
-
-	// Nested input_file object: {"type":"input_file","input_file":{...}}.
-	// Only select known fields; do not wholesale-copy.
-	if nested, ok := part["input_file"].(map[string]any); ok {
-		if v, ok := nonEmptyStr(nested, "file_data"); ok {
-			file["file_data"] = v
-		}
-		if v, ok := nonEmptyStr(nested, "file_id"); ok {
-			file["file_id"] = v
-		}
-		// nested file_url maps to file.file_data (best-effort).
-		if v, ok := nonEmptyStr(nested, "file_url"); ok {
-			file["file_data"] = v
-		}
-		if v, ok := nonEmptyStr(nested, "filename"); ok {
-			file["filename"] = v
-		}
-	}
-
-	// Flat fields take priority over nested values.
-	if v, ok := nonEmptyStr(part, "file_data"); ok {
-		file["file_data"] = v
-	}
-	if v, ok := nonEmptyStr(part, "file_id"); ok {
-		file["file_id"] = v
-	}
-	// Flat file_url maps to file.file_data (best-effort).
-	if v, ok := nonEmptyStr(part, "file_url"); ok {
-		file["file_data"] = v
-	}
-	if v, ok := nonEmptyStr(part, "filename"); ok {
-		file["filename"] = v
-	}
-
-	// A usable payload requires at least one of file_data / file_id.
-	if _, hasData := file["file_data"]; !hasData {
-		if _, hasID := file["file_id"]; !hasID {
-			return nil, false
-		}
-	}
-	return file, true
+	return bridge.ResponsesInputFileToFile(part)
 }
 
 func responsesContentToMessageContent(content any) any {
-	if content == nil {
-		return nil
-	}
-	if s, ok := content.(string); ok {
-		return s
-	}
-
-	parts, ok := content.([]any)
-	if !ok {
-		b, err := json.Marshal(content)
-		if err != nil {
-			return nil
-		}
-		return string(b)
-	}
-
-	convertedParts := make([]any, 0, len(parts))
-	texts := make([]string, 0, len(parts))
-	onlyTextParts := true
-
-	for _, rawPart := range parts {
-		part, ok := rawPart.(map[string]any)
-		if !ok {
-			continue
-		}
-		convertedPart, ok := convertResponsesContentPart(part)
-		if !ok {
-			text := extractTextFromContentParts([]any{part})
-			if text == "" {
-				b, err := json.Marshal(part)
-				if err != nil {
-					continue
-				}
-				text = string(b)
-			}
-			convertedParts = append(convertedParts, map[string]any{
-				"type": "text",
-				"text": text,
-			})
-			texts = append(texts, text)
-			continue
-		}
-
-		if convertedPart["type"] != "text" {
-			onlyTextParts = false
-		}
-		if text, ok := convertedPart["text"].(string); ok && text != "" {
-			texts = append(texts, text)
-		}
-		convertedParts = append(convertedParts, convertedPart)
-	}
-
-	if len(convertedParts) == 0 {
-		return ""
-	}
-	if onlyTextParts {
-		return strings.Join(texts, "\n")
-	}
-	return convertedParts
+	return bridge.ResponsesContentToMessageContent(content)
 }
 
 func chatContentToResponsesContent(content any) ([]any, string) {
-	switch v := content.(type) {
-	case nil:
-		return nil, ""
-	case string:
-		if v == "" {
-			return nil, ""
-		}
-		return []any{map[string]any{
-			"type":        "output_text",
-			"text":        v,
-			"annotations": []any{},
-			"logprobs":    []any{},
-		}}, v
-	case []any:
-		parts := make([]any, 0, len(v))
-		texts := make([]string, 0, len(v))
-		for _, rawPart := range v {
-			part, ok := rawPart.(map[string]any)
-			if !ok {
-				continue
-			}
-			partType, _ := part["type"].(string)
-			switch partType {
-			case "text", "input_text", "output_text":
-				text, _ := part["text"].(string)
-				if text == "" {
-					continue
-				}
-				annotations, ok := part["annotations"]
-				if !ok {
-					annotations = []any{}
-				}
-				logprobs, ok := part["logprobs"]
-				if !ok {
-					logprobs = []any{}
-				}
-				texts = append(texts, text)
-				parts = append(parts, map[string]any{
-					"type":        "output_text",
-					"text":        text,
-					"annotations": annotations,
-					"logprobs":    logprobs,
-				})
-			}
-		}
-		return parts, strings.Join(texts, "\n")
-	default:
-		b, err := json.Marshal(v)
-		if err != nil {
-			return nil, ""
-		}
-		text := string(b)
-		return []any{map[string]any{
-			"type":        "output_text",
-			"text":        text,
-			"annotations": []any{},
-			"logprobs":    []any{},
-		}}, text
-	}
+	return bridge.ChatContentToResponsesContent(content)
 }
 
 func responsesHandler(w http.ResponseWriter, r *http.Request) {
@@ -1562,14 +558,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 // ======================== Responses Stream Handler ========================
 
 func responsesInputTokensDetails(details any) map[string]any {
-	if m, ok := details.(map[string]any); ok {
-		if cached, ok := m["cached_tokens"]; ok && cached != nil {
-			return m
-		}
-		m["cached_tokens"] = 0
-		return m
-	}
-	return map[string]any{"cached_tokens": 0}
+	return bridge.ResponsesInputTokensDetails(details)
 }
 
 func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.Response, model string, _ string, wantReasoning bool, tools []ResponsesTool, toolChoice any, originalReq ResponsesAPIRequest) {
@@ -2247,120 +1236,12 @@ loop:
 }
 
 func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, tools []ResponsesTool, toolChoice any, include []string) []byte {
-	var chat struct {
-		ID      string `json:"id"`
-		Created int64  `json:"created"`
-		Choices []struct {
-			FinishReason string `json:"finish_reason"`
-			Message      struct {
-				Content          any        `json:"content"`
-				Refusal          string     `json:"refusal"`
-				ReasoningContent string     `json:"reasoning_content"`
-				ToolCalls        []ToolCall `json:"tool_calls"`
-			} `json:"message"`
-		} `json:"choices"`
-		Usage map[string]any `json:"usage"`
-	}
-	if err := json.Unmarshal(chatBody, &chat); err != nil {
-		slog.Warn("convertChatToResponses unmarshal failed", "error", err)
-	}
-
-	reasoning := ""
-	finishReason := ""
-	var toolCalls []ToolCall
-	messageContent := []any(nil)
-	toolKinds := responsesToolKindMap(tools)
-	if len(chat.Choices) > 0 {
-		messageContent, _ = chatContentToResponsesContent(chat.Choices[0].Message.Content)
-		if refusal := chat.Choices[0].Message.Refusal; refusal != "" {
-			messageContent = []any{map[string]any{"type": "refusal", "refusal": refusal}}
-		}
-		rc := chat.Choices[0].Message.ReasoningContent
-		if wantReasoning {
-			reasoning = rc
-		}
-		toolCalls = chat.Choices[0].Message.ToolCalls
-		finishReason = chat.Choices[0].FinishReason
-		if len(messageContent) == 0 && rc != "" && len(toolCalls) == 0 {
-			messageContent, _ = chatContentToResponsesContent(rc)
-		}
-	}
-
-	outcome := responsesOutcome(finishReason)
-	status := outcome.Status
-	normalizedID := normalizeResponsesID(chat.ID)
-	responses := map[string]any{
-		"id":                 normalizedID,
-		"object":             "response",
-		"status":             status,
-		"background":         false,
-		"error":              nil,
-		"incomplete_details": outcome.IncompleteDetails,
-		"model":              model,
-		"created_at":         chat.Created,
-	}
-	if len(tools) > 0 {
-		responses["tools"] = tools
-	}
-	if toolChoice != nil {
-		responses["tool_choice"] = toolChoice
-	}
-	outputID := "msg_" + normalizedID + "_0"
-	output := []any{}
-	if reasoning != "" {
-		reasoningItem := map[string]any{
-			"id":      "rs_" + normalizedID,
-			"type":    "reasoning",
-			"summary": []any{map[string]any{"type": "summary_text", "text": reasoning}},
-		}
-		if includeHas(include, "reasoning.encrypted_content") {
-			reasoningItem["encrypted_content"] = ""
-		}
-		output = append(output, reasoningItem)
-	}
-	if len(messageContent) > 0 {
-		output = append(output, map[string]any{
-			"id":      outputID,
-			"type":    "message",
-			"status":  status,
-			"role":    "assistant",
-			"content": messageContent,
-		})
-	}
-	for _, tc := range toolCalls {
-		item := buildResponseToolCallItem(tc, toolCallOutputType(tc.Function.Name, toolKinds))
-		item["status"] = status
-		output = append(output, item)
-	}
-	// 空输出补一条空 message：Responses 客户端（Codex/官方 SDK）期望非空
-	// output；纯 reasoning（wantReasoning=false）+ 无内容的回合兜底空文本，
-	// 保持数组形状与 status。
-	if len(output) == 0 {
-		output = append(output, emptyAssistantMessageItem(outputID, status))
-	}
-	responses["output"] = output
-	if chat.Usage != nil {
-		responses["usage"] = chatUsageMapToResponses(chat.Usage)
-	}
-
-	result, _ := json.Marshal(responses)
-	return result
+	return bridge.ConvertChatToResponses(randomIDGen, chatBody, model, wantReasoning, tools, toolChoice, include)
 }
 
 // emptyAssistantMessageItem 构造条 status 一致的空 output_text message。
 func emptyAssistantMessageItem(outputID, status string) map[string]any {
-	return map[string]any{
-		"id":     outputID,
-		"type":   "message",
-		"status": status,
-		"role":   "assistant",
-		"content": []any{map[string]any{
-			"type":        "output_text",
-			"text":        "",
-			"annotations": []any{},
-			"logprobs":    []any{},
-		}},
-	}
+	return bridge.EmptyAssistantMessageItem(outputID, status)
 }
 
 // chatUsageMapToResponses 把 Chat Completions usage（上游 zen/go 口径）转
@@ -2374,73 +1255,9 @@ func emptyAssistantMessageItem(outputID, status string) map[string]any {
 //   - output_tokens_details 从 completion_tokens_details 透传
 //     reasoning_tokens（thinking token）等细节。
 func chatUsageMapToResponses(u map[string]any) map[string]any {
-	usage := map[string]any{}
-	readInt := func(v any) int64 {
-		if n, ok := numberAsFloat(v); ok {
-			return int64(n)
-		}
-		return 0
-	}
-	// input：prompt 分量 + 顶层缓存字段
-	prompt, hasPrompt := u["prompt_tokens"]
-	cacheRead, hasCacheRead := u["cache_read_input_tokens"]
-	cacheCreation, hasCacheCreation := u["cache_creation_input_tokens"]
-	inputTotal := readInt(prompt)
-	if hasPrompt {
-		if hasCacheRead {
-			inputTotal += readInt(cacheRead)
-		}
-		if hasCacheCreation {
-			inputTotal += readInt(cacheCreation)
-		}
-		usage["input_tokens"] = inputTotal
-	}
-	// cached_tokens：优先顶层 cache_read_input_tokens，退回 prompt_tokens_details。
-	// 其余 prompt_tokens_details 字段（text_tokens 等）原样透传。
-	var detailsOut map[string]any
-	if d, ok := u["prompt_tokens_details"].(map[string]any); ok {
-		detailsOut = make(map[string]any, len(d)+1)
-		for k, v := range d {
-			detailsOut[k] = v
-		}
-	} else {
-		detailsOut = map[string]any{}
-	}
-	cached := int64(0)
-	if hasCacheRead {
-		cached = readInt(cacheRead)
-	} else if c, ok := detailsOut["cached_tokens"]; ok {
-		cached = readInt(c)
-	}
-	detailsOut["cached_tokens"] = cached
-	usage["input_tokens_details"] = detailsOut
-	if v, ok := u["completion_tokens"]; ok {
-		usage["output_tokens"] = v
-	}
-	if v, ok := u["completion_tokens_details"]; ok {
-		usage["output_tokens_details"] = v
-	} else if reasoningTokens := reasoningTokenEstimate(u); reasoningTokens > 0 {
-		usage["output_tokens_details"] = map[string]any{"reasoning_tokens": reasoningTokens}
-	}
-	if v, ok := u["total_tokens"]; ok {
-		usage["total_tokens"] = v
-	}
-	if v, ok := u["input_tokens"]; ok && usage["input_tokens"] == nil {
-		usage["input_tokens"] = v
-	}
-	if v, ok := u["output_tokens"]; ok && usage["output_tokens"] == nil {
-		usage["output_tokens"] = v
-	}
-	return usage
+	return bridge.ChatUsageMapToResponses(u)
 }
 
 // reasoningTokenEstimate 从 usage 中提取 thinking/reasoning token 数量的兜底
 // 估算：缺 completion_tokens_details 时按已知顶层/通用键查找。
-func reasoningTokenEstimate(u map[string]any) int64 {
-	for _, k := range []string{"reasoning_tokens", "thinking_tokens"} {
-		if v, ok := numberAsFloat(u[k]); ok && v > 0 {
-			return int64(v)
-		}
-	}
-	return 0
-}
+func reasoningTokenEstimate(u map[string]any) int64 { return bridge.ReasoningTokenEstimate(u) }

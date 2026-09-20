@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/bridge"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"github.com/6Kmfi6HP/opencode2api/internal/random"
@@ -750,6 +751,20 @@ func (e *anthropicProtocolError) Error() string {
 		return e.errType + ": " + e.message
 	}
 	return e.message
+}
+
+// wrapBridgeProtocolError 把 bridge 返回的类型化 *bridge.ProtocolError 包回
+// app 的 anthropicProtocolError，保持对外错误字符串（"<type>: <message>"）
+// 与错误链语义逐字节不变；其它错误（含 nil）原样返回。
+func wrapBridgeProtocolError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var pe *bridge.ProtocolError
+	if errors.As(err, &pe) {
+		return &anthropicProtocolError{errType: pe.ErrType, message: pe.Message}
+	}
+	return err
 }
 
 // upstreamBodyError 携带上游 HTTP 错误体的 error，供 writeUpstreamError 在
