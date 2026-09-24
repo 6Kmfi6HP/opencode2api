@@ -1377,3 +1377,29 @@ func TestSanitizeResponsesPassthroughBody_InjectsForMuseSpark(t *testing.T) {
 		t.Fatalf("muse-spark 模型也应注入 max_output_tokens=128000, got %#v", got["max_output_tokens"])
 	}
 }
+
+func TestSanitizeResponsesPassthroughBody_EffortNormalizedAddsSummary(t *testing.T) {
+	// muse-spark：effort 归一化（max->xhigh）后补默认 summary:auto，否则上游
+	// 静默思考、codex 不显示 thinking；客户端已显式给 summary 时不动。
+	raw := []byte(`{"model":"m","input":"hi","reasoning":{"effort":"max"}}`)
+	fixed, _ := sanitizeResponsesPassthroughBody(raw, "muse-spark-1.3-contributor")
+	var body map[string]any
+	if err := json.Unmarshal(fixed, &body); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, _ := body["reasoning"].(map[string]any)
+	if reasoning["effort"] != "xhigh" || reasoning["summary"] != "auto" {
+		t.Fatalf("reasoning = %#v, want {effort:xhigh summary:auto}", body["reasoning"])
+	}
+
+	// effort 归一化为空（none）时整段 reasoning 删除，不残留 summary-only。
+	raw2 := []byte(`{"model":"m","input":"hi","reasoning":{"effort":"none","summary":"auto"}}`)
+	fixed2, _ := sanitizeResponsesPassthroughBody(raw2, "muse-spark-1.3-contributor")
+	var body2 map[string]any
+	if err := json.Unmarshal(fixed2, &body2); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := body2["reasoning"]; ok && r != nil {
+		t.Fatalf("reasoning 应整体删除, got %#v", body2["reasoning"])
+	}
+}

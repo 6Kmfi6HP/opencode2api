@@ -705,3 +705,36 @@ func TestClaudeToResponsesBody_EffortNonMuseSparkRaw(t *testing.T) {
 		t.Fatalf("non muse-spark effort should stay max, got %#v", req["reasoning"])
 	}
 }
+
+func TestClaudeToResponsesBody_ReasoningSummaryAuto(t *testing.T) {
+	// thinking 开启时请求 summary:auto：只带 effort 时上游静默思考、summary
+	// 恒空，Claude Code 不显示思考。
+	var claudeReq ClaudeRequest
+	raw := `{"model":"m","thinking":{"type":"enabled","budget_tokens":5000},"messages":[{"role":"user","content":"hi"}]}`
+	if err := json.Unmarshal([]byte(raw), &claudeReq); err != nil {
+		t.Fatal(err)
+	}
+	body := claudeToResponsesBody(claudeReq, "muse-spark-1.3-contributor")
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, _ := got["reasoning"].(map[string]any)
+	if reasoning == nil || reasoning["summary"] != "auto" {
+		t.Fatalf("reasoning = %#v, want summary:auto", got["reasoning"])
+	}
+	// budget 5000 -> low 档（且 muse-spark 白名单收口后仍为非空合法值）。
+	if reasoning["effort"] == "" || reasoning["effort"] == nil {
+		t.Fatalf("effort 不应为空, got %#v", reasoning)
+	}
+
+	// 非 muse-spark 模型同样补 summary:auto（可见 summary 由上游生成）。
+	body = claudeToResponsesBody(claudeReq, "gpt-x")
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, _ = got["reasoning"].(map[string]any)
+	if reasoning == nil || reasoning["summary"] != "auto" {
+		t.Fatalf("reasoning = %#v, want summary:auto", got["reasoning"])
+	}
+}

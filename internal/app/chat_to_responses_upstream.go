@@ -178,7 +178,9 @@ func chatToResponsesBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[
 			effort = reasoningEffortFromThinking(req.Thinking)
 		}
 		if effort != "" && effort != "none" {
-			body["reasoning"] = map[string]any{"effort": mappedReasoningEffort(effort)}
+			if r := responsesReasoningBody(mappedReasoningEffort(effort), modelID); r != nil {
+				body["reasoning"] = r
+			}
 		}
 	}
 	// 客户端 include（从 ExtraBody / rawBody 顶层）先落入 body,再与
@@ -197,6 +199,24 @@ func chatToResponsesBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[
 		return []byte(fmt.Sprintf(`{"model":%q,"input":[],"stream":%t}`, modelID, req.Stream))
 	}
 	return b
+}
+
+// responsesReasoningBody 构造上行 Responses 请求体的 reasoning 字段。
+// 只带 effort 时上游（muse-spark 系实测如此）静默思考、summary 恒为空数组，
+// 可见思考必须有 reasoning.summary；上行该字段只负责"请求 summary"，敏感
+// 原文仍由 include reasoning.encrypted_content 的加密通道承载，可见 summary
+// 由上游自行生成，因此对所有原生 responses 上游统一请求 summary:auto，
+// 支持 / 忽略都不破坏请求。muse-spark 的原生 responses 对 effort 有白名单
+// 校验，未归一化的取值在此收口（与透传路径同名归一化对齐，防 400）。
+// effort 归一化后为空时返回 nil（调用方省略 reasoning 字段）。
+func responsesReasoningBody(effort, modelID string) map[string]any {
+	if isMuseSparkModel(modelID) {
+		effort = normalizeResponsesEffort(effort)
+	}
+	if effort == "" {
+		return nil
+	}
+	return map[string]any{"effort": effort, "summary": "auto"}
 }
 
 // mergeResponsesIncludeKey 把 key 合并进 Responses 请求体的顶层 include

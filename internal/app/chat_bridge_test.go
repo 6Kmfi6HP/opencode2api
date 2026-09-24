@@ -534,3 +534,47 @@ func TestConvertResponsesToChat_RefusalFieldPreserved(t *testing.T) {
 		t.Fatalf("非流式 refusal 字段 = %#v, want \"cannot do that\"", msg["refusal"])
 	}
 }
+
+func TestChatToResponsesBody_ReasoningSummaryAuto(t *testing.T) {
+	reasoningOf := func(t *testing.T, effort, model string) map[string]any {
+		t.Helper()
+		req := &OpenAIRequest{
+			Model:           model,
+			Messages:        []Message{{Role: "user", Content: "hi"}},
+			ReasoningEffort: effort,
+		}
+		var got map[string]any
+		if err := json.Unmarshal(chatToResponsesBody(req, model), &got); err != nil {
+			t.Fatal(err)
+		}
+		r, _ := got["reasoning"].(map[string]any)
+		return r
+	}
+
+	// 通用 reasoning 模型：请求 summary:auto，否则上游静默思考、客户端只见
+	// reasoning_tokens 增长而无可见思考文本。
+	if r := reasoningOf(t, "low", "mimo-v2.6-flash-free"); r["effort"] != "low" || r["summary"] != "auto" {
+		t.Fatalf("reasoning = %#v, want {effort:low summary:auto}", r)
+	}
+
+	// muse-spark：白名单内 effort 不动并补 summary:auto（默认让思考可见）。
+	if r := reasoningOf(t, "high", "muse-spark-1.3-contributor"); r["effort"] != "high" || r["summary"] != "auto" {
+		t.Fatalf("reasoning = %#v, want {effort:high summary:auto}", r)
+	}
+
+	// muse-spark：effort 收口白名单（max->xhigh），归一化后同样请求 summary:auto。
+	if r := reasoningOf(t, "max", "muse-spark-1.3-contributor"); r["effort"] != "xhigh" || r["summary"] != "auto" {
+		t.Fatalf("reasoning = %#v, want {effort:xhigh summary:auto}", r)
+	}
+
+	// muse-spark + 无法归一化的 effort（如 minimal 之外的自定义串）：
+	// 归一化为空后整体省略 reasoning，避免 400。
+	if r := reasoningOf(t, "ultra", "muse-spark-1.3-contributor"); r != nil {
+		t.Fatalf("reasoning 应省略（effort 归一化为空）, got %#v", r)
+	}
+
+	// 非 muse-spark 的未知 effort 不归一化，保持原值透传（附带 summary:auto）。
+	if r := reasoningOf(t, "ultra", "some-other-model"); r["effort"] != "ultra" || r["summary"] != "auto" {
+		t.Fatalf("reasoning = %#v, want {effort:ultra summary:auto}", r)
+	}
+}

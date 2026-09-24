@@ -202,13 +202,22 @@ func resolveLaunchModel(model string, extraArgs []string, extract func([]string)
 		base, _ := stripContextSuffix(modelID)
 		ctx = modelsdev.ContextWindow(base, catalog)
 		if contextSuffix {
-			if ctx >= 1000000 {
+			switch {
+			case isFreeModel(base):
+				// 免费变体（*-free）没有 1M 扩展档：上游对 "xxx-free[1m]" 一律
+				// 401 "Model not supported"。清掉 context 后缀走标准免费窗口，
+				// 保留 autoCompactWindow 即可。
+				modelID = base
+				if ctx > 0 {
+					autoCompactWindow = int(float64(ctx) * 0.9)
+				}
+			case ctx >= 1000000:
 				modelID = base + "[1m]"
 				autoCompactWindow = int(float64(ctx) * 0.9)
-			} else if ctx > 0 {
+			case ctx > 0:
 				modelID = base
 				autoCompactWindow = int(float64(ctx) * 0.9)
-			} else {
+			default:
 				modelID = base
 			}
 		} else {

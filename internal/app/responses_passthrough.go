@@ -683,14 +683,31 @@ func sanitizeResponsesPassthroughBody(rawBody []byte, modelID string) ([]byte, *
 		}
 	}
 	if r, ok := body["reasoning"].(map[string]any); ok {
-		if e, _ := r["effort"].(string); e != "" {
+		e, _ := r["effort"].(string)
+		effortChanged := false
+		if e != "" {
 			if ne := normalizeResponsesEffort(e); ne != e {
+				effortChanged = true
 				if ne == "" {
+					// effort 不在白名单且无法归一化（含 none）：整段 reasoning
+					// 省略；残留的 summary-only 请求对上游无意义且可能 400。
 					delete(body, "reasoning")
 				} else {
 					r["effort"] = ne
 					body["reasoning"] = r
 				}
+			}
+		}
+		if effortChanged {
+			changed = true
+		}
+		if _, reasonKept := body["reasoning"]; reasonKept && e != "" {
+			// effort 有效（含归一化后）：只带 effort 时 muse-spark 静默思考、
+			// summary 恒空，补默认 summary:auto 让客户端可见；客户端已显式
+			// 给出 summary 值时尊重原样。
+			if _, hasSummary := r["summary"]; !hasSummary {
+				r["summary"] = "auto"
+				body["reasoning"] = r
 				changed = true
 			}
 		}

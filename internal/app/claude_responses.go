@@ -601,8 +601,13 @@ func claudeToResponsesBody(claudeReq ClaudeRequest, modelID string) []byte {
 	if claudeToolChoiceDisablesParallel(claudeReq.ToolChoice) {
 		body["parallel_tool_calls"] = false
 	}
+	// reasoningOn 时请求 summary:auto：只带 effort 时上游（muse-spark 系实测）
+	// 静默思考、summary 恒空，Claude Code 侧因此不显示思考。可见 summary 由
+	// 上游生成，敏感原文仍走 include reasoning.encrypted_content 加密通道
+	// （落到 thinking.signature 供 roundtrip）。muse-spark 的 effort 已在
+	// claudeThinkingToResponsesEffort 收口白名单，此处不会再产生空值。
 	if reasoningOn {
-		body["reasoning"] = map[string]any{"effort": effort}
+		body["reasoning"] = responsesReasoningBody(effort, modelID)
 	}
 	if user := narrowClaudeMetadataUser(claudeReq.Metadata); user != "" {
 		body["user"] = user
