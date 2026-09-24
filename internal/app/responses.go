@@ -1910,6 +1910,12 @@ loop:
 								choice, _ := choices[0].(map[string]any)
 								delta, _ := choice["delta"].(map[string]any)
 								finishReason, _ := choice["finish_reason"].(string)
+								if delta != nil {
+									// Hoist OpenRouter-style reasoning /
+									// reasoning_details into reasoning_content so
+									// the reasoning_summary branch below sees it.
+									normalizeReasoningContent(delta)
+								}
 								if finishReason != "" {
 									stats.FinishReason = finishReason
 									stats.SawFinish = true

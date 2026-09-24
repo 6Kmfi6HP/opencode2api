@@ -382,6 +382,26 @@ func (s *StreamStats) ObserveDelta(delta map[string]any, keepReasoning bool) {
 	if c, ok := delta["content"].(string); ok {
 		s.TextChars += len(c)
 	}
+	// Hoist OpenRouter-style reasoning / reasoning_details into
+	// reasoning_content so reasoning is counted regardless of which field the
+	// upstream used (mirrors app.normalizeReasoningContent).
+	if rc, _ := delta["reasoning_content"].(string); rc == "" {
+		if r, _ := delta["reasoning"].(string); r != "" {
+			delta["reasoning_content"] = r
+		} else if details, ok := delta["reasoning_details"].([]any); ok {
+			var sb strings.Builder
+			for _, d := range details {
+				if m, ok := d.(map[string]any); ok {
+					if t, _ := m["text"].(string); t != "" {
+						sb.WriteString(t)
+					}
+				}
+			}
+			if sb.Len() > 0 {
+				delta["reasoning_content"] = sb.String()
+			}
+		}
+	}
 	if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
 		s.ReasoningChars += len(rc)
 		if !keepReasoning {
