@@ -247,8 +247,38 @@ func cleanNulls(m map[string]any) {
 	}
 }
 
+// normalizeReasoningContent hoists OpenRouter-style reasoning into the
+// canonical reasoning_content slot so every downstream consumer (chat / claude
+// / responses converters and the stream stats) sees it. Sources checked, in
+// order: existing reasoning_content, delta.reasoning (plain string), and
+// reasoning_details[].text (typed array). Existing reasoning_content wins so
+// we never clobber an upstream that already uses the canonical field.
+func normalizeReasoningContent(fields map[string]any) {
+	if rc, _ := fields["reasoning_content"].(string); rc != "" {
+		return
+	}
+	if r, _ := fields["reasoning"].(string); r != "" {
+		fields["reasoning_content"] = r
+		return
+	}
+	if details, ok := fields["reasoning_details"].([]any); ok {
+		var sb strings.Builder
+		for _, d := range details {
+			if m, ok := d.(map[string]any); ok {
+				if t, _ := m["text"].(string); t != "" {
+					sb.WriteString(t)
+				}
+			}
+		}
+		if sb.Len() > 0 {
+			fields["reasoning_content"] = sb.String()
+		}
+	}
+}
+
 // precedes tool calls is left alone when keepReasoning is true.
 func promoteMisplacedReasoning(fields map[string]any, keepReasoning bool) bool {
+	normalizeReasoningContent(fields)
 	rc, _ := fields["reasoning_content"].(string)
 	if rc == "" {
 		return false
@@ -272,6 +302,11 @@ func promoteMisplacedReasoning(fields map[string]any, keepReasoning bool) bool {
 }
 
 func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
+	// Hoist OpenRouter-style reasoning / reasoning_details into
+	// reasoning_content BEFORE any keepReasoning handling so the downstream
+	// converters (and the keepReasoning delete below) operate on the canonical
+	// field.
+	normalizeReasoningContent(delta)
 	_ = promoteMisplacedReasoning(delta, keepReasoning)
 	if v, ok := delta["content"]; ok && v == nil {
 		delete(delta, "content")
