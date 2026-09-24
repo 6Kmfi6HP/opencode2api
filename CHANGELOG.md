@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.4
+
+- Fix missing thinking/reasoning output for `mimo-v2.6-flash` (`fix(reasoning)`): mimo (via the OpenCode `/zen/v1/chat/completions` upstream) returns reasoning as OpenRouter-style fields — `delta.reasoning` (string) and `delta.reasoning_details[].text` — not the canonical `delta.reasoning_content` the gateway's converters read. Every reasoning consumer only looked at `reasoning_content`, so the thinking chain was silently dropped: chat passthrough surfaced a non-standard `reasoning` field that standard clients ignore, and the claude/responses converters emitted **no** thinking/reasoning blocks at all (so reasoning never displayed). A new `normalizeReasoningContent` hoists `reasoning` / `reasoning_details[].text` into `reasoning_content` (never clobbering an existing value), applied at the three places that consume upstream chat deltas — `cleanStreamDelta`/`promoteMisplacedReasoning` (chat), `claudeStreamHandler` (claude), the responses stream converter — and in the stream stats (`logging.ObserveDelta`) so `reasoning_chars` is counted correctly. Verified live against `mimo-v2.6-flash` on all three protocols (chat/messages/responses now emit reasoning, previously `reasoning_chars` was 0 on all), with no regression on models that already emit canonical `reasoning_content` (mimo-v2.5, nemotron-3-*, ling-3.0-flash-fin, big-pickle, space-bunny).
+
 ## v0.14.3
 
 - Fix the misleading `stream disconnected before completion: Incomplete response returned, reason: max_output_tokens` errors codex hit against the native responses passthrough (e.g. `muse-spark-*-contributor`): two complementary fixes.
