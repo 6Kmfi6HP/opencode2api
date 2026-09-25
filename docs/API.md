@@ -133,6 +133,7 @@ curl http://127.0.0.1:8000/v1/responses \
 ### 鉴权
 
 - `Authorization: Bearer <key>` 与 `x-api-key: <key>` 同权；Bearer 优先。
+- 转发上游原生 `/zen/v1/messages` 时，网关同时发送 `Authorization: Bearer <key>` 与 Anthropic 原生 `x-api-key: <key>`；上游 `/messages` 以 `x-api-key` 为准。
 - 有效 opencode key：`sk-` 前缀且长度 > 15；`go:` / `zen:` 前缀路由同样适用于两种头。
 - Anthropic 真 key（`sk-ant-`）不会转发上游，回落 public。
 - 占位短 key（如 Claude Code 默认 `sk-local`）因长度不足走 public。
