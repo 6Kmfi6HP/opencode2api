@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1233,6 +1234,169 @@ func buildUpstreamBody(req *OpenAIRequest) []byte {
 		slog.Error("marshal upstream body failed", "error", err)
 	}
 	return b
+}
+
+// buildUpstreamBodyFromClaude 把 Claude Messages 请求经 chat 转换后构建
+// 上游请求体,并把 Claude 侧显式 cache_control 断点按文本/工具名重放到转
+// 换结果上(GLM/Zhipu 等拒绝该字段的模型除外;幂等)。
+func buildUpstreamBodyFromClaude(chatReq *OpenAIRequest, claudeReq ClaudeRequest) []byte {
+	body := buildUpstreamBody(chatReq)
+	return applyClaudeCacheBreakpointsToChatBody(body, claudeReq)
+}
+
+// derivePromptCacheKey 从请求上下文里的 client x-opencode-session 派生稳定
+// 的 prompt_cache_key（上游按该 key 温缓存,跨轮 inherited prefix 命中率更高)。
+// 客户端已显式传 prompt_cache_key 时不覆盖。没拿到 session 则回落 upstream
+// session ID,仍能跨同进程代理请求命中同一会话前缀。
+func derivePromptCacheKey(ctx context.Context, modelID string) string {
+	if session := strings.TrimSpace(sessionFromRequestContext(ctx, "")); session != "" {
+		return "oc2api:" + session
+	}
+	if ocSessionID != "" {
+		return "oc2api:" + ocSessionID
+	}
+	return ""
+}
+
+// applyCacheHintsToRawBody 对已 marshal 的上游请求体（raw JSON bytes）注入// applyCacheHintsToRawBody 对已 marshal 的上游请求体（raw JSON bytes）注入
+// prompt_cache_retention 和顶层 cache_control breakpoint（尊重现有字段，已知
+// 拒绝该字段的模型除外）。用于原生透传路径（claude/responses 直通上游）。
+func applyCacheHintsToRawBody(body []byte, modelID string) []byte {
+	return applyCacheHintsToRawBodyWithContext(body, modelID, nil)
+}
+
+// applyCacheHintsToRawBodyWithContext 注入 retention + 顶层 cache_control,并在
+// 缺省时补一个从 client session 派生的稳定 prompt_cache_key。
+func applyCacheHintsToRawBodyWithContext(body []byte, modelID string, ctx context.Context) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	changed := false
+	if retention := config.PromptCacheRetention(); retention != "" && retention != "off" {
+		if _, exists := m["prompt_cache_retention"]; !exists {
+			m["prompt_cache_retention"] = retention
+			changed = true
+		}
+	}
+	if _, exists := m["prompt_cache_key"]; !exists {
+		if key := derivePromptCacheKey(ctx, modelID); key != "" {
+			m["prompt_cache_key"] = key
+			changed = true
+		}
+	}
+	if config.CacheBreakpoints() && !rejectsCacheControl(modelID) {
+		if _, exists := m["cache_control"]; !exists {
+			m["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// collectClaudeCacheTaggedTexts 提取所有显式带 cache_control 的 text 块内容
+// (system blocks 和 message blocks), 用于把断点重放到转换后的 chat 消息上。
+func collectClaudeCacheTaggedTexts(claudeReq ClaudeRequest) map[string]struct{} {
+	tagged := map[string]struct{}{}
+	if sys, ok := claudeReq.System.([]any); ok {
+		for _, item := range sys {
+			if block, ok := item.(map[string]any); ok {
+				if block["type"] == "text" && block["cache_control"] != nil {
+					if t, _ := block["text"].(string); t != "" {
+						tagged[t] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	for _, msg := range claudeReq.Messages {
+		if content, ok := msg.Content.([]any); ok {
+			for _, item := range content {
+				if block, ok := item.(map[string]any); ok {
+					if block["type"] == "text" && block["cache_control"] != nil {
+						if t, _ := block["text"].(string); t != "" {
+							tagged[t] = struct{}{}
+						}
+					}
+				}
+			}
+		}
+	}
+	return tagged
+}
+
+// applyClaudeCacheBreakpointsToChatBody 在 buildUpstreamBody 产出的序列化
+// 请求体上把 Claude 侧显式 cache_control 移植回来:text 内容匹配时在该消
+// 息/content part 上标注断点,工具按名字在 tool.function 上标注。幂等;对
+// 拒绝 cache_control 的模型(GLM/Zhipu)跳过。
+func applyClaudeCacheBreakpointsToChatBody(body []byte, claudeReq ClaudeRequest) []byte {
+	if !config.CacheBreakpoints() || rejectsCacheControl(claudeReq.Model) {
+		return body
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	taggedTexts := collectClaudeCacheTaggedTexts(claudeReq)
+	mark := func(mm map[string]any) {
+		if _, ok := mm["cache_control"]; !ok {
+			mm["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
+		}
+	}
+	if len(taggedTexts) > 0 {
+		if msgs, ok := m["messages"].([]any); ok {
+			for _, im := range msgs {
+				mm, ok := im.(map[string]any)
+				if !ok {
+					continue
+				}
+				switch c := mm["content"].(type) {
+				case string:
+					if _, hit := taggedTexts[c]; hit {
+						mark(mm)
+					}
+				case []any:
+					for _, p := range c {
+						if pm, ok := p.(map[string]any); ok {
+							if t, _ := pm["text"].(string); t != "" {
+								if _, hit := taggedTexts[t]; hit {
+									mark(pm)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, ct := range claudeReq.Tools {
+		if ct.CacheControl == nil {
+			continue
+		}
+		if tools, ok := m["tools"].([]any); ok {
+			for _, it := range tools {
+				tm, ok := it.(map[string]any)
+				if !ok {
+					continue
+				}
+				if fn, ok := tm["function"].(map[string]any); ok && fn["name"] == ct.Name {
+					mark(tm)
+				}
+			}
+		}
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // same output. An empty id gets a random suffix (callers should cache).

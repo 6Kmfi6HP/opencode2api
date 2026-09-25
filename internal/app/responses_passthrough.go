@@ -628,11 +628,6 @@ func sanitizeResponsesPassthroughBody(rawBody []byte, modelID string) ([]byte, *
 		return rawBody, rewrites
 	}
 	changed := false
-	// max_output_tokens 钳制对全部 native passthrough 模型生效：
-	// codex 在 native responses 直连下不发 max_output_tokens（日志实测
-	// "max_tokens=<nil>"），缺省时上游按自身默认预算截断、流里没有
-	// response.completed，兜底合成 reason=max_output_tokens，客户端因而
-	// 误报 max_output_tokens。cap>0 时注入/钳到 [128, cap]。
 	if tokCap := config.MaxTokensCapFor(modelID); tokCap > 0 {
 		if v, ok := intFromAny(body["max_output_tokens"]); !ok || v <= 0 {
 			body["max_output_tokens"] = clampPassThroughMaxTokens(tokCap, tokCap)
