@@ -171,6 +171,20 @@ func chatToResponsesBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[
 	if req.ToolChoice != nil {
 		body["tool_choice"] = claudeToolChoiceCore(req.ToolChoice, false)
 	}
+	// 缓存增强透传到 Responses 上游：与 chat 翻译路径 (convertRequest) 同口径。
+	// prompt_cache_retention 拉长 zen 前缀缓存 TTL（默认 ~5min → 24h），
+	// cache_control 顶层 breakpoint 让支持 anthropic 风格标记的上游缓存整段
+	// 前缀。已知拒绝该字段的模型（GLM/Zhipu）不注入顶层 cache_control。
+	if retention := config.PromptCacheRetention(); retention != "" && retention != "off" {
+		if _, exists := body["prompt_cache_retention"]; !exists {
+			body["prompt_cache_retention"] = retention
+		}
+	}
+	if config.CacheBreakpoints() && !rejectsCacheControl(modelID) {
+		if _, exists := body["cache_control"]; !exists {
+			body["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
+		}
+	}
 	// reasoning：effort 映射；none/禁用省略。
 	if !config.ForceDisableThinking() && !isThinkingDisabled(req.Thinking) {
 		effort := req.ReasoningEffort

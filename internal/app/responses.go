@@ -1376,6 +1376,15 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if upstreamProto == upstreamProtocolResponses {
 		slog.Info("responses passthrough (remembered)",
 			"model_in", modelIn, "model", respReq.Model, "stream", respReq.Stream)
+		body = applyCacheHintsToRawBodyWithContext(body, respReq.Model, r.Context())
+		if cacheDebugEnabled() {
+			var m map[string]any
+			if err := json.Unmarshal(body, &m); err == nil {
+				if v, ok := m["prompt_cache_key"]; ok {
+					slog.Info("cache_debug_passthrough_body", "model", respReq.Model, "prompt_cache_key_present", v != "")
+				}
+			}
+		}
 		if forwardNativeResponses(r.Context(), w, auth, respReq.Model, body, respReq.Stream, respReq) {
 			return
 		}
@@ -1581,6 +1590,35 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	upstreamBody := buildUpstreamBody(&chatReq)
+	upstreamBody = applyCacheHintsToRawBodyWithContext(upstreamBody, chatReq.Model, r.Context())
+	// 与 chat 翻译路径同口径:注入 prompt_cache_retention 并把顶层 cache_control
+	// breakpoint 写入请求体(拒绝该字段的模型除外)。
+	if retention := config.PromptCacheRetention(); retention != "" && retention != "off" {
+		var m map[string]any
+		if err := json.Unmarshal(upstreamBody, &m); err == nil {
+			if _, exists := m["prompt_cache_retention"]; !exists {
+				m["prompt_cache_retention"] = retention
+			}
+			if config.CacheBreakpoints() && !rejectsCacheControl(chatReq.Model) {
+				if _, exists := m["cache_control"]; !exists {
+					m["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
+				}
+			}
+			if out, err := json.Marshal(m); err == nil {
+				upstreamBody = out
+			}
+		}
+	} else if config.CacheBreakpoints() && !rejectsCacheControl(chatReq.Model) {
+		var m map[string]any
+		if err := json.Unmarshal(upstreamBody, &m); err == nil {
+			if _, exists := m["cache_control"]; !exists {
+				m["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
+			}
+			if out, err := json.Marshal(m); err == nil {
+				upstreamBody = out
+			}
+		}
+	}
 
 	if respReq.Stream {
 		upResp, status, _, err := callOpenCodeAPIStream(r.Context(), upstreamBody, chatReq.Model, auth)
@@ -2352,6 +2390,7 @@ loop:
 	}
 
 	if totalUsage != nil {
+		logCacheDebugUsage("responses", model, totalUsage)
 		statsx.RecordChatUsage(model, totalUsage)
 	}
 
