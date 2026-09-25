@@ -1376,7 +1376,9 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if upstreamProto == upstreamProtocolResponses {
 		slog.Info("responses passthrough (remembered)",
 			"model_in", modelIn, "model", respReq.Model, "stream", respReq.Stream)
-		body = applyCacheHintsToRawBodyWithContext(body, respReq.Model, r.Context())
+		// 原生 /responses 透传:顶层 cache_control 不是合法 Responses 字段,只注入
+		// prompt_cache_key/retention（Console 等上游对未知顶层参数整包 400)。
+		body = applyResponsesCacheHintsToRawBody(body, respReq.Model, r.Context())
 		if cacheDebugEnabled() {
 			var m map[string]any
 			if err := json.Unmarshal(body, &m); err == nil {
@@ -1591,34 +1593,6 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 	upstreamBody := buildUpstreamBody(&chatReq)
 	upstreamBody = applyCacheHintsToRawBodyWithContext(upstreamBody, chatReq.Model, r.Context())
-	// 与 chat 翻译路径同口径:注入 prompt_cache_retention 并把顶层 cache_control
-	// breakpoint 写入请求体(拒绝该字段的模型除外)。
-	if retention := config.PromptCacheRetention(); retention != "" && retention != "off" {
-		var m map[string]any
-		if err := json.Unmarshal(upstreamBody, &m); err == nil {
-			if _, exists := m["prompt_cache_retention"]; !exists {
-				m["prompt_cache_retention"] = retention
-			}
-			if config.CacheBreakpoints() && !rejectsCacheControl(chatReq.Model) {
-				if _, exists := m["cache_control"]; !exists {
-					m["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
-				}
-			}
-			if out, err := json.Marshal(m); err == nil {
-				upstreamBody = out
-			}
-		}
-	} else if config.CacheBreakpoints() && !rejectsCacheControl(chatReq.Model) {
-		var m map[string]any
-		if err := json.Unmarshal(upstreamBody, &m); err == nil {
-			if _, exists := m["cache_control"]; !exists {
-				m["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
-			}
-			if out, err := json.Marshal(m); err == nil {
-				upstreamBody = out
-			}
-		}
-	}
 
 	if respReq.Stream {
 		upResp, status, _, err := callOpenCodeAPIStream(r.Context(), upstreamBody, chatReq.Model, auth)
@@ -1628,6 +1602,27 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			if upResp != nil {
 				transErrBody, _ = io.ReadAll(upResp)
 				upResp.Close()
+			}
+			// 上游明确把顶层 cache_control 判为未知参数：剥离后重发一次
+			// （prompt_cache_key/retention 保留），并记住该模型不再注入。
+			if rc, st, rerr := retryChatCompletionsWithoutCacheControl(r.Context(), upstreamBody, chatReq.Model, auth, status, transErrBody, true); rc != nil || rerr != nil || st != 0 {
+				if rerr == nil && st >= 200 && st < 300 {
+					defer rc.Close()
+					resp := &http.Response{
+						StatusCode: st,
+						Body:       rc,
+						Header:     make(http.Header),
+					}
+					responsesStreamHandler(w, r, resp, chatReq.Model, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice, respReq)
+					return
+				}
+				if rerr != nil {
+					writeUpstreamError(w, st, rerr, "responses")
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(st)
+				return
 			}
 			// 翻译路径失败：探测上游原生 responses，成功则透传并记住该模型。
 			// 类型化转换错误（上游有明确错误信息）不探测，原样返回。
@@ -1655,6 +1650,26 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
+	if err != nil || status < 200 || status >= 300 {
+		// 上游明确把顶层 cache_control 判为未知参数：剥离后重发一次
+		// （prompt_cache_key/retention 保留），并记住该模型不再注入。
+		if rc, st, rerr := retryChatCompletionsWithoutCacheControl(r.Context(), upstreamBody, chatReq.Model, auth, status, respBody, false); rc != nil || rerr != nil || st != 0 {
+			if rerr == nil && st >= 200 && st < 300 {
+				respBody, _ = io.ReadAll(rc)
+				rc.Close()
+				status = st
+				err = nil
+			} else {
+				if rerr != nil {
+					writeUpstreamError(w, st, rerr, "responses")
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(st)
+				}
+				return
+			}
+		}
+	}
 	if err != nil || status < 200 || status >= 300 {
 		// 翻译路径失败：探测上游原生 responses，成功则透传并记住该模型。
 		// 类型化转换错误（上游有明确错误信息）不探测，原样返回。

@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
@@ -1258,16 +1260,31 @@ func derivePromptCacheKey(ctx context.Context, modelID string) string {
 	return ""
 }
 
-// applyCacheHintsToRawBody 对已 marshal 的上游请求体（raw JSON bytes）注入// applyCacheHintsToRawBody 对已 marshal 的上游请求体（raw JSON bytes）注入
-// prompt_cache_retention 和顶层 cache_control breakpoint（尊重现有字段，已知
-// 拒绝该字段的模型除外）。用于原生透传路径（claude/responses 直通上游）。
+// applyCacheHintsToRawBody 对已 marshal 的上游请求体（raw JSON bytes）注入
+// 缓存提示。等价于 applyCacheHintsToRawBodyWithContext + cacheControl=true。
 func applyCacheHintsToRawBody(body []byte, modelID string) []byte {
-	return applyCacheHintsToRawBodyWithContext(body, modelID, nil)
+	return applyCacheHintsToRawBodyOpts(body, modelID, nil, true)
 }
 
 // applyCacheHintsToRawBodyWithContext 注入 retention + 顶层 cache_control,并在
 // 缺省时补一个从 client session 派生的稳定 prompt_cache_key。
+// 用于 chat-completions 翻译路径以及上游按 chat schema 接收的请求体。
 func applyCacheHintsToRawBodyWithContext(body []byte, modelID string, ctx context.Context) []byte {
+	return applyCacheHintsToRawBodyOpts(body, modelID, ctx, true)
+}
+
+// applyResponsesCacheHintsToRawBody 用于原生 /responses 透传：注入 retention 和
+// session 派生的 prompt_cache_key，但不注入顶层 cache_control（不是合法
+// Responses API 字段,Console 等上游会以 unknown parameter 整包 400)。
+func applyResponsesCacheHintsToRawBody(body []byte, modelID string, ctx context.Context) []byte {
+	return applyCacheHintsToRawBodyOpts(body, modelID, ctx, false)
+}
+
+// applyCacheHintsToRawBodyOpts 对已 marshal 的上游请求体（raw JSON bytes）注入
+// prompt_cache_retention 和 prompt_cache_key（尊重现有字段）; enableCacheControl
+// 为 true 且模型不拒绝该字段时追加顶层 cache_control breakpoint（已知 GLM/Zhipu
+// 等拒绝该字段的模型除外）。用于原生透传与翻译路径的 post-marshal 注入。
+func applyCacheHintsToRawBodyOpts(body []byte, modelID string, ctx context.Context, enableCacheControl bool) []byte {
 	var m map[string]any
 	if err := json.Unmarshal(body, &m); err != nil {
 		return body
@@ -1285,7 +1302,7 @@ func applyCacheHintsToRawBodyWithContext(body []byte, modelID string, ctx contex
 			changed = true
 		}
 	}
-	if config.CacheBreakpoints() && !rejectsCacheControl(modelID) {
+	if enableCacheControl && config.CacheBreakpoints() && !rejectsCacheControl(modelID) {
 		if _, exists := m["cache_control"]; !exists {
 			m["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
 			changed = true
@@ -1299,6 +1316,105 @@ func applyCacheHintsToRawBodyWithContext(body []byte, modelID string, ctx contex
 		return body
 	}
 	return out
+}
+
+// isTopLevelCacheControlRejection 识别上游对顶层 cache_control 参数的 schema 拒绝
+// (Console 等按严格 schema 校验的上游会返回 unknown parameter / Extra inputs /
+// Unrecognized field 之类错误)。仅针对顶层参数本身的拒绝（param/cache_control
+// 出现在顶层 error），不把消息内部的文本回显误判为参数拒绝。
+func isTopLevelCacheControlRejection(errBody []byte) bool {
+	var raw map[string]any
+	if json.Unmarshal(errBody, &raw) != nil {
+		return false
+	}
+	em, ok := raw["error"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if p, _ := em["param"].(string); p == "cache_control" {
+		return true
+	}
+	msg, _ := em["message"].(string)
+	msgLower := strings.ToLower(msg)
+	if !strings.Contains(msgLower, "cache_control") {
+		return false
+	}
+	return strings.Contains(msgLower, "unknown parameter") ||
+		strings.Contains(msgLower, "extra inputs") ||
+		strings.Contains(msgLower, "unrecognized field") ||
+		strings.Contains(msgLower, "unsupported parameter") ||
+		strings.Contains(msgLower, "not permitted") ||
+		strings.Contains(msgLower, "unknown field")
+}
+
+// stripTopLevelCacheControl 删除顶层 cache_control 键（message content block 内部
+// 的 cache_control 不动——响应侧含缓存统计的场景里上游能容忍；仅顶层参数被称为
+// unknown parameter)。返回是否删除过字段，供上层决定是否值得重发。
+func stripTopLevelCacheControl(body []byte) ([]byte, bool) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body, false
+	}
+	if _, exists := m["cache_control"]; !exists {
+		return body, false
+	}
+	delete(m, "cache_control")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+// cacheControlRejections 记录已命中顶层 cache_control 拒绝的模型,命中后同进程
+// 不再为该模型注入顶层 cache_control（一次性事后学习，重启清零)。
+var cacheControlRejections sync.Map // modelID -> struct{}
+
+func markCacheControlRejected(modelID string) {
+	if strings.TrimSpace(modelID) == "" {
+		return
+	}
+	cacheControlRejections.Store(modelID, struct{}{})
+	if base, _ := stripContextSuffix(modelID); base != "" && base != modelID {
+		cacheControlRejections.Store(base, struct{}{})
+	}
+}
+
+func hasCacheControlRejected(modelID string) bool {
+	if _, ok := cacheControlRejections.Load(modelID); ok {
+		return true
+	}
+	if base, _ := stripContextSuffix(modelID); base != "" && base != modelID {
+		_, ok := cacheControlRejections.Load(base)
+		return ok
+	}
+	return false
+}
+
+// retryChatCompletionsWithoutCacheControl 在 400 且错误明确指向顶层
+// cache_control 时,剥离该字段后重发一次（prompt_cache_key/retention 保留,继续
+// 命中 zen 前缀缓存）。成功/失败都返回最终 (resp, status, err);不适用时返回
+// (nil, 0, nil)，调用方走原有错误路径。记住该模型以避免再次注入。
+func retryChatCompletionsWithoutCacheControl(ctx context.Context, body []byte, modelID string, auth UpstreamAuth, status int, errBody []byte, stream bool) (io.ReadCloser, int, error) {
+	if status != http.StatusBadRequest || !isTopLevelCacheControlRejection(errBody) {
+		return nil, 0, nil
+	}
+	stripped, ok := stripTopLevelCacheControl(body)
+	if !ok {
+		return nil, 0, nil
+	}
+	markCacheControlRejected(modelID)
+	slog.Warn("upstream rejected top-level cache_control, stripped and retrying once",
+		"model", modelID, "stream", stream)
+	if stream {
+		rc, st, _, err := callOpenCodeAPIStream(ctx, stripped, modelID, auth)
+		return rc, st, err
+	}
+	respBody, st, _, err := callOpenCodeAPI(ctx, stripped, modelID, auth)
+	if err != nil || st < 200 || st >= 300 {
+		return nil, st, err
+	}
+	return io.NopCloser(bytes.NewReader(respBody)), st, nil
 }
 
 // collectClaudeCacheTaggedTexts 提取所有显式带 cache_control 的 text 块内容
