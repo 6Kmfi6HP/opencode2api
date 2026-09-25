@@ -479,6 +479,9 @@ func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth Upst
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", auth.authorizationHeader())
+	if subpath == "messages" {
+		req.Header.Set("x-api-key", auth.apiKey())
+	}
 	// UA 对齐 lite L1931: ai-sdk/runtime 后缀贴近真实 opencode 客户端。
 	uaVersion := ocClientVer
 	if strings.TrimSpace(uaVersion) == "" {
