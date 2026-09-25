@@ -253,9 +253,7 @@ func runLaunchChild(tool, path string, args, extraEnv []string, server *http.Ser
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	env := os.Environ()
-	env = append(env, extraEnv...)
-	cmd.Env = env
+	cmd.Env = buildChildProcessEnv(tool, os.Environ(), extraEnv)
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
