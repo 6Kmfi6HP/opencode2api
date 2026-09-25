@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.7
+
+- Fix `/v1/models` hiding `-free` models from API key requests (`fix(models)`): the list endpoint ran every visible model through `publicFacingModelID`, which strips the upstream `-free` suffix before display — for every route, including authenticated ones. API key users therefore never saw the `xxx-free` variants in the catalog even though their key can call them, and Chat/Responses clients could not pick a free variant by its real ID. `replaceModelIDsWithAliases` now takes a `stripFreeSuffix` flag: only the public (keyless) route keeps the bare-name display (still paired with `resolveModel`'s bare→`xxx-free` reverse map, unchanged), while keyed requests (`auto` / `zen:` / `go:`) get the true upstream IDs verbatim. Explicitly configured aliases still win on both tiers.
+
 ## v0.14.6
 
 - Fix `spawn_agent` (codex `multi_agent_v1`) unusable through the gateway (`fix(responses)` / `fix(launch)`), two cooperating root causes:
