@@ -1,10 +1,15 @@
 # Changelog
 
-## v0.14.8
+## v0.14.9
 
 - Fix `400 Error from provider (Console): unknown parameter 'cache_control'` on `/v1/responses` for models routed to the native responses passthrough (`fix(responses)` / `fix(cache)`), regressing from v0.14.7's cache-hint patch. The passthrough previously called the shared `applyCacheHintsToRawBodyWithContext`, which injects a top-level `cache_control: {"type":"ephemeral","ttl":"1h"}` — but `cache_control` is only a legal **Anthropic Messages** field; on the OpenAI Responses surface it is an unknown top-level parameter, and strict-schema upstreams (Console) reject the whole request with `invalid_request_error`. The fix splits the injection: a new `applyResponsesCacheHintsToRawBody` is used on both native passthrough (`responses.go:1379`) and the chat→responses upstream bridge (`chat_to_responses_upstream.go`), keeping `prompt_cache_key` / `prompt_cache_retention` (zen prefix-cache hints remain effective — verified `cached_tokens:625` on `muse-spark-1.3-contributor-free` immediately after the fix) while no longer writing `cache_control`. The Anthropic-side passthrough keeps the top-level `cache_control` because the field **is** part of Anthropic Messages schema.
 - Auto-recover on the chat translation path when the upstream still rejects top-level `cache_control` (`fix(cache)`): `responses.go` now detects a 400 whose body explicitly blames `cache_control` (`param="cache_control"`, or `message` containing `cache_control` + `unknown parameter` / `extra inputs` / `unrecognized|unsupported parameter` / `not permitted`), strips just the top-level key (per-message and tool-level `cache_control` blocks on Anthropic passthrough are preserved — those are legal), retries once, and **remembers** the model ID in-process so subsequent requests skip the injection entirely. `prompt_cache_key` / `prompt_cache_retention` stay on the retry, preserving cache-hit rate. Unrelated 400s (e.g. `Model is unavailable`) do not trigger the retry.
 - New regression coverage (`protocol_regression_test.go`): passthrough skips top-level `cache_control`; rejection detector handles Console / `extra inputs` / `unsupported parameter` wordings and ignores message-text echoes; `stripTopLevelCacheControl` removes only the top-level key; marked models no longer get the field injected; unrelated 400s do not retry. `go test ./...` and `go vet ./...` clean.
+
+## v0.14.8
+
+- Docs (`docs(cache)`): clarify the v0.14.7 cache-hint patch's behavior — `cache_control` breakpoints are replayed on chat→claude translations, `prompt_cache_key` / `prompt_cache_retention` (default `24h`) are injected on responses passthrough + chat→responses translation, derived from the client `x-opencode-session` so per-session prefix caches survive across turns. Verified against `mimo-v2.6-flash` and `big-pickle` (turn-2 `prompt_cached_tokens` 28,672 → 32,448 within the ~32k cap).
+- Fix (`fix(cache)`): preserve Claude `cache_control` breakpoints after Claude→Chat mapping and inject `prompt_cache` hints across all chat / responses paths; GLM/Zhipu skips the top-level injection (see v0.14.9 for the responses-side follow-up).
 
 ## v0.14.7
 
