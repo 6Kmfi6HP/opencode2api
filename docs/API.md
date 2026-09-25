@@ -158,7 +158,7 @@ curl http://127.0.0.1:8000/v1/responses \
 - 请求历史中的 thinking `signature` 没有 Chat Completions 等价物，会被丢弃；代理仅统计历史中非空 signature block 数量到 `request_plan`（`history_signature_count`），不记录签名内容。
 - `redacted_thinking.data` 是不可解释的加密数据，无法无损转成请求侧 reasoning；请求历史中的 redacted data 会被丢弃。native Anthropic 响应中明确存在的 signature / redacted data 由第二批私有 roundtrip 字段（`_opencode2api_anthropic_content`）保留，仅用于 Claude Messages 往返，Chat/Responses 公共 payload 不会泄漏这些私有字段。
 - 无 Chat Completions 等价物的字段不进上游 body，但会绑定并记入 `request_plan` / body summary：`context_management`、`cache_control`、`anthropic-beta`、带 `type` 且无 `input_schema` 的 server tools（如 `web_search_*`）。
-- `cache_control` breakpoints 不会被透传或实现；Chat 上游的自动前缀缓存无法表达 Anthropic TTL/breakpoint，`cached_tokens` usage 仅在上游提供时映射。请求中的 `cache_control` 计入 `cache_control_blocks` 并丢弃。
+- `cache_control` breakpoints 现在被保留：Claude 侧的 `system[].cache_control`、`messages[].content[].cache_control`、`tools[].cache_control` 会在转换到 Chat 上游时按文本/工具名重放到对应消息/工具上（`config.cache_control_breakpoints` 默认开启，`rejectsCacheControl` 列表内的 GLM/Zhipu 仍跳过），同时自动附加顶层 `cache_control` breakpoint；`cached_tokens` usage 由上游返回时映射到 `prompt_tokens_details.cached_tokens` 并累计到本地 stats。请求中的 `cache_control` 也仍然计入 `cache_control_blocks` 供诊断。
 
 ### 不支持（不实现语义）
 
