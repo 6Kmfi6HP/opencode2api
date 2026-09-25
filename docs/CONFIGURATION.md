@@ -255,34 +255,27 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 
 域名列表变化（增删改）时自动清空全部 sticky 绑定，避免指向已不存在的目标。
 
-### `prompt_cache_retention`
+### `prompt_cache_key` / `prompt_cache_retention` / `cache_control_breakpoints`
 
-向上游 zen 网关显式声明 prompt 前缀缓存的保留时长。上游默认约 5 分钟（`in_memory`），agent 任务间歇过长时缓存容易过期导致命中率低。
+缓存命中率与三个开关相关，默认对接受的模型都会启用（详见 `internal/app/cache_debug.go` 的 `OPENCODE2API_CACHE_DEBUG=1` 运行时日志可以在各入口看到生效后的上游 body 摘要）：
 
-- 不填或 `"24h"`：注入 `prompt_cache_retention: "24h"`，缓存保留一天
-- `"in_memory"`：显式维持上游默认（约 5 分钟）
-- `"off"`：完全不注入该字段
-
-```json
-{
-  "prompt_cache_retention": "24h"
-}
-```
-
-### `cache_control_breakpoints`
-
-是否向上游请求附加 Anthropic 风格缓存断点 `cache_control: {"type":"ephemeral","ttl":"1h"}`。
-
-- 缺省或 `true`：注入（对支持的上游提升缓存命中；GLM/Zhipu 模型会拒绝该字段，自动跳过）
-- `false`：不注入
-
-运行时观测：统计文件路径见上文“统计与日志路径解析”。`stats.json` 中每个模型新增 `cache_read_tokens` / `cache_created_tokens` 聚合（来自上游 `cache_read_input_tokens` / `cache_creation_input_tokens`、`prompt_cache_hit_tokens` 或 `prompt_tokens_details.cached_tokens` 等），管理面板也会显示“缓存读取/缓存写入”两列。DeepSeek 的 `prompt_cache_miss_tokens` 是普通未命中输入，不是缓存写入，不累计为 `cache_created_tokens`；命中率用 `cache_read / prompt_tokens` 计算。
+- `prompt_cache_retention`：向上游 zen 网关显式声明 prompt 前缀缓存的保留时长。上游默认约 5 分钟（`in_memory`），agent 任务间歇过长时缓存容易过期导致命中率低。
+  - 不填或 `"24h"`：注入 `prompt_cache_retention: "24h"`，缓存保留一天
+  - `"in_memory"`：显式维持上游默认（约 5 分钟）
+  - `"off"`：完全不注入该字段
+- `prompt_cache_key`：按客户端 `x-opencode-session` / `x-session-id` 自动派生稳定 key（`oc2api:<session>`），跨轮对话/同 session 的 prefix 更容易命中；显式传入时优先。
+- `cache_control_breakpoints`：是否向上游请求附加 Anthropic 风格缓存断点 `cache_control: {"type":"ephemeral","ttl":"1h"}`。
+  - 缺省或 `true`：注入（对支持的上游提升缓存命中；GLM/Zhipu 模型会拒绝该字段，自动跳过）
+  - `false`：不注入
 
 ```json
 {
+  "prompt_cache_retention": "24h",
   "cache_control_breakpoints": true
 }
 ```
+
+> 真实运行验证：`opencode2api launch claude --model mimo-v2.6-flash` 第二轮 `prompt_cached_tokens` 从 ~28.7k 提升到 ~32.4k（≈99.9% 的 prompt 命中），`big-pickle` 31.5k/31.6k；`codex --model mimo-v2.6-flash` `prompt_cached_tokens=9.92k`（≈98%），都已通过 `OPENCODE2API_CACHE_DEBUG=1` 中的 `cache_debug_usage` 观察。先前行为是只在 `buildUpstreamBody` 时注入顶层 `prompt_cache_retention`；现在 chat/claude/responses 直通（remembered）与 chat→responses 桥都统一补齐，并保持 IDEMPOTENT（上游已有字段时不覆盖）。
 
 ## 管理面板
 
