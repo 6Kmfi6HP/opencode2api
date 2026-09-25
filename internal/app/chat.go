@@ -778,7 +778,11 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		combinedModels = models
 	}
-	allModels := replaceModelIDsWithAliases(combinedModels, aliases)
+	// 只有 public（无 key）路由把免费模型剥皮成裸名展示，与 resolveModel 的
+	// 裸名→xxx-free 反向映射配套。API key 用户看到的是上游真实 ID，不要隐藏
+	// -free 后缀，否则用户无法在目录里看到并直接选用免费变体。
+	stripFreeSuffix := auth.Mode == AuthRoutePublic
+	allModels := replaceModelIDsWithAliases(combinedModels, aliases, stripFreeSuffix)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
@@ -787,7 +791,9 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func replaceModelIDsWithAliases(models []ModelInfo, aliases map[string]string) []ModelInfo {
+// stripFreeSuffix 为 true 时，未配别名的免费模型以剥掉 "-free" 的裸名展示
+// （pure public 展示契约）；false 时按上游真实 ID 原样展示。
+func replaceModelIDsWithAliases(models []ModelInfo, aliases map[string]string, stripFreeSuffix bool) []ModelInfo {
 	aliasesByUpstream := make(map[string][]string, len(aliases))
 	for alias, upstream := range aliases {
 		alias = strings.TrimSpace(alias)
@@ -806,7 +812,11 @@ func replaceModelIDsWithAliases(models []ModelInfo, aliases map[string]string) [
 	for _, model := range models {
 		visibleIDs := aliasesByUpstream[model.ID]
 		if len(visibleIDs) == 0 {
-			visibleIDs = []string{publicFacingModelID(model.ID)}
+			visibleID := model.ID
+			if stripFreeSuffix {
+				visibleID = publicFacingModelID(model.ID)
+			}
+			visibleIDs = []string{visibleID}
 		}
 		for _, visibleID := range visibleIDs {
 			if _, exists := seen[visibleID]; exists {

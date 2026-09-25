@@ -595,12 +595,12 @@ func TestListModelsHandlerSeparatesPublicZenAndGoCatalogs(t *testing.T) {
 		{
 			name:       "bare zen key sees zen catalog only",
 			authHeader: "Bearer sk-auto0123456789abcdef",
-			wantIDs:    []string{"deepseek-v4-flash", "glm-5.2", "gpt-5.5"},
+			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "gpt-5.5"},
 		},
 		{
 			name:       "go prefix sees free and go catalog",
 			authHeader: "Bearer go:sk-go0123456789abcdef",
-			wantIDs:    []string{"deepseek-v4-flash", "glm-5.2", "kimi-k2.7-code"},
+			wantIDs:    []string{"deepseek-v4-flash-free", "glm-5.2", "kimi-k2.7-code"},
 		},
 	}
 
@@ -739,6 +739,55 @@ func TestListModelsHandlerStripsFreeSuffixWithoutAlias(t *testing.T) {
 	}
 	if len(payload.Data) != 1 || payload.Data[0].ID != "mimo-v2.5" {
 		t.Fatalf("ids = %#v, want [mimo-v2.5]", payload.Data)
+	}
+}
+
+func TestListModelsHandlerKeepsFreeSuffixForAPIKey(t *testing.T) {
+	oldModelsCache := modelsCache
+	oldGoModelsCache := goModelsCache
+	oldModelsLoaded := modelsLoaded
+	oldModelAlias := getModelKeywordRules()
+	modelMu.Lock()
+	modelsCache = []ModelInfo{
+		{ID: "mimo-v2.5-free", Object: "model", OwnedBy: "opencode"},
+		{ID: "glm-5.2", Object: "model", OwnedBy: "opencode"},
+	}
+	goModelsCache = nil
+	modelsLoaded = true
+	modelMu.Unlock()
+	configMu.Lock()
+	modelAliasRules = nil
+	configMu.Unlock()
+	t.Cleanup(func() {
+		modelMu.Lock()
+		modelsCache = oldModelsCache
+		goModelsCache = oldGoModelsCache
+		modelsLoaded = oldModelsLoaded
+		modelMu.Unlock()
+		applyConfig(AppConfig{ModelAlias: oldModelAlias})
+	})
+
+	// 带 API key 时，免费变体按上游真实 ID 原样列出，不隐藏 -free 后缀。
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer sk-auto0123456789abcdef")
+	rec := httptest.NewRecorder()
+	listModelsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var payload struct {
+		Data []ModelInfo `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	gotIDs := make([]string, 0, len(payload.Data))
+	for _, model := range payload.Data {
+		gotIDs = append(gotIDs, model.ID)
+	}
+	wantIDs := []string{"mimo-v2.5-free", "glm-5.2"}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("listModelsHandler() ids = %#v, want %#v", gotIDs, wantIDs)
 	}
 }
 
