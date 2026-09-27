@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -487,32 +488,26 @@ func forwardChatViaAnthropic(w http.ResponseWriter, r *http.Request, auth Upstre
 		"model", req.Model, "stream", req.Stream, "keep_reasoning", keepReasoning)
 
 	if req.Stream {
-		rc, status, _, err := callOpenCodeAnthropicEndpoint(ctx, upstreamBody, req.Model, auth)
-		if err != nil || status < 200 || status >= 300 {
-			var errBody []byte
-			if rc != nil {
-				errBody, _ = io.ReadAll(io.LimitReader(rc, 64*1024))
-				rc.Close()
-			}
-			if status < 100 || status >= 600 {
-				status = http.StatusBadGateway
-			}
-			if len(errBody) > 0 {
-				if ape, ok := parseAnthropicErrorBody(errBody); ok {
-					writeUpstreamError(w, status, ape, "chat")
-					return
-				}
-				// 上游错误体非 Anthropic 形状：原样透传，保真状态码。
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				w.Write(errBody)
-				return
-			}
-			writeUpstreamError(w, status, fmt.Errorf("upstream error"), "chat")
+		// DriveStreamWithRetry 内部首轮调 callOnce 建立流；peek 失败（空流
+		// EOF/读错/首字节看门狗）时按 StreamEmptyRetryMax 换 key 重试。
+		callOnce := func(callCtx context.Context) (io.ReadCloser, int, error) {
+			rc, status, _, err := callOpenCodeAnthropicEndpoint(callCtx, upstreamBody, req.Model, auth)
+			return rc, status, err
+		}
+		runOnce := func(runCtx context.Context, rw http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
+			return anthropicSSEToChatStream(runCtx, rw, rc, req.Model, keepReasoning, true, peeked, rd)
+		}
+		committed, streamErr := DriveStreamWithRetry(ctx, w, AnthropicProtocolHooks, callOnce, runOnce)
+		if committed {
 			return
 		}
-		defer rc.Close()
-		anthropicSSEToChatStream(ctx, w, rc, req.Model, keepReasoning, true)
+		// 全部 attempt 都未 commit：尚未向客户端写过任何字节,落 502,
+		// 不伪装半截流。ctx 取消由调用方按客户端断开处理,原样透传。
+		if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
+			return
+		}
+		log.Warn("chat via anthropic stream empty after retries", "model", req.Model, "err", streamErr)
+		writeUpstreamError(w, http.StatusBadGateway, fmt.Errorf("upstream stream empty after retries"), "chat")
 		return
 	}
 
@@ -618,11 +613,22 @@ func (t *anthropicToolState) initialArguments() string {
 	}
 }
 
-func anthropicSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, keepReasoning bool, includeUsage bool) {
+// anthropicSSEToChatStream 把上游 Anthropic Messages SSE 翻译为 Chat SSE。
+//
+// 返回值的约定（与 PeekFirstFrame 配合，实现「首 token 前可重试」）：
+//   - (true, nil)：已向客户端写过至少一个字节（含 finish 后的 [DONE]），上游流
+//     正常翻译完毕或按已有规则合成收尾。这是唯一「已 commit」的返回。
+//   - (false, err)：未向客户端写过任何字节——peek 窗口里上游给了空流/
+//     错误事件/EOF/超时或 message_start 之前 EOF。调用方可以安全地关闭当前
+//     rc、换 key 重发请求。
+//
+// peeked 非空时直接进入主循环（此调用已是某次 peek-commit 之后的干跑），
+// 不再二次 peek、不再做首字节看门狗（窗口已在第一次调用里耗尽）。rd 是
+// peek 主循环里续用的 reader；为 nil 时函数自己在 rc 上新建。
+func anthropicSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, keepReasoning bool, includeUsage bool, peeked []streamReadResult, rd *streamReader) (bool, error) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
 	st := &anthropicToChatState{
@@ -646,27 +652,103 @@ func anthropicSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		st.stats.Log(ctx, "chat")
 	}()
 
-	reader := newStreamReader(ctx, rc, 0)
+	// WriteHeader 延迟到首字节真正写出（避免 peek 阶段占用了 200，让那次
+	// 空流的调用方可安全重试而不污染客户端）。
+	wroteHeader := false
+	writeHeaderOnce := func() {
+		if wroteHeader {
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		wroteHeader = true
+	}
+
+	var reader *streamReader
+	if len(peeked) == 0 {
+		peek := PeekFirstFrame(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, AnthropicProtocolHooks)
+		if peek.Err != nil {
+			return false, peek.Err
+		}
+		peeked = peek.Consumed
+		reader = peek.Reader
+		if reader == nil {
+			// 上游 EOF 但已见完整帧（极少见：单帧流）。续读的 reader 直接
+			// 落在已 EOF 的 rc 上,主循环立即收 EOF 并走 finalize。
+			reader = newStreamReader(ctx, rc, 15*time.Second)
+		} else {
+			// 复用 peek 的 reader(它的 bufio 可能已预读后续行);顺手开
+			// keepalive(此前为 0,看门狗由 timeout 承担)。
+			reader.enableKeepalive(15 * time.Second)
+		}
+	} else {
+		// 已有 peeked：此调用即某次 peek-commit 之后的干跑；调用方透传
+		// 了自己的 reader（rd）就用，否则在 rc 上新建。
+		if rd != nil {
+			reader = rd
+		} else {
+			reader = newStreamReader(ctx, rc, 15*time.Second)
+		}
+	}
 	defer reader.Close()
+
+	// flushPending 按序回放 peek 阶段攒下的行（peek 阶段已按 SSE 行结构
+	// 验证过帧完整性），随后转为 nil 直读上游。
+	pending := append([]streamReadResult(nil), peeked...)
+	consumePending := func() []streamReadResult {
+		out := pending
+		pending = nil
+		return out
+	}
+
+	// processResult 处理一行上游 SSE（行可能为空字符串收尾一帧,err 非空
+	// 表示当前行已是最后一行）。committed=true 表示已经向客户端写出过至
+	// 少一字节。
+	processResult := func(result streamReadResult) (committed bool, done bool, retErr error) {
+		if result.line != "" {
+			st.stats.NoteChunk()
+			writeHeaderOnce()
+			st.handleLine(result.line)
+		}
+		if result.err != nil {
+			// EOF / 读错误兜底。
+			if !st.sentRole {
+				// message_start 都未到达 = 完全空流,从未 commit。
+				return false, true, errStreamIncompleteNoCommit
+			}
+			// 已有 role 输出后再 EOF:按finalize合成 stop chunk+[DONE],
+			// 保证 OpenAI SDK 不挂起（幂等）。
+			st.finalize()
+			if st.skippedSig > 0 || st.skippedRedacted > 0 {
+				slog.Debug("chat stream: dropped unrepresentable anthropic deltas",
+					"model", model, "signature_delta", st.skippedSig, "redacted_thinking", st.skippedRedacted)
+			}
+			return true, true, nil
+		}
+		return wroteHeader, false, nil
+	}
+
+	// 先回放 peeked，再进入主循环。
+	for _, res := range consumePending() {
+		_, done, err := processResult(res)
+		if done {
+			if err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return wroteHeader, ctx.Err()
 		case result := <-reader.Read():
-			pendingErr := result.err
-			if result.line != "" {
-				st.stats.NoteChunk()
-				st.handleLine(result.line)
-			}
-			if pendingErr != nil {
-				// EOF / 读错误兜底:message_stop 未到达时补 finish+usage 终块
-				// +[DONE],保证 OpenAI SDK 不挂起（幂等）。
-				st.finalize()
-				if st.skippedSig > 0 || st.skippedRedacted > 0 {
-					slog.Debug("chat stream: dropped unrepresentable anthropic deltas",
-						"model", model, "signature_delta", st.skippedSig, "redacted_thinking", st.skippedRedacted)
+			_, done, err := processResult(result)
+			if done {
+				if err != nil {
+					return false, err
 				}
-				return
+				return true, nil
 			}
 		}
 	}
