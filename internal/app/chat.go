@@ -916,7 +916,9 @@ func handleChatStreamLine(
 	if usage != nil && !*doneSeen && wasCommitted {
 		statsx.RecordChatUsage(req.Model, usage)
 	}
-	emitLine(out + "\n")
+	// SSE 帧分隔必须是 \n\n(\n 单换行是同一帧内的多行 data)。否则严格
+	// 解析的 OpenAI SDK 会把多个 data 帧拼成一个,触发 "Extra data"。
+	emitLine(out + "\n\n")
 	return false
 }
 
