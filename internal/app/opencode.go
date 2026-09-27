@@ -14,11 +14,13 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"github.com/6Kmfi6HP/opencode2api/internal/random"
+	"golang.org/x/sync/singleflight"
 )
 
 // ======================== 随机 ID ========================
@@ -121,11 +123,15 @@ func normalizedTransportScope(session string) string {
 	return fmt.Sprintf("%x", sum[:8])
 }
 
+type opencodeSessionState struct {
+	clientVersion string
+	sessionID     string
+	projectID     string
+}
+
 var (
-	ocSessionID string
-	ocProjectID string
-	ocClientVer string
-	ocOnce      sync.Once
+	ocSessionState   atomic.Pointer[opencodeSessionState]
+	ocSessionRefresh singleflight.Group
 )
 
 const (
@@ -213,24 +219,25 @@ func fetchOCVersion() string {
 	return ocDefaultFreeTierVersion
 }
 
-func initOCSession() {
-	ocOnce.Do(func() {
-		ocClientVer = fetchOCVersion()
-		ocSessionID = newOCSessionID()
-		ocProjectID = randomHex(40)
-		slog.Info("opencode version", "version", ocClientVer)
-		slog.Info("session initialized", "session_id", ocSessionID)
-		slog.Info("project initialized", "project_id", ocProjectID)
-	})
+func initOCSession() *opencodeSessionState {
+	if state := ocSessionState.Load(); state != nil {
+		return state
+	}
+	return refreshOCSession()
 }
 
-func refreshOCSession() {
-	ocClientVer = fetchOCVersion()
-	ocSessionID = newOCSessionID()
-	ocProjectID = randomHex(40)
-	slog.Info("session refreshed", "version", ocClientVer, "session_id", ocSessionID)
-	// 重置 Once 以便后续 initOCSession 调用直接通过
-	ocOnce = sync.Once{}
+func refreshOCSession() *opencodeSessionState {
+	value, _, _ := ocSessionRefresh.Do("opencode-session", func() (any, error) {
+		state := &opencodeSessionState{
+			clientVersion: fetchOCVersion(),
+			sessionID:     newOCSessionID(),
+			projectID:     randomHex(40),
+		}
+		ocSessionState.Store(state)
+		slog.Info("opencode session ready", "version", state.clientVersion, "session_id", state.sessionID, "project_id", state.projectID)
+		return state, nil
+	})
+	return value.(*opencodeSessionState)
 }
 
 // ======================== 模型 ========================
@@ -252,10 +259,8 @@ var (
 func fetchModels() ([]ModelInfo, error) {
 	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
-	session := strings.TrimSpace(sessionFromRequestContext(nil, ocSessionID))
-	if session == "" {
-		session = ocSessionID
-	}
+	sessionState := initOCSession()
+	session := strings.TrimSpace(sessionFromRequestContext(nil, sessionState.sessionID))
 	if session == "" {
 		session = newOCSessionID()
 	}
@@ -289,10 +294,8 @@ func fetchModels() ([]ModelInfo, error) {
 func fetchGoModels() ([]ModelInfo, error) {
 	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/go/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
-	session := strings.TrimSpace(sessionFromRequestContext(nil, ocSessionID))
-	if session == "" {
-		session = ocSessionID
-	}
+	sessionState := initOCSession()
+	session := strings.TrimSpace(sessionFromRequestContext(nil, sessionState.sessionID))
 	if session == "" {
 		session = newOCSessionID()
 	}
@@ -442,15 +445,21 @@ func startModelRefresh() {
 // left untouched.
 
 func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (*http.Request, error) {
-	baseURL, _ := selectUpstreamTarget(auth, bodyMap, nil, ocSessionID)
-	return buildOCRequestWithSubpath(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID), baseURL, "chat/completions", ocSessionID)
+	state := initOCSession()
+	baseURL, _ := selectUpstreamTarget(auth, bodyMap, nil, state.sessionID)
+	return buildOCRequestWithSubpathAndState(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID), baseURL, "chat/completions", state.sessionID, state)
 }
 
 func buildOCRequestWithEndpoint(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string) (*http.Request, error) {
-	return buildOCRequestWithSubpath(modelID, bodyMap, auth, useGoEndpoint, baseURL, "chat/completions", ocSessionID)
+	state := initOCSession()
+	return buildOCRequestWithSubpathAndState(modelID, bodyMap, auth, useGoEndpoint, baseURL, "chat/completions", state.sessionID, state)
 }
 
 func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string, subpath string, ocSession string) (*http.Request, error) {
+	return buildOCRequestWithSubpathAndState(modelID, bodyMap, auth, useGoEndpoint, baseURL, subpath, ocSession, initOCSession())
+}
+
+func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string, subpath string, ocSession string, state *opencodeSessionState) (*http.Request, error) {
 	bodyMap["model"] = modelID
 	// 上游 2026-09-18 实测门禁(docs/labs/2026-09-18-fingerprint-ablation.md):
 	// 是否执行免费层指纹重做**只看解析后的上游模型是否免费**,与客户端
@@ -480,14 +489,14 @@ func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth Upst
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", auth.authorizationHeader())
 	// UA 对齐 lite L1931: ai-sdk/runtime 后缀贴近真实 opencode 客户端。
-	uaVersion := ocClientVer
+	uaVersion := state.clientVersion
 	if strings.TrimSpace(uaVersion) == "" {
 		uaVersion = ocDefaultFreeTierVersion
 	}
 	uaVersion = normalizeOCVersion(uaVersion)
 	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", uaVersion))
 	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-project", ocProjectID)
+	req.Header.Set("x-opencode-project", state.projectID)
 	if subpath == "messages" {
 		// Anthropic Messages 上游需要版本头；流式时 Accept 切为 SSE。
 		req.Header.Set("anthropic-version", "2023-06-01")
@@ -501,7 +510,7 @@ func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth Upst
 	}
 	session := sessionFromRequestContext(nil, ocSession)
 	if strings.TrimSpace(session) == "" {
-		session = ocSessionID
+		session = state.sessionID
 	}
 	if strings.TrimSpace(session) == "" {
 		session = newOCSessionID()
@@ -552,7 +561,7 @@ func maxAttemptsForUpstreamStatus(status int) int {
 // callOpenCodeEndpoint 统一封装所有对上游 /zen/v1/* 和 /zen/go/v1/* 端点的 HTTP 调用，
 // 包含重试机制、SOCKS5 会话粘性与轮换、多域名轮换、错误归一与结构化日志输出。
 func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
-	initOCSession()
+	sessionState := initOCSession()
 
 	var bodyMap map[string]any
 	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
@@ -579,14 +588,14 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		// 仅"裸进程内回退值"才现造一次会话,避免同一请求的重试在
 		// newOCSessionID() 兜底下换 session 破坏 sticky egress。
-		ocSession := sessionFromRequestContext(ctx, ocSessionID)
+		ocSession := sessionFromRequestContext(ctx, sessionState.sessionID)
 		if strings.TrimSpace(ocSession) == "" {
 			ocSession = newOCSessionID()
 		}
 		upstreamHeaders := upstreamHeadersFromContext(ctx)
 		baseURL, client := selectUpstreamTarget(auth, bodyMap, upstreamHeaders, normalizedTransportScope(ocSession))
 		lastBaseURL = baseURL
-		up, err := buildOCRequestWithSubpath(modelID, bodyMap, auth, useGoEndpoint, baseURL, endpointSubpath, ocSession)
+		up, err := buildOCRequestWithSubpathAndState(modelID, bodyMap, auth, useGoEndpoint, baseURL, endpointSubpath, ocSession, sessionState)
 		if err != nil {
 			return nil, 500, nil, err
 		}
@@ -614,7 +623,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 			)
 			if canRetry {
 				client.CloseIdleConnections()
-				invalidateUpstreamTarget(auth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, ocSessionID))
+				invalidateUpstreamTarget(auth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, sessionState.sessionID))
 				retryCount++
 				continue
 			}
@@ -668,7 +677,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		}
 		// 免费层 429 按出口 IP 限流,5xx 也可能是出口问题:
 		// 重试前切断 sticky,让同一会话换到下一个出口。
-		invalidateUpstreamTarget(auth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, ocSessionID))
+		invalidateUpstreamTarget(auth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, sessionState.sessionID))
 		client.CloseIdleConnections()
 		retryCount++
 	}

@@ -23,10 +23,10 @@ vet:
 
 build:
 	mkdir -p bin
-	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(APP) ./cmd/opencode2api
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(APP) ./cmd/opencode2api
 
 release-snapshot:
-	VERSION=$(VERSION) COMMIT=$(COMMIT) DATE=$(DATE) ./scripts/build-release.sh
+	CGO_ENABLED=0 VERSION=$(VERSION) COMMIT=$(COMMIT) DATE=$(DATE) ./scripts/build-release.sh
 
 clean:
 	rm -rf bin dist

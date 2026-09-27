@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -2557,11 +2556,7 @@ func TestChatHandler_TransportError502(t *testing.T) {
 	defer func() { httpClient = oldClient }()
 
 	// Reset session state
-	ocOnce = sync.Once{}
-	ocOnce.Do(func() {})
-	ocClientVer = "test"
-	ocSessionID = "ses_test"
-	ocProjectID = "project_test"
+	setDefaultOCSessionStateForTest()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"primary-model","messages":[]}`))
 	rec := httptest.NewRecorder()
@@ -2588,11 +2583,7 @@ func TestClaudeHandler_TransportError502(t *testing.T) {
 	httpClient = &http.Client{Transport: &errorTransport{}}
 	defer func() { httpClient = oldClient }()
 
-	ocOnce = sync.Once{}
-	ocOnce.Do(func() {})
-	ocClientVer = "test"
-	ocSessionID = "ses_test"
-	ocProjectID = "project_test"
+	setDefaultOCSessionStateForTest()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"primary-model","messages":[]}`))
 	rec := httptest.NewRecorder()
@@ -2619,11 +2610,7 @@ func TestResponsesHandler_TransportError502(t *testing.T) {
 	httpClient = &http.Client{Transport: &errorTransport{}}
 	defer func() { httpClient = oldClient }()
 
-	ocOnce = sync.Once{}
-	ocOnce.Do(func() {})
-	ocClientVer = "test"
-	ocSessionID = "ses_test"
-	ocProjectID = "project_test"
+	setDefaultOCSessionStateForTest()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"primary-model","input":[]}`))
 	rec := httptest.NewRecorder()
