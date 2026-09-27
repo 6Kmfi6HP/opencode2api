@@ -322,7 +322,7 @@ func TestAnthropicSSEToChatStream(t *testing.T) {
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, true)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, true, nil, nil)
 	})
 
 	// role 首块。
@@ -360,7 +360,7 @@ func TestAnthropicSSEToChatStream_ToolUseInitialInputFallback(t *testing.T) {
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false, nil, nil)
 	})
 	// 首块:arguments 应为空(不等 initial,避免与后续 delta 拼接)。
 	// JSON 字段序由 map 序列化决定,这里只断言关键 token 同时存在。
@@ -383,7 +383,7 @@ func TestAnthropicSSEToChatStream_ToolUseInitialInputNotDoubledWhenDeltaArrives(
 		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false, nil, nil)
 	})
 	// delta 到达 → initial 必须被抑制;只能看到 delta 碎片,不能出现 initial 内容。
 	if strings.Contains(body, `{\"k\":\"v\"}`) {
@@ -404,7 +404,7 @@ func TestAnthropicSSEToChatStream_ToolUseEmptyInputFallback(t *testing.T) {
 		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false, nil, nil)
 	})
 	// start 块仍先流 "arguments":""(不为空 initial 单独 emit),stop 兜底补 "{}"。
 	if !strings.Contains(body, `"arguments":""`) {
@@ -717,7 +717,7 @@ func TestAnthropicSSEToChatStream_DropsReasoningWhenDisabled(t *testing.T) {
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false, nil, nil)
 	})
 	if strings.Contains(body, "secret") {
 		t.Fatalf("reasoning leaked: %s", body)
