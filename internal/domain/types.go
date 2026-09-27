@@ -284,6 +284,9 @@ type ResponsesTool struct {
 	Authorization   string         `json:"authorization,omitempty"`
 	AllowedTools    []string       `json:"allowed_tools,omitempty"`
 	RequireApproval any            `json:"require_approval,omitempty"`
+	// Tools 仅在 type=="namespace" 时出现（Responses namespace 工具，子工具为
+	// 命名空间内 function，如 codex 的 multi_agent_v1.spawn_agent）。
+	Tools []ResponsesTool `json:"tools,omitempty"`
 }
 
 type ReasonEffort struct {

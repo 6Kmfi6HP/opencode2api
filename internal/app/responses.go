@@ -203,6 +203,9 @@ func responsesInputToMessages(input any, instructions string) []Message {
 // 无对应 function 形状，由 responsesToolFunction 返回 ok=false，此处丢弃并
 // 日志计数；若 tool_choice 指向被丢弃的工具，由调用方 normalizeToolChoiceWithTools
 // 兜底为不传。
+// namespace 工具（codex multi_agent_v1 等）按 <namespace>.<name> 展平为 function
+// 工具对下游可见，同时对每个非空子工具单独登记无前缀别名（spawn_agent 等），
+// 供 toolCallOutputType 在下游不按前缀回调时仍能还原 custom_tool_call。
 // ======== tool_use/tool_result 配对归一化（Responses→Anthropic 组装前） ========
 
 // messageTextContent 从 Chat content（纯字符串或多模态 parts 数组）提取可见文本。
@@ -410,13 +413,24 @@ func normalizeAnthropicToolPairing(messages []Message) []Message {
 
 func convertResponsesTools(tools []ResponsesTool) []Tool {
 	converted := make([]Tool, 0, len(tools))
+	seen := make(map[string]bool, len(tools))
 	dropped := 0
 	for _, tool := range tools {
+		if tool.Type == "namespace" {
+			for _, fn := range namespaceToolFunctions(tool, seen) {
+				converted = append(converted, Tool{Type: "function", Function: fn})
+			}
+			continue
+		}
 		fn, ok := responsesToolFunction(tool)
-		if !ok {
+		if !ok || fn.Name == "" {
 			dropped++
 			continue
 		}
+		if seen[fn.Name] {
+			continue
+		}
+		seen[fn.Name] = true
 		converted = append(converted, Tool{Type: "function", Function: fn})
 	}
 	if dropped > 0 {
@@ -544,6 +558,40 @@ func responsesToolFunction(tool ResponsesTool) (ToolFunction, bool) {
 	}
 }
 
+// namespaceToolFunctions 把 Responses namespace 工具（codex multi_agent_v1 等）
+// 展平为 Chat Completions function 工具：名称保持纯子工具名（回放时经 kinds
+// 还原 namespace 字段），描述前追加所属命名空间提示。seen 为已登记名字集合，
+// 先到先赢（顶层同名工具优先），避免名字冲突时两套 schema 漂移。
+func namespaceToolFunctions(tool ResponsesTool, seen map[string]bool) []ToolFunction {
+	if tool.Type != "namespace" || tool.Name == "" {
+		return nil
+	}
+	var out []ToolFunction
+	for _, sub := range tool.Tools {
+		if sub.Name == "" || seen[sub.Name] {
+			continue
+		}
+		seen[sub.Name] = true
+		desc := "Namespace: " + tool.Name + "."
+		if sub.Description != "" {
+			desc += " " + sub.Description
+		} else if tool.Description != "" {
+			desc += " " + tool.Description
+		}
+		params := sub.Parameters
+		if params == nil {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		out = append(out, ToolFunction{
+			Name:        sub.Name,
+			Description: desc,
+			Parameters:  params,
+			Strict:      new(bool), // 显式 false：部分上游缺省按 strict=true 校验
+		})
+	}
+	return out
+}
+
 func responsesToolName(tool ResponsesTool) string {
 	switch tool.Type {
 	case "function":
@@ -560,14 +608,35 @@ func responsesToolName(tool ResponsesTool) string {
 	}
 }
 
+// responsesToolKindMap 构建 输出名 → 回放类型 的映射。
+// namespace 子工具登记 "namespace:<ns>"（回放为 function_call + namespace 字段，
+// 名称还原为纯子工具名）；顶层工具登记其自身类型。顶层与 namespace 子工具同名
+// 时先到先赢，与 convertResponsesTools 保持一致。
 func responsesToolKindMap(tools []ResponsesTool) map[string]string {
 	kinds := make(map[string]string, len(tools))
 	for _, tool := range tools {
+		if tool.Type == "namespace" {
+			if tool.Name == "" {
+				continue
+			}
+			for _, sub := range tool.Tools {
+				name := responsesToolName(sub)
+				if name == "" {
+					continue
+				}
+				if _, exists := kinds[name]; !exists {
+					kinds[name] = "namespace:" + tool.Name
+				}
+			}
+			continue
+		}
 		name := responsesToolName(tool)
 		if name == "" {
 			continue
 		}
-		kinds[name] = tool.Type
+		if _, exists := kinds[name]; !exists {
+			kinds[name] = tool.Type
+		}
 	}
 	return kinds
 }
@@ -591,6 +660,14 @@ func toolCallOutputType(name string, kinds map[string]string) string {
 	default:
 		return "function_call"
 	}
+}
+
+// splitNamespaceKind 把 kinds 里的 "namespace:<ns>" 值拆出命名空间名。
+func splitNamespaceKind(kind string) (string, bool) {
+	if ns, ok := strings.CutPrefix(kind, "namespace:"); ok && ns != "" {
+		return ns, true
+	}
+	return "", false
 }
 
 // normalizeToolChoiceWithTools 在 convertResponsesToolChoice 结果上兜底：
@@ -622,7 +699,7 @@ func normalizeToolChoiceWithTools(choice any, tools []Tool) any {
 	return nil
 }
 
-func convertResponsesToolChoice(choice any) any {
+func convertResponsesToolChoice(choice any, tools []ResponsesTool) any {
 	if choice == nil {
 		return nil
 	}
@@ -631,11 +708,26 @@ func convertResponsesToolChoice(choice any) any {
 		return choice
 	}
 	if choiceMap["type"] == "function" {
-		if name, ok := choiceMap["name"].(string); ok && name != "" {
-			return map[string]any{
-				"type":     "function",
-				"function": map[string]any{"name": name},
+		name, _ := choiceMap["name"].(string)
+		if name == "" {
+			return choice
+		}
+		// namespace 子工具的 tool_choice（{"type":"function","namespace":"ns",
+		// "name":"ns.tool" 或裸 "tool"}）规范为裸子工具名：上行 tools 已按裸名
+		// 展平。带有 "+" 等非法字符的点分名直接剥前缀；其余（如 MCP 名带点）
+		// 保守保留原名，由 normalizeToolChoiceWithTools 兜底丢弃无法匹配的。
+		if nsField, _ := choiceMap["namespace"].(string); nsField != "" {
+			name = strings.TrimPrefix(name, nsField+".")
+		} else if dot := strings.IndexByte(name, '.'); dot > 0 {
+			if _, exists := responsesToolKindMap(tools)[name]; !exists {
+				if _, isNS := splitNamespaceKind(responsesToolKindMap(tools)[name[dot+1:]]); isNS {
+					name = name[dot+1:]
+				}
 			}
+		}
+		return map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": name},
 		}
 	}
 	if choiceType, ok := choiceMap["type"].(string); ok {
@@ -834,15 +926,26 @@ func buildResponseToolCallItem(tc ToolCall, outputType string) map[string]any {
 		}
 		return item
 	default:
-		return map[string]any{
-			"id":        "fc_" + tc.ID,
-			"type":      "function_call",
-			"status":    "completed",
-			"arguments": tc.Function.Arguments,
-			"call_id":   tc.ID,
-			"name":      tc.Function.Name,
-		}
+		return buildFunctionCallItem(tc.ID, tc.Function.Name, tc.Function.Arguments, "")
 	}
+}
+
+// buildFunctionCallItem 构造 Responses function_call 输出项；namespace 非空时
+// 附加 namespace 字段（codex 多代理/MCP 命名空间工具的路由键，见
+// codex-rs protocol ResponseItem::FunctionCall.namespace）。
+func buildFunctionCallItem(callID, name, arguments, namespace string) map[string]any {
+	item := map[string]any{
+		"id":        "fc_" + callID,
+		"type":      "function_call",
+		"status":    "completed",
+		"arguments": arguments,
+		"call_id":   callID,
+		"name":      name,
+	}
+	if namespace != "" {
+		item["namespace"] = namespace
+	}
+	return item
 }
 
 func cloneJSONValue[T any](value T) T {
@@ -1273,6 +1376,17 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if upstreamProto == upstreamProtocolResponses {
 		slog.Info("responses passthrough (remembered)",
 			"model_in", modelIn, "model", respReq.Model, "stream", respReq.Stream)
+		// 原生 /responses 透传:顶层 cache_control 不是合法 Responses 字段,只注入
+		// prompt_cache_key/retention（Console 等上游对未知顶层参数整包 400)。
+		body = applyResponsesCacheHintsToRawBody(body, respReq.Model, r.Context())
+		if cacheDebugEnabled() {
+			var m map[string]any
+			if err := json.Unmarshal(body, &m); err == nil {
+				if v, ok := m["prompt_cache_key"]; ok {
+					slog.Info("cache_debug_passthrough_body", "model", respReq.Model, "prompt_cache_key_present", v != "")
+				}
+			}
+		}
 		if forwardNativeResponses(r.Context(), w, auth, respReq.Model, body, respReq.Stream, respReq) {
 			return
 		}
@@ -1321,7 +1435,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if respReq.ToolChoice != nil {
 		// normalizeToolChoiceWithTools 兜底：tool_choice 指向被丢弃的服务端
 		// 工具时改为不传，避免上游因引用不存在的 function 而 400。
-		chatReq.ToolChoice = normalizeToolChoiceWithTools(convertResponsesToolChoice(respReq.ToolChoice), chatReq.Tools)
+		chatReq.ToolChoice = normalizeToolChoiceWithTools(convertResponsesToolChoice(respReq.ToolChoice, respReq.Tools), chatReq.Tools)
 	}
 	if respReq.ParallelToolCalls != nil {
 		if chatReq.ExtraBody == nil {
@@ -1478,6 +1592,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	upstreamBody := buildUpstreamBody(&chatReq)
+	upstreamBody = applyCacheHintsToRawBodyWithContext(upstreamBody, chatReq.Model, r.Context())
 
 	if respReq.Stream {
 		upResp, status, _, err := callOpenCodeAPIStream(r.Context(), upstreamBody, chatReq.Model, auth)
@@ -1487,6 +1602,27 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			if upResp != nil {
 				transErrBody, _ = io.ReadAll(upResp)
 				upResp.Close()
+			}
+			// 上游明确把顶层 cache_control 判为未知参数：剥离后重发一次
+			// （prompt_cache_key/retention 保留），并记住该模型不再注入。
+			if rc, st, rerr := retryChatCompletionsWithoutCacheControl(r.Context(), upstreamBody, chatReq.Model, auth, status, transErrBody, true); rc != nil || rerr != nil || st != 0 {
+				if rerr == nil && st >= 200 && st < 300 {
+					defer rc.Close()
+					resp := &http.Response{
+						StatusCode: st,
+						Body:       rc,
+						Header:     make(http.Header),
+					}
+					responsesStreamHandler(w, r, resp, chatReq.Model, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice, respReq)
+					return
+				}
+				if rerr != nil {
+					writeUpstreamError(w, st, rerr, "responses")
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(st)
+				return
 			}
 			// 翻译路径失败：探测上游原生 responses，成功则透传并记住该模型。
 			// 类型化转换错误（上游有明确错误信息）不探测，原样返回。
@@ -1514,6 +1650,26 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
+	if err != nil || status < 200 || status >= 300 {
+		// 上游明确把顶层 cache_control 判为未知参数：剥离后重发一次
+		// （prompt_cache_key/retention 保留），并记住该模型不再注入。
+		if rc, st, rerr := retryChatCompletionsWithoutCacheControl(r.Context(), upstreamBody, chatReq.Model, auth, status, respBody, false); rc != nil || rerr != nil || st != 0 {
+			if rerr == nil && st >= 200 && st < 300 {
+				respBody, _ = io.ReadAll(rc)
+				rc.Close()
+				status = st
+				err = nil
+			} else {
+				if rerr != nil {
+					writeUpstreamError(w, st, rerr, "responses")
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(st)
+				}
+				return
+			}
+		}
+	}
 	if err != nil || status < 200 || status >= 300 {
 		// 翻译路径失败：探测上游原生 responses，成功则透传并记住该模型。
 		// 类型化转换错误（上游有明确错误信息）不探测，原样返回。
@@ -1781,6 +1937,9 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			itemType = "function_call"
 		}
 		item := buildResponseToolCallItem(ToolCall{ID: callID, Function: FunctionCall{Name: name, Arguments: args}}, itemType)
+		if ns, _ := call["namespace"].(string); ns != "" && itemType == "function_call" {
+			item["namespace"] = ns
+		}
 		item["status"] = itemStatus
 		writeSSEEvent(w, flusher, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
@@ -1910,6 +2069,12 @@ loop:
 								choice, _ := choices[0].(map[string]any)
 								delta, _ := choice["delta"].(map[string]any)
 								finishReason, _ := choice["finish_reason"].(string)
+								if delta != nil {
+									// Hoist OpenRouter-style reasoning /
+									// reasoning_details into reasoning_content so
+									// the reasoning_summary branch below sees it.
+									normalizeReasoningContent(delta)
+								}
 								if finishReason != "" {
 									stats.FinishReason = finishReason
 									stats.SawFinish = true
@@ -2035,7 +2200,7 @@ loop:
 											}
 											fn, _ := tc["function"].(map[string]any)
 											name, _ := fn["name"].(string)
-											itemType := toolCallOutputType(name, toolKinds)
+											ns, _ := splitNamespaceKind(toolKinds[name])
 											call = map[string]any{
 												"output_index": outputIndex,
 												"item_id":      "fc_" + callID,
@@ -2043,28 +2208,38 @@ loop:
 												"name":         name,
 												"arguments":    "",
 												"done":         false,
-												"item_type":    itemType,
+												"item_type":    toolCallOutputType(name, toolKinds),
+												"namespace":    ns,
 											}
 											toolCalls[upstreamIndex] = call
 											toolOrder = append(toolOrder, upstreamIndex)
 											seq++
+											addedItem := map[string]any{
+												"id":        call["item_id"],
+												"type":      call["item_type"],
+												"status":    "in_progress",
+												"arguments": "",
+												"call_id":   callID,
+												"name":      name,
+											}
+											if ns != "" {
+												addedItem["namespace"] = ns
+											}
 											writeSSEEvent(w, flusher, "response.output_item.added", map[string]any{
 												"type":            "response.output_item.added",
 												"sequence_number": seq,
 												"output_index":    outputIndex,
-												"item": map[string]any{
-													"id":        call["item_id"],
-													"type":      itemType,
-													"status":    "in_progress",
-													"arguments": "",
-													"call_id":   callID,
-													"name":      name,
-												},
+												"item":            addedItem,
 											})
 										}
 										fn, _ := tc["function"].(map[string]any)
 										if name, _ := fn["name"].(string); name != "" {
 											call["name"] = name
+											if call["namespace"] == "" {
+												if ns, ok := splitNamespaceKind(toolKinds[name]); ok {
+													call["namespace"] = ns
+												}
+											}
 											if call["item_type"] == "function_call" {
 												call["item_type"] = toolCallOutputType(name, toolKinds)
 											}
@@ -2230,6 +2405,7 @@ loop:
 	}
 
 	if totalUsage != nil {
+		logCacheDebugUsage("responses", model, totalUsage)
 		statsx.RecordChatUsage(model, totalUsage)
 	}
 
@@ -2328,7 +2504,11 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		})
 	}
 	for _, tc := range toolCalls {
+		kind := toolKinds[tc.Function.Name]
 		item := buildResponseToolCallItem(tc, toolCallOutputType(tc.Function.Name, toolKinds))
+		if ns, ok := splitNamespaceKind(kind); ok {
+			item["namespace"] = ns
+		}
 		item["status"] = status
 		output = append(output, item)
 	}

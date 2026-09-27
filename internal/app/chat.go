@@ -2,6 +2,8 @@ package app
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
@@ -247,8 +250,38 @@ func cleanNulls(m map[string]any) {
 	}
 }
 
+// normalizeReasoningContent hoists OpenRouter-style reasoning into the
+// canonical reasoning_content slot so every downstream consumer (chat / claude
+// / responses converters and the stream stats) sees it. Sources checked, in
+// order: existing reasoning_content, delta.reasoning (plain string), and
+// reasoning_details[].text (typed array). Existing reasoning_content wins so
+// we never clobber an upstream that already uses the canonical field.
+func normalizeReasoningContent(fields map[string]any) {
+	if rc, _ := fields["reasoning_content"].(string); rc != "" {
+		return
+	}
+	if r, _ := fields["reasoning"].(string); r != "" {
+		fields["reasoning_content"] = r
+		return
+	}
+	if details, ok := fields["reasoning_details"].([]any); ok {
+		var sb strings.Builder
+		for _, d := range details {
+			if m, ok := d.(map[string]any); ok {
+				if t, _ := m["text"].(string); t != "" {
+					sb.WriteString(t)
+				}
+			}
+		}
+		if sb.Len() > 0 {
+			fields["reasoning_content"] = sb.String()
+		}
+	}
+}
+
 // precedes tool calls is left alone when keepReasoning is true.
 func promoteMisplacedReasoning(fields map[string]any, keepReasoning bool) bool {
+	normalizeReasoningContent(fields)
 	rc, _ := fields["reasoning_content"].(string)
 	if rc == "" {
 		return false
@@ -272,6 +305,11 @@ func promoteMisplacedReasoning(fields map[string]any, keepReasoning bool) bool {
 }
 
 func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
+	// Hoist OpenRouter-style reasoning / reasoning_details into
+	// reasoning_content BEFORE any keepReasoning handling so the downstream
+	// converters (and the keepReasoning delete below) operate on the canonical
+	// field.
+	normalizeReasoningContent(delta)
 	_ = promoteMisplacedReasoning(delta, keepReasoning)
 	if v, ok := delta["content"]; ok && v == nil {
 		delete(delta, "content")
@@ -743,7 +781,11 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		combinedModels = models
 	}
-	allModels := replaceModelIDsWithAliases(combinedModels, aliases)
+	// 只有 public（无 key）路由把免费模型剥皮成裸名展示，与 resolveModel 的
+	// 裸名→xxx-free 反向映射配套。API key 用户看到的是上游真实 ID，不要隐藏
+	// -free 后缀，否则用户无法在目录里看到并直接选用免费变体。
+	stripFreeSuffix := auth.Mode == AuthRoutePublic
+	allModels := replaceModelIDsWithAliases(combinedModels, aliases, stripFreeSuffix)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
@@ -752,7 +794,9 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func replaceModelIDsWithAliases(models []ModelInfo, aliases map[string]string) []ModelInfo {
+// stripFreeSuffix 为 true 时，未配别名的免费模型以剥掉 "-free" 的裸名展示
+// （pure public 展示契约）；false 时按上游真实 ID 原样展示。
+func replaceModelIDsWithAliases(models []ModelInfo, aliases map[string]string, stripFreeSuffix bool) []ModelInfo {
 	aliasesByUpstream := make(map[string][]string, len(aliases))
 	for alias, upstream := range aliases {
 		alias = strings.TrimSpace(alias)
@@ -771,7 +815,11 @@ func replaceModelIDsWithAliases(models []ModelInfo, aliases map[string]string) [
 	for _, model := range models {
 		visibleIDs := aliasesByUpstream[model.ID]
 		if len(visibleIDs) == 0 {
-			visibleIDs = []string{publicFacingModelID(model.ID)}
+			visibleID := model.ID
+			if stripFreeSuffix {
+				visibleID = publicFacingModelID(model.ID)
+			}
+			visibleIDs = []string{visibleID}
 		}
 		for _, visibleID := range visibleIDs {
 			if _, exists := seen[visibleID]; exists {
@@ -1188,6 +1236,283 @@ func buildUpstreamBody(req *OpenAIRequest) []byte {
 		slog.Error("marshal upstream body failed", "error", err)
 	}
 	return b
+}
+
+// buildUpstreamBodyFromClaude 把 Claude Messages 请求经 chat 转换后构建
+// 上游请求体,并把 Claude 侧显式 cache_control 断点按文本/工具名重放到转
+// 换结果上(GLM/Zhipu 等拒绝该字段的模型除外;幂等)。
+func buildUpstreamBodyFromClaude(chatReq *OpenAIRequest, claudeReq ClaudeRequest) []byte {
+	body := buildUpstreamBody(chatReq)
+	return applyClaudeCacheBreakpointsToChatBody(body, claudeReq)
+}
+
+// derivePromptCacheKey 从请求上下文里的 client x-opencode-session 派生稳定
+// 的 prompt_cache_key（上游按该 key 温缓存,跨轮 inherited prefix 命中率更高)。
+// 客户端已显式传 prompt_cache_key 时不覆盖。没拿到 session 则回落 upstream
+// session ID,仍能跨同进程代理请求命中同一会话前缀。
+func derivePromptCacheKey(ctx context.Context, modelID string) string {
+	if session := strings.TrimSpace(sessionFromRequestContext(ctx, "")); session != "" {
+		return "oc2api:" + session
+	}
+	if state := ocSessionState.Load(); state != nil && state.sessionID != "" {
+		return "oc2api:" + state.sessionID
+	}
+	return ""
+}
+
+// applyCacheHintsToRawBody 对已 marshal 的上游请求体（raw JSON bytes）注入
+// 缓存提示。等价于 applyCacheHintsToRawBodyWithContext + cacheControl=true。
+func applyCacheHintsToRawBody(body []byte, modelID string) []byte {
+	return applyCacheHintsToRawBodyOpts(body, modelID, nil, true)
+}
+
+// applyCacheHintsToRawBodyWithContext 注入 retention + 顶层 cache_control,并在
+// 缺省时补一个从 client session 派生的稳定 prompt_cache_key。
+// 用于 chat-completions 翻译路径以及上游按 chat schema 接收的请求体。
+func applyCacheHintsToRawBodyWithContext(body []byte, modelID string, ctx context.Context) []byte {
+	return applyCacheHintsToRawBodyOpts(body, modelID, ctx, true)
+}
+
+// applyResponsesCacheHintsToRawBody 用于原生 /responses 透传：注入 retention 和
+// session 派生的 prompt_cache_key，但不注入顶层 cache_control（不是合法
+// Responses API 字段,Console 等上游会以 unknown parameter 整包 400)。
+func applyResponsesCacheHintsToRawBody(body []byte, modelID string, ctx context.Context) []byte {
+	return applyCacheHintsToRawBodyOpts(body, modelID, ctx, false)
+}
+
+// applyCacheHintsToRawBodyOpts 对已 marshal 的上游请求体（raw JSON bytes）注入
+// prompt_cache_retention 和 prompt_cache_key（尊重现有字段）; enableCacheControl
+// 为 true 且模型不拒绝该字段时追加顶层 cache_control breakpoint（已知 GLM/Zhipu
+// 等拒绝该字段的模型除外）。用于原生透传与翻译路径的 post-marshal 注入。
+func applyCacheHintsToRawBodyOpts(body []byte, modelID string, ctx context.Context, enableCacheControl bool) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	changed := false
+	if retention := config.PromptCacheRetention(); retention != "" && retention != "off" {
+		if _, exists := m["prompt_cache_retention"]; !exists {
+			m["prompt_cache_retention"] = retention
+			changed = true
+		}
+	}
+	if _, exists := m["prompt_cache_key"]; !exists {
+		if key := derivePromptCacheKey(ctx, modelID); key != "" {
+			m["prompt_cache_key"] = key
+			changed = true
+		}
+	}
+	if enableCacheControl && config.CacheBreakpoints() && !rejectsCacheControl(modelID) {
+		if _, exists := m["cache_control"]; !exists {
+			m["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// isTopLevelCacheControlRejection 识别上游对顶层 cache_control 参数的 schema 拒绝
+// (Console 等按严格 schema 校验的上游会返回 unknown parameter / Extra inputs /
+// Unrecognized field 之类错误)。仅针对顶层参数本身的拒绝（param/cache_control
+// 出现在顶层 error），不把消息内部的文本回显误判为参数拒绝。
+func isTopLevelCacheControlRejection(errBody []byte) bool {
+	var raw map[string]any
+	if json.Unmarshal(errBody, &raw) != nil {
+		return false
+	}
+	em, ok := raw["error"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if p, _ := em["param"].(string); p == "cache_control" {
+		return true
+	}
+	msg, _ := em["message"].(string)
+	msgLower := strings.ToLower(msg)
+	if !strings.Contains(msgLower, "cache_control") {
+		return false
+	}
+	return strings.Contains(msgLower, "unknown parameter") ||
+		strings.Contains(msgLower, "extra inputs") ||
+		strings.Contains(msgLower, "unrecognized field") ||
+		strings.Contains(msgLower, "unsupported parameter") ||
+		strings.Contains(msgLower, "not permitted") ||
+		strings.Contains(msgLower, "unknown field")
+}
+
+// stripTopLevelCacheControl 删除顶层 cache_control 键（message content block 内部
+// 的 cache_control 不动——响应侧含缓存统计的场景里上游能容忍；仅顶层参数被称为
+// unknown parameter)。返回是否删除过字段，供上层决定是否值得重发。
+func stripTopLevelCacheControl(body []byte) ([]byte, bool) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body, false
+	}
+	if _, exists := m["cache_control"]; !exists {
+		return body, false
+	}
+	delete(m, "cache_control")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+// cacheControlRejections 记录已命中顶层 cache_control 拒绝的模型,命中后同进程
+// 不再为该模型注入顶层 cache_control（一次性事后学习，重启清零)。
+var cacheControlRejections sync.Map // modelID -> struct{}
+
+func markCacheControlRejected(modelID string) {
+	if strings.TrimSpace(modelID) == "" {
+		return
+	}
+	cacheControlRejections.Store(modelID, struct{}{})
+	if base, _ := stripContextSuffix(modelID); base != "" && base != modelID {
+		cacheControlRejections.Store(base, struct{}{})
+	}
+}
+
+func hasCacheControlRejected(modelID string) bool {
+	if _, ok := cacheControlRejections.Load(modelID); ok {
+		return true
+	}
+	if base, _ := stripContextSuffix(modelID); base != "" && base != modelID {
+		_, ok := cacheControlRejections.Load(base)
+		return ok
+	}
+	return false
+}
+
+// retryChatCompletionsWithoutCacheControl 在 400 且错误明确指向顶层
+// cache_control 时,剥离该字段后重发一次（prompt_cache_key/retention 保留,继续
+// 命中 zen 前缀缓存）。成功/失败都返回最终 (resp, status, err);不适用时返回
+// (nil, 0, nil)，调用方走原有错误路径。记住该模型以避免再次注入。
+func retryChatCompletionsWithoutCacheControl(ctx context.Context, body []byte, modelID string, auth UpstreamAuth, status int, errBody []byte, stream bool) (io.ReadCloser, int, error) {
+	if status != http.StatusBadRequest || !isTopLevelCacheControlRejection(errBody) {
+		return nil, 0, nil
+	}
+	stripped, ok := stripTopLevelCacheControl(body)
+	if !ok {
+		return nil, 0, nil
+	}
+	markCacheControlRejected(modelID)
+	slog.Warn("upstream rejected top-level cache_control, stripped and retrying once",
+		"model", modelID, "stream", stream)
+	if stream {
+		rc, st, _, err := callOpenCodeAPIStream(ctx, stripped, modelID, auth)
+		return rc, st, err
+	}
+	respBody, st, _, err := callOpenCodeAPI(ctx, stripped, modelID, auth)
+	if err != nil || st < 200 || st >= 300 {
+		return nil, st, err
+	}
+	return io.NopCloser(bytes.NewReader(respBody)), st, nil
+}
+
+// collectClaudeCacheTaggedTexts 提取所有显式带 cache_control 的 text 块内容
+// (system blocks 和 message blocks), 用于把断点重放到转换后的 chat 消息上。
+func collectClaudeCacheTaggedTexts(claudeReq ClaudeRequest) map[string]struct{} {
+	tagged := map[string]struct{}{}
+	if sys, ok := claudeReq.System.([]any); ok {
+		for _, item := range sys {
+			if block, ok := item.(map[string]any); ok {
+				if block["type"] == "text" && block["cache_control"] != nil {
+					if t, _ := block["text"].(string); t != "" {
+						tagged[t] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	for _, msg := range claudeReq.Messages {
+		if content, ok := msg.Content.([]any); ok {
+			for _, item := range content {
+				if block, ok := item.(map[string]any); ok {
+					if block["type"] == "text" && block["cache_control"] != nil {
+						if t, _ := block["text"].(string); t != "" {
+							tagged[t] = struct{}{}
+						}
+					}
+				}
+			}
+		}
+	}
+	return tagged
+}
+
+// applyClaudeCacheBreakpointsToChatBody 在 buildUpstreamBody 产出的序列化
+// 请求体上把 Claude 侧显式 cache_control 移植回来:text 内容匹配时在该消
+// 息/content part 上标注断点,工具按名字在 tool.function 上标注。幂等;对
+// 拒绝 cache_control 的模型(GLM/Zhipu)跳过。
+func applyClaudeCacheBreakpointsToChatBody(body []byte, claudeReq ClaudeRequest) []byte {
+	if !config.CacheBreakpoints() || rejectsCacheControl(claudeReq.Model) {
+		return body
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	taggedTexts := collectClaudeCacheTaggedTexts(claudeReq)
+	mark := func(mm map[string]any) {
+		if _, ok := mm["cache_control"]; !ok {
+			mm["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
+		}
+	}
+	if len(taggedTexts) > 0 {
+		if msgs, ok := m["messages"].([]any); ok {
+			for _, im := range msgs {
+				mm, ok := im.(map[string]any)
+				if !ok {
+					continue
+				}
+				switch c := mm["content"].(type) {
+				case string:
+					if _, hit := taggedTexts[c]; hit {
+						mark(mm)
+					}
+				case []any:
+					for _, p := range c {
+						if pm, ok := p.(map[string]any); ok {
+							if t, _ := pm["text"].(string); t != "" {
+								if _, hit := taggedTexts[t]; hit {
+									mark(pm)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, ct := range claudeReq.Tools {
+		if ct.CacheControl == nil {
+			continue
+		}
+		if tools, ok := m["tools"].([]any); ok {
+			for _, it := range tools {
+				tm, ok := it.(map[string]any)
+				if !ok {
+					continue
+				}
+				if fn, ok := tm["function"].(map[string]any); ok && fn["name"] == ct.Name {
+					mark(tm)
+				}
+			}
+		}
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // same output. An empty id gets a random suffix (callers should cache).

@@ -34,7 +34,10 @@ type launchFlags struct {
 	port           int
 	debug          bool
 	showVer        bool
-	extraArgs      []string
+	// codexNoModelCatalog 为 true 时不向 codex 注入临时 model_catalog_json,
+	// 让用户 config.toml 中的 catalog 生效（保留 spawn_agent 等 namespace 工具）。
+	codexNoModelCatalog bool
+	extraArgs           []string
 }
 
 // newLaunchFlagSet parses the flags shared by `opencode2api launch claude` and
@@ -50,6 +53,12 @@ func newLaunchFlagSet(tool string, args []string) launchFlags {
 	fs.IntVar(&f.port, "port", 0, "port to bind; 0 = random")
 	fs.BoolVar(&f.debug, "debug", false, "enable debug logs")
 	fs.BoolVar(&f.showVer, "version", false, "print version and exit")
+	// codex 专用：默认注入临时 model_catalog_json（来自 opencode 上游 modeldev),
+	// 但会覆盖用户 config.toml 中自己的 model_catalog_json,在 codex 0.156 上
+	// 会抑制 multi_agent_v1 namespace 工具的声明（codex 是否拿到 spawn_agent
+	// 取决于 catalog)。--no-model-catalog 可关掉注入。
+	fs.BoolVar(&f.codexNoModelCatalog, "no-model-catalog", false,
+		"codex: skip injecting the temporary model_catalog_json (keeps the user's own catalog, preserving namespace tools like spawn_agent)")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
@@ -202,13 +211,22 @@ func resolveLaunchModel(model string, extraArgs []string, extract func([]string)
 		base, _ := stripContextSuffix(modelID)
 		ctx = modelsdev.ContextWindow(base, catalog)
 		if contextSuffix {
-			if ctx >= 1000000 {
+			switch {
+			case isFreeModel(base):
+				// 免费变体（*-free）没有 1M 扩展档：上游对 "xxx-free[1m]" 一律
+				// 401 "Model not supported"。清掉 context 后缀走标准免费窗口，
+				// 保留 autoCompactWindow 即可。
+				modelID = base
+				if ctx > 0 {
+					autoCompactWindow = int(float64(ctx) * 0.9)
+				}
+			case ctx >= 1000000:
 				modelID = base + "[1m]"
 				autoCompactWindow = int(float64(ctx) * 0.9)
-			} else if ctx > 0 {
+			case ctx > 0:
 				modelID = base
 				autoCompactWindow = int(float64(ctx) * 0.9)
-			} else {
+			default:
 				modelID = base
 			}
 		} else {
@@ -235,9 +253,7 @@ func runLaunchChild(tool, path string, args, extraEnv []string, server *http.Ser
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	env := os.Environ()
-	env = append(env, extraEnv...)
-	cmd.Env = env
+	cmd.Env = buildChildProcessEnv(tool, os.Environ(), extraEnv)
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -332,17 +348,19 @@ func launchCodex(args []string) {
 	catalog := fetchLaunchCatalog()
 	modelID, extraArgs, _, _ := resolveLaunchModel(f.model, f.extraArgs, extractCodexModelFromExtraArgs, catalog, false)
 
-	specs := buildCodexModelCatalogSpecs(catalog, tierLabel(f.key) == "free")
 	var catalogPath string
 	var cleanup func()
-	if len(specs) > 0 {
-		writtenPath, err := writeCodexModelCatalog(specs)
-		if err != nil {
-			slog.Warn("failed to write launch codex model catalog", "error", err)
-		} else {
-			catalogPath = writtenPath
-			slog.Info("codex model catalog written", "path", catalogPath, "models", len(specs))
-			cleanup = func() { _ = os.RemoveAll(filepath.Dir(catalogPath)) }
+	if !f.codexNoModelCatalog {
+		specs := buildCodexModelCatalogSpecs(catalog, tierLabel(f.key) == "free")
+		if len(specs) > 0 {
+			writtenPath, err := writeCodexModelCatalog(specs)
+			if err != nil {
+				slog.Warn("failed to write launch codex model catalog", "error", err)
+			} else {
+				catalogPath = writtenPath
+				slog.Info("codex model catalog written", "path", catalogPath, "models", len(specs))
+				cleanup = func() { _ = os.RemoveAll(filepath.Dir(catalogPath)) }
+			}
 		}
 	}
 
@@ -487,6 +505,9 @@ type codexModelCatalogEntry struct {
 	SupportVerbosity              bool                       `json:"support_verbosity"`
 	TruncationPolicy              map[string]any             `json:"truncation_policy"`
 	ExperimentalSupportedTools    []any                      `json:"experimental_supported_tools"`
+	// MultiAgentVersion 显式声明多代理协议版本（codex features.multi_agent 开启时
+	// 据此声明 spawn_agent/wait_agent 等工具）。空值则不写字段。
+	MultiAgentVersion string `json:"multi_agent_version,omitempty"`
 }
 
 type codexModelCatalog struct {
@@ -559,6 +580,9 @@ func writeCodexModelCatalog(specs []codexModelCatalogSpec) (string, error) {
 				"limit": 10000,
 			},
 			ExperimentalSupportedTools: []any{},
+			// codex 0.156 的 features.multi_agent 默认走 multi_agent_v1；临时 catalog
+			// 缺省会抑制 spawn_agent 等命名空间工具的声明，这里显式声明 v1。
+			MultiAgentVersion: "v1",
 		}
 		if spec.ContextWindow > 0 {
 			entry.AutoCompactTokenLimit = int(float64(spec.ContextWindow) * 0.9)

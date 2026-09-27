@@ -130,7 +130,7 @@ Claude Code 客户端
 |------|---------|------|
 | 字符串 system | 提取为 system message | ✅ |
 | 数组 system（text blocks） | 合并为单个 system message（`\n` 连接） | ✅ |
-| system block 中的 `cache_control` | 丢弃，计入 `cache_control_blocks` | ✅ (正确忽略) |
+| system block 中的 `cache_control` | 重放到 Chat 上游对应 system message（`config.cache_control_breakpoints` 默认开启，GLM/Zhipu 跳过），同时计入 `cache_control_blocks` | ✅ (保留) |
 | Mid-conversation `role:system` message | 合并到 leading system message | ✅ |
 | Billing header 在 system prompt 中 | 作为文本保留在 system message 中 | ✅ (可接受) |
 
@@ -337,7 +337,7 @@ event: message_stop      → {type:"message_stop"}
 |------|---------|------|
 | 不认识的请求字段 | JSON unmarshal 自动忽略 | ✅ |
 | `context_management` | 解析到结构体，不转发 | ✅ |
-| `cache_control` | 丢弃，仅计数 | ✅ |
+| `cache_control` | 重放到 Chat 上游 text block / tool 上（按名称/内容匹配，GLM/Zhipu 跳过），并计入 `cache_control_blocks` | ✅ (保留) |
 | `anthropic-beta` header | 仅计数，不转发 | ✅ |
 | Server tools (web_search等) | 跳过，记入 `skipped_server_tools` | ✅ |
 | 不支持的 content block 类型 | 计入 `unsupported_blocks`，不阻止请求 | ✅ |
@@ -432,7 +432,7 @@ event: message_stop      → {type:"message_stop"}
 | Thinking signature 不伪造 | 无法伪造加密签名，正确策略 |
 | `signature_delta` 不发送 | 同上 |
 | `redacted_thinking` 请求历史丢弃 | 无法无损转换，正确策略 |
-| `cache_control` 丢弃 | OpenAI 上游不支持，正确忽略 |
+| `cache_control` 重放 | 支持 Anthropic 风格 breakpoint 的上游（GLM/Zhipu 除外）会收到 `cache_control` 与 `prompt_cache_retention: "24h"` 并命中缓存 | ⚠️ (条件保留) |
 | `anthropic-beta` header 不转发 | 上游是 OpenAI 格式，正确忽略 |
 | `context_management` 不转发 | 同上 |
 | Server tools 跳过 | 同上 |

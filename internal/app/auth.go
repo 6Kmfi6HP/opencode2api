@@ -167,10 +167,14 @@ func (auth UpstreamAuth) tier() TierType {
 }
 
 func (auth UpstreamAuth) authorizationHeader() string {
+	return "Bearer " + auth.apiKey()
+}
+
+func (auth UpstreamAuth) apiKey() string {
 	if auth.Mode == AuthRoutePublic {
-		return "Bearer public"
+		return "public"
 	}
-	return "Bearer " + auth.Token
+	return auth.Token
 }
 
 func (auth UpstreamAuth) shouldUseGoCatalog() bool {

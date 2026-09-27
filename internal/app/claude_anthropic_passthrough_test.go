@@ -181,4 +181,24 @@ func TestBuildOCRequestWithSubpath_Messages(t *testing.T) {
 	if req2.Header.Get("Accept") != "application/json" {
 		t.Fatalf("non-stream Accept = %q", req2.Header.Get("Accept"))
 	}
+
+	for _, tc := range []struct {
+		name string
+		auth UpstreamAuth
+		want string
+	}{
+		{"public", UpstreamAuth{Mode: AuthRoutePublic}, "public"},
+		{"auto", UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-validkey0123456789abcdef"}, "sk-validkey0123456789abcdef"},
+	} {
+		req, err := buildOCRequestWithSubpath("claude-x", map[string]any{"stream": true}, tc.auth, false, "https://upstream.test", "messages", "ses_test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := req.Header.Get("x-api-key"); got != tc.want {
+			t.Errorf("%s: x-api-key = %q, want %q", tc.name, got, tc.want)
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer "+tc.want {
+			t.Errorf("%s: Authorization = %q, want Bearer %q", tc.name, got, tc.want)
+		}
+	}
 }

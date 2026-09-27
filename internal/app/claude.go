@@ -993,6 +993,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	case upstreamProtocolAnthropic:
 		slog.Info("claude anthropic passthrough",
 			"model_in", modelIn, "model", claudeReq.Model, "stream", claudeReq.Stream, "via", protoSource)
+		body = applyCacheHintsToRawBodyWithContext(body, claudeReq.Model, r.Context())
 		if forwardClaudeViaAnthropic(r.Context(), w, auth, claudeReq.Model, body, claudeReq.Stream) {
 			return
 		}
@@ -1076,7 +1077,19 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	logging.PlanRequest(r.Context(), plan)
 
-	upstreamBody := buildUpstreamBody(&chatReq)
+	upstreamBody := buildUpstreamBodyFromClaude(&chatReq, claudeReq)
+	upstreamBody = applyCacheHintsToRawBodyWithContext(upstreamBody, claudeReq.Model, r.Context())
+	if cacheDebugEnabled() {
+		var m map[string]any
+		if err := json.Unmarshal(upstreamBody, &m); err == nil {
+			if v, ok := m["prompt_cache_key"]; ok {
+				slog.Info("cache_debug_upstream_body", "model", chatReq.Model, "prompt_cache_key", v)
+			}
+			if v, ok := m["prompt_cache_retention"]; ok {
+				slog.Info("cache_debug_upstream_body", "model", chatReq.Model, "prompt_cache_retention", v)
+			}
+		}
+	}
 
 	if claudeReq.Stream {
 		upResp, status, _, err := callOpenCodeAPIStream(r.Context(), upstreamBody, chatReq.Model, auth)
@@ -1199,6 +1212,7 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 	reader := newStreamReader(ctx, respBody, keepaliveInterval)
 
 	defer func() {
+		logCacheDebugUsage("claude", model, fullUsage)
 		if len(fullUsage) > 0 {
 			statsx.RecordChatUsage(model, fullUsage)
 		}
@@ -1396,6 +1410,13 @@ loop:
 								choice, _ := choices[0].(map[string]any)
 								delta, _ := choice["delta"].(map[string]any)
 								finishReason, _ := choice["finish_reason"].(string)
+								if delta != nil {
+									// Hoist OpenRouter-style reasoning /
+									// reasoning_details into reasoning_content
+									// (chat upstream for e.g. mimo) so the
+									// thinking_delta branch below sees it.
+									normalizeReasoningContent(delta)
+								}
 								stats.NoteChunk()
 
 								ensureMessageStart()

@@ -787,3 +787,118 @@ func TestResponsesConvertChatUsageAddsCachedTokensWhenPromptDetailsLackIt(t *tes
 		})
 	}
 }
+
+// TestApplyResponsesCacheHintsSkipsTopLevelCacheControl 锁定回归：原生
+// /responses 透传路径不得注入顶层 cache_control（不是合法 OpenAI Responses
+// 字段,Console 等按严格 schema 校验的上游会以 unknown parameter 整包 400)。
+// prompt_cache_key/retention 仍注入,继续命中 zen 前缀缓存。
+func TestApplyResponsesCacheHintsSkipsTopLevelCacheControl(t *testing.T) {
+	base := []byte(`{"model":"muse-spark-1.3-contributor-free","input":[{"role":"user","content":"hi"}]}`)
+	out := applyResponsesCacheHintsToRawBody(base, "muse-spark-1.3-contributor-free", context.Background())
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["cache_control"]; ok {
+		t.Fatalf("responses passthrough must not inject top-level cache_control: %#v", m["cache_control"])
+	}
+	if _, ok := m["prompt_cache_retention"]; !ok {
+		t.Fatalf("responses passthrough keeps prompt_cache_retention: %#v", m)
+	}
+	// 没有 session 上下文时 prompt_cache_key 允许缺省。
+	if v, ok := m["prompt_cache_key"]; ok {
+		if s, _ := v.(string); s == "" {
+			t.Fatalf("prompt_cache_key must be non-empty when set: %#v", v)
+		}
+	}
+}
+
+// TestApplyCacheHintsMarkedRejectedModel 锁定:命中过顶层 cache_control 拒绝的
+// 模型在后续请求里不再被注入该字段（一次性事后学习)。
+func TestApplyCacheHintsMarkedRejectedModel(t *testing.T) {
+	model := "muse-spark-1.3-contributor-free"
+	markCacheControlRejected(model)
+	t.Cleanup(func() {
+		cacheControlRejections.Delete(model)
+	})
+	if !hasCacheControlRejected(model) {
+		t.Fatal("markCacheControlRejected should be observable via hasCacheControlRejected")
+	}
+	if !hasCacheControlRejected(model + "[400k]") {
+		t.Fatal("context-suffix variant should share the rejection record")
+	}
+}
+
+// TestIsTopLevelCacheControlRejection 锁定 Console 等按严格 schema 校验的上游
+// 对顶层 cache_control 的多种错误文案,避免把消息内部文本回显误判为参数拒绝。
+func TestIsTopLevelCacheControlRejection(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"console unknown parameter", `{"error":{"code":null,"message":"Error from provider (Console): unknown parameter ` + "`cache_control`" + `","param":"cache_control","type":"invalid_request_error"}}`, true},
+		{"glm extra inputs", `{"error":{"message":"Extra inputs are not permitted: cache_control","type":"invalid_request_error"}}`, true},
+		{"unsupported parameter", `{"error":{"message":"Unsupported parameter: cache_control","type":"invalid_request_error"}}`, true},
+		{"message echo not a rejection", `{"error":{"message":"echo: cache_control looks fine","type":"server_error"}}`, false},
+		{"no cache_control mention", `{"error":{"message":"boom","type":"server_error"}}`, false},
+		{"non-json", `boom`, false},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTopLevelCacheControlRejection([]byte(tt.body)); got != tt.want {
+				t.Fatalf("isTopLevelCacheControlRejection = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestStripTopLevelCacheControl 仅剥顶层键，不动消息内部 block 上的
+// cache_control（响应侧 anthropic 风味统计等场景上游能容忍，仅顶层参数是
+// unknown parameter 的来源）。
+func TestStripTopLevelCacheControl(t *testing.T) {
+	body := []byte(`{"model":"m","cache_control":{"type":"ephemeral","ttl":"1h"},"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}`)
+	stripped, ok := stripTopLevelCacheControl(body)
+	if !ok {
+		t.Fatal("expected stripTopLevelCacheControl to report change")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(stripped, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := m["cache_control"]; exists {
+		t.Fatalf("top-level cache_control still present: %#v", m)
+	}
+	msgs, _ := m["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %#v", m["messages"])
+	}
+	msg, _ := msgs[0].(map[string]any)
+	content, _ := msg["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("content = %#v", msg["content"])
+	}
+	block, _ := content[0].(map[string]any)
+	if _, ok := block["cache_control"]; !ok {
+		t.Fatalf("per-block cache_control must be preserved: %#v", block)
+	}
+
+	// 没有顶层键时幂等返回原 body。
+	again, changed := stripTopLevelCacheControl([]byte(`{"model":"m"}`))
+	if changed {
+		t.Fatalf("no top-level key should report no change: %#v", string(again))
+	}
+}
+
+// TestRetryChatCompletionsWithoutCacheControl 非 400/非 cache_control 拒绝时
+// 不触发重发，避免把客户端本来就该看到的参数错误默默吞掉。
+func TestRetryChatCompletionsWithoutCacheControl_NoRetryOnUnrelated400(t *testing.T) {
+	right, st, err := retryChatCompletionsWithoutCacheControl(
+		context.Background(), []byte(`{"model":"m"}`), "m",
+		UpstreamAuth{}, http.StatusBadRequest,
+		[]byte(`{"error":{"message":"unrelated invalid_request_error","type":"invalid_request_error"}}`),
+		false)
+	if right != nil || st != 0 || err != nil {
+		t.Fatalf("unexpected retry: rc=%v status=%d err=%v", right, st, err)
+	}
+}

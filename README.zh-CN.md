@@ -239,7 +239,7 @@ opencode2api 还会根据当前可用上游模型生成一个临时 Codex model 
 
 `--` 之后的参数原样透传给选中的子 CLI，除了模型参数（Claude 的 `--model`；Codex 的 `--model` / `-m`）会被提取用于设置模型。
 
-Claude 工作原理：`ANTHROPIC_API_KEY` 携带 OpenCode key（`public`、`sk-…`、`go:…` 或 `zen:…`）。五个环境变量（`ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_HAIKU_MODEL`、`ANTHROPIC_SMALL_FAST_MODEL`）统一设为选中的模型 ID，避免 `[claude-code:unrecognized_model]` 警告。`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` 告知 Claude Code 由宿主机管理认证（跳过 OAuth/订阅登录窗口）。
+Claude 工作原理：`ANTHROPIC_API_KEY` 携带 OpenCode key（`public`、`sk-…`、`go:…` 或 `zen:…`）。启动器会替换继承的 `ANTHROPIC_API_KEY`，并移除继承的 Claude 认证替代变量（`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_OAUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_API_KEY`），确保子进程使用选中的 key。五个环境变量（`ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_HAIKU_MODEL`、`ANTHROPIC_SMALL_FAST_MODEL`）统一设为选中的模型 ID，避免 `[claude-code:unrecognized_model]` 警告。`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` 告知 Claude Code 由宿主机管理认证（跳过 OAuth/订阅登录窗口）。
 
 Codex 工作原理：代理服务地址为 `http://127.0.0.1:<port>/v1`，Codex 通过本次进程的临时 `model_providers.opencode2api` 配置使用 Responses wire API。仅子进程可见的 `OPENCODE2API_OPENAI_API_KEY` 携带 OpenCode key；代理读取 Authorization/x-api-key header 并按前缀路由——`go:` → go 层级、`zen:` → zen 层级、`sk-` → auto、`public` → free——自动选择正确的上游。
 
