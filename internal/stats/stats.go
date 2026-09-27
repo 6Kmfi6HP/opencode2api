@@ -378,6 +378,52 @@ func RecordKeyUsage(keyID string, status int, errMsg string) {
 	})
 }
 
+// RecordKeyCacheResult 在 selectPoolKey 已接管（keyID 非空）且单次尝试完成后
+// 调用，把缓存命中/未命中记到对应 key 上；cachedTokens<=0 视为 miss（含 0）。
+// 幂等：同一请求会被多次 attempt 时只应调用一次（由上游请求的最后一次决定）。现在调用
+// 方只来自 opencode.go 的成功分支（200-299）,原样写。
+func RecordKeyCacheResult(keyID string, cachedTokens int64) {
+	if keyID == "" {
+		return
+	}
+	tokenStatsMu.Lock()
+	ks, ok := tokenStats.Keys[keyID]
+	if !ok {
+		ks = &KeyStats{}
+		tokenStats.Keys[keyID] = ks
+	}
+	if cachedTokens > 0 {
+		ks.CacheHitRequests++
+	} else {
+		ks.CacheMissRequests++
+	}
+	total := ks.CacheHitRequests + ks.CacheMissRequests
+	if total > 0 {
+		ks.CacheHitRatio = float64(ks.CacheHitRequests) / float64(total)
+	}
+	tokenStatsMu.Unlock()
+
+	go persistTokenStatsDelta(func(cur *TokenStatsData) {
+		if cur.Keys == nil {
+			cur.Keys = map[string]*KeyStats{}
+		}
+		k, ok := cur.Keys[keyID]
+		if !ok {
+			k = &KeyStats{}
+			cur.Keys[keyID] = k
+		}
+		if cachedTokens > 0 {
+			k.CacheHitRequests++
+		} else {
+			k.CacheMissRequests++
+		}
+		t := k.CacheHitRequests + k.CacheMissRequests
+		if t > 0 {
+			k.CacheHitRatio = float64(k.CacheHitRequests) / float64(t)
+		}
+	})
+}
+
 // RecordCacheUsage aggregates upstream prompt-cache accounting per model.
 // Call it with the raw upstream usage map; zero/nil inputs are no-ops so
 // call sites don't need extra branching.
