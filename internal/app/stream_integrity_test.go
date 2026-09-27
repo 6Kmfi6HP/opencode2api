@@ -427,7 +427,7 @@ func TestResponsesStream_UsageOnlyEnd_SynthesizesCompleted(t *testing.T) {
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if hasEvent(events, "response.failed") {
 		t.Fatalf("must not emit response.failed on usage-terminated stream:\n%s", rr.Body.String())
@@ -448,7 +448,7 @@ func TestResponsesStream_DoneNoFinishWithUsage_SynthesizesCompleted(t *testing.T
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if hasEvent(events, "response.failed") {
 		t.Fatalf("must not emit response.failed on [DONE] with usage-terminated stream:\n%s", rr.Body.String())
@@ -465,7 +465,7 @@ func TestResponsesStream_PartialEOF_ResponseFailed(t *testing.T) {
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "response.failed") {
 		t.Fatalf("expected response.failed on partial EOF:\n%s", rr.Body.String())
@@ -500,7 +500,7 @@ func TestResponsesStream_InBandError_ResponseFailed(t *testing.T) {
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "response.failed") {
 		t.Fatalf("expected response.failed on in-band error:\n%s", rr.Body.String())
@@ -516,7 +516,7 @@ func TestResponsesStream_ReaderError_ResponseFailed(t *testing.T) {
 	}
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: er, Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "response.failed") {
 		t.Fatalf("expected response.failed on reader error:\n%s", rr.Body.String())
@@ -535,7 +535,7 @@ func TestResponsesStream_DoneNoFinish_ResponseFailed(t *testing.T) {
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "response.failed") {
 		t.Fatalf("expected response.failed on [DONE] without finish:\n%s", rr.Body.String())
@@ -554,7 +554,7 @@ func TestResponsesStream_BadJSON_ResponseFailed(t *testing.T) {
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "response.failed") {
 		t.Fatalf("expected response.failed on bad JSON:\n%s", rr.Body.String())
@@ -575,7 +575,7 @@ func TestResponsesStream_NormalFinish(t *testing.T) {
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if hasEvent(events, "response.failed") {
 		t.Fatalf("must not emit response.failed on normal finish:\n%s", rr.Body.String())
@@ -596,7 +596,7 @@ func TestResponsesStream_LengthFinish_Incomplete(t *testing.T) {
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if hasEvent(events, "response.failed") {
 		t.Fatalf("must not emit response.failed on length finish:\n%s", rr.Body.String())
@@ -623,7 +623,7 @@ func TestResponsesStream_FinishNoTrailingNewline_EOF(t *testing.T) {
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if hasEvent(events, "response.failed") {
 		t.Fatalf("must not emit response.failed when finish chunk has no trailing newline:\n%s", rr.Body.String())
@@ -640,7 +640,7 @@ func TestResponsesStream_PartialDeltaThenReaderError(t *testing.T) {
 	}
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: er, Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	body := rr.Body.String()
 	// The partial delta should be present (as output_text.delta)
 	if !strings.Contains(body, "partial delta") {
@@ -724,7 +724,7 @@ func TestResponsesStream_FinishThenInBandError(t *testing.T) {
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "response.failed") {
 		t.Fatalf("expected response.failed after finish+in-band error: %s", rr.Body.String())
@@ -749,7 +749,7 @@ func TestResponsesStream_FinishThenReaderError(t *testing.T) {
 	}
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: er, Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "response.failed") {
 		t.Fatalf("expected response.failed after finish+reader error: %s", rr.Body.String())
