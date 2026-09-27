@@ -14,5 +14,20 @@
     "nemotron-3-ultra-free": 1000000,
     "nemotron-3.5-lightning-free": 1000000
   },
-  "protocol_rules": []
+  "protocol_rules": [],
+  "_comment_password": "Admin panel password. Empty disables /api/* auth AND disables the admin-as-API-key (Bearer) route.",
+  "admin_password": "",
+  "_comment_key_pool": "Optional upstream key pool used when Authorization Bearer matches admin_password OR is a real opencode key (sk-/oc_sk-). Strategy: round_robin | weighted | sticky (default). Plain strings in keys[] are shorthand for {\"key\": ...}.",
+  "key_pool": {
+    "enabled": false,
+    "strategy": "sticky",
+    "max_retries": 2,
+    "retry_on": [429, 500, 502, 503, 504],
+    "cooldown_secs": 60,
+    "blacklist_after": 3,
+    "keys": [
+      {"id": "k1", "key": "sk-placeholder-1", "group": "", "weight": 1, "enabled": true, "note": "account A"},
+      "sk-placeholder-2"
+    ]
+  }
 }

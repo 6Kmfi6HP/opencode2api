@@ -1076,6 +1076,10 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 				if usage, response := extractStreamEventUsage(outLine); usage != nil || response != nil {
 					if usage != nil {
 						lastUsage = usage
+						if cacheDebugEnabled() {
+							b, _ := json.Marshal(usage)
+							slog.Info("cache_debug_stream_usage", "model", modelID, "usage", string(b))
+						}
 					}
 					if response != nil {
 						if round == 0 {

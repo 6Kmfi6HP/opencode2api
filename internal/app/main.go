@@ -24,6 +24,8 @@ const MatchRegex = domain.MatchRegex
 type ModelAliasList = domain.ModelAliasList
 
 type Socks5Proxy = domain.Socks5Proxy
+type UpstreamKey = domain.UpstreamKey
+type KeyPool = domain.KeyPool
 type ClaudeRequest = domain.ClaudeRequest
 type ClaudeMessage = domain.ClaudeMessage
 type ClaudeContent = domain.ClaudeContent

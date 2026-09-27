@@ -174,6 +174,8 @@ type AppConfig struct {
 	// responses（/zen/v1/responses）。声明顺序即优先级，首个命中生效；
 	// 未命中时保持既有行为（native_responses_models 记忆 > Chat 翻译）。
 	ProtocolRules []ProtocolRule `json:"protocol_rules,omitempty"`
+	// KeyPool configures rotation across multiple upstream API keys.
+	KeyPool KeyPool `json:"key_pool,omitempty"`
 }
 
 type Socks5Proxy struct {
@@ -181,6 +183,134 @@ type Socks5Proxy struct {
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
 	Name     string `json:"name,omitempty"`
+}
+
+// UpstreamKey is one pooled upstream credential. The compact JSON form
+// accepts a plain string as the key value ("sk-..." ≡ {"key":"sk-..."}
+// with weight 1 and enabled by default).
+type UpstreamKey struct {
+	ID      string `json:"id,omitempty"`
+	Key     string `json:"key"`
+	Group   string `json:"group,omitempty"`
+	Weight  int    `json:"weight,omitempty"`
+	Enabled *bool  `json:"enabled,omitempty"`
+	Note    string `json:"note,omitempty"`
+}
+
+// IsEnabled reports whether the entry participates in selection.
+// Missing field defaults to true; explicit false disables.
+func (k UpstreamKey) IsEnabled() bool {
+	if k.Enabled == nil {
+		return true
+	}
+	return *k.Enabled
+}
+
+// UnmarshalJSON accepts the string shorthand "sk-..." ≡ {"key":"sk-..."}.
+// The shorthand leaves weight/enabled unset: nil Enabled means enabled via
+// IsEnabled, and weight defaults to 1 via Normalized/normalizeKeyPool.
+func (k *UpstreamKey) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if strings.HasPrefix(trimmed, `"`) {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		k.Key = s
+		return nil
+	}
+	type plain UpstreamKey
+	var p plain
+	if err := json.Unmarshal(data, (*plain)(&p)); err != nil {
+		return err
+	}
+	*k = UpstreamKey(p)
+	return nil
+}
+
+// MarshalJSON keeps Enabled as bool for panel compat: nil → true.
+func (k UpstreamKey) MarshalJSON() ([]byte, error) {
+	enabled := true
+	if k.Enabled != nil {
+		enabled = *k.Enabled
+	}
+	type out struct {
+		ID      string `json:"id,omitempty"`
+		Key     string `json:"key"`
+		Group   string `json:"group,omitempty"`
+		Weight  int    `json:"weight,omitempty"`
+		Enabled bool   `json:"enabled"`
+		Note    string `json:"note,omitempty"`
+	}
+	return json.Marshal(out{
+		ID:      k.ID,
+		Key:     k.Key,
+		Group:   k.Group,
+		Weight:  k.Weight,
+		Enabled: enabled,
+		Note:    k.Note,
+	})
+}
+
+// Normalized returns the runtime view: default weight 1, lowercased group.
+func (k UpstreamKey) Normalized() UpstreamKey {
+	if k.Weight < 1 {
+		k.Weight = 1
+	}
+	k.Group = strings.ToLower(strings.TrimSpace(k.Group))
+	return k
+}
+
+// KeyPool mirrors the config.json "key_pool" section. Strategy is
+// round_robin (default), weighted, or sticky; unknown values are rejected
+// by strict admin validation and fall back to round_robin at runtime.
+type KeyPool struct {
+	Enabled        bool          `json:"enabled"`
+	Strategy       string        `json:"strategy,omitempty"`
+	MaxRetries     int           `json:"max_retries,omitempty"`
+	RetryOn        []int         `json:"retry_on,omitempty"`
+	CooldownSecs   int           `json:"cooldown_secs,omitempty"`
+	BlacklistAfter int           `json:"blacklist_after,omitempty"`
+	Keys           []UpstreamKey `json:"keys,omitempty"`
+}
+
+// UnmarshalJSON allows keys[] string shorthand entries.
+func (p *KeyPool) UnmarshalJSON(data []byte) error {
+	var shadow struct {
+		Enabled        bool              `json:"enabled"`
+		Strategy       string            `json:"strategy,omitempty"`
+		MaxRetries     int               `json:"max_retries,omitempty"`
+		RetryOn        []int             `json:"retry_on,omitempty"`
+		CooldownSecs   int               `json:"cooldown_secs,omitempty"`
+		BlacklistAfter int               `json:"blacklist_after,omitempty"`
+		Keys           []json.RawMessage `json:"keys,omitempty"`
+	}
+	if err := json.Unmarshal(data, &shadow); err != nil {
+		return err
+	}
+	p.Enabled = shadow.Enabled
+	p.Strategy = shadow.Strategy
+	p.MaxRetries = shadow.MaxRetries
+	p.RetryOn = shadow.RetryOn
+	p.CooldownSecs = shadow.CooldownSecs
+	p.BlacklistAfter = shadow.BlacklistAfter
+	for _, m := range shadow.Keys {
+		trimmed := strings.TrimSpace(string(m))
+		if strings.HasPrefix(trimmed, `"`) {
+			var s string
+			if err := json.Unmarshal(m, &s); err != nil {
+				return err
+			}
+			p.Keys = append(p.Keys, UpstreamKey{Key: s, Weight: 1})
+			continue
+		}
+		var k UpstreamKey
+		if err := json.Unmarshal(m, &k); err != nil {
+			return err
+		}
+		p.Keys = append(p.Keys, k)
+	}
+	return nil
 }
 
 type ClaudeRequest struct {

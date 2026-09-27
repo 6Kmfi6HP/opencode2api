@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -1297,7 +1298,22 @@ func applyCacheHintsToRawBodyOpts(body []byte, modelID string, ctx context.Conte
 		}
 	}
 	if _, exists := m["prompt_cache_key"]; !exists {
-		if key := derivePromptCacheKey(ctx, modelID); key != "" {
+		// hasToken 用于"免费层才默认内容 key"的开关判据：付费 token 走账号
+		// 路由时，让上游自己的负载均衡决定，不再用内容 key 抢占。
+		hasToken := false
+		if ctx != nil {
+			if auth, ok := ctx.Value(upstreamAuthContextKey{}).(UpstreamAuth); ok && auth.Token != "" {
+				hasToken = true
+			}
+		}
+		key := ""
+		if preferContentKey(hasToken) {
+			key = contentPromptCacheKey(m)
+		}
+		if key == "" {
+			key = derivePromptCacheKey(ctx, modelID)
+		}
+		if key != "" {
 			m["prompt_cache_key"] = key
 			changed = true
 		}
@@ -1540,4 +1556,116 @@ func normalizeResponsesID(id string) string {
 // normalizeClaudeMessageID ensures a Claude message ID has the msg_ prefix.
 func normalizeClaudeMessageID(id string) string {
 	return deterministicResponseID("msg_", id)
+}
+
+// preferContentKey 决定 prompt_cache_key 的派生方式。默认在免费层（无
+// 上游账号 token）开启内容派生——跨 launch / CLI 的稳定 key 是 zen 免费层
+// 命中率的关键（实测 session key 命中率 ~50%、内容 key 命中 2/3 且稳定）。
+// 显式 OPENCODE2API_PROMPT_CACHE_KEY=session 可回退到 session 派生；
+// 付费层（已 token 路由）默认不抢占上游自身的负载均衡意图。
+func preferContentKey(hasToken bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("OPENCODE2API_PROMPT_CACHE_KEY")))
+	if v == "session" {
+		return false
+	}
+	if v == "content" {
+		return true
+	}
+	return !hasToken
+}
+
+// contentPromptCacheKey 对上游请求体（已 marshal 的 chat/responses JSON）的
+// 公共前缀求 SHA-256 派生稳定 key：system 提示、工具清单、instructions 与
+// 首个 user message 决定缓存前缀；assistant/tool 后续消息会随轮次变化，
+// 不参与哈希。同一份系统提示 + 工具栈在跨 launch 之间生成同一 key，让上游
+// 一致性哈希到同一 zen 缓存分片；前缀内容一旦改动则自然换 key，避免串污染。
+func contentPromptCacheKey(m map[string]any) string {
+	if m == nil {
+		return ""
+	}
+	// 采样：system 块、tools 形状、instructions、首个 user 消息文本——这些
+	// 是任何 agent 会话的稳定前缀；其它动态字段忽略。
+	parts := []string{}
+	if sys, ok := m["system"]; ok {
+		b, _ := json.Marshal(sys)
+		parts = append(parts, "sys:"+string(b))
+	}
+	if instr, ok := m["instructions"].(string); ok && instr != "" {
+		parts = append(parts, "instr:"+instr)
+	}
+	if tools, ok := m["tools"].([]any); ok {
+		if b, err := json.Marshal(tools); err == nil {
+			parts = append(parts, "tools:"+string(b))
+		}
+	}
+	// 第一条 user 消息（chat.messages 或 responses.input）的前 8KB：同一会话
+	// 的首条 user 消息恒定，又是 prompts 中首个动态段——参与哈希才能区分
+	// 不同用户/会话，仅靠 system+tools 会让整个匿名池撞同一 key。
+	if msgs, ok := m["messages"].([]any); ok {
+		for _, im := range msgs {
+			if mm, ok := im.(map[string]any); ok && mm["role"] == "user" {
+				content := mm["content"]
+				var text string
+				switch c := content.(type) {
+				case string:
+					text = c
+				case []any:
+					for _, p := range c {
+						if pm, ok := p.(map[string]any); ok {
+							if t, _ := pm["text"].(string); t != "" {
+								text = t
+								break
+							}
+						}
+					}
+				}
+				if len(text) > 8192 {
+					text = text[:8192]
+				}
+				if text != "" {
+					parts = append(parts, "first_user:"+text)
+					break
+				}
+			}
+		}
+	}
+	if input, ok := m["input"].([]any); ok {
+		for _, im := range input {
+			if mm, ok := im.(map[string]any); ok {
+				role, _ := mm["role"].(string)
+				if role != "user" {
+					continue
+				}
+				var text string
+				if c, ok := mm["content"].([]any); ok {
+					for _, p := range c {
+						if pm, ok := p.(map[string]any); ok {
+							if t, _ := pm["text"].(string); t != "" {
+								text = t
+								break
+							}
+							if t, _ := pm["input_text"].(string); t != "" {
+								text = t
+								break
+							}
+						}
+					}
+				} else if s, ok := mm["content"].(string); ok {
+					text = s
+				}
+				if len(text) > 8192 {
+					text = text[:8192]
+				}
+				if text != "" {
+					parts = append(parts, "first_user:"+text)
+					break
+				}
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
+	return "oc2api:csha:" + hex.EncodeToString(sum[:16])
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/util"
 )
@@ -27,9 +28,25 @@ type ModelStats struct {
 	CacheCreatedTokens int64 `json:"cache_created_tokens,omitempty"`
 }
 
+// KeyStats 各字段汇总 key_pool 池内单把 key 的运行状态；Rate 字段由 cache
+// hit/miss 导出，避免前端/日志里再做除法。
+type KeyStats struct {
+	RequestCount int64  `json:"request_count"`
+	ErrorCount   int64  `json:"error_count"`
+	LastStatus   int    `json:"last_status"`
+	LastError    string `json:"last_error,omitempty"`
+	LastUsedUnix int64  `json:"last_used_unix"`
+	// CacheHitRequests / CacheMissRequests 以带 token 的请求为口径：
+	// 命中=usage.cached_tokens>0，miss=cached_tokens<=0（或无 usage）。
+	CacheHitRequests  int64   `json:"cache_hit_requests,omitempty"`
+	CacheMissRequests int64   `json:"cache_miss_requests,omitempty"`
+	CacheHitRatio     float64 `json:"cache_hit_ratio,omitempty"`
+}
+
 type TokenStatsData struct {
 	TotalRequests int64                  `json:"total_requests"`
 	Models        map[string]*ModelStats `json:"models"`
+	Keys          map[string]*KeyStats   `json:"keys,omitempty"`
 }
 
 var (
@@ -87,6 +104,13 @@ func cloneTokenStatsSnapshot() *TokenStatsData {
 	for k, v := range tokenStats.Models {
 		cp := *v
 		snap.Models[k] = &cp
+	}
+	if len(tokenStats.Keys) > 0 {
+		snap.Keys = make(map[string]*KeyStats, len(tokenStats.Keys))
+		for k, v := range tokenStats.Keys {
+			cp := *v
+			snap.Keys[k] = &cp
+		}
 	}
 	return snap
 }
@@ -260,6 +284,13 @@ func saveTokenStats() error {
 			m := *v
 			cur.Models[k] = &m
 		}
+		if len(snap.Keys) > 0 {
+			cur.Keys = make(map[string]*KeyStats, len(snap.Keys))
+			for k, v := range snap.Keys {
+				ks := *v
+				cur.Keys[k] = &ks
+			}
+		}
 	})
 }
 
@@ -291,6 +322,105 @@ func RecordTokenUsage(model string, promptTokens, completionTokens, totalTokens 
 		m.PromptTokens += promptTokens
 		m.CompletionTokens += completionTokens
 		m.TotalTokens += totalTokens
+	})
+}
+
+// RecordKeyUsage aggregates per-key upstream outcomes. It mirrors the
+// RecordTokenUsage dual in-memory+async-delta pattern: the in-memory snapshot
+// is updated synchronously so an immediately-following /api/stats GET sees
+// fresh counts, while the disk merge happens asynchronously under a
+// cross-process lock. Empty keyIDs are no-ops. errMsg should already be
+// truncated by the caller; overlong values are defensively capped at 200
+// bytes here as well.
+func RecordKeyUsage(keyID string, status int, errMsg string) {
+	if keyID == "" {
+		return
+	}
+	if len(errMsg) > 200 {
+		errMsg = errMsg[:200]
+	}
+	isErr := status == 0 || status >= 400
+	now := time.Now().Unix()
+	tokenStatsMu.Lock()
+	if tokenStats.Keys == nil {
+		tokenStats.Keys = map[string]*KeyStats{}
+	}
+	ks, ok := tokenStats.Keys[keyID]
+	if !ok {
+		ks = &KeyStats{}
+		tokenStats.Keys[keyID] = ks
+	}
+	ks.RequestCount++
+	if isErr {
+		ks.ErrorCount++
+	}
+	ks.LastStatus = status
+	ks.LastError = errMsg
+	ks.LastUsedUnix = now
+	tokenStatsMu.Unlock()
+
+	go persistTokenStatsDelta(func(cur *TokenStatsData) {
+		if cur.Keys == nil {
+			cur.Keys = map[string]*KeyStats{}
+		}
+		k, ok := cur.Keys[keyID]
+		if !ok {
+			k = &KeyStats{}
+			cur.Keys[keyID] = k
+		}
+		k.RequestCount++
+		if isErr {
+			k.ErrorCount++
+		}
+		k.LastStatus = status
+		k.LastError = errMsg
+		k.LastUsedUnix = now
+	})
+}
+
+// RecordKeyCacheResult 在 selectPoolKey 已接管（keyID 非空）且单次尝试完成后
+// 调用，把缓存命中/未命中记到对应 key 上；cachedTokens<=0 视为 miss（含 0）。
+// 幂等：同一请求会被多次 attempt 时只应调用一次（由上游请求的最后一次决定）。现在调用
+// 方只来自 opencode.go 的成功分支（200-299）,原样写。
+func RecordKeyCacheResult(keyID string, cachedTokens int64) {
+	if keyID == "" {
+		return
+	}
+	tokenStatsMu.Lock()
+	ks, ok := tokenStats.Keys[keyID]
+	if !ok {
+		ks = &KeyStats{}
+		tokenStats.Keys[keyID] = ks
+	}
+	if cachedTokens > 0 {
+		ks.CacheHitRequests++
+	} else {
+		ks.CacheMissRequests++
+	}
+	total := ks.CacheHitRequests + ks.CacheMissRequests
+	if total > 0 {
+		ks.CacheHitRatio = float64(ks.CacheHitRequests) / float64(total)
+	}
+	tokenStatsMu.Unlock()
+
+	go persistTokenStatsDelta(func(cur *TokenStatsData) {
+		if cur.Keys == nil {
+			cur.Keys = map[string]*KeyStats{}
+		}
+		k, ok := cur.Keys[keyID]
+		if !ok {
+			k = &KeyStats{}
+			cur.Keys[keyID] = k
+		}
+		if cachedTokens > 0 {
+			k.CacheHitRequests++
+		} else {
+			k.CacheMissRequests++
+		}
+		t := k.CacheHitRequests + k.CacheMissRequests
+		if t > 0 {
+			k.CacheHitRatio = float64(k.CacheHitRequests) / float64(t)
+		}
 	})
 }
 

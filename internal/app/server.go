@@ -128,22 +128,28 @@ func buildMux() *http.ServeMux {
 	mux.HandleFunc("/v1/messages/count_tokens", sessionContextMiddleware(logging.Middleware(claudeCountTokensHandler)))
 	mux.HandleFunc("/v1/systemone", sessionContextMiddleware(logging.Middleware(systemoneHandler)))
 	mux.HandleFunc("/v1/models", sessionContextMiddleware(logging.Middleware(listModelsHandler)))
-	mux.HandleFunc("/login", logging.Middleware(loginHandler))
-	mux.HandleFunc("/logout", logging.Middleware(logoutHandler))
-	mux.HandleFunc("/api/config", logging.Middleware(requireAuth(adminConfigHandler)))
-	mux.HandleFunc("/api/stats", logging.Middleware(requireAuth(adminStatsHandler)))
-	mux.HandleFunc("/api/reload", logging.Middleware(requireAuth(reloadHandler)))
 	mux.HandleFunc("/health", logging.Middleware(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	}))
-	mux.HandleFunc("/", logging.Middleware(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			requireAuth(adminPageHandler)(w, r)
-			return
-		}
-		http.NotFound(w, r)
-	}))
+	// 管理/统计路由只在 admin API 启用时注册。launch 模式默认 adminPassword=""
+	// → 不注册这些端点，避免本地代理被无意暴露。
+	if adminAPIEnabled() {
+		mux.HandleFunc("/login", logging.Middleware(loginHandler))
+		mux.HandleFunc("/logout", logging.Middleware(logoutHandler))
+		mux.HandleFunc("/api/config", logging.Middleware(requireAuth(adminConfigHandler)))
+		mux.HandleFunc("/api/stats", logging.Middleware(requireAuth(adminStatsHandler)))
+		mux.HandleFunc("/api/key_parse", logging.Middleware(requireAuth(keyPoolParseHandler)))
+		mux.HandleFunc("/api/key_status", logging.Middleware(requireAuth(keyPoolStatusHandler)))
+		mux.HandleFunc("/api/reload", logging.Middleware(requireAuth(reloadHandler)))
+		mux.HandleFunc("/", logging.Middleware(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/" {
+				requireAuth(adminPageHandler)(w, r)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+	}
 	return mux
 }
 
@@ -237,5 +243,7 @@ func readJSONRequestBody(w http.ResponseWriter, r *http.Request) (auth UpstreamA
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return auth, nil, false
 	}
+	// 缓存注入路径从 ctx 读 UpstreamAuth 决定免费层默认行为。
+	*r = *r.WithContext(withUpstreamAuth(r.Context(), auth))
 	return auth, body, true
 }

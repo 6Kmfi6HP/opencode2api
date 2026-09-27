@@ -2,6 +2,7 @@ package app
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"net/http"
 	"strings"
@@ -21,6 +22,8 @@ var (
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if adminPassword == "" {
+			// 无密码=不启用面板鉴权，原样放行。launch 默认 adminPassword=""
+			// （server.go/launch.go 尚未写变量）→ /api/* 见 server.go mux 注册。
 			next(w, r)
 			return
 		}
@@ -38,6 +41,14 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// adminAPIEnabled 报告管理 API（/login /logout /api/*）是否注册。
+// 仅当 adminPassword 非空时才启用；launch 模式通过不注册这些路由把
+// /api/config /api/key_* 等口子全部关闭（避免无密码的本地代理被同网段/同机
+// 攻击者改 keypool）。
+func adminAPIEnabled() bool {
+	return adminPassword != ""
 }
 
 func generateToken() (string, error) {
@@ -108,6 +119,9 @@ const (
 	AuthRouteAuto
 	AuthRouteZen
 	AuthRouteGo
+	// AuthRouteAdmin 匹配 adminPassword（panel 密码兼作 API key）。提取时
+	// 命中即不再比对真实 sk-，池 selectPoolKey 强制接管（design-keypool §2）。
+	AuthRouteAdmin
 )
 
 type UpstreamAuth struct {
@@ -137,6 +151,11 @@ func extractUpstreamAuth(r *http.Request) UpstreamAuth {
 		}
 		return UpstreamAuth{Mode: AuthRoutePublic, Source: src}
 	}
+	// admin 密码作为池触发 token：常量时间比对防时序侧信道；命中 → 强制池
+	// 接管（Mode=AuthRouteAdmin），不进入下游 sk- 校验。
+	if adminPassword != "" && subtle.ConstantTimeCompare([]byte(token), []byte(adminPassword)) == 1 {
+		return UpstreamAuth{Mode: AuthRouteAdmin, Source: "admin"}
+	}
 	// go:/zen: 前缀路由：去掉前缀后剩余部分仍需是有效 key（sk- 开头）
 	if rest, ok := strings.CutPrefix(token, "go:"); ok && isValidOpenCodeKey(rest) {
 		return UpstreamAuth{Token: rest, Mode: AuthRouteGo, Source: source}
@@ -151,12 +170,17 @@ func extractUpstreamAuth(r *http.Request) UpstreamAuth {
 	return UpstreamAuth{Mode: AuthRoutePublic, Source: source}
 }
 
-// 只认 sk- 开头的 opencode key；Anthropic sk-ant-* 不能转发上游。
+// isValidOpenCodeKey 只认 opencode 自己的 key 前缀（sk- 与 oc_sk- 都属同一
+// 发行网关，后者为线上运营实际格式）；Anthropic sk-ant- 及过短占位串
+// （no-key-required / placeholder 等）一律拒绝，回落 public。
 func isValidOpenCodeKey(token string) bool {
 	if strings.HasPrefix(token, "sk-ant-") {
 		return false
 	}
-	return strings.HasPrefix(token, "sk-") && len(token) > 15
+	if !strings.HasPrefix(token, "sk-") && !strings.HasPrefix(token, "oc_sk-") && !strings.HasPrefix(token, "oc_sk_") {
+		return false
+	}
+	return len(token) > len("sk-")+10 // 至少 3 位前缀 + 11 字节熵，防占位
 }
 
 func (auth UpstreamAuth) tier() TierType {

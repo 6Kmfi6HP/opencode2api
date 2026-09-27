@@ -109,7 +109,9 @@ func resolveLaunchKey(key string) string {
 
 func configureLaunchGlobals(f launchFlags) {
 	configPath = f.cfgPath
-	adminPassword = "" // launch mode disables the admin panel
+	adminPassword = os.Getenv("OPENCODE2API_ADMIN_PASSWORD") // 空 = admin/as-key 路径不生效
+	// launch 模式仍禁用 web panel（无 mux 注册），但 adminPassword 可作为
+	// Bearer token 让 extractUpstreamAuth 命中 AuthRouteAdmin 并触发 key_pool。
 	debugMode = f.debug
 	logLevel := "info"
 	if f.debug {
