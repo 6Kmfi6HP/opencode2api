@@ -31,8 +31,7 @@ func TestSession_IDFormatAndUniqueness(t *testing.T) {
 }
 
 func TestOCRequest_FreeTierInjectsSessionHeadersAndStream(t *testing.T) {
-	ocClientVer = "1.18.31"
-	ocSessionID = ""
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRoutePublic}
 	bodyMap := map[string]any{"messages": []any{}, "stream": false}
 	req, err := buildOCRequestWithSubpath("mimo-v2.5-free", bodyMap, auth, false, "https://opencode.ai", "chat/completions", "ses_sticky_000000000000aa")
@@ -95,7 +94,7 @@ func TestOCRequest_FreeTierInjectsSessionHeadersAndStream(t *testing.T) {
 // 注意判据是上游模型是否免费,而不是客户端 tier——sk- key + 免费模型仍会
 // 被上游要求指纹(见 TestFreeTierFingerprint_SKKeyFreeModelNoTools)。
 func TestOCRequest_PaidTierKeepsClientBody(t *testing.T) {
-	ocClientVer = "1.18.31"
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-validkey0123456789abcdef"}
 	bodyMap := map[string]any{"messages": []any{}, "stream": false}
 	req, err := buildOCRequestWithSubpath("claude-x", bodyMap, auth, false, "https://opencode.ai", "chat/completions", "ses_paid_0000000000000a")
@@ -123,7 +122,7 @@ func TestOCRequest_PaidTierKeepsClientBody(t *testing.T) {
 // 在前、把缺失的 bash/glob/grep/read 追加在后——上游按"有无四件"整体判定,
 // 客户端带了 weather 改变不了缺四件就 403 的事实。
 func TestOCRequest_FreeTierKeepsClientToolsWhenPresent(t *testing.T) {
-	ocClientVer = "1.18.31"
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRoutePublic}
 	bodyMap := map[string]any{
 		"messages": []any{},
@@ -158,7 +157,7 @@ func TestOCRequest_FreeTierKeepsClientToolsWhenPresent(t *testing.T) {
 
 // 免费层 hits count_tokens 计费子路径时不动 body(计费接口不套该门禁)。
 func TestOCRequest_FreeTierSkipsInjectionOnNonChatCompletions(t *testing.T) {
-	ocClientVer = "1.18.31"
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRoutePublic}
 	bodyMap := map[string]any{"messages": []any{}}
 	req, err := buildOCRequestWithSubpath("claude-x", bodyMap, auth, false, "https://opencode.ai", "messages/count_tokens", "ses_12345678901234567890123")

@@ -1254,8 +1254,8 @@ func derivePromptCacheKey(ctx context.Context, modelID string) string {
 	if session := strings.TrimSpace(sessionFromRequestContext(ctx, "")); session != "" {
 		return "oc2api:" + session
 	}
-	if ocSessionID != "" {
-		return "oc2api:" + ocSessionID
+	if state := ocSessionState.Load(); state != nil && state.sessionID != "" {
+		return "oc2api:" + state.sessionID
 	}
 	return ""
 }
