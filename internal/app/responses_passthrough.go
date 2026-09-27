@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -16,6 +15,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ======================== function_call 参数浮点归一化 ========================
@@ -910,7 +910,26 @@ func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Re
 	}
 
 	if stream && status >= 200 && status < 300 {
-		relayResponsesStream(ctx, w, rc, status, modelID, req, rewrites, auth, rawBody, upstreamCall)
+		// 用 DriveStreamWithRetry 在 peek 失败时切换 key 重试,空流/超时/上游
+		// 错误帧都被翻译为可重试的 errStreamIncompleteNoCommit。首轮复用
+		// 调用方已打开的 rc,后续重试走 upstreamCall 让 key pool 换下一把 key。
+		pending := rc.(io.ReadCloser)
+		callOnce := func(c context.Context) (io.ReadCloser, int, error) {
+			if pending != nil {
+				r := pending
+				pending = nil
+				return r, status, nil
+			}
+			nrc, nstatus, _, nerr := upstreamCall(c, rawBody)
+			return nrc, nstatus, nerr
+		}
+		runOnce := func(c context.Context, w http.ResponseWriter, nrc io.Reader, _ []streamReadResult, _ *streamReader) (bool, error) {
+			return relayResponsesStream(c, w, nrc, status, modelID, req, rewrites, auth, rawBody, upstreamCall)
+		}
+		committed, driveErr := DriveStreamWithRetry(ctx, w, ResponsesProtocolHooks, callOnce, runOnce)
+		if !committed && driveErr != nil {
+			logging.FromContext(ctx).Warn("relayResponsesStream exhausted retries", "model", modelID, "err", driveErr)
+		}
 		return
 	}
 
@@ -965,25 +984,80 @@ func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Re
 // relayResponsesStream 逐行透传 SSE 并在每个事件行后 Flush，保证打字机效果；
 // 同时从 response.completed / usage 事件中提取 usage 做 Token 统计，并保存
 // 完整响应对象以维持 previous_response_id 会话链条。
-func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, modelID string, req ResponsesAPIRequest, rewrites *responsesNameRewrites, auth UpstreamAuth, rawBody []byte, upstreamCall func(context.Context, []byte) (io.ReadCloser, int, http.Header, error)) {
+//
+// 返回 (true, nil)：已 commit 且本轮处理完毕（写完或合成了收尾），调用方
+// 无需重试。返回 (false, err)：peek 窗口内未 commit（空流 / EOF / 错误帧 /
+// 首字节超时），由 DriveStreamWithRetry 决定是否换 key 重发。已 commit 后
+// 主循环返回 (true, nil)——半截流由 continuation / 末尾 [DONE] 兜底处理。
+func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, modelID string, req ResponsesAPIRequest, rewrites *responsesNameRewrites, auth UpstreamAuth, rawBody []byte, upstreamCall func(context.Context, []byte) (io.ReadCloser, int, http.Header, error)) (bool, error) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(status)
 
+	// peek 首帧：在 WriteHeader 之前约束 commit 边界，空流 / EOF / 错误帧 /
+	// 首字节超时返回 errStreamIncompleteNoCommit,由调用方驱动重试。
+	peek := PeekFirstFrame(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, ResponsesProtocolHooks)
+	if peek.Err != nil {
+		return false, peek.Err
+	}
+
+	w.WriteHeader(status)
 	flusher, _ := w.(http.Flusher)
 	if flusher != nil {
 		flusher.Flush()
 	}
 
-	_ = ctx
+	// byte-level 透传：peek 已消费的字节保持原样直写 w,与主循环读取的
+	// 后续字节拼成完整 SSE 流。
+	if err := FlushPeekedBytes(w, peek.Consumed); err != nil {
+		return false, err
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	// 续用 peek 内部的 reader（它的 bufio 可能已预读后续行）。
+	sr := peek.Reader
+	if sr == nil {
+		// EOF 收尾的 peek 没留下 reader——上游已 EOF,主循环立即结束。
+		sr = newStreamReader(ctx, rc, 0)
+	}
+	defer sr.Close()
+
 	var lastUsage map[string]any
 	var lastResponse map[string]any
-	sawData := false
+	sawData := len(peek.Consumed) > 0
 	doneSeen := false
 	writeFailed := false
 	terminalSeen := false
+	// peek 阶段已看到完整帧，但终端事件（completed/failed/incomplete / [DONE]）
+	// 要逐行扫过目前 consumed 才知道——这里只预先回填终端标志，让末尾判定
+	// 与原有逻辑一致。
+	for _, res := range peek.Consumed {
+		trimmed := bytes.TrimSpace([]byte(res.line))
+		if bytes.Equal(trimmed, []byte("data: [DONE]")) || bytes.Equal(trimmed, []byte("[DONE]")) {
+			doneSeen = true
+			continue
+		}
+		if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+			continue
+		}
+		payload := trimmed[6:]
+		if len(payload) == 0 || payload[0] != '{' {
+			continue
+		}
+		var evt map[string]any
+		if json.Unmarshal(payload, &evt) != nil {
+			continue
+		}
+		if _, response := extractStreamEventUsage([]byte(res.line)); response != nil {
+			lastResponse = response
+			if s, _ := response["status"].(string); s == "completed" || s == "failed" || s == "incomplete" {
+				terminalSeen = true
+			}
+		}
+	}
 
 	argStates := map[int]*argsNormState{}
 	argItemToOutput := map[string]int{}
@@ -997,18 +1071,43 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 	// pendingTerminalLine 保存本轮的终结事件行（incomplete + max_output_tokens 时暂缓写入）
 	var pendingTerminalLine []byte
 
+	// 首轮主循环复用 peek 的 streamReader；续写轮重新发起 upstreamCall 后,
+	// 用新响应的 rc 新建 streamReader。
+	currentReader := sr
+
 	for round := 0; round <= maxContinuations && !doneSeen && !writeFailed; round++ {
-		reader := bufio.NewReader(currentRC)
 		var contLastResponse map[string]any
 		isTruncatedByMaxTokens = false
 		pendingTerminalLine = nil
 
+		reader := currentReader
+		needClose := false
+		if round > 0 {
+			// 续写轮：用新 rc 起一个 streamReader(它的内部协程按行投递,与
+			// 主循环的 select 模型对齐),不再用裸 bufio.NewReader——前者同时
+			// 兼容 rc 后台 Close 触发 EOF。本轮结束后立刻 Close,不堆积协程。
+			reader = newStreamReader(ctx, currentRC, 0)
+			needClose = true
+		}
+
+	lineLoop:
 		for {
-			line, err := reader.ReadBytes('\n')
+			var (
+				line string
+				err  error
+			)
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case res := <-reader.Read():
+				line = res.line
+				err = res.err
+			}
 			if len(line) > 0 {
-				outLine := line
+				lineBytes := []byte(line)
+				outLine := lineBytes
 				if isMuseSparkModel(modelID) {
-					if normalized, ok := normalizeResponsesStreamLine(line, argStates, argItemToOutput, rewrites); ok {
+					if normalized, ok := normalizeResponsesStreamLine(lineBytes, argStates, argItemToOutput, rewrites); ok {
 						outLine = normalized
 					}
 				}
@@ -1016,7 +1115,7 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 				isDoneSentinel := bytes.Equal(trimmed, []byte("data: [DONE]")) || bytes.Equal(trimmed, []byte("[DONE]"))
 				if isDoneSentinel && !terminalSeen {
 					if err != nil {
-						break
+						break lineLoop
 					}
 					continue
 				}
@@ -1055,7 +1154,7 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 				} else if !isTerminalLine {
 					if _, werr := w.Write(outLine); werr != nil {
 						writeFailed = true
-						break
+						break lineLoop
 					}
 					if flusher != nil {
 						flusher.Flush()
@@ -1064,7 +1163,7 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 					// completed / failed / 其他 incomplete：直写
 					if _, werr := w.Write(outLine); werr != nil {
 						writeFailed = true
-						break
+						break lineLoop
 					}
 					if flusher != nil {
 						flusher.Flush()
@@ -1094,8 +1193,11 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 				}
 			}
 			if err != nil {
-				break
+				break lineLoop
 			}
+		}
+		if needClose {
+			reader.Close()
 		}
 		if flusher != nil {
 			flusher.Flush()
@@ -1241,6 +1343,7 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 			flusher.Flush()
 		}
 	}
+	return true, nil
 }
 
 // buildContinuationBody 构造续写请求：input 设为已收到的 output 数组，
