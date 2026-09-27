@@ -239,5 +239,7 @@ func readJSONRequestBody(w http.ResponseWriter, r *http.Request) (auth UpstreamA
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return auth, nil, false
 	}
+	// 缓存注入路径从 ctx 读 UpstreamAuth 决定免费层默认行为。
+	*r = *r.WithContext(withUpstreamAuth(r.Context(), auth))
 	return auth, body, true
 }

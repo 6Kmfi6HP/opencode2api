@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -290,6 +291,16 @@ func stickyKeyForRequest(auth UpstreamAuth, bodyMap map[string]any, upstreamHead
 		base = "usr:" + u
 	}
 
+	// 匿名（免费公共）请求优先以 inject 的 prompt_cache_key 作为 sticky 键：
+	// 该 key 跨 launch 由内容派生时,命中缓存的稳定性显著优于每-launch 新会话
+	// 头。OPENCODE2API_STICKY_BY_BODY=off 显式回退。付费层有上游自身的账号
+	// 路由,不再覆盖。
+	if stickyByBodyEnabled() && auth.Token == "" {
+		if pck, ok := bodyMap["prompt_cache_key"].(string); ok && strings.TrimSpace(pck) != "" {
+			return "pck:" + pck
+		}
+	}
+
 	for _, raw := range []string{
 		hashSessionRouteKey(sessionHeaderValue(upstreamHeaders, headerClaudeSession)),
 		hashSessionRouteKey(sessionHeaderValue(upstreamHeaders, headerCodexThread1)),
@@ -306,6 +317,14 @@ func stickyKeyForRequest(auth UpstreamAuth, bodyMap map[string]any, upstreamHead
 		return base + "|oc:" + strings.TrimSpace(ocScope)
 	}
 	return base
+}
+
+// stickyByBodyEnabled 决定是否按 prompt_cache_key 内容键做 sticky 出口。
+// 默认开启（对无 token 的免费流量收益最大：内容 key 跨 launch 稳定 → 粘到
+// 同一缓存出口）; OPENCODE2API_STICKY_BY_BODY=off 回退到原 session-头绑定。
+func stickyByBodyEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("OPENCODE2API_STICKY_BY_BODY")))
+	return v != "0" && v != "false" && v != "no" && v != "off"
 }
 
 // buildProxyClient 为指定代理构建带 SOCKS5 dial 的 HTTP 客户端。
@@ -341,7 +360,9 @@ func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any, upstreamHea
 	// 快路径：单域名且代理维也不需要 sticky 绑定。跟随下游 OpenCode 会话
 	// 时，即使只有一个上游域名也要保留 sticky entry：这样本地重试能基于
 	// 会话 key 改绑，同时把 x-opencode-session 原样交给上游自行做后端亲和。
-	followOCSession := strings.TrimSpace(ocScope) != ""
+	// OPENCODE2API_STICKY_BY_BODY=1 时若 key 已被提升为 pck:，也强制启用域名
+	// 维 sticky（pck 是内容键，跨 launch 稳定，理应锁定同一出口）。
+	followOCSession := strings.TrimSpace(ocScope) != "" || strings.HasPrefix(key, "pck:")
 	domainSticky := len(baseURLs) > 1 || followOCSession
 	proxySticky := sticky && rr && len(proxies) > 0 && !paidDirect
 	if !domainSticky && !proxySticky {

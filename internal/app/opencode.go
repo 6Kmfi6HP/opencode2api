@@ -83,6 +83,14 @@ type opencodeSessionContextKey struct{}
 
 type opencodeUpstreamHeadersContextKey struct{}
 
+// upstreamAuthContextKey 把 extractUpstreamAuth 解析出的 UpstreamAuth 透传至缓存
+// 注入路径,供 derivePromptCacheKey / applyCacheHintsToRawBodyOpts 判 free 层。
+type upstreamAuthContextKey struct{}
+
+func withUpstreamAuth(ctx context.Context, auth UpstreamAuth) context.Context {
+	return context.WithValue(ctx, upstreamAuthContextKey{}, auth)
+}
+
 func sessionFromRequestContext(ctx context.Context, fallback string) string {
 	if ctx == nil {
 		return fallback
