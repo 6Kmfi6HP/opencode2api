@@ -102,7 +102,10 @@ func TestPipeAnthropicStream_PreservesHeaderAndBytes(t *testing.T) {
 	rec := httptest.NewRecorder()
 	header := http.Header{}
 	header.Set("Content-Type", "text/event-stream")
-	pipeAnthropicStream(context.Background(), rec, io.NopCloser(strings.NewReader(upstreamBody)), http.StatusOK, header, "m")
+	committed, perr := pipeAnthropicStream(context.Background(), rec, io.NopCloser(strings.NewReader(upstreamBody)), http.StatusOK, header, "m")
+	if !committed || perr != nil {
+		t.Fatalf("pipeAnthropicStream = (%v, %v), want (true, nil)", committed, perr)
+	}
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)

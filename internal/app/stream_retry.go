@@ -123,6 +123,21 @@ var (
 // 错误 / 上游错误事件——尚未向客户端写过任何字节，调用方可安全重试。
 var errStreamIncompleteNoCommit = errors.New("stream incomplete before first client byte")
 
+// FlushPeekedBytes 把 peek 阶段攒的 SSE 行原样写回 w（行字节、换行符都
+// 不动）。返回首个写错误。byte-level 透传路径用它把 peek 消费掉的字节
+// 回放给客户端。
+func FlushPeekedBytes(w io.Writer, peeked []streamReadResult) error {
+	for _, res := range peeked {
+		if res.line == "" {
+			continue
+		}
+		if _, err := io.WriteString(w, res.line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // PeekOutcome 是 PeekFirstFrame 的结果。Consumed 不为空时表示「已有完整
 // SSE 帧被消费」，调用方应把它原样喂回 handler 主循环。
 type PeekOutcome struct {

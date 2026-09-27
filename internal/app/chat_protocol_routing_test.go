@@ -427,7 +427,10 @@ func TestPipeAnthropicStream_ByteIdentityPassthrough(t *testing.T) {
 	rec := httptest.NewRecorder()
 	header := http.Header{}
 	header.Set("Content-Type", "text/event-stream")
-	pipeAnthropicStream(context.Background(), rec, io.NopCloser(strings.NewReader(upstreamBody)), http.StatusOK, header, "m")
+	committed, perr := pipeAnthropicStream(context.Background(), rec, io.NopCloser(strings.NewReader(upstreamBody)), http.StatusOK, header, "m")
+	if !committed || perr != nil {
+		t.Fatalf("pipeAnthropicStream = (%v, %v), want (true, nil)", committed, perr)
+	}
 
 	// 字节完全一致。
 	if rec.Body.String() != upstreamBody {
@@ -476,8 +479,14 @@ func TestPipeAnthropicStream_FlushesEachUpstreamChunk(t *testing.T) {
 	chunk2 := "event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n"
 	fcr := &flushCountingRecorder{ResponseRecorder: httptest.NewRecorder()}
 	header := http.Header{}
-	pipeAnthropicStream(context.Background(), fcr, &chunkedReader{chunks: []string{chunk1, chunk2}}, http.StatusOK, header, "m")
+	committed, perr := pipeAnthropicStream(context.Background(), fcr, &chunkedReader{chunks: []string{chunk1, chunk2}}, http.StatusOK, header, "m")
+	if !committed || perr != nil {
+		t.Fatalf("pipeAnthropicStream = (%v, %v), want (true, nil)", committed, perr)
+	}
 
+	// 上游 chunk1 + chunk2 各占一次 flush;peek 阶段已刷过 chunk1。新流式
+	// 路径先写 peek 字节、Flush,再逐行写;如果 peek / 主循环都发生过 Flush,
+	// 总数应与上游 chunk 数一致(2)。
 	if fcr.flushes != 2 {
 		t.Fatalf("expected one flush per upstream chunk (2), got %d", fcr.flushes)
 	}

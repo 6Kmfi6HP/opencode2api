@@ -58,34 +58,55 @@ func forwardClaudeViaAnthropic(ctx context.Context, w http.ResponseWriter, auth 
 	// 非 2xx 即使请求方要求 stream 也统一走 buffered JSON 错误直转
 	// （上游未建立 SSE 流，tee 会把错误 JSON 包进 data frame 破坏客户端解析）。
 	if status >= 200 && status < 300 && stream {
-		pipeAnthropicStream(ctx, w, rc, status, header, modelID)
+		// 用 DriveStreamWithRetry 在 peek 失败时切换 key 重试,空流 / EOF /
+		// 首字节超时被翻译为可重试的 errStreamIncompleteNoCommit。首轮复用
+		// 调用方已打开的 rc,后续重试通过 callOpenCodeAnthropicEndpoint 让
+		// key pool 切到下一把可用 key。
+		pending := rc
+		callOnce := func(c context.Context) (io.ReadCloser, int, error) {
+			if pending != nil {
+				r := pending
+				pending = nil
+				return r, status, nil
+			}
+			nrc, nstatus, _, nerr := callOpenCodeAnthropicEndpoint(c, upstreamBody, modelID, auth)
+			return nrc, nstatus, nerr
+		}
+		runOnce := func(c context.Context, w http.ResponseWriter, nrc io.Reader, _ []streamReadResult, _ *streamReader) (bool, error) {
+			return pipeAnthropicStream(c, w, nrc, status, header, modelID)
+		}
+		committed, driveErr := DriveStreamWithRetry(ctx, w, AnthropicProtocolHooks, callOnce, runOnce)
+		if !committed {
+			// 一直未 commit,让上层走 chat 翻译路径;不写任何字节给客户端。
+			if driveErr != nil {
+				log.Warn("anthropic passthrough stream exhausted retries", "model", modelID, "err", driveErr)
+			}
+			return false
+		}
 		return true
 	}
 	relayAnthropicBuffered(ctx, w, rc, status, header, modelID)
 	return true
 }
 
-// flushWriter 在每次 Write 后立即 Flush,保证 SSE 以事件粒度实时下发;
-// http.ResponseWriter 内部带 bufio 缓冲,不显式 Flush 会把事件攒批到 EOF
-// (与 responses_passthrough.go relayResponsesStream 的逐行 Flush 同一约定)。
-type flushWriter struct {
-	w io.Writer
-	f http.Flusher
-}
-
-func (fw flushWriter) Write(p []byte) (int, error) {
-	n, err := fw.w.Write(p)
-	if n > 0 {
-		fw.f.Flush()
-	}
-	return n, err
-}
-
 // pipeAnthropicStream 把上游 Anthropic SSE 流字节级原样转发给客户端,同时
 // 旁路 tee 解析 message_start / message_delta 中的 usage 记入 token 统计。
 // 行边界、CRLF/LF、空行均不做改写,确保下游收到与上游完全一致的字节流。
 // 仅在上游 2xx(真 SSE)时被调用；错误响应一律走 relayAnthropicBuffered。
-func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, header http.Header, modelID string) {
+//
+// 返回 (true, nil)：已 commit（首帧已 peek + 写入）。EOF 时若未见过
+// message_stop 但见过 message_start,合成一条 message_stop 保证客户端正常
+// 关流；若两者皆无（不应发生：peek 至少要看到一帧）返回 false 供调用方
+// 走未 commit 重试。返回 (false, err)：peek 未 commit(空流 / EOF / 错误帧 /
+// 首字节超时),由 DriveStreamWithRetry 决定是否换 key 重发。
+func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, status int, header http.Header, modelID string) (bool, error) {
+	// peek 首帧:在 WriteHeader 之前约束 commit 边界,空流 / EOF / 错误帧 /
+	// 首字节超时都返回 errStreamIncompleteNoCommit,由调用方驱动重试。
+	peek := PeekFirstFrame(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, AnthropicProtocolHooks)
+	if peek.Err != nil {
+		return false, peek.Err
+	}
+
 	filtered := filterResponseHeaders(header)
 	for k, v := range filtered {
 		w.Header().Set(k, v[0])
@@ -97,61 +118,113 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 
 	stats := &logging.StreamStats{Start: time.Now()}
 	fullUsage := map[string]any{}
-
-	// tee 管道:旁路解析走 pipeWriter,主流走 io.Copy 直透;两组无背压,
-	// io.Copy 返回(EOF、rc 读取失败、pw.Write 失败)时主动 pw.Close()
-	// 告知解析端收尾;ctx 取消则先 close 上游 rc 解锁 io.Copy,再
-	// pw.CloseWithError(ctx.Err()) 让 pr.Read 立刻返回。
-	pr, pw := io.Pipe()
-	copyDone := make(chan struct{})
-	go func() {
-		defer close(copyDone)
-		// MultiWriter 把每个 read 同步写给客户端与旁路解析端;flushWriter
-		// 让每片上游数据即时下发(不攒批)。任一侧写失败 io.Copy 立即返回,
-		// 随后 pw.Close 告知解析端收尾,最终 close(copyDone) 供主循环 join。
-		flusher, _ := w.(http.Flusher)
-		cw := io.Writer(w)
-		if flusher != nil {
-			cw = flushWriter{w: w, f: flusher}
-		}
-		_, _ = io.Copy(io.MultiWriter(cw, pw), rc)
-		_ = pw.Close()
-	}()
-
-	// tee 解析流:复用 newStreamReader 的协程,读到行就 observe,不写出。
-	reader := newStreamReader(ctx, pr, 0)
 	defer func() {
 		if len(fullUsage) > 0 {
 			statsx.RecordChatUsage(modelID, anthropicUsageToChat(fullUsage))
 		}
 		stats.Log(ctx, "claude")
 	}()
+
+	flusher, _ := w.(http.Flusher)
+	// 写 peek 出的原始字节(完整保留 \r\n / 换行 / 空行),同时喂给
+	// observeAnthropicStreamEvent 让 stats 与 message_start/stop 计数正确
+	// 累计——peek 消费过的帧不再二次进 reader.Read() 通道,所以这里必须补
+	// 一次观察。
+	if err := FlushPeekedBytes(w, peek.Consumed); err != nil {
+		return true, err
+	}
+	sawMessageStart := false
+	sawMessageStop := false
+	observeLine := func(line string) {
+		stats.NoteChunk()
+		observeAnthropicStreamEvent(stats, fullUsage, line)
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			return
+		}
+		var evt map[string]any
+		if json.Unmarshal([]byte(strings.TrimSpace(payload)), &evt) != nil {
+			return
+		}
+		switch typ, _ := evt["type"].(string); typ {
+		case "message_start":
+			sawMessageStart = true
+		case "message_stop":
+			sawMessageStop = true
+		}
+	}
+	// 先用 peek 消费过的行回填 sawMessageStart / sawMessageStop——后续 EOF
+	// 兜底合成 message_stop 需要知道是否已见过 message_start / message_stop。
+	for _, res := range peek.Consumed {
+		if res.line != "" {
+			observeLine(res.line)
+		}
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	// 续用 peek 内部 streamReader(它的 bufio 已预读后续行),按 SSE 帧聚合
+	// 再写客户端——与原 io.Copy 的「一次上游 chunk ≈ 一次 Write+Flush」
+	// 节奏对齐,保留逐事件的打字机效果,而不是退回到 line-at-a-time。
+	reader := peek.Reader
+	if reader == nil {
+		// EOF 收尾的 peek 没留下 reader——主循环立即结束。
+		reader = newStreamReader(ctx, rc, 0)
+	}
 	defer reader.Close()
+
+	var frameBuf strings.Builder
+	flushFrame := func() error {
+		if frameBuf.Len() == 0 {
+			return nil
+		}
+		_, err := io.WriteString(w, frameBuf.String())
+		frameBuf.Reset()
+		if err != nil {
+			return err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			// 先 close 上游,让 io.Copy 立刻读到错误退出(不再卡在 w.Write),
-			// 再 close pipe 让旁路解析收尾,这样 copyDone 不会等慢客户端。
-			if c, ok := rc.(io.Closer); ok {
-				_ = c.Close()
-			}
-			_ = pw.CloseWithError(ctx.Err())
-			<-copyDone
-			return
+			return true, ctx.Err()
 		case result := <-reader.Read():
-			pendingErr := result.err
 			line := result.line
+			pendingErr := result.err
 			if line != "" {
-				stats.NoteChunk()
-				observeAnthropicStreamEvent(stats, fullUsage, line)
+				observeLine(line)
+				frameBuf.WriteString(line)
+				// 空行 = 帧边界:整帧一次写出再 Flush。
+				if strings.TrimRight(line, "\r\n") == "" {
+					if err := flushFrame(); err != nil {
+						return true, err
+					}
+				}
 			}
 			if pendingErr != nil {
-				// pr 的错误只可能来自 pw.Close(),即 copy 协程已越过 io.Copy,
-				// 此处 join 必然立即返回;保证协程不再于 handler 返回后触碰
-				// 已交还的 http.ResponseWriter(net/http 禁止这种并发使用)。
-				<-copyDone
-				return
+				// EOF / 上游读取失败。先把残帧(无空行收尾)吐出去,再看是否
+				// 需要补 message_stop / 走重试。
+				if err := flushFrame(); err != nil {
+					return true, err
+				}
+				if !sawMessageStop {
+					if !sawMessageStart {
+						return false, errStreamIncompleteNoCommit
+					}
+					if _, err := io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"); err != nil {
+						return true, err
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+				return true, nil
 			}
 		}
 	}
