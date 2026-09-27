@@ -28,12 +28,19 @@ type ModelStats struct {
 	CacheCreatedTokens int64 `json:"cache_created_tokens,omitempty"`
 }
 
+// KeyStats 各字段汇总 key_pool 池内单把 key 的运行状态；Rate 字段由 cache
+// hit/miss 导出，避免前端/日志里再做除法。
 type KeyStats struct {
 	RequestCount int64  `json:"request_count"`
 	ErrorCount   int64  `json:"error_count"`
 	LastStatus   int    `json:"last_status"`
 	LastError    string `json:"last_error,omitempty"`
 	LastUsedUnix int64  `json:"last_used_unix"`
+	// CacheHitRequests / CacheMissRequests 以带 token 的请求为口径：
+	// 命中=usage.cached_tokens>0，miss=cached_tokens<=0（或无 usage）。
+	CacheHitRequests  int64   `json:"cache_hit_requests,omitempty"`
+	CacheMissRequests int64   `json:"cache_miss_requests,omitempty"`
+	CacheHitRatio     float64 `json:"cache_hit_ratio,omitempty"`
 }
 
 type TokenStatsData struct {
