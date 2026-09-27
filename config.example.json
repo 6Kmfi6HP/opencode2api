@@ -14,5 +14,18 @@
     "nemotron-3-ultra-free": 1000000,
     "nemotron-3.5-lightning-free": 1000000
   },
-  "protocol_rules": []
+  "protocol_rules": [],
+  "_comment_key_pool": "Optional upstream key pool: plain strings in keys[] are shorthand for {\"key\": ...}. Strategy: round_robin | weighted | sticky. Remove this comment key; copy the key_pool block below and fill real keys.",
+  "key_pool": {
+    "enabled": false,
+    "strategy": "round_robin",
+    "max_retries": 2,
+    "retry_on": [429, 500, 502, 503, 504],
+    "cooldown_secs": 60,
+    "blacklist_after": 3,
+    "keys": [
+      {"id": "k1", "key": "sk-placeholder-1", "group": "", "weight": 1, "enabled": true, "note": "account A"},
+      "sk-placeholder-2"
+    ]
+  }
 }

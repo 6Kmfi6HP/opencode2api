@@ -19,6 +19,7 @@ import (
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 	"github.com/6Kmfi6HP/opencode2api/internal/random"
+	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
 
 // ======================== 随机 ID ========================
@@ -552,6 +553,20 @@ func maxAttemptsForUpstreamStatus(status int) int {
 	return maxUpstreamRetries
 }
 
+func truncateKeyErr(s string) string {
+	if len(s) > 200 {
+		return s[:200]
+	}
+	return s
+}
+
+func truncateKeyErrBytes(b []byte) []byte {
+	if len(b) > 200 {
+		return b[:200]
+	}
+	return b
+}
+
 // callOpenCodeEndpoint 统一封装所有对上游 /zen/v1/* 和 /zen/go/v1/* 端点的 HTTP 调用，
 // 包含重试机制、SOCKS5 会话粘性与轮换、多域名轮换、错误归一与结构化日志输出。
 func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
@@ -578,6 +593,9 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 	if max401Retries > maxAttempts {
 		maxAttempts = max401Retries
 	}
+	if poolEnabled() && keypoolMaxAttempts() > maxAttempts {
+		maxAttempts = keypoolMaxAttempts()
+	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		// 仅"裸进程内回退值"才现造一次会话,避免同一请求的重试在
@@ -586,26 +604,34 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		if strings.TrimSpace(ocSession) == "" {
 			ocSession = newOCSessionID()
 		}
+		attemptAuth, keyID, pooled := selectPoolKey(auth, modelID, attempt)
+		targetAuth := auth
+		if pooled {
+			targetAuth = attemptAuth
+		}
 		upstreamHeaders := upstreamHeadersFromContext(ctx)
-		baseURL, client := selectUpstreamTarget(auth, bodyMap, upstreamHeaders, normalizedTransportScope(ocSession))
+		baseURL, client := selectUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, normalizedTransportScope(ocSession))
 		lastBaseURL = baseURL
-		up, err := buildOCRequestWithSubpath(modelID, bodyMap, auth, useGoEndpoint, baseURL, endpointSubpath, ocSession)
+		up, err := buildOCRequestWithSubpath(modelID, bodyMap, targetAuth, useGoEndpoint, baseURL, endpointSubpath, ocSession)
 		if err != nil {
 			return nil, 500, nil, err
 		}
-		up = up.WithContext(ctx)
 		attemptStart := time.Now()
 		resp, err := client.Do(up)
 		durationMs := time.Since(attemptStart).Milliseconds()
 		if err != nil {
 			lastErr = err
 			lastStatus = 0
+			if pooled {
+				reportKeyResult(keyID, 0, err)
+				statsx.RecordKeyUsage(keyID, 0, truncateKeyErr(err.Error()))
+			}
 			retryReason := "transport_error"
 			canRetry := attempt+1 < maxUpstreamRetries
 			if !canRetry {
 				retryReason = ""
 			}
-			log.Info("upstream_attempt",
+			args := []any{
 				"try_model", modelID,
 				"base_url", baseURL,
 				"surface", surface,
@@ -614,24 +640,36 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 				"attempt_index", attempt,
 				"retry_reason", retryReason,
 				"error", err.Error(),
-			)
+			}
+			if pooled {
+				args = append(args, "key_id", keyID)
+			}
+			log.Info("upstream_attempt", args...)
 			if canRetry {
 				client.CloseIdleConnections()
-				invalidateUpstreamTarget(auth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, ocSessionID))
+				invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, ocSessionID))
 				retryCount++
 				continue
 			}
 			break
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			log.Info("upstream_attempt",
+			if pooled {
+				reportKeyResult(keyID, resp.StatusCode, nil)
+				statsx.RecordKeyUsage(keyID, resp.StatusCode, "")
+			}
+			args := []any{
 				"try_model", modelID,
 				"base_url", baseURL,
 				"surface", surface,
 				"status", resp.StatusCode,
 				"duration_ms", durationMs,
 				"attempt_index", attempt,
-			)
+			}
+			if pooled {
+				args = append(args, "key_id", keyID)
+			}
+			log.Info("upstream_attempt", args...)
 			log.Info("upstream_result",
 				"models_tried", []string{modelID},
 				"base_url", baseURL,
@@ -644,6 +682,10 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		resp.Body.Close()
 		logging.UpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL)
+		if pooled {
+			reportKeyResult(keyID, resp.StatusCode, nil, errBody)
+			statsx.RecordKeyUsage(keyID, resp.StatusCode, string(truncateKeyErrBytes(errBody)))
+		}
 		nonRetryable := isNonRetryableUpstreamError(resp.StatusCode, errBody)
 		canRetry := !nonRetryable && shouldRetryUpstreamStatus(resp.StatusCode) && attempt+1 < maxAttemptsForUpstreamStatus(resp.StatusCode)
 		retryReason := ""
@@ -651,9 +693,17 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 			retryReason = fmt.Sprintf("status_%d", resp.StatusCode)
 		}
 		if nonRetryable {
-			retryReason = "non_retryable_upstream"
+			if pooled && !keypoolAttemptsExhausted(attempt) {
+				retryReason = "pool_failover"
+				canRetry = true
+			} else {
+				retryReason = "non_retryable_upstream"
+			}
+		} else if pooled && resp.StatusCode == http.StatusTooManyRequests && !canRetry && !keypoolAttemptsExhausted(attempt) {
+			retryReason = "pool_failover"
+			canRetry = true
 		}
-		log.Info("upstream_attempt",
+		args := []any{
 			"try_model", modelID,
 			"base_url", baseURL,
 			"surface", surface,
@@ -661,7 +711,11 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 			"duration_ms", durationMs,
 			"attempt_index", attempt,
 			"retry_reason", retryReason,
-		)
+		}
+		if pooled {
+			args = append(args, "key_id", keyID)
+		}
+		log.Info("upstream_attempt", args...)
 		lastBody = errBody
 		lastStatus = resp.StatusCode
 		lastHeader = resp.Header
@@ -671,7 +725,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		}
 		// 免费层 429 按出口 IP 限流,5xx 也可能是出口问题:
 		// 重试前切断 sticky,让同一会话换到下一个出口。
-		invalidateUpstreamTarget(auth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, ocSessionID))
+		invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, ocSessionID))
 		client.CloseIdleConnections()
 		retryCount++
 	}

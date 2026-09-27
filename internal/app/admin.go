@@ -69,6 +69,12 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		cfg.UpstreamBaseURLs = upstreamBaseURLs
 		socks5StickyRT := socks5Sticky
 		socks5Mu.RUnlock()
+		// key_pool (plaintext keys, same precedent as socks5_proxies
+		// passwords): admin is authenticated; the torn-read caveat above
+		// applies equally here.
+		keypoolMu.RLock()
+		keyPoolRT := keypoolCfg
+		keypoolMu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"model_alias":               cfg.ModelAlias,
@@ -85,6 +91,8 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			"socks5_sticky":             socks5StickyRT,
 			"text_only_models":          textOnlyModelsRT,
 			"protocol_rules":            getProtocolRules(),
+			"key_pool":                  keyPoolRT,
+			"key_pool_status":           keyPoolStatus(),
 			"log_level":                 logging.LevelString(),
 			"log_bodies":                logging.BodiesEnabled(),
 		})
@@ -104,6 +112,16 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
 				json.NewEncoder(w).Encode(map[string]string{"error": "invalid protocol_rules: " + err.Error()})
+				return
+			}
+		}
+		// key_pool 严格校验：strategy 非法、空 key、重复 id、weight<1
+		// 即 400，且不落盘不生效。Keys==nil 表示字段缺席，保持原值。
+		if payload.KeyPool.Keys != nil {
+			if err := validateKeyPool(payload.KeyPool); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "invalid key_pool: " + err.Error()})
 				return
 			}
 		}

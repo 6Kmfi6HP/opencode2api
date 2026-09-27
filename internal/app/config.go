@@ -57,7 +57,17 @@ func saveConfig(path string, cfg AppConfig) error {
 			return err
 		}
 	}
-	return os.WriteFile(path, data, 0o644)
+	// Key 池明文落盘：新文件 0600；已存在的旧文件（0644 等）同样收紧，
+	// 避免仅靠 umask 残留可读权限。
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm() != 0o600 {
+		if err := os.Chmod(path, 0o600); err != nil {
+			slog.Warn("config chmod failed", "path", path, "error", err)
+		}
+	}
+	return nil
 }
 
 func compileKeywordRules(rules []domain.ModelKeywordRule) ([]domain.ModelKeywordRule, []compiledKeywordRule) {
@@ -209,6 +219,15 @@ func applyConfig(cfg AppConfig) {
 
 	if cfg.ProtocolRules != nil {
 		setProtocolRules(compileProtocolRulesLenient(cfg.ProtocolRules))
+	}
+
+	// Key pool: normalize (default strategy round_robin, weight>=1,
+	// k1.. ids, dedup ids) and swap into runtime. A nil Keys slice means
+	// the section was absent, so keep prior runtime state (same precedent
+	// as the socks5 nil-guard above); normalizeKeyPool itself also
+	// preserves nil as nil for torn-read parity.
+	if cfg.KeyPool.Keys != nil {
+		setKeyPool(cfg.KeyPool)
 	}
 }
 
