@@ -366,7 +366,10 @@ func TestResponsesToChat_FunctionArgumentsDoneEmitsOnlyRemainder(t *testing.T) {
 		"event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc1\",\"arguments\":\"{\\\"q\\\":\\\"beijing\\\"}\"}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, true)
+		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, true, nil, nil)
+		if err != nil || !committed {
+			t.Fatalf("responsesSSEToChatStream = (%v, %v), want (true, nil)", committed, err)
+		}
 	})
 	// delta 已发 `{"q":`;done 只补发后缀 `"beijing"}`,不能重复 `{"q":`。
 	if !strings.Contains(body, `"arguments":"{\"q\":"`) {
@@ -390,7 +393,10 @@ func TestResponsesToChat_OutputItemDoneAnnouncesUndeclaredCall(t *testing.T) {
 		"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc9\",\"call_id\":\"call_9\",\"name\":\"ping\",\"arguments\":\"{}\"}}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false)
+		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false, nil, nil)
+		if err != nil || !committed {
+			t.Fatalf("responsesSSEToChatStream = (%v, %v), want (true, nil)", committed, err)
+		}
 	})
 	if !strings.Contains(body, `"id":"call_9"`) || !strings.Contains(body, `"name":"ping"`) {
 		t.Fatalf("未补发首 chunk 宣告工具调用: %s", body)
@@ -407,7 +413,10 @@ func TestResponsesToChat_FailedThenDoneSentinel(t *testing.T) {
 	sse := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-x\"}}\n\n" +
 		"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"r\",\"error\":{\"message\":\"upstream blew up\"}}}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false)
+		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false, nil, nil)
+		if err != nil || !committed {
+			t.Fatalf("responsesSSEToChatStream = (%v, %v), want (true, nil)", committed, err)
+		}
 	})
 	if !strings.Contains(body, `"error":{"message":"upstream blew up"}`) {
 		t.Fatalf("缺错误事件: %s", body)
