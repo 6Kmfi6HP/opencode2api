@@ -1838,8 +1838,7 @@ func TestResponsesStream_NormalizesUpstreamID(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream)), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, strings.NewReader(upstream), "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	for _, e := range events {
 		if e.Name == "response.created" {

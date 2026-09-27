@@ -481,7 +481,7 @@ func TestResponsesStreamHandlerRawDSML(t *testing.T) {
 	}, "\n")
 	rr := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: 200, Body: wrapRawSSE(io.NopCloser(strings.NewReader(upstream))), Header: make(http.Header)}
-	responsesStreamHandler(rr, nil, resp, "m", "m", false, nil, nil, ResponsesAPIRequest{})
+	responsesStreamHandler(rr, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "response.function_call_arguments.done") {
 		t.Fatalf("missing function_call done:\n%s", rr.Body.String())
