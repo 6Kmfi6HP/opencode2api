@@ -736,7 +736,10 @@ func TestResponsesSSEToChatStream(t *testing.T) {
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_9\",\"usage\":{\"input_tokens\":8,\"output_tokens\":5,\"total_tokens\":13}}}\n\n"
 
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", true, true)
+		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", true, true, nil, nil)
+		if err != nil || !committed {
+			t.Fatalf("responsesSSEToChatStream = (%v, %v), want (true, nil)", committed, err)
+		}
 	})
 
 	if !strings.Contains(body, `"role":"assistant"`) {
@@ -965,7 +968,10 @@ func TestResponsesSSEToChatStream_ToolArgumentsShareIndex(t *testing.T) {
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_7\"}}\n\n"
 
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false)
+		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false, nil, nil)
+		if err != nil || !committed {
+			t.Fatalf("responsesSSEToChatStream = (%v, %v), want (true, nil)", committed, err)
+		}
 	})
 
 	names := map[int]string{}
