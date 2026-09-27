@@ -8,7 +8,7 @@
 ```jsonc
 "key_pool": {
   "enabled": false,
-  "strategy": "round_robin",   // round_robin | weighted | sticky，三选一
+  "strategy": "sticky",        // 默认 sticky（缓存亲和）；round_robin | weighted 仍然可显式选配
   "max_retries": 2,            // 换 key 重试上限；总 attempt = 1+max_retries
   "retry_on": [429, 500, 502, 503, 504],
   "cooldown_secs": 60,         // 429/5xx/传输错误后的冷却窗口
@@ -80,3 +80,19 @@ DB/SQLite、密钥加密落盘（现阶段靠文件权限，见 §8）、下游 
 
 * `saveConfig` 写权限从 `0644` 收紧为 `0600`（单运维者工具；key 明文落盘的最低补偿）。
 * 运维备份 `config.json` 即备份全部 key；`config.example.json` 只放占位示例。
+
+
+## 9. 管理员密码兼任 pool 触发 API key（v0.15.x 起）
+
+- 客户端 `Authorization: Bearer <adminPassword>`（或 `x-api-key`）→ 由
+  `extractUpstreamAuth` 常量时间比对命中，归为 `AuthRouteAdmin`，跳过 sk-
+  前缀校验与池的 `Mode != Public` gate。`Authentication` 不再回传给上游。
+- `adminPassword == ""` 时该路径恒不命中；launch 模式默认就是空。
+- `go:` / `zen:` 前缀优先于密码判定（`<prefix>password` 仍按池接管且锁定那
+  个 surface 的 group）。
+- 池为空 / 全部冷却时按现状 `selectPoolKey` 返回 `pooled=false`，请求仍用
+  原密码直接转发给上游 —— 上游会 401。这与"客户端 sk-..."直传的兜底一致。
+- 安全约定：
+  - 比较走 `crypto/subtle.ConstantTimeCompare`，拒绝时序侧信道。
+  - `Source="admin"` 写日志，以便审计；密码本身永不落日志。
+  - `config.json` 已收紧 0600 权限（key_pool 明文 + adminPassword 落盘）。

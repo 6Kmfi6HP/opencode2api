@@ -52,7 +52,9 @@ func normalizeKeyPool(p KeyPool) KeyPool {
 	out := p
 	out.Keys = nil
 	if strings.TrimSpace(out.Strategy) == "" {
-		out.Strategy = "round_robin"
+		// 默认 sticky：与 prompt cache 亲和（同 stickySessionBase → 同池 key）。
+		// 显式 round_robin/weighted 仍然生效；只是不再默认按请求顺序轮动。
+		out.Strategy = "sticky"
 	}
 	seen := map[string]bool{}
 	nextAuto := 1

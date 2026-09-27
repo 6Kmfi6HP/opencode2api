@@ -2,6 +2,7 @@ package app
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"net/http"
 	"strings"
@@ -108,6 +109,9 @@ const (
 	AuthRouteAuto
 	AuthRouteZen
 	AuthRouteGo
+	// AuthRouteAdmin 匹配 adminPassword（panel 密码兼作 API key）。提取时
+	// 命中即不再比对真实 sk-，池 selectPoolKey 强制接管（design-keypool §2）。
+	AuthRouteAdmin
 )
 
 type UpstreamAuth struct {
@@ -136,6 +140,11 @@ func extractUpstreamAuth(r *http.Request) UpstreamAuth {
 			src = "none"
 		}
 		return UpstreamAuth{Mode: AuthRoutePublic, Source: src}
+	}
+	// admin 密码作为池触发 token：常量时间比对防时序侧信道；命中 → 强制池
+	// 接管（Mode=AuthRouteAdmin），不进入下游 sk- 校验。
+	if adminPassword != "" && subtle.ConstantTimeCompare([]byte(token), []byte(adminPassword)) == 1 {
+		return UpstreamAuth{Mode: AuthRouteAdmin, Source: "admin"}
 	}
 	// go:/zen: 前缀路由：去掉前缀后剩余部分仍需是有效 key（sk- 开头）
 	if rest, ok := strings.CutPrefix(token, "go:"); ok && isValidOpenCodeKey(rest) {

@@ -14,7 +14,8 @@ func resetPool(t *testing.T) {
 
 func TestKeyPool_RoundRobin(t *testing.T) {
 	resetPool(t)
-	setKeyPool(KeyPool{Enabled: true, Keys: []UpstreamKey{{Key: "k-a"}, {Key: "k-b"}, {Key: "k-c"}}})
+	// Strategy 默认是 "sticky"（design P0 更新）；本测试显式 round_robin 以验证老逻辑。
+	setKeyPool(KeyPool{Enabled: true, Strategy: "round_robin", Keys: []UpstreamKey{{Key: "k-a"}, {Key: "k-b"}, {Key: "k-c"}}})
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "client"}
 	var got []string
 	for range 6 {
