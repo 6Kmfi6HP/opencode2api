@@ -29,7 +29,7 @@
 | `/health` | `GET` | 健康检查 |
 | `/api/config` | `GET`/`POST` | 管理面板配置接口 |
 | `/api/stats` | `GET`/`DELETE` | token 统计接口 |
-| `/api/reload` | `POST` | 刷新 OpenCode 会话和模型列表 |
+| `/api/reload` | `POST` | 刷新 OpenCode 会话和模型列表；并发请求共享一次刷新 |
 
 `GET /v1/models` 的返回会随鉴权模式变化：
 

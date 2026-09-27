@@ -1,8 +1,13 @@
 package app
 
 import (
+	"io"
+	"net/http"
 	"regexp"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // The upstream free tier only accepts requests whose x-opencode-session
@@ -53,12 +58,11 @@ func TestSession_IDUniqueAcrossGenerations(t *testing.T) {
 // buildOCRequestWithSubpath must send the client-shaped headers: UA version,
 // client tag, session and request IDs.
 func TestOpenCode_RequestHeadersMirrorClient(t *testing.T) {
-	ocClientVer = ocMinFreeTierVersion
-	ocSessionID = newOCSessionID()
-	ocProjectID = randomHex(40)
+	state := &opencodeSessionState{clientVersion: ocMinFreeTierVersion, sessionID: newOCSessionID(), projectID: randomHex(40)}
+	setOCSessionStateForTest(state)
 	auth := UpstreamAuth{}
 	body := map[string]any{"messages": []any{}}
-	req, err := buildOCRequestWithSubpath("mimo-v2.5-free", body, auth, false, "https://opencode.ai", "chat/completions", ocSessionID)
+	req, err := buildOCRequestWithSubpath("mimo-v2.5-free", body, auth, false, "https://opencode.ai", "chat/completions", state.sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,11 +70,11 @@ func TestOpenCode_RequestHeadersMirrorClient(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got != wantUA {
 		t.Fatalf("User-Agent = %q, want %q", got, wantUA)
 	}
-	if got := req.Header.Get("x-session-id"); got != ocSessionID {
-		t.Fatalf("x-session-id = %q, want %q", got, ocSessionID)
+	if got := req.Header.Get("x-session-id"); got != state.sessionID {
+		t.Fatalf("x-session-id = %q, want %q", got, state.sessionID)
 	}
-	if got := req.Header.Get("x-session-affinity"); got != ocSessionID {
-		t.Fatalf("x-session-affinity = %q, want %q", got, ocSessionID)
+	if got := req.Header.Get("x-session-affinity"); got != state.sessionID {
+		t.Fatalf("x-session-affinity = %q, want %q", got, state.sessionID)
 	}
 	if got := req.Header.Get("x-opencode-client"); got != "cli" {
 		t.Fatalf("x-opencode-client = %q, want cli", got)
@@ -81,4 +85,67 @@ func TestOpenCode_RequestHeadersMirrorClient(t *testing.T) {
 	if !regexp.MustCompile(`^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`).MatchString(req.Header.Get("x-opencode-request")) {
 		t.Fatalf("x-opencode-request = %q has wrong format", req.Header.Get("x-opencode-request"))
 	}
+}
+
+func TestOpenCode_SessionRefreshSingleflight(t *testing.T) {
+	resetOCSessionForTest()
+	oldHTTPClient, oldActiveSocks5 := httpClient, activeSocks5
+	t.Cleanup(func() {
+		httpClient = oldHTTPClient
+		socks5Mu.Lock()
+		activeSocks5 = oldActiveSocks5
+		socks5Mu.Unlock()
+	})
+
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"version":"1.18.31"}`))}, nil
+	})}
+	socks5Mu.Lock()
+	activeSocks5 = ""
+	socks5Mu.Unlock()
+
+	initResult := make(chan *opencodeSessionState, 1)
+	go func() { initResult <- initOCSession() }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("initial session fetch did not start")
+	}
+
+	refreshResult := make(chan *opencodeSessionState, 1)
+	go func() { refreshResult <- refreshOCSession() }()
+	select {
+	case <-refreshResult:
+		close(release)
+		t.Fatal("refresh did not join the in-flight initialization")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+
+	first, refreshed := <-initResult, <-refreshResult
+	if calls.Load() != 1 || first != refreshed {
+		t.Fatalf("concurrent refresh calls = %d, states equal = %t", calls.Load(), first == refreshed)
+	}
+	second := refreshOCSession()
+	if calls.Load() != 2 || second == first {
+		t.Fatalf("sequential refresh calls = %d, replaced state = %t", calls.Load(), second != first)
+	}
+}
+
+func setDefaultOCSessionStateForTest() {
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "test", sessionID: "ses_test", projectID: "project_test"})
+}
+
+func setOCSessionStateForTest(state *opencodeSessionState) {
+	ocSessionState.Store(state)
+}
+
+func resetOCSessionForTest() {
+	ocSessionState.Store(nil)
 }
