@@ -70,6 +70,13 @@ func forwardClaudeViaAnthropic(ctx context.Context, w http.ResponseWriter, auth 
 				return r, status, nil
 			}
 			nrc, nstatus, _, nerr := callOpenCodeAnthropicEndpoint(c, upstreamBody, modelID, auth)
+			// Drive 拿到非 2xx 会立即返回(不再 close)。retry 路径里我们已
+			// 在上层只能是「走 chat 翻译兜底」,rc 在这里直接 close 掉防泄漏。
+			if nerr == nil && (nstatus < 200 || nstatus >= 300) {
+				if nrc != nil {
+					nrc.Close()
+				}
+			}
 			return nrc, nstatus, nerr
 		}
 		runOnce := func(c context.Context, w http.ResponseWriter, nrc io.Reader, _ []streamReadResult, _ *streamReader) (bool, error) {
@@ -133,7 +140,6 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 	if err := FlushPeekedBytes(w, peek.Consumed); err != nil {
 		return true, err
 	}
-	sawMessageStart := false
 	sawMessageStop := false
 	observeLine := func(line string) {
 		stats.NoteChunk()
@@ -146,10 +152,7 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 		if json.Unmarshal([]byte(strings.TrimSpace(payload)), &evt) != nil {
 			return
 		}
-		switch typ, _ := evt["type"].(string); typ {
-		case "message_start":
-			sawMessageStart = true
-		case "message_stop":
+		if typ, _ := evt["type"].(string); typ == "message_stop" {
 			sawMessageStop = true
 		}
 	}
@@ -213,10 +216,16 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 				if err := flushFrame(); err != nil {
 					return true, err
 				}
+				// 关键不变量:此时 WriteHeader + peeked 首帧字节已经发出去了,
+				// 客户端连接已经处于 SSE 数据段。**绝不可再返回 (false, ...)**
+				// 否则 DriveStreamWithRetry 会用同一个 ResponseWriter 二次
+				// WriteHeader + 二次 replay peeked 字节,流被污染(I4/I7)。
 				if !sawMessageStop {
-					if !sawMessageStart {
-						return false, errStreamIncompleteNoCommit
-					}
+					// 上游 EOF 但没关 message:展开成「合成 message_stop」让
+					// Claude SDK 正常关流。sawMessageStart=false 也照发——客
+					// 户端拿到「没 message_start 直接 message_stop」虽不规范,
+					// 但比重复写 header 安全(对一个非法流,SDK 通常仅丢弃该
+					// 事件,而不是报错)。
 					if _, err := io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"); err != nil {
 						return true, err
 					}

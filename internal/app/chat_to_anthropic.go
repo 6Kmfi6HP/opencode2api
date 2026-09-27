@@ -490,10 +490,13 @@ func forwardChatViaAnthropic(w http.ResponseWriter, r *http.Request, auth Upstre
 	if req.Stream {
 		// DriveStreamWithRetry 内部首轮调 callOnce 建立流；peek 失败（空流
 		// EOF/读错/首字节看门狗）时按 StreamEmptyRetryMax 换 key 重试。
-		callOnce := func(callCtx context.Context) (io.ReadCloser, int, error) {
+		// 用 UpstreamErrorCapture 暂存非 2xx 响应,这样 retry 全失败后能
+		// 把上游真实 status+body 透回去给客户端,而不是吞掉换成通用 502。
+		upstreamCap := &UpstreamErrorCapture{}
+		callOnce := upstreamCap.WrapCallOnce(func(callCtx context.Context) (io.ReadCloser, int, error) {
 			rc, status, _, err := callOpenCodeAnthropicEndpoint(callCtx, upstreamBody, req.Model, auth)
 			return rc, status, err
-		}
+		})
 		runOnce := func(runCtx context.Context, rw http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
 			return anthropicSSEToChatStream(runCtx, rw, rc, req.Model, keepReasoning, true, peeked, rd)
 		}
@@ -507,6 +510,10 @@ func forwardChatViaAnthropic(w http.ResponseWriter, r *http.Request, auth Upstre
 			return
 		}
 		log.Warn("chat via anthropic stream empty after retries", "model", req.Model, "err", streamErr)
+		// 优先回写上游真实错误(4xx/5xx 的 status+body),比通用 502 更利于调试。
+		if upstreamCap.WriteUpstreamErrorTo(w) {
+			return
+		}
 		writeUpstreamError(w, http.StatusBadGateway, fmt.Errorf("upstream stream empty after retries"), "chat")
 		return
 	}
@@ -711,10 +718,17 @@ func anthropicSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		}
 		if result.err != nil {
 			// EOF / 读错误兜底。
-			if !st.sentRole {
-				// message_start 都未到达 = 完全空流,从未 commit。
+			// 关键不变量:一旦 writeHeaderOnce 触发(任何行非空就调),HTTP
+			// 头已发出,**绝不能返回 (false, ...)** 否则 DriveStreamWithRetry
+			// 会用同一个 ResponseWriter 二次 WriteHeader 并 retry,流被污染
+			// (I4/I7)。message_start 未到但 header 已写的「伪 commit」场景:
+			// 让 st.finalize() 合成 finish 终止,对客户端是干净流末尾。
+			if !wroteHeader {
+				// 真未 commit(message_start 都未达且一字未写)= 让 Drive retry。
+				// 此分支只在 peeked 全空且首行就是 EOF 时进入。
 				return false, true, errStreamIncompleteNoCommit
 			}
+			// 已写过任意字节(无论是否到 message_start) —— 收尾 finalize。
 			// 已有 role 输出后再 EOF:按finalize合成 stop chunk+[DONE],
 			// 保证 OpenAI SDK 不挂起（幂等）。
 			st.finalize()

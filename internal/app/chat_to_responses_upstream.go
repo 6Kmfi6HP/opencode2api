@@ -283,7 +283,8 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 		// 负责 Close),这里不能再 defer Close。
 
 		pending := rc
-		callOnce := func(ctx context.Context) (io.ReadCloser, int, error) {
+		upstreamCap := &UpstreamErrorCapture{}
+		callOnce := upstreamCap.WrapCallOnce(func(ctx context.Context) (io.ReadCloser, int, error) {
 			if pending != nil {
 				first := pending
 				pending = nil
@@ -291,7 +292,7 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 			}
 			rc2, status2, _, err2 := callOpenCodeEndpoint(ctx, "responses", upstreamBody, req.Model, auth)
 			return rc2, status2, err2
-		}
+		})
 		runOnce := func(ctx context.Context, w http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
 			return responsesSSEToChatStream(ctx, w, rc, req.Model, keepReasoning, true, peeked, rd)
 		}
@@ -301,6 +302,10 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 		}
 		if driveErr != nil && (errors.Is(driveErr, context.Canceled) || errors.Is(driveErr, context.DeadlineExceeded)) {
 			// 客户端已离开:不要往已断开的连接再写错误。
+			return
+		}
+		// 优先回写上游真实错误(4xx/5xx 的 status+body),比通用 502 更利于调试。
+		if upstreamCap.WriteUpstreamErrorTo(w) {
 			return
 		}
 		// 全部 attempt 都未 commit(空流 EOF / 上游首帧错误 / 首字节超时

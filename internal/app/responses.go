@@ -1655,7 +1655,8 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		// 一个 502 JSON。
 		ctx := r.Context()
 		pending := upResp
-		callOnce := func(c context.Context) (io.ReadCloser, int, error) {
+		upstreamCap := &UpstreamErrorCapture{}
+		callOnce := upstreamCap.WrapCallOnce(func(c context.Context) (io.ReadCloser, int, error) {
 			if pending != nil {
 				rc := pending
 				pending = nil
@@ -1663,7 +1664,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			nrc, nstatus, _, nerr := callOpenCodeAPIStream(c, upstreamBody, chatReq.Model, auth)
 			return nrc, nstatus, nerr
-		}
+		})
 		runOnce := func(c context.Context, w http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
 			return responsesStreamHandler(w, r, rc, chatReq.Model, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice, respReq, peeked, rd)
 		}
@@ -1673,6 +1674,10 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			logging.FromContext(ctx).Warn("responses translate stream exhausted retries", "model", chatReq.Model, "err", driveErr)
+			// 优先回写上游真实错误(4xx/5xx 的 status+body),比通用 502 更利于调试。
+			if upstreamCap.WriteUpstreamErrorTo(w) {
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream stream incomplete", "type": "upstream_error"}})

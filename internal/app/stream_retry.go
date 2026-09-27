@@ -123,6 +123,87 @@ var (
 // 错误 / 上游错误事件——尚未向客户端写过任何字节，调用方可安全重试。
 var errStreamIncompleteNoCommit = errors.New("stream incomplete before first client byte")
 
+// UpstreamErrorCapture 捕获最近一次非 2xx 响应的 (rc, status),让调用
+// 方在 Drive 返回 (!committed, ...) 后还能把真实 status+body 回写给客
+// 户端——而不是吞掉换成通用 502。
+//
+// 使用模式:
+//
+//	cap := &UpstreamErrorCapture{}
+//	committed, err := DriveStreamWithRetry(ctx, w, hooks,
+//	    cap.WrapCallOnce(rawCallOnce),
+//	    runOnce)
+//	if !committed {
+//	    if cap.Status != 0 && cap.RC != nil {
+//	        // write the buffered status+body to w
+//	    }
+//	}
+//
+// WrapCallOnce 同时在「Drive 内部 close 不到非 2xx rc」的前提下兜底:
+// 非 2xx 时不交给 Drive Close,由 WrapCallOnce 把 rc 暂存到字段里;调用
+// 方在后面读取并 close。
+type UpstreamErrorCapture struct {
+	RC     io.ReadCloser
+	Status int
+}
+
+// WrapCallOnce 包装一个原始 callOnce:首轮/重试都过Wrap。
+//   - 进 Drive 的 rc 仅在 2xx 时由 Drive 拥有;
+//   - 非 2xx 时 Wrap 把 rc 暂存到 Cap,返回 (nil, status, nil)——Drive 看到
+//     nil rc + 非 2xx status 就直接放弃(不再 close 一个已经是 nil 的 rc)。
+func (cap *UpstreamErrorCapture) WrapCallOnce(
+	callOnce func(ctx context.Context) (io.ReadCloser, int, error),
+) func(ctx context.Context) (io.ReadCloser, int, error) {
+	return func(ctx context.Context) (io.ReadCloser, int, error) {
+		rc, status, err := callOnce(ctx)
+		if err != nil {
+			if rc != nil {
+				rc.Close()
+			}
+			return nil, status, err
+		}
+		if status < 200 || status >= 300 {
+			// 由 Wrap 持有 rc,Drive 不会 Close——调用方在 committed=false 后
+			// 读出 body 回写给客户端,然后 Close。
+			if cap.RC != nil {
+				cap.RC.Close()
+			}
+			cap.RC = rc
+			cap.Status = status
+			return nil, status, nil
+		}
+		return rc, status, nil
+	}
+}
+
+// WriteUpstreamErrorTo 把捕获到的非 2xx 上游响应原样回写给客户端。返回
+// 是否成功表达了一段上游错误(若 cap 里没有捕获,返回 false)。调用方在
+// false 时应回退到自己的通用错误。
+func (cap *UpstreamErrorCapture) WriteUpstreamErrorTo(w http.ResponseWriter) bool {
+	if cap.RC == nil || cap.Status < 200 {
+		return false
+	}
+	defer cap.RC.Close()
+	errBody, _ := io.ReadAll(io.LimitReader(cap.RC, 32*1024*1024))
+	status := cap.Status
+	if status < 100 || status >= 600 {
+		status = http.StatusBadGateway
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if len(errBody) > 0 {
+		_, _ = w.Write(errBody)
+	} else {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": fmt.Sprintf("upstream status %d", status),
+				"type":    "upstream_error",
+			},
+		})
+	}
+	return true
+}
+
 // FlushPeekedBytes 把 peek 阶段攒的 SSE 行原样写回 w（行字节、换行符都
 // 不动）。返回首个写错误。byte-level 透传路径用它把 peek 消费掉的字节
 // 回放给客户端。
@@ -201,6 +282,10 @@ func PeekFirstFrame(ctx context.Context, rc io.Reader, timeout time.Duration, ho
 	for {
 		select {
 		case <-ctx.Done():
+			// 关键:必须 Close reader,否则它的 goroutine 会永阻塞在 readCh
+			// 上(readCh 已无接收方,<-r.done 又从未被 close)——每客户端断开
+			// 一次的连接就 leak 一个 goroutine。
+			reader.Close()
 			return PeekOutcome{Err: ctx.Err()}
 		case <-timeoutCh:
 			reader.Close()
@@ -274,9 +359,8 @@ func DriveStreamWithRetry(
 		return false, err
 	}
 	if status < 200 || status >= 300 {
-		if rc != nil {
-			rc.Close()
-		}
+		// 不在这里 close rc —— 调用方可能还要把上游错误体透传给客户端。
+		// 由调用方负责 close(或在 callOnce 内留好暂存句柄)。
 		return false, fmt.Errorf("upstream status %d on retry", status)
 	}
 
@@ -295,13 +379,15 @@ func DriveStreamWithRetry(
 			logging.FromContext(ctx).Warn("stream empty before commit, retrying with next key",
 				"attempt", attempt+1, "max_retry", maxRetry, "cause", runErr)
 			nextRC, status, callErr := callOnce(ctx)
-			if callErr != nil || status < 200 || status >= 300 {
+			if callErr != nil {
+				// 调用方有 wrap 时它已 close;无 wrap 时这里 close 兜底。
 				if nextRC != nil {
 					nextRC.Close()
 				}
-				if callErr != nil {
-					return false, callErr
-				}
+				return false, callErr
+			}
+			if status < 200 || status >= 300 {
+				// 与顶部路径一致:不 close,让调用方 WrapCallOnce 处理。
 				return false, fmt.Errorf("upstream status %d on retry", status)
 			}
 			rc = nextRC

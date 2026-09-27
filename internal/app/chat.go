@@ -571,11 +571,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	if req.Stream {
 		ctx := r.Context()
+		// 用 UpstreamErrorCapture 包住 callOnce:非 2xx 时 rc 暂存到 cap
+		// (Drive 不会 close),让外层在后面把上游真实 status+body 回写给客户
+		// 端,而不是吞掉换成通用 502。
+		upstreamCap := &UpstreamErrorCapture{}
 		committed, driveErr := DriveStreamWithRetry(ctx, w, ChatProtocolHooks,
-			func(c context.Context) (io.ReadCloser, int, error) {
+			upstreamCap.WrapCallOnce(func(c context.Context) (io.ReadCloser, int, error) {
 				rc, status, _, err := callOpenCodeAPIStream(c, upstreamBody, req.Model, auth)
 				return rc, status, err
-			},
+			}),
 			func(c context.Context, w http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
 				return chatStreamRunOnce(c, w, rc, peeked, rd, &req, keepReasoning, clientWantsUsage)
 			})
@@ -583,6 +587,12 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		// 形式写给客户端（未 WriteHeader,还是非流式响应）。
 		if !committed {
 			if driveErr != nil && errors.Is(driveErr, context.Canceled) {
+				return
+			}
+			// 优先把上游真实 status + body 透回去:4xx/5xx 客户端能从 body
+			// 里看到具体错误信息(max_tokens 越界、rate limit 等),比 502
+			// 通用错误更有用。仅在没拿到上游 body 时落在通用 502。
+			if upstreamCap.WriteUpstreamErrorTo(w) {
 				return
 			}
 			msg := "upstream stream incomplete"
@@ -794,7 +804,7 @@ func chatStreamRunOnce(
 			if trimmed := strings.TrimSpace(res.line); trimmed != "" {
 				// 残帧也算一次处理尝试:走到下面统一行处理。
 				res.err = nil // 清掉让下方逻辑把残行当完整行处理
-				if handleChatStreamLine(res.line, req, keepReasoning, clientWantsUsage, stats, &doneSeen, emitLine) {
+				if handleChatStreamLine(res.line, req, keepReasoning, clientWantsUsage, stats, &doneSeen, emitLine, wroteHeader) {
 					// 残行内含 [DONE]:正常收尾
 					stats.Log(ctx, "chat")
 					return true, nil
@@ -832,7 +842,7 @@ func chatStreamRunOnce(
 			continue
 		}
 		// 处理一行:返回 true 表示这一行刚好是 [DONE],流应正常收尾。
-		if handleChatStreamLine(res.line, req, keepReasoning, clientWantsUsage, stats, &doneSeen, emitLine) {
+		if handleChatStreamLine(res.line, req, keepReasoning, clientWantsUsage, stats, &doneSeen, emitLine, wroteHeader) {
 			stats.Log(ctx, "chat")
 			return true, nil
 		}
@@ -850,7 +860,11 @@ func chatStreamRunOnce(
 // true 表示这一帧是 [DONE](流天然收尾),false 表示还需继续。已经经过
 // convertStreamChunkWithUsage 的改写,逐条原样 emit 给客户端。
 //
-// 注意:emit 通过闭包完成,首次 emit 时由它去 WriteHeader(200) —— 即
+// wasCommitted 表示「本行处理之前 HTTP 头是否已发出」——只在已 commit
+// 之后才允许 RecordChatUsage,否则 attempt 在 commit 前夭折时,Drive 的
+// 下一次 attempt 会重复统计同一笔上游 usage(double-count)。
+//
+// emit 通过闭包完成,首次 emit 时由它去 WriteHeader(200) —— 即
 // 「commit 点」在第一次实际写出时发生,而不是 handler 入口。
 func handleChatStreamLine(
 	line string,
@@ -860,6 +874,7 @@ func handleChatStreamLine(
 	stats *logging.StreamStats,
 	doneSeen *bool,
 	emitLine func(string),
+	wasCommitted bool,
 ) bool {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "data: [DONE]" {
@@ -891,13 +906,14 @@ func handleChatStreamLine(
 
 	out, usage := convertStreamChunkWithUsage(line, keepReasoning, clientWantsUsage)
 	if out == "" {
-		// 空 choices chunk,但可能有 usage。
-		if usage != nil {
+		// 空 choices chunk,但可能有 usage。仅在已 commit 后才记录 usage;
+		// 否则本次 attempt 由 retry 取消时,usage 仍会被错误地统计进账号。
+		if usage != nil && wasCommitted {
 			statsx.RecordChatUsage(req.Model, usage)
 		}
 		return false
 	}
-	if usage != nil && !*doneSeen {
+	if usage != nil && !*doneSeen && wasCommitted {
 		statsx.RecordChatUsage(req.Model, usage)
 	}
 	emitLine(out + "\n")

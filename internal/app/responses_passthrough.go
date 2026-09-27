@@ -1010,8 +1010,11 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 
 	// byte-level 透传：peek 已消费的字节保持原样直写 w,与主循环读取的
 	// 后续字节拼成完整 SSE 流。
+	// 关键不变量:WriteHeader(status) 已发出 —— 此后绝对不能再返回
+	// (false, ...) 让 Drive 二次 WriteHeader。flush 写错(连接已断)也
+	// 同样视为已 commit。
 	if err := FlushPeekedBytes(w, peek.Consumed); err != nil {
-		return false, err
+		return true, err
 	}
 	if flusher != nil {
 		flusher.Flush()
@@ -1098,7 +1101,10 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 			)
 			select {
 			case <-ctx.Done():
-				return false, ctx.Err()
+				// 已写过 WriteHeader + peeked 字节,不能再返回 (false, ...) 让
+				// Drive 二次 WriteHeader / retry。返回 (true, ...) 透传 ctx
+				// 错误,Drive 看到 committed=true 立即结束循环。
+				return true, ctx.Err()
 			case res := <-reader.Read():
 				line = res.line
 				err = res.err
