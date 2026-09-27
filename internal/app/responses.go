@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
@@ -1607,13 +1608,18 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			// （prompt_cache_key/retention 保留），并记住该模型不再注入。
 			if rc, st, rerr := retryChatCompletionsWithoutCacheControl(r.Context(), upstreamBody, chatReq.Model, auth, status, transErrBody, true); rc != nil || rerr != nil || st != 0 {
 				if rerr == nil && st >= 200 && st < 300 {
-					defer rc.Close()
-					resp := &http.Response{
-						StatusCode: st,
-						Body:       rc,
-						Header:     make(http.Header),
+					// 这条 cache_control 回退路径不再走 DriveStreamWithRetry —— 它本身
+					// 已是一次重发;空流兜底由 responsesStreamHandler 的内部 peek 给
+					// 出 (false, err),然后我们回落 502 JSON。rc 由 handler 内部
+					// reader 关闭,所以这里不能再 defer Close。
+					ctx := r.Context()
+					committed, driveErr := responsesStreamHandler(w, r, rc, chatReq.Model, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice, respReq, nil, nil)
+					if !committed && driveErr != nil && !errors.Is(driveErr, context.Canceled) && !errors.Is(driveErr, context.DeadlineExceeded) {
+						logging.FromContext(ctx).Warn("cache_control fallback stream empty before commit", "err", driveErr)
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusBadGateway)
+						json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream stream incomplete", "type": "upstream_error"}})
 					}
-					responsesStreamHandler(w, r, resp, chatReq.Model, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice, respReq)
 					return
 				}
 				if rerr != nil {
@@ -1638,14 +1644,44 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error"}})
 			return
 		}
-		defer upResp.Close()
-
-		resp := &http.Response{
-			StatusCode: status,
-			Body:       upResp,
-			Header:     make(http.Header),
+		// rc 的所有权交给 DriveStreamWithRetry(它在每次 attempt 结束后负责
+		// Close),这里不能再 defer Close。
+		//
+		// 上游是 OpenAI chat completions —— 用 ChatProtocolHooks;首个请求已
+		// 在这里同步拿到,首轮复用 upResp、后续 attempt 让 callOnce 重发以便
+		// key pool 切到下一把可用 key。空流 / EOF / 错误帧 / 首字节超时都会
+		// 走到 DriveStreamWithRetry 内部按 errStreamIncompleteNoCommit 重试;
+		// 全部 attempt 失败时,因为尚未向客户端写过任何字节,可以干净地写
+		// 一个 502 JSON。
+		ctx := r.Context()
+		pending := upResp
+		upstreamCap := &UpstreamErrorCapture{}
+		callOnce := upstreamCap.WrapCallOnce(func(c context.Context) (io.ReadCloser, int, error) {
+			if pending != nil {
+				rc := pending
+				pending = nil
+				return rc, http.StatusOK, nil
+			}
+			nrc, nstatus, _, nerr := callOpenCodeAPIStream(c, upstreamBody, chatReq.Model, auth)
+			return nrc, nstatus, nerr
+		})
+		runOnce := func(c context.Context, w http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
+			return responsesStreamHandler(w, r, rc, chatReq.Model, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice, respReq, peeked, rd)
 		}
-		responsesStreamHandler(w, r, resp, chatReq.Model, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice, respReq)
+		committed, driveErr := DriveStreamWithRetry(ctx, w, ChatProtocolHooks, callOnce, runOnce)
+		if !committed && driveErr != nil {
+			if errors.Is(driveErr, context.Canceled) || errors.Is(driveErr, context.DeadlineExceeded) {
+				return
+			}
+			logging.FromContext(ctx).Warn("responses translate stream exhausted retries", "model", chatReq.Model, "err", driveErr)
+			// 优先回写上游真实错误(4xx/5xx 的 status+body),比通用 502 更利于调试。
+			if upstreamCap.WriteUpstreamErrorTo(w) {
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream stream incomplete", "type": "upstream_error"}})
+		}
 		return
 	}
 
@@ -1728,15 +1764,55 @@ func responsesInputTokensDetails(details any) map[string]any {
 	return map[string]any{"cached_tokens": 0}
 }
 
-func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.Response, model string, _ string, wantReasoning bool, tools []ResponsesTool, toolChoice any, originalReq ResponsesAPIRequest) {
+// responsesStreamHandler 把上游 OpenAI chat-completions SSE 翻译为
+// Responses SSE。返回值的约定(与 PeekFirstFrame / DriveStreamWithRetry
+// 配合,实现「首 token 前可重试」):
+//   - (true, nil):已向客户端写过至少一个字节(SSE 头 + response.created
+//     已写出),即已 commit。此后即使上游再出错也仅向客户端发
+//     response.failed 收尾,不再重试。
+//   - (false, err):未向客户端写过任何字节——peek 窗口里上游给了空流/
+//     错误事件/EOF/超时。调用方可以安全地关闭当前 reader、换 key 重发。
+//
+// peeked 非空时,把这些行回放进主循环(此调用已是某次 peek-commit 之后
+// 的干跑),不再二次 peek、不再做首字节看门狗(窗口已在第一次调用里
+// 耗尽);状态(responseID/msgID 等)在本函数顶部已初始化,回放不会再
+// 触发重新随机化——ensureCreated 内部 createdSent 会保证只产生一次。
+func responsesStreamHandler(w http.ResponseWriter, r *http.Request, rc io.Reader, model string, _ string, wantReasoning bool, tools []ResponsesTool, toolChoice any, originalReq ResponsesAPIRequest, peeked []streamReadResult, rd *streamReader) (bool, error) {
 	ctx := context.Background()
 	if r != nil {
 		ctx = r.Context()
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
+
+	// 初始化 reader:reuse rd(其 bufio 已包含 peek 预读),否则在 rc 上
+	// 新建并先做首字节 peek。peek 失败等价于「commit 前空流」,返回
+	// (false, errStreamIncompleteNoCommit) 交给外层 Drive 重试。
+	var reader *streamReader
+	if len(peeked) == 0 {
+		peek := PeekFirstFrame(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, ChatProtocolHooks)
+		if peek.Err != nil {
+			if peek.Reader == nil {
+				// peek 内部已经关闭了它的 reader(失败路径),无需再关。
+			}
+			return false, peek.Err
+		}
+		peeked = peek.Consumed
+		reader = peek.Reader
+		if reader == nil {
+			// 上游 EOF 但已有完整帧(极少见:单帧流)。续读 reader 落
+			// 在已 EOF 的 rc 上,主循环立即收 EOF 走 finalize。
+			reader = newStreamReader(ctx, rc, 15*time.Second)
+		} else {
+			// 复用 peek 的 reader(它的 bufio 可能已预读后续行);顺手开
+			// keepalive(此前为 0,看门狗由 timeout 承担)。
+			reader.enableKeepalive(15 * time.Second)
+		}
+	} else if rd != nil {
+		reader = rd
+		reader.enableKeepalive(15 * time.Second)
+	} else {
+		reader = newStreamReader(ctx, rc, 15*time.Second)
+	}
+	defer reader.Close()
 
 	flusher, _ := w.(http.Flusher)
 	stats := &logging.StreamStats{Start: time.Now()}
@@ -1772,7 +1848,33 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 	reasoningOutputIndex := -1
 	messageIndex := -1
 
-	reader := newStreamReader(ctx, resp.Body, 0)
+	// wroteHeader 标记「是否已向客户端写过任何字节」——即 commit 点。一旦
+	// 写过就不可逆,后续错误只能发错误帧收尾,不可重试。
+	wroteHeader := false
+	// writeEvent 包装一层惰性 WriteHeader——首次真正写字节时才 WriteHeader(200),
+	// 这样 peek 失败路径从未碰过 w,客户端能拿到干净的 JSON 错误。
+	writeEvent := func(event string, data any) {
+		if !wroteHeader {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(http.StatusOK)
+			wroteHeader = true
+		}
+		writeSSEEvent(w, flusher, event, data)
+	}
+
+	// pending 是 peek 阶段回放给主循环的行(含 peek 收的那批首帧数据),按
+	// 序消费直到清空,然后转去读 reader.Read() 直读上游。
+	pending := append([]streamReadResult(nil), peeked...)
+	popPending := func() (streamReadResult, bool) {
+		if len(pending) == 0 {
+			return streamReadResult{}, false
+		}
+		out := pending[0]
+		pending = pending[1:]
+		return out, true
+	}
 
 	defer func() {
 		stats.TextChars = len(fullText)
@@ -1780,8 +1882,6 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		stats.ToolCallCount = len(toolOrder)
 		stats.Log(ctx, "responses")
 	}()
-	// Reader cleanup: signal goroutine, unblock any pending read, wait for exit.
-	defer reader.Close()
 
 	messageOutputIndex := func() int {
 		if messageIndex < 0 {
@@ -1836,7 +1936,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			return
 		}
 		seq++
-		writeSSEEvent(w, flusher, "response.reasoning_summary_text.done", map[string]any{
+		writeEvent("response.reasoning_summary_text.done", map[string]any{
 			"type":            "response.reasoning_summary_text.done",
 			"sequence_number": seq,
 			"item_id":         reasoningID,
@@ -1845,7 +1945,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			"text":            fullReasoning,
 		})
 		seq++
-		writeSSEEvent(w, flusher, "response.reasoning_summary_part.done", map[string]any{
+		writeEvent("response.reasoning_summary_part.done", map[string]any{
 			"type":            "response.reasoning_summary_part.done",
 			"sequence_number": seq,
 			"item_id":         reasoningID,
@@ -1854,7 +1954,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			"part":            map[string]any{"type": "summary_text", "text": fullReasoning},
 		})
 		seq++
-		writeSSEEvent(w, flusher, "response.output_item.done", map[string]any{
+		writeEvent("response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    reasoningOutputIndex,
@@ -1869,7 +1969,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		}
 		idx := messageOutputIndex()
 		seq++
-		writeSSEEvent(w, flusher, "response.output_text.done", map[string]any{
+		writeEvent("response.output_text.done", map[string]any{
 			"type":            "response.output_text.done",
 			"sequence_number": seq,
 			"item_id":         msgID,
@@ -1879,7 +1979,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			"logprobs":        []any{},
 		})
 		seq++
-		writeSSEEvent(w, flusher, "response.content_part.done", map[string]any{
+		writeEvent("response.content_part.done", map[string]any{
 			"type":            "response.content_part.done",
 			"sequence_number": seq,
 			"item_id":         msgID,
@@ -1888,7 +1988,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			"part":            map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": fullText},
 		})
 		seq++
-		writeSSEEvent(w, flusher, "response.output_item.done", map[string]any{
+		writeEvent("response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    idx,
@@ -1903,7 +2003,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		}
 		idx := messageOutputIndex()
 		seq++
-		writeSSEEvent(w, flusher, "response.refusal.done", map[string]any{
+		writeEvent("response.refusal.done", map[string]any{
 			"type":            "response.refusal.done",
 			"sequence_number": seq,
 			"item_id":         msgID,
@@ -1923,7 +2023,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		name, _ := call["name"].(string)
 		args, _ := call["arguments"].(string)
 		seq++
-		writeSSEEvent(w, flusher, "response.function_call_arguments.done", map[string]any{
+		writeEvent("response.function_call_arguments.done", map[string]any{
 			"type":            "response.function_call_arguments.done",
 			"sequence_number": seq,
 			"item_id":         itemID,
@@ -1941,7 +2041,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			item["namespace"] = ns
 		}
 		item["status"] = itemStatus
-		writeSSEEvent(w, flusher, "response.output_item.done", map[string]any{
+		writeEvent("response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    idx,
@@ -1964,13 +2064,13 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 			}
 		}
 		seq++
-		writeSSEEvent(w, flusher, "response.created", map[string]any{
+		writeEvent("response.created", map[string]any{
 			"type":            "response.created",
 			"sequence_number": seq,
 			"response":        map[string]any{"id": responseID, "object": "response", "created_at": createdAt, "status": "in_progress", "background": false, "error": nil, "output": []any{}},
 		})
 		seq++
-		writeSSEEvent(w, flusher, "response.in_progress", map[string]any{
+		writeEvent("response.in_progress", map[string]any{
 			"type":            "response.in_progress",
 			"sequence_number": seq,
 			"response":        map[string]any{"id": responseID, "object": "response", "created_at": createdAt, "status": "in_progress"},
@@ -1996,7 +2096,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 		}
 		applyResponsesRequestEcho(failedResponse, originalReq)
 		seq++
-		writeSSEEvent(w, flusher, "response.failed", map[string]any{
+		writeEvent("response.failed", map[string]any{
 			"type":            "response.failed",
 			"sequence_number": seq,
 			"response":        failedResponse,
@@ -2008,11 +2108,22 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, resp *http.R
 
 loop:
 	for {
-		select {
-		case <-ctx.Done():
-			// Client cancelled: quiet exit, no error writes.
-			return
-		case result := <-reader.Read():
+		var result streamReadResult
+		// 优先回放 peeked 行;空了再 select reader/ctx.Done。
+		if r0, ok := popPending(); ok {
+			result = r0
+		} else {
+			select {
+			case <-ctx.Done():
+				// Client cancelled: quiet exit, no error writes.
+				if wroteHeader {
+					return true, nil
+				}
+				return false, ctx.Err()
+			case result = <-reader.Read():
+			}
+		}
+		{
 			// bufio.ReadString may return both a non-empty line and an error
 			// (e.g. the last line without a trailing newline + io.EOF). Process
 			// the line first, then handle the accompanying error via pendingErr.
@@ -2029,8 +2140,12 @@ loop:
 						finished = true
 						break loop
 					}
+					if !wroteHeader {
+						// [DONE] 但从未 commit 过——上游没有给我们任何产出帧。
+						return false, errStreamIncompleteNoCommit
+					}
 					emitResponseFailed("stream ended with [DONE] but no finish_reason")
-					return
+					return true, nil
 				}
 				break loop
 			}
@@ -2039,8 +2154,11 @@ loop:
 				if strings.TrimSpace(payload) != "" {
 					var chunk map[string]any
 					if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+						if !wroteHeader {
+							return false, errStreamIncompleteNoCommit
+						}
 						emitResponseFailed("stream received malformed JSON data")
-						return
+						return true, nil
 					} else {
 						// In-band error from upstream.
 						if errVal, ok := chunk["error"]; ok && errVal != nil {
@@ -2052,8 +2170,11 @@ loop:
 							} else if errStr, ok := errVal.(string); ok && errStr != "" {
 								errMsg = errStr
 							}
+							if !wroteHeader {
+								return false, errStreamIncompleteNoCommit
+							}
 							emitResponseFailed(errMsg)
-							return
+							return true, nil
 						} else {
 							stats.NoteChunk()
 							ensureCreated(chunk)
@@ -2087,14 +2208,14 @@ loop:
 											if !reasoningStarted {
 												reasoningOutputIndex = indexAllocator.Allocate()
 												seq++
-												writeSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+												writeEvent("response.output_item.added", map[string]any{
 													"type":            "response.output_item.added",
 													"sequence_number": seq,
 													"output_index":    reasoningOutputIndex,
 													"item":            reasoningItem("in_progress"),
 												})
 												seq++
-												writeSSEEvent(w, flusher, "response.reasoning_summary_part.added", map[string]any{
+												writeEvent("response.reasoning_summary_part.added", map[string]any{
 													"type":            "response.reasoning_summary_part.added",
 													"sequence_number": seq,
 													"item_id":         reasoningID,
@@ -2106,7 +2227,7 @@ loop:
 											}
 											fullReasoning += rcStr
 											seq++
-											writeSSEEvent(w, flusher, "response.reasoning_summary_text.delta", map[string]any{
+											writeEvent("response.reasoning_summary_text.delta", map[string]any{
 												"type":            "response.reasoning_summary_text.delta",
 												"sequence_number": seq,
 												"item_id":         reasoningID,
@@ -2137,14 +2258,14 @@ loop:
 										if !messageStarted {
 											idx := messageOutputIndex()
 											seq++
-											writeSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+											writeEvent("response.output_item.added", map[string]any{
 												"type":            "response.output_item.added",
 												"sequence_number": seq,
 												"output_index":    idx,
 												"item":            map[string]any{"id": msgID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
 											})
 											seq++
-											writeSSEEvent(w, flusher, "response.content_part.added", map[string]any{
+											writeEvent("response.content_part.added", map[string]any{
 												"type":            "response.content_part.added",
 												"sequence_number": seq,
 												"item_id":         msgID,
@@ -2156,7 +2277,7 @@ loop:
 										}
 										fullText += contentStr
 										seq++
-										writeSSEEvent(w, flusher, "response.output_text.delta", map[string]any{
+										writeEvent("response.output_text.delta", map[string]any{
 											"type":            "response.output_text.delta",
 											"sequence_number": seq,
 											"item_id":         msgID,
@@ -2173,7 +2294,7 @@ loop:
 										}
 										fullRefusal += refusalStr
 										seq++
-										writeSSEEvent(w, flusher, "response.refusal.delta", map[string]any{
+										writeEvent("response.refusal.delta", map[string]any{
 											"type":            "response.refusal.delta",
 											"sequence_number": seq,
 											"item_id":         msgID,
@@ -2225,7 +2346,7 @@ loop:
 											if ns != "" {
 												addedItem["namespace"] = ns
 											}
-											writeSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+											writeEvent("response.output_item.added", map[string]any{
 												"type":            "response.output_item.added",
 												"sequence_number": seq,
 												"output_index":    outputIndex,
@@ -2247,7 +2368,7 @@ loop:
 										if argDelta, _ := fn["arguments"].(string); argDelta != "" {
 											call["arguments"] = call["arguments"].(string) + argDelta
 											seq++
-											writeSSEEvent(w, flusher, "response.function_call_arguments.delta", map[string]any{
+											writeEvent("response.function_call_arguments.delta", map[string]any{
 												"type":            "response.function_call_arguments.delta",
 												"sequence_number": seq,
 												"item_id":         call["item_id"],
@@ -2294,14 +2415,24 @@ loop:
 							finished = true
 							break loop
 						}
-						emitResponseFailed("stream ended without finish_reason")
-						return
+						if !wroteHeader {
+							// EOF 但从未 commit——上游空流/EOF,可重试。
+							return false, errStreamIncompleteNoCommit
+						}
+						// 已 commit 但 EOF 时上游还未给 finish_reason:合
+						// 成一个 response.failed 收尾(reason 标记 upstream_
+						// truncated),客户端能拿到完整错误事件。
+						emitResponseFailed("upstream_truncated: stream ended without finish_reason")
+						return true, nil
 					}
 					break loop
 				}
 				logging.FromContext(ctx).Error("stream read error", "error", pendingErr)
+				if !wroteHeader {
+					return false, errStreamIncompleteNoCommit
+				}
 				emitResponseFailed("stream read error")
-				return
+				return true, nil
 			}
 		}
 	}
@@ -2312,14 +2443,14 @@ loop:
 	if !messageStarted && len(toolCalls) == 0 {
 		idx := messageOutputIndex()
 		seq++
-		writeSSEEvent(w, flusher, "response.output_item.added", map[string]any{
+		writeEvent("response.output_item.added", map[string]any{
 			"type":            "response.output_item.added",
 			"sequence_number": seq,
 			"output_index":    idx,
 			"item":            map[string]any{"id": msgID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
 		})
 		seq++
-		writeSSEEvent(w, flusher, "response.content_part.added", map[string]any{
+		writeEvent("response.content_part.added", map[string]any{
 			"type":            "response.content_part.added",
 			"sequence_number": seq,
 			"item_id":         msgID,
@@ -2410,7 +2541,7 @@ loop:
 	}
 
 	seq++
-	writeSSEEvent(w, flusher, terminalEvent, map[string]any{
+	writeEvent(terminalEvent, map[string]any{
 		"type":            terminalEvent,
 		"sequence_number": seq,
 		"response":        completedResponse,
@@ -2420,6 +2551,8 @@ loop:
 		flusher.Flush()
 	}
 	storeResponseState(completedResponse, originalReq)
+	// 正常 finalize:已经写过 response.created,必然 commit 过。
+	return true, nil
 }
 
 func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, tools []ResponsesTool, toolChoice any, include []string) []byte {

@@ -312,7 +312,7 @@ func TestAnthropicToChat_EOFEmitsFinishAndDone(t *testing.T) {
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n"
 	// 无 message_stop。
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, true)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, true, nil, nil)
 	})
 	if !strings.Contains(body, `"finish_reason":"stop"`) {
 		t.Fatalf("EOF 后缺 finish chunk: %s", body)
@@ -335,7 +335,7 @@ func TestAnthropicToChat_TextStartPreEmitsInitialText(t *testing.T) {
 		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, false, nil, nil)
 	})
 	if !strings.Contains(body, `"content":"partial-prefix"`) {
 		t.Fatalf("start 初始 text 未预 emit: %s", body)
@@ -350,7 +350,7 @@ func TestAnthropicToChat_SignatureAndRedactedAreSkipped(t *testing.T) {
 		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, false, nil, nil)
 	})
 	if strings.Contains(body, "sig-abc") || strings.Contains(body, "reasoning_content") {
 		t.Fatalf("signature/redacted 不应进入 reasoning_content: %s", body)
@@ -366,7 +366,10 @@ func TestResponsesToChat_FunctionArgumentsDoneEmitsOnlyRemainder(t *testing.T) {
 		"event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc1\",\"arguments\":\"{\\\"q\\\":\\\"beijing\\\"}\"}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, true)
+		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, true, nil, nil)
+		if err != nil || !committed {
+			t.Fatalf("responsesSSEToChatStream = (%v, %v), want (true, nil)", committed, err)
+		}
 	})
 	// delta 已发 `{"q":`;done 只补发后缀 `"beijing"}`,不能重复 `{"q":`。
 	if !strings.Contains(body, `"arguments":"{\"q\":"`) {
@@ -390,7 +393,10 @@ func TestResponsesToChat_OutputItemDoneAnnouncesUndeclaredCall(t *testing.T) {
 		"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc9\",\"call_id\":\"call_9\",\"name\":\"ping\",\"arguments\":\"{}\"}}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false)
+		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false, nil, nil)
+		if err != nil || !committed {
+			t.Fatalf("responsesSSEToChatStream = (%v, %v), want (true, nil)", committed, err)
+		}
 	})
 	if !strings.Contains(body, `"id":"call_9"`) || !strings.Contains(body, `"name":"ping"`) {
 		t.Fatalf("未补发首 chunk 宣告工具调用: %s", body)
@@ -407,7 +413,10 @@ func TestResponsesToChat_FailedThenDoneSentinel(t *testing.T) {
 	sse := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-x\"}}\n\n" +
 		"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"r\",\"error\":{\"message\":\"upstream blew up\"}}}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false)
+		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false, nil, nil)
+		if err != nil || !committed {
+			t.Fatalf("responsesSSEToChatStream = (%v, %v), want (true, nil)", committed, err)
+		}
 	})
 	if !strings.Contains(body, `"error":{"message":"upstream blew up"}`) {
 		t.Fatalf("缺错误事件: %s", body)
@@ -489,7 +498,7 @@ func TestAnthropicToChat_NormalStopNotDoubleFinalized(t *testing.T) {
 	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":2}}}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, true)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, true, nil, nil)
 	})
 	if cnt := strings.Count(body, "data: [DONE]"); cnt != 1 {
 		t.Fatalf("[DONE] 出现 %d 次, want 1", cnt)
@@ -507,13 +516,13 @@ func TestAnthropicToChat_UsageChunkOnlyWhenIncludeUsage(t *testing.T) {
 	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":2}}}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	noUsage := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false, nil, nil)
 	})
 	if strings.Contains(noUsage, `"prompt_tokens"`) {
 		t.Fatalf("includeUsage=false 不应发 usage 终块: %s", noUsage)
 	}
 	withUsage := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, true)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, true, nil, nil)
 	})
 	if !strings.Contains(withUsage, `"prompt_tokens":2`) {
 		t.Fatalf("includeUsage=true 应发 usage 终块: %s", withUsage)

@@ -322,7 +322,7 @@ func TestAnthropicSSEToChatStream(t *testing.T) {
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, true)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, true, nil, nil)
 	})
 
 	// role 首块。
@@ -360,7 +360,7 @@ func TestAnthropicSSEToChatStream_ToolUseInitialInputFallback(t *testing.T) {
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false, nil, nil)
 	})
 	// 首块:arguments 应为空(不等 initial,避免与后续 delta 拼接)。
 	// JSON 字段序由 map 序列化决定,这里只断言关键 token 同时存在。
@@ -383,7 +383,7 @@ func TestAnthropicSSEToChatStream_ToolUseInitialInputNotDoubledWhenDeltaArrives(
 		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false, nil, nil)
 	})
 	// delta 到达 → initial 必须被抑制;只能看到 delta 碎片,不能出现 initial 内容。
 	if strings.Contains(body, `{\"k\":\"v\"}`) {
@@ -404,7 +404,7 @@ func TestAnthropicSSEToChatStream_ToolUseEmptyInputFallback(t *testing.T) {
 		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false, nil, nil)
 	})
 	// start 块仍先流 "arguments":""(不为空 initial 单独 emit),stop 兜底补 "{}"。
 	if !strings.Contains(body, `"arguments":""`) {
@@ -427,7 +427,10 @@ func TestPipeAnthropicStream_ByteIdentityPassthrough(t *testing.T) {
 	rec := httptest.NewRecorder()
 	header := http.Header{}
 	header.Set("Content-Type", "text/event-stream")
-	pipeAnthropicStream(context.Background(), rec, io.NopCloser(strings.NewReader(upstreamBody)), http.StatusOK, header, "m")
+	committed, perr := pipeAnthropicStream(context.Background(), rec, io.NopCloser(strings.NewReader(upstreamBody)), http.StatusOK, header, "m")
+	if !committed || perr != nil {
+		t.Fatalf("pipeAnthropicStream = (%v, %v), want (true, nil)", committed, perr)
+	}
 
 	// 字节完全一致。
 	if rec.Body.String() != upstreamBody {
@@ -476,8 +479,14 @@ func TestPipeAnthropicStream_FlushesEachUpstreamChunk(t *testing.T) {
 	chunk2 := "event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n"
 	fcr := &flushCountingRecorder{ResponseRecorder: httptest.NewRecorder()}
 	header := http.Header{}
-	pipeAnthropicStream(context.Background(), fcr, &chunkedReader{chunks: []string{chunk1, chunk2}}, http.StatusOK, header, "m")
+	committed, perr := pipeAnthropicStream(context.Background(), fcr, &chunkedReader{chunks: []string{chunk1, chunk2}}, http.StatusOK, header, "m")
+	if !committed || perr != nil {
+		t.Fatalf("pipeAnthropicStream = (%v, %v), want (true, nil)", committed, perr)
+	}
 
+	// 上游 chunk1 + chunk2 各占一次 flush;peek 阶段已刷过 chunk1。新流式
+	// 路径先写 peek 字节、Flush,再逐行写;如果 peek / 主循环都发生过 Flush,
+	// 总数应与上游 chunk 数一致(2)。
 	if fcr.flushes != 2 {
 		t.Fatalf("expected one flush per upstream chunk (2), got %d", fcr.flushes)
 	}
@@ -717,7 +726,7 @@ func TestAnthropicSSEToChatStream_DropsReasoningWhenDisabled(t *testing.T) {
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false)
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false, nil, nil)
 	})
 	if strings.Contains(body, "secret") {
 		t.Fatalf("reasoning leaked: %s", body)
@@ -736,7 +745,10 @@ func TestResponsesSSEToChatStream(t *testing.T) {
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_9\",\"usage\":{\"input_tokens\":8,\"output_tokens\":5,\"total_tokens\":13}}}\n\n"
 
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", true, true)
+		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", true, true, nil, nil)
+		if err != nil || !committed {
+			t.Fatalf("responsesSSEToChatStream = (%v, %v), want (true, nil)", committed, err)
+		}
 	})
 
 	if !strings.Contains(body, `"role":"assistant"`) {
@@ -965,7 +977,10 @@ func TestResponsesSSEToChatStream_ToolArgumentsShareIndex(t *testing.T) {
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_7\"}}\n\n"
 
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false)
+		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false, nil, nil)
+		if err != nil || !committed {
+			t.Fatalf("responsesSSEToChatStream = (%v, %v), want (true, nil)", committed, err)
+		}
 	})
 
 	names := map[int]string{}

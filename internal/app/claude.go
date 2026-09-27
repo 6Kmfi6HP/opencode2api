@@ -96,6 +96,18 @@ func (r *streamReader) Read() <-chan streamReadResult { return r.readCh }
 // disabled.
 func (r *streamReader) Keepalive() <-chan time.Time { return r.keepCh }
 
+// enableKeepalive 在 reader 已启动后补一个 keepalive ticker。用于「先
+// 零 keepalive 完成 peek 窗口(避免把 ticker 当 watch dog),commit 后
+// 再切到常规心跳」。幂等:重复调用只保留首个 ticker;Close 会停掉它。
+func (r *streamReader) enableKeepalive(interval time.Duration) {
+	if interval <= 0 || r.keepCh != nil {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	r.keepCh = ticker.C
+	r.stopKeepalive = ticker.Stop
+}
+
 // Close stops the reader: it signals the goroutine, unblocks any pending
 // read by closing the upstream body, and waits for the goroutine to exit.
 func (r *streamReader) Close() {

@@ -188,6 +188,12 @@ func applyConfig(cfg AppConfig) {
 		if cfg.TextOnlyModels != nil {
 			s.TextOnlyModels = append([]string(nil), cfg.TextOnlyModels...)
 		}
+		if cfg.StreamEmptyRetryMax != nil {
+			s.StreamEmptyRetryMax = *cfg.StreamEmptyRetryMax
+		}
+		if cfg.StreamFirstByteTimeoutMs != nil {
+			s.StreamFirstByteTimeoutMs = *cfg.StreamFirstByteTimeoutMs
+		}
 	})
 
 	socks5Mu.Lock()

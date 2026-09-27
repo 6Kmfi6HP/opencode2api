@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -256,6 +257,9 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 	log.Info("chat via responses upstream", "model", req.Model, "stream", req.Stream, "keep_reasoning", keepReasoning)
 
 	if req.Stream {
+		// 首个请求仍在这里同步发起,以便非 2xx 时把上游错误体原样透传;
+		// 之后的空流/挂起重试由 DriveStreamWithRetry + ResponsesProtocolHooks
+		// 通过 callOnce 重新发请求(自动落到 key pool 的下一把可用 key)。
 		rc, status, _, err := callOpenCodeEndpoint(ctx, "responses", upstreamBody, req.Model, auth)
 		if err != nil || status < 200 || status >= 300 {
 			var errBody []byte
@@ -275,8 +279,41 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 			writeUpstreamError(w, status, fmt.Errorf("upstream error"), "chat")
 			return
 		}
-		defer rc.Close()
-		responsesSSEToChatStream(ctx, w, rc, req.Model, keepReasoning, true)
+		// rc 的所有权交给 DriveStreamWithRetry(它在每次 attempt 结束后
+		// 负责 Close),这里不能再 defer Close。
+
+		pending := rc
+		upstreamCap := &UpstreamErrorCapture{}
+		callOnce := upstreamCap.WrapCallOnce(func(ctx context.Context) (io.ReadCloser, int, error) {
+			if pending != nil {
+				first := pending
+				pending = nil
+				return first, http.StatusOK, nil
+			}
+			rc2, status2, _, err2 := callOpenCodeEndpoint(ctx, "responses", upstreamBody, req.Model, auth)
+			return rc2, status2, err2
+		})
+		runOnce := func(ctx context.Context, w http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
+			return responsesSSEToChatStream(ctx, w, rc, req.Model, keepReasoning, true, peeked, rd)
+		}
+		committed, driveErr := DriveStreamWithRetry(ctx, w, ResponsesProtocolHooks, callOnce, runOnce)
+		if committed {
+			return
+		}
+		if driveErr != nil && (errors.Is(driveErr, context.Canceled) || errors.Is(driveErr, context.DeadlineExceeded)) {
+			// 客户端已离开:不要往已断开的连接再写错误。
+			return
+		}
+		// 优先回写上游真实错误(4xx/5xx 的 status+body),比通用 502 更利于调试。
+		if upstreamCap.WriteUpstreamErrorTo(w) {
+			return
+		}
+		// 全部 attempt 都未 commit(空流 EOF / 上游首帧错误 / 首字节超时
+		// 等):此刻还没向客户端写过任何字节,可以安全地写一个 502 JSON。
+		if driveErr == nil {
+			driveErr = errStreamIncompleteNoCommit
+		}
+		writeUpstreamError(w, http.StatusBadGateway, fmt.Errorf("upstream error: %v", driveErr), "chat")
 		return
 	}
 
@@ -761,11 +798,29 @@ type responsesToChatState struct {
 	finalized     bool // 已写 [DONE]/终态帧（幂等）
 }
 
-func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, keepReasoning bool, includeUsage bool) {
+// responsesSSEToChatStream 把上游 Responses SSE 翻译为 Chat SSE。
+//
+// 返回约定（与 PeekFirstFrame / DriveStreamWithRetry 配合,实现「首 token 前
+// 可重试」）：
+//   - (true, nil)：已向客户端写过至少一个字节（首块 role chunk 即 commit 边
+//     界)。上游之后 EOF / 故障由 finalize 按既有规则合成 finish + [DONE]
+//     收尾,不再触发重试。
+//   - (false, err)：未向客户端写过任何字节——peek 窗口里上游给了空流/
+//     错误事件/EOF/超时,或主循环在写出 role 前遇到 EOF。调用方可安全地
+//     关闭当前 rc 并换 key 重试。
+//
+// peeked/rd 配套:rd != nil 表示调用方已经完成 peek,这里直接复用其
+// reader 并把 peeked 行回放进主循环;rd == nil 表示由本函数内部先做
+// PeekFirstFrame(ResponsesProtocolHooks)再进主循环。
+//
+// 首个非错误产出 chunk 由 emitChunk 隐式触发 http 库 WriteHeader(200);在此
+// 之前不向客户端写任何字节,所以 peek 失败路径调用方看到的是干净的连接。
+func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, keepReasoning bool, includeUsage bool, peeked []streamReadResult, rd *streamReader) (bool, error) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
+	// 注意:不在这里显式 WriteHeader。第一笔写入(无论是 ensureRole 的
+	// role chunk、还是失败路径的 502 JSON)由 http 库隐式提交 header。
 	flusher, _ := w.(http.Flusher)
 
 	st := &responsesToChatState{
@@ -789,12 +844,59 @@ func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		st.stats.Log(ctx, "chat")
 	}()
 
-	reader := newStreamReader(ctx, rc, 0)
+	var reader *streamReader
+	if rd != nil {
+		// 调用方已完成 peek:续用它的 reader(bufio 里可能已预读后续行),
+		// 不再二次 peek。
+		reader = rd
+	} else {
+		peek := PeekFirstFrame(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, ResponsesProtocolHooks)
+		if peek.Err != nil {
+			// 空流 / 上游首帧错误 / 首字节超时:尚未向客户端写过任何字节,
+			// 让外层 DriveStreamWithRetry 换 key 重试。
+			return false, peek.Err
+		}
+		peeked = peek.Consumed
+		reader = peek.Reader
+		if reader == nil {
+			// 极端情况:上游 EOF 之前刚好吐完一帧完整产出。reader 已经关闭,
+			// 这里在已 EOF 的 rc 上重启一个 reader——Read 立即返回 EOF,
+			// 主循环走 finalize 收尾。
+			reader = newStreamReader(ctx, rc, 15*time.Second)
+		} else {
+			// 复用 peek 的 reader;顺手开 keepalive(peek 窗口期它是关的)。
+			reader.enableKeepalive(15 * time.Second)
+		}
+	}
 	defer reader.Close()
+
+	// 回放 peek 阶段消费的行(帧边界已对齐,不会撕碎)。
+	for _, res := range peeked {
+		if res.line != "" {
+			st.stats.NoteChunk()
+			st.handleLine(res.line)
+		}
+	}
+	// peeked 末位如果带 EOF(peek 在 EOF 截断时把 EOF 也计入 consumed),
+	// 主循环等价于立即收到 EOF——直接在回放后判定,不再进 select。
+	if n := len(peeked); n > 0 && peeked[n-1].err != nil {
+		if !st.sentRole {
+			return false, errStreamIncompleteNoCommit
+		}
+		st.finalize()
+		return true, nil
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			// 客户端已断开:已 commit 就静默退出,未 commit 把 ctx 错误原样
+			// 透传给 DriveStreamWithRetry(它对 ctx.Canceled/DeadlineExceeded
+			// 不重试)。
+			if !st.sentRole {
+				return false, ctx.Err()
+			}
+			return true, nil
 		case result := <-reader.Read():
 			pendingErr := result.err
 			if result.line != "" {
@@ -802,11 +904,15 @@ func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 				st.handleLine(result.line)
 			}
 			if pendingErr != nil {
-				// EOF / 读错误兜底:response.completed 未到达时补终态
-				// finish chunk(+usage)+[DONE],保证 OpenAI SDK 不挂起
-				// （幂等:已完成路径不受影响）。
+				// EOF / 读错误:role 尚未发出说明上游没产出任何内容,返回未
+				// commit,让外层 DriveStreamWithRetry 换 key 重试。已 commit
+				// 时按既有规则合成 finish chunk(+usage)+[DONE] 兜底,保证
+				// OpenAI SDK 不挂起（幂等:已完成路径不受影响）。
+				if !st.sentRole {
+					return false, errStreamIncompleteNoCommit
+				}
 				st.finalize()
-				return
+				return true, nil
 			}
 		}
 	}
