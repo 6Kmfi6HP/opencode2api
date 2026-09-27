@@ -277,6 +277,32 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 
 > 真实运行验证：`opencode2api launch claude --model mimo-v2.6-flash` 第二轮 `prompt_cached_tokens` 从 ~28.7k 提升到 ~32.4k（≈99.9% 的 prompt 命中），`big-pickle` 31.5k/31.6k；`codex --model mimo-v2.6-flash` `prompt_cached_tokens=9.92k`（≈98%），都已通过 `OPENCODE2API_CACHE_DEBUG=1` 中的 `cache_debug_usage` 观察。先前行为是只在 `buildUpstreamBody` 时注入顶层 `prompt_cache_retention`；现在 chat/claude/responses 直通（remembered）与 chat→responses 桥都统一补齐，并保持 IDEMPOTENT（上游已有字段时不覆盖）。
 
+### `stream_empty_retry_max` / `stream_first_byte_timeout_ms`
+
+claude→responses 流式链路的「空流兜底 + 首 token 前重试」。覆盖两类常见上游故障:
+
+- **prefill 阶段被宰**:上游代理(CF / nginx)在首个 token 前杀 tunnel,网关只收到一个干净的 EOF——按旧实现客户端会看到 `stream ended without completion`,agent 中断。
+- **挂死**:上游接受了连接但既不发数据也不关,客户端永久等待。
+
+开启后(默认开启):上游 200 收到、但还没向客户端 WriteHeader 之前的窗口里,遇到 **空流 EOF / 超时未发数据 / 上游只发 `response.failed` 错误帧**,静默重发同一份请求最多 `stream_empty_retry_max` 次,客户端完全无感;重试经 `key_pool` 自动落到下一个可用 key,不会重复同一根 pipe。
+
+```json
+{
+  "stream_empty_retry_max": 1,
+  "stream_first_byte_timeout_ms": 30000
+}
+```
+
+- `stream_empty_retry_max`:重试次数,默认 `1`,`0` 关闭。每个 attempt 都用同一份请求体重发(prompt_cache_key 稳定,input tokens 在缓存命中时接近零成本)。
+- `stream_first_byte_timeout_ms`:peek 窗口毫秒数,默认 `30000`(30s)。覆盖大多数上游 prefill 时间;`<=0` 关闭看门狗,仅 EOF/error 触发。
+
+**不重试的情况**(不改的承诺):
+- 已向客户端写过任何字节后 EOF/杀流——按 ParalonCloud Rule 2 合成正常 stop 收尾(已有产出交付给 agent)。
+- 仅有 thinking 没有 text 的 EOF——`reasoningFallback` 兜底把思考内容提升为 text,agent 拿到思考、不发 error。
+- 非流式请求(`stream: false`)走的是另一条路径,与本机制无关。
+
+> 真实运行验证:故意用反代在 5s 时杀 upstream tunnel,agent 端原本会 `stream ended without completion` 中断;开启本机制后第一次空流透明重试到下一个 key,整轮圆满完成。
+
 ## 管理面板
 
 打开 `http://127.0.0.1:8000/` 可进入管理面板。面板可以修改配置、刷新模型和查看 token 统计。管理面板现已可设置 `prompt_cache_retention`、`cache_control_breakpoints`、`socks5_sticky`、`text_only_models`（「模型与路由」/「网络与代理」Tab），保存时这些字段随其余配置一并持久化到 `config.json`，不再被静默回擦。

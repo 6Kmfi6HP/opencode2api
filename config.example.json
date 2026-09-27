@@ -29,5 +29,9 @@
       {"id": "k1", "key": "sk-placeholder-1", "group": "", "weight": 1, "enabled": true, "note": "account A"},
       "sk-placeholder-2"
     ]
-  }
+  },
+  "_comment_stream_empty_retry": "claude→responses 流式链路的空流兜底:上游 200 后首个有效产出前若遇到空流 EOF / 无数据超时,最多重试 N 次(0=关闭,默认 1)。重试会经 key_pool 自动切到下一个可用 key。",
+  "stream_empty_retry_max": 1,
+  "_comment_stream_first_byte_timeout_ms": "空流检测的首字节看门狗(毫秒,默认 30000,<=0 关闭)。上游 200 后一直没发任何 SSE 数据,超过该阈值视为空流并触发重试。",
+  "stream_first_byte_timeout_ms": 30000
 }

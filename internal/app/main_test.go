@@ -41,10 +41,11 @@ func TestVersionStringFormat(t *testing.T) {
 }
 
 type fakeUpstreamResponse struct {
-	status int
-	body   string
-	header http.Header
-	err    error
+	status     int
+	body       string
+	header     http.Header
+	err        error
+	customBody io.ReadCloser // 非 nil 时优先于 body,用于挂死/慢速流测试
 }
 
 type fakeRetryTransport struct {
@@ -65,7 +66,15 @@ func (f *fakeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 		return nil, errors.New("fakeRetryTransport: unexpected bodyless request to " + req.URL.String())
 	}
 	if len(f.responses) == 0 {
-		f.t.Fatalf("unexpected request to %s", req.URL.String())
+		// 队列为空时返回 502,而不是 fatal:一方面允许上层 fallback 探测
+		// (probe / 翻译路径)在测试未显式排队时优雅失败;另一方面不会把
+		// 测试主体掐死在天花板上。大多数用例只关心自己排队的槽位。
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"message":"fake upstream: no more queued responses"}}`)),
+			Request:    req,
+		}, nil
 	}
 
 	body, err := io.ReadAll(req.Body)
@@ -91,10 +100,16 @@ func (f *fakeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error
 	if header == nil {
 		header = make(http.Header)
 	}
+	var respBody io.ReadCloser
+	if next.customBody != nil {
+		respBody = next.customBody
+	} else {
+		respBody = io.NopCloser(strings.NewReader(next.body))
+	}
 	return &http.Response{
 		StatusCode: next.status,
 		Header:     header.Clone(),
-		Body:       io.NopCloser(strings.NewReader(next.body)),
+		Body:       respBody,
 		Request:    req,
 	}, nil
 }

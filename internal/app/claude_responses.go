@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
@@ -970,8 +971,14 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 	logging.FromContext(ctx).Info("claude_responses_probe_succeeded", "model", modelID, "stream", stream)
 
 	if stream {
-		claudeResponsesStreamHandler(ctx, w, rc, modelID, wantReasoning)
-		return true
+		committed, streamErr := claudeResponsesStreamWithRetry(ctx, w, auth, modelID, claudeReq, wantReasoning, rc)
+		if committed {
+			return true
+		}
+		// 全部 attempt 都未 commit(空流/timeout),让调用方走 fallback。
+		logging.FromContext(ctx).Warn("claude-responses probe stream empty after retries",
+			"model", modelID, "err", streamErr)
+		return false
 	}
 	respBody, readErr := io.ReadAll(io.LimitReader(rc, 32*1024*1024))
 	if readErr != nil {
@@ -1013,8 +1020,15 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 	}
 
 	if stream && status >= 200 && status < 300 {
-		claudeResponsesStreamHandler(ctx, w, rc, modelID, wantReasoning)
-		return true
+		committed, streamErr := claudeResponsesStreamWithRetry(ctx, w, auth, modelID, claudeReq, wantReasoning, rc)
+		if committed {
+			return true
+		}
+		// 全部 attempt 都未 commit(空流/timeout/rc 异常),让调用方走
+		// 更上层的 fallback(probe 的调用方会落到常规 chat 翻译路径)。
+		logging.FromContext(ctx).Warn("claude-responses forward stream empty after retries",
+			"model", modelID, "status", status, "err", streamErr)
+		return false
 	}
 
 	respBody, readErr := io.ReadAll(io.LimitReader(rc, 32*1024*1024))
@@ -1048,8 +1062,6 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 	return true
 }
 
-// ======================== Claude 经原生 responses 的流式转换 ========================
-
 type claudeResponsesBlock struct {
 	claudeIndex int
 	kind        string // text | thinking | tool
@@ -1061,14 +1073,221 @@ type claudeResponsesBlock struct {
 	signature string
 }
 
-func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, wantReasoning bool) {
+// ======================== Claude 经原生 responses 的流式转换 ========================
+
+// claudeResponsesStreamWithRetry 负责把「peek 失败的可重试错误」翻译为最多
+// StreamEmptyRetryMax 次同请求重试。首轮复用调用方已打开的 firstRC；后续
+// attempt 重新构请求（callOpenCodeEndpoint 会自动切到 key pool 的下一个
+// 可用 key——空流不再重试同一把死 key）。
+//
+// 返回与 claudeResponsesStreamHandler 一致：(true, nil) 已 commit /
+// (false, err) 全部 attempt 都未 commit。ctx.Done 与所有错误原样透传。
+func claudeResponsesStreamWithRetry(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, claudeReq ClaudeRequest, wantReasoning bool, firstRC io.ReadCloser) (bool, error) {
+	maxRetry := config.StreamEmptyRetryMax()
+	rc := firstRC
+	for attempt := 0; attempt <= maxRetry; attempt++ {
+		committed, err := claudeResponsesStreamHandler(ctx, w, rc, modelID, wantReasoning, nil)
+		if committed {
+			return true, nil
+		}
+		rc.Close()
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return false, err
+		}
+		if attempt < maxRetry {
+			logging.FromContext(ctx).Warn("claude-responses empty stream, retrying with next key",
+				"model", modelID, "attempt", attempt+1, "max_retry", maxRetry, "cause", err)
+			nextRC, status, _, callErr := callOpenCodeEndpoint(ctx, "responses", claudeToResponsesBody(claudeReq, modelID), modelID, auth)
+			if callErr != nil || status < 200 || status >= 300 {
+				if nextRC != nil {
+					nextRC.Close()
+				}
+				if callErr != nil {
+					return false, callErr
+				}
+				return false, fmt.Errorf("upstream status %d on retry", status)
+			}
+			rc = nextRC
+			continue
+		}
+		return false, err
+	}
+	return false, errStreamIncompleteNoCommit
+}
+
+// errStreamIncompleteNoCommit：peek 窗口内上游空流 EOF / 首字节超时 / 读
+// 错误 / 上游错误事件——尚未向客户端写过任何字节，调用方可安全重试。
+var errStreamIncompleteNoCommit = errors.New("stream incomplete before first client byte")
+
+// peekOutcome 是 peekFirstOutput 的结果。consumed 不为空时表示「已有完整
+// SSE 帧被消费」，调用方应把它原样喂回 handler 主循环。
+type peekOutcome struct {
+	consumed []streamReadResult
+	err      error
+	// reader 是 peek 内部使用的流式 reader（已经包了一层自己的 bufio 缓
+	// 冲）。调用方应把它原样续用做主循环 reader ——否则其内部 bufio 里
+	// 已经预读的行会被两个独立 bufio 撕成两半。
+	reader *streamReader
+}
+
+// peekFirstOutput 在向上游拿到 200、但还未向客户端 WriteHeader 之前「窥
+// 视」首个**完整 SSE 帧**(空行收尾；流末尾则接受 EOF 收尾)。
+//
+// 返回约定：
+//   - hasFrame=true 且 errorEvent=false:上游已产出有效事件(壳或
+//     delta)——commit,handler 进入主循环继续。
+//   - hasFrame=true 且 errorEvent=true:上游发了 error / response.failed
+//     ——按 errStreamIncompleteNoCommit 返回,由调用方走未 commit 重试。
+//   - hasFrame=false:窗口内 EOF、读错或超时——同样返回
+//     errStreamIncompleteNoCommit(空流,可安全重试)。
+//
+// 关键不变量:返回时 consumed 一定落在帧边界(空行或 EOF 行)之后,
+// 绝不截断在帧中间——否则 handler 侧的 bufio 续读会把当前帧的剩余行
+// 与后续帧拼错。
+func peekFirstOutput(ctx context.Context, rc io.Reader, timeout time.Duration) peekOutcome {
+	reader := newStreamReader(ctx, rc, 0)
+	// 不要 defer Close:成功路径里调用方会续用这个 reader(它的 bufio
+	// 里可能已经预读了后续行);只有失败路径在这里显式关闭。
+
+	var timeoutCh <-chan time.Time
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+		timeoutCh = timer.C
+		defer timer.Stop()
+	}
+
+	var consumed []streamReadResult
+	var frameBuf []string
+	// hasFrame：已经见过至少一个完整 data 帧（含 ERROR 帧——错误帧也是「有产出」）。
+	hasFrame := false
+	// errorEvent：已见帧里存在 error / response.failed。
+	errorEvent := false
+
+	// flushFrame 在当前帧边界（空行或 EOF）结算 frameBuf：判定 hasFrame /
+	// errorEvent，并原样把整帧追加进 consumed。clearPending 表示丢弃而不是
+	// 结算（用于 input：上游事件 payload 里夹的裸 error JSON，不算帧）。
+	flushFrame := func() {
+		for _, dl := range frameBuf {
+			t := strings.TrimSpace(dl)
+			if t == "" || t == "[DONE]" {
+				continue
+			}
+			hasFrame = true
+			if !errorEvent {
+				var evt map[string]any
+				if json.Unmarshal([]byte(t), &evt) == nil {
+					typ, _ := evt["type"].(string)
+					if typ == "error" || typ == "response.failed" {
+						errorEvent = true
+					} else if _, hasErr := evt["error"]; hasErr {
+						errorEvent = true
+					}
+				}
+			}
+		}
+		frameBuf = nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return peekOutcome{err: ctx.Err()}
+		case <-ctx.Done():
+			reader.Close()
+			return peekOutcome{err: ctx.Err()}
+		case <-timeoutCh:
+			reader.Close()
+			return peekOutcome{err: errStreamIncompleteNoCommit}
+		case res := <-reader.Read():
+			consumed = append(consumed, res)
+			trimmed := strings.TrimSpace(res.line)
+			switch {
+			case trimmed == "":
+				flushFrame()
+			case strings.HasPrefix(trimmed, ":"):
+				// SSE 心跳注释：不算产出。
+			case strings.HasPrefix(trimmed, "data:"):
+				frameBuf = append(frameBuf, strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")))
+			case strings.HasPrefix(trimmed, "event:"):
+				// 仅记录属于哪个事件；data 到帧尾才结算。
+			case strings.HasPrefix(trimmed, "{"):
+				// 非标准裸 JSON 行：直接当一帧。
+				frameBuf = append(frameBuf, trimmed)
+				flushFrame()
+			}
+			if res.err != nil {
+				// EOF：流自然终止。当前若有残帧,先按帧结算;随后无论
+				// 是否有产出都关闭——截在 EOF 处 consumed 已对齐帧边界。
+				flushFrame()
+				if !hasFrame || errorEvent {
+					// 失败路径:把 reader 也关掉,免得泄漏 goroutine。
+					reader.Close()
+					return peekOutcome{consumed: consumed, err: errStreamIncompleteNoCommit}
+				}
+				return peekOutcome{consumed: consumed, reader: reader}
+			}
+			if hasFrame {
+				if errorEvent {
+					reader.Close()
+					return peekOutcome{consumed: consumed, err: errStreamIncompleteNoCommit}
+				}
+				return peekOutcome{consumed: consumed, reader: reader}
+			}
+		}
+	}
+}
+
+// claudeResponsesStreamHandler 把上游 Responses SSE 翻译为 Claude SSE。
+//
+// 返回值的约定（与 peekFirstOutput 配合，实现「首 token 前可重试」）：
+//   - (true, nil)：已向客户端写过至少一个字节（含 ping），上游流正常翻
+//     译完毕或按已有规则合成收尾。这是唯一「已 commit」的返回。
+//   - (false, err)：未向客户端写过任何字节——peek 窗口里上游给了空流/
+//     错误事件/EOF/超时。调用方可以安全地关闭当前 rc、换 key 重发请求。
+//
+// peeked 非空时直接进入主循环（此调用已是某次 peek-commit 之后的干跑），
+// 不再二次 peek、不再做首字节看门狗（窗口已在第一次调用里耗尽）。
+func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, wantReasoning bool, peeked []streamReadResult) (bool, error) {
+	var reader *streamReader
+	if len(peeked) == 0 {
+		peek := peekFirstOutput(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond)
+		if peek.err != nil {
+			return false, peek.err
+		}
+		peeked = peek.consumed
+		reader = peek.reader
+		if reader == nil {
+			// 上游 EOF 但已有完整帧（极少见：单帧流）。续读的 reader 直接
+			// 落在已 EOF 的 rc 上,主循环立即收 EOF 并走 finalize。
+			reader = newStreamReader(ctx, rc, 15*time.Second)
+		} else {
+			// 复用 peek 的 reader(它的 bufio 可能已预读后续行);顺手开
+			// keepalive(此前为 0,看门狗由 timeout 承担)。
+			reader.enableKeepalive(15 * time.Second)
+		}
+	} else {
+		reader = newStreamReader(ctx, rc, 15*time.Second)
+	}
+	defer reader.Close()
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
 	stats := &logging.StreamStats{Start: time.Now()}
+	// flushPending 按序回放 peek 阶段攒下的行（peek 阶段已按 SSE 行结构
+	// 验证过帧完整性），随后转为 nil 直读上游。
+	var pending []streamReadResult
+	if len(peeked) > 0 {
+		pending = append([]streamReadResult(nil), peeked...)
+	}
+	flushPending := func() []streamReadResult {
+		out := pending
+		pending = nil
+		return out
+	}
 
 	msgID := fmt.Sprintf("msg_%s", randomString(24))
 	blockIndex := 0
@@ -1094,7 +1313,12 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 	fullTextLen := 0
 	fullReasoningLen := 0
 
+	wroteHeader := false
 	emitEvent := func(event string, data any) {
+		if !wroteHeader {
+			w.WriteHeader(http.StatusOK)
+			wroteHeader = true
+		}
 		writeSSEEvent(w, flusher, event, data)
 	}
 	// adoptResponseID: response.created/in_progress 的 response.id 非空时，
@@ -1209,8 +1433,10 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		}
 		stats.ReasoningChars += len(text)
 		fullReasoningLen += len(text)
+		// 无论 wantReasoning 与否都累积 reasoningFallback：空流 EOF 兜底
+		// （finalizeClaudeResponsesStream 的「仅有思考无文本」分支）依赖它。
+		reasoningFallback.WriteString(text)
 		if wantReasoning {
-			reasoningFallback.WriteString(text)
 			startThinkingBlock(b)
 			emitEvent("content_block_delta", map[string]any{
 				"type": "content_block_delta", "index": b.claudeIndex,
@@ -1307,15 +1533,36 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		}
 	}
 
-	// keepalive：首 token 前客户端仅能收到 ping。
-	reader := newStreamReader(ctx, rc, 15*time.Second)
-	defer reader.Close()
+	// 先回放 peek 阶段攒下的行（帧边界已验证），再直读上游。peeked 为
+	// nil 时表示正常路径（peek 在函数开头已做过），此处 pending 必为空、
+	// 循环等同于旧行为。
+	for _, res := range flushPending() {
+		line := res.line
+		trimmedRight := strings.TrimRight(line, "\r\n")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			flushFrame()
+			if finished {
+				break
+			}
+		} else if strings.HasPrefix(trimmed, ":") {
+		} else if strings.HasPrefix(trimmed, "event:") {
+			frameEvent = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
+		} else if strings.HasPrefix(trimmed, "data:") {
+			frameData = append(frameData, strings.TrimSpace(strings.TrimPrefix(trimmedRight, "data:")))
+		} else if strings.HasPrefix(trimmed, "{") {
+			frameData = append(frameData, trimmed)
+		}
+		if finished && len(frameData) == 0 {
+			continue
+		}
+	}
 
 loop:
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return true, nil
 		case <-reader.Keepalive():
 			emitEvent("ping", map[string]any{"type": "ping"})
 		case res := <-reader.Read():
@@ -1348,15 +1595,31 @@ loop:
 					flushFrame()
 				}
 				if !finalized {
-					if producedText || len(toolOrder) > 0 {
+					switch {
+					case producedText || len(toolOrder) > 0:
 						// 上游干净 EOF 但缺 completed（如 muse-spark 系只发事件不发 DONE）：
 						// 合成正常结束，不报错。
 						stats.SawFinish = true
 						stats.FinishReason = "stop"
 						finished = true
 						doFinalize()
-					} else {
-						emitError("stream ended without completion")
+					case reasoningFallback.Len() > 0:
+						// 仅 thinking 无 text/tool：上游在思考阶段被杀。
+						// reasoningFallback 无条件累积（见 emitThinkingDelta），
+						// finalize 里「空回复保护」会把它提升为文本块——agent
+						// 至少拿到思考内容，不会空手中断。
+						stats.SawFinish = true
+						stats.FinishReason = "stop"
+						stats.PromotedReasoning = true
+						finished = true
+						doFinalize()
+					default:
+						// 完全空流且已过了 peek 阶段（说明 peek 时见过壳
+						// 事件，之后才断）：保持显式 error，不默默吞掉。
+						stats.SawFinish = false
+						logging.FromContext(ctx).Warn("claude-responses stream ended without content",
+							"model", model, "text_chars", stats.TextChars, "reasoning_chars", stats.ReasoningChars)
+						emitError("upstream ended stream before any content (empty completion)")
 					}
 				}
 				break loop
@@ -1370,6 +1633,7 @@ loop:
 	_ = fullReasoningLen
 	_ = fullTextLen
 	_ = bytes.MinRead
+	return true, nil
 }
 
 func indexOfToolOrder(order []int, v int) (int, bool) {

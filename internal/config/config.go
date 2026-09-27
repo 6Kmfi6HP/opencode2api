@@ -17,6 +17,13 @@ type Snapshot struct {
 	PromptCacheRetention string
 	CacheBreakpoints     bool
 	TextOnlyModels       []string
+	// StreamEmptyRetryMax / StreamFirstByteTimeoutMs：claude→responses 流式
+	// 链路的空流兜底。上游 200 后首个有效产出（text/thinking/tool delta 或
+	// 终态事件）前的窗口里，若遇到空流 EOF / 无数据超时，只重试
+	// StreamEmptyRetryMax 次（0 = 关闭），每次重试经 callOpenCodeEndpoint
+	// 自动落到 key pool 的下一个可用 key。
+	StreamEmptyRetryMax      int
+	StreamFirstByteTimeoutMs int
 }
 
 // snapshot holds the current Snapshot. All reads go through Get, which lazily
@@ -37,6 +44,10 @@ func Default() Snapshot {
 		PromptCacheRetention: "", // "" -> runtime default "24h"; "off" disables injection
 		CacheBreakpoints:     true,
 		TextOnlyModels:       []string{}, // models.dev modality data drives the default
+		// 空流重试默认开（1 次）；首字节超时默认 30s（小于常见上游 / 反代
+		// 的 idle kill 阈值，又足够覆盖冷启动 prefill）。
+		StreamEmptyRetryMax:      1,
+		StreamFirstByteTimeoutMs: 30000,
 	}
 }
 
@@ -96,6 +107,24 @@ func CacheBreakpoints() bool {
 // ForceDisableThinking reports whether reasoning is disabled globally.
 func ForceDisableThinking() bool {
 	return Get().ForceDisableThinking
+}
+
+// StreamEmptyRetryMax reports how many times the claude→responses stream may
+// be retried when the upstream returns an empty first-byte window (clean EOF
+// or first-byte timeout before any content). 0 disables the retry.
+func StreamEmptyRetryMax() int {
+	if v := Get().StreamEmptyRetryMax; v < 0 {
+		return 0
+	} else {
+		return v
+	}
+}
+
+// StreamFirstByteTimeoutMs is the first-byte watchdog for the pre-commit
+// peek window, in milliseconds (<= 0 disables the watchdog; only EOF/error
+// then aborts the window).
+func StreamFirstByteTimeoutMs() int {
+	return Get().StreamFirstByteTimeoutMs
 }
 
 // ReasoningEffortMap returns a copy of the reasoning-effort mapping so callers

@@ -176,6 +176,14 @@ type AppConfig struct {
 	ProtocolRules []ProtocolRule `json:"protocol_rules,omitempty"`
 	// KeyPool configures rotation across multiple upstream API keys.
 	KeyPool KeyPool `json:"key_pool,omitempty"`
+	// StreamEmptyRetryMax：claude→responses 流式链路在「上游 200 后首个
+	// 有效产出前」遇到空流 EOF / 首字节超时时的重试次数上限（0=关闭，
+	// 缺省 1）。重试经 key pool 自动切到下一个可用 key。
+	StreamEmptyRetryMax *int `json:"stream_empty_retry_max,omitempty"`
+	// StreamFirstByteTimeoutMs：空流检测的首字节看门狗（毫秒，缺省
+	// 30000；<=0 关闭看门狗，只靠 EOF）。上游 200 后若一直没有发送任何
+	// SSE 数据，超过该阈值视为空流并触发重试。
+	StreamFirstByteTimeoutMs *int `json:"stream_first_byte_timeout_ms,omitempty"`
 }
 
 type Socks5Proxy struct {
