@@ -22,6 +22,8 @@ var (
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if adminPassword == "" {
+			// 无密码=不启用面板鉴权，原样放行。launch 默认 adminPassword=""
+			// （server.go/launch.go 尚未写变量）→ /api/* 见 server.go mux 注册。
 			next(w, r)
 			return
 		}
@@ -39,6 +41,14 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// adminAPIEnabled 报告管理 API（/login /logout /api/*）是否注册。
+// 仅当 adminPassword 非空时才启用；launch 模式通过不注册这些路由把
+// /api/config /api/key_* 等口子全部关闭（避免无密码的本地代理被同网段/同机
+// 攻击者改 keypool）。
+func adminAPIEnabled() bool {
+	return adminPassword != ""
 }
 
 func generateToken() (string, error) {
