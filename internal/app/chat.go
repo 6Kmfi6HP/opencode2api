@@ -1,12 +1,12 @@
 package app
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -570,103 +570,34 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(r.Context(), upstreamBody, req.Model, auth)
-		if err != nil || status < 200 || status >= 300 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(status)
-			if upResp != nil {
-				errBody, _ := io.ReadAll(upResp)
-				if len(errBody) > 0 {
-					w.Write(errBody)
-					return
+		ctx := r.Context()
+		committed, driveErr := DriveStreamWithRetry(ctx, w, ChatProtocolHooks,
+			func(c context.Context) (io.ReadCloser, int, error) {
+				rc, status, _, err := callOpenCodeAPIStream(c, upstreamBody, req.Model, auth)
+				return rc, status, err
+			},
+			func(c context.Context, w http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
+				return chatStreamRunOnce(c, w, rc, peeked, rd, &req, keepReasoning, clientWantsUsage)
+			})
+		// 走完重试仍未 commit：上游错误 / 重试额度用尽——统一以 JSON
+		// 形式写给客户端（未 WriteHeader,还是非流式响应）。
+		if !committed {
+			if driveErr != nil && errors.Is(driveErr, context.Canceled) {
+				return
+			}
+			msg := "upstream stream incomplete"
+			if driveErr != nil {
+				if errors.Is(driveErr, context.DeadlineExceeded) {
+					msg = "upstream stream timeout"
+				} else {
+					msg = msg + ": " + driveErr.Error()
 				}
 			}
-			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error", "type": "upstream_error"}})
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error"}})
 			return
 		}
-		defer upResp.Close()
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
-		reader := bufio.NewReader(upResp)
-		stats := &logging.StreamStats{Start: time.Now()}
-		doneSeen := false
-		// sendDone 幂等补发 [DONE]：正常路径上游会自带；上游提前断流（EOF
-		// 而未发 DONE）时由这里兜底，保证客户端总能收到终止标记。
-		sendDone := func() {
-			if doneSeen {
-				return
-			}
-			doneSeen = true
-			stats.DoneSeen = true
-			w.Write([]byte("data: [DONE]\n\n"))
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					sendDone()
-					break
-				}
-				logging.FromContext(r.Context()).Error("stream read error", "error", err)
-				// 发送错误事件通知客户端
-				w.Write([]byte("data: {\"error\":\"stream read error\"}\n\n"))
-				sendDone()
-				stats.Log(r.Context(), "chat")
-				return
-			}
-			if doneSeen {
-				// [DONE] 已发（上游自带或兜底），后续仅腾空缓冲区。
-				continue
-			}
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "data: [DONE]" {
-				sendDone()
-				continue
-			}
-
-			if strings.HasPrefix(line, "data: ") {
-				var raw map[string]any
-				if json.Unmarshal([]byte(line[6:]), &raw) == nil {
-					if choices, ok := raw["choices"].([]any); ok && len(choices) > 0 {
-						if choice, ok := choices[0].(map[string]any); ok {
-							if delta, ok := choice["delta"].(map[string]any); ok {
-								stats.ObserveDelta(delta, keepReasoning)
-							}
-							if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
-								stats.FinishReason = fr
-								stats.SawFinish = true
-							}
-						}
-					}
-				}
-			}
-
-			out, usage := convertStreamChunkWithUsage(line, keepReasoning, clientWantsUsage)
-			if out == "" {
-				// 空choices chunk，但可能有 usage
-				if usage != nil {
-					statsx.RecordChatUsage(req.Model, usage)
-				}
-				continue
-			}
-
-			// 提取 usage（已在 convertStreamChunkWithUsage 中解析）
-			if usage != nil && !doneSeen {
-				statsx.RecordChatUsage(req.Model, usage)
-			}
-
-			w.Write([]byte(out))
-			w.Write([]byte("\n"))
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-		stats.Log(r.Context(), "chat")
 		return
 	}
 
@@ -718,6 +649,259 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	w.Write(outBody)
+}
+
+// chatStreamRunOnce 是 chat 直连流式分支的单轮执行体,与 DriveStreamWithRetry
+// 配套实现「首字节前空流/错误帧可换 key 重试」。
+//
+// 返回约定:
+//   - (true, nil):已向客户端写过至少一个字节(WriteHeader + 一条 SSE 帧),
+//     即已 commit。此后即使上游再出错也仅向客户端发 error 帧收尾,不再重试。
+//   - (false, err):peek 窗口内未见任何产出帧(空流 EOF / 错误帧 / 首字节超
+//     时 / 读错误)。错误通常是 errStreamIncompleteNoCommit,Drive 会换 key
+//     重试。ctx.Canceled/DeadlineExceeded 原样透传不再重试。
+//
+// peeked 非空时直接进入主循环(此调用已是某次 peek-commit 之后的干跑);
+// 否则对 rc 做一次 PeekFirstFrame(由它先看门狗 / 吞错误帧 / 摘出首个产
+// 出帧)。WriteHeader(200) 只发生在「第一帧要真正写给客户端时」——这就
+// 是 commit 点。
+func chatStreamRunOnce(
+	ctx context.Context,
+	w http.ResponseWriter,
+	rc io.Reader,
+	peeked []streamReadResult,
+	rd *streamReader,
+	req *OpenAIRequest,
+	keepReasoning bool,
+	clientWantsUsage bool,
+) (bool, error) {
+	// 初始化 reader:reuse rd(其 bufio 已包含 peek 预读),否则在 rc 上新建。
+	var reader *streamReader
+	if len(peeked) == 0 {
+		peek := PeekFirstFrame(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, ChatProtocolHooks)
+		if peek.Err != nil {
+			return false, peek.Err
+		}
+		peeked = peek.Consumed
+		reader = peek.Reader
+		if reader == nil {
+			// 上游 EOF 但已有完整帧(极少见:单帧流)。续读 reader 落
+			// 在已 EOF 的 rc 上,主循环立即收 EOF 走兜底 DONE。
+			reader = newStreamReader(ctx, rc, 15*time.Second)
+		} else {
+			// peek 阶段 keepalive=0(由 timeout 当首字节看门狗);commit
+			// 后开启 15s 心跳,在长间隙里客户端不至于挂住。
+			reader.enableKeepalive(15 * time.Second)
+		}
+	} else if rd != nil {
+		reader = rd
+		reader.enableKeepalive(15 * time.Second)
+	} else {
+		reader = newStreamReader(ctx, rc, 15*time.Second)
+	}
+	defer reader.Close()
+
+	flusher, _ := w.(http.Flusher)
+	stats := &logging.StreamStats{Start: time.Now()}
+	doneSeen := false
+	// wroteHeader 标记「是否已向客户端写过任何字节」——即 commit 点。一旦
+	// 写过就不可逆,后续错误只能发错误帧收尾,不可重试。
+	wroteHeader := false
+
+	// emitLine 把一段完整帧 payload 写给客户端,首次调用时先 WriteHeader(200)
+	// + 写 SSE 响应头,然后才写实数据。它是「commit」的唯一入口。
+	emitLine := func(payload string) {
+		if !wroteHeader {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(http.StatusOK)
+			wroteHeader = true
+		}
+		w.Write([]byte(payload))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	// sendDone 幂等补发 [DONE]:正常末尾上游会自带;EOF 兜底也会调它一
+	// 次,保证客户端总能收到终止标记。
+	sendDone := func() {
+		if doneSeen {
+			return
+		}
+		doneSeen = true
+		stats.DoneSeen = true
+		emitLine("data: [DONE]\n\n")
+	}
+	// emitError 在已 commit 的流上补一个错误帧 + [DONE]。客户端拿到完整
+	// 的(带错的)终止序列。
+	emitError := func(msg string) {
+		payload := map[string]any{
+			"error": map[string]any{
+				"message": msg,
+				"type":    "upstream_truncated",
+			},
+			"choices": []any{map[string]any{"index": 0, "finish_reason": "error"}},
+		}
+		data, _ := json.Marshal(payload)
+		emitLine("data: " + string(data) + "\n\n")
+		sendDone()
+	}
+
+	// pending 是 peek 阶段回放给主循环的行(含 peek 收的那批首帧数据),按
+	// 序消费直到清空,然后转去读 reader.Read() 直读上游。
+	pending := append([]streamReadResult(nil), peeked...)
+	popPending := func() (streamReadResult, bool) {
+		if len(pending) == 0 {
+			return streamReadResult{}, false
+		}
+		out := pending[0]
+		pending = pending[1:]
+		return out, true
+	}
+
+	for {
+		var res streamReadResult
+		// 优先回放 pending;空了再去 select reader / keepalive / ctx.Done。
+		if r, ok := popPending(); ok {
+			res = r
+		} else {
+			select {
+			case <-ctx.Done():
+				// 客户端断开也属于「未 commit 的中断」——已写过头就仅退出,
+				// 未写过则返回 err 让上层理解。
+				if wroteHeader {
+					stats.Log(ctx, "chat")
+					return true, nil
+				}
+				return false, ctx.Err()
+			case <-reader.Keepalive():
+				// 15s 无新数据时主动发个心跳行,既避免客户端和中间层断连,
+				// 也由 emitLine 承担首次 WriteHeader(意味着「commit 点
+				// 可能由一次心跳触发」——这与 claude_responses 行为一致)。
+				if wroteHeader {
+					emitLine(": keepalive\n\n")
+				}
+				continue
+			case res = <-reader.Read():
+			}
+		}
+
+		if res.err != nil {
+			// 读到错(含 EOF):先结算手头这一行(可能是末尾不带 \n 的
+			// 残行);再按「是否已 commit / 是否已见产出」决定 sendDone 兜底
+			// 还是返回可重试错误。
+			if trimmed := strings.TrimSpace(res.line); trimmed != "" {
+				// 残帧也算一次处理尝试:走到下面统一行处理。
+				res.err = nil // 清掉让下方逻辑把残行当完整行处理
+				if handleChatStreamLine(res.line, req, keepReasoning, clientWantsUsage, stats, &doneSeen, emitLine) {
+					// 残行内含 [DONE]:正常收尾
+					stats.Log(ctx, "chat")
+					return true, nil
+				}
+			}
+			if res.err == nil || errors.Is(res.err, io.EOF) {
+				// EOF 分支:已 commit → emit error 帧 + [DONE] 收尾(spec:
+				// 上游提前断流时——即使已写过正文——也要让客户端知道这
+				// 不是干净的 finish_reason=stop);未 commit → 返回
+				// errStreamIncompleteNoCommit 让 Drive 重试。
+				if wroteHeader {
+					emitError("upstream stream ended prematurely")
+					stats.Log(ctx, "chat")
+					return true, nil
+				}
+				return false, errStreamIncompleteNoCommit
+			}
+			// 非 EOF 读错(网络断等):同上,只是顺带记一条日志。
+			logging.FromContext(ctx).Error("stream read error", "error", res.err)
+			if wroteHeader {
+				emitError("upstream stream ended prematurely")
+				stats.Log(ctx, "chat")
+				return true, nil
+			}
+			return false, errStreamIncompleteNoCommit
+		}
+
+		if doneSeen {
+			// [DONE] 已发过(上游自带或我们兜底),后续仅排空缓冲。
+			continue
+		}
+
+		trimmed := strings.TrimSpace(res.line)
+		if trimmed == "" {
+			continue
+		}
+		// 处理一行:返回 true 表示这一行刚好是 [DONE],流应正常收尾。
+		if handleChatStreamLine(res.line, req, keepReasoning, clientWantsUsage, stats, &doneSeen, emitLine) {
+			stats.Log(ctx, "chat")
+			return true, nil
+		}
+		// 检测到 payload 是顶层错误帧且尚未 commit:让上层可重试。
+		if !wroteHeader && strings.HasPrefix(trimmed, "data:") {
+			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if payload != "" && payload != "[DONE]" && chatIsErrorEvent([]byte(payload)) {
+				return false, errStreamIncompleteNoCommit
+			}
+		}
+	}
+}
+
+// handleChatStreamLine 处理一行业务数据(不含 keepalive / EOF 分支),返回
+// true 表示这一帧是 [DONE](流天然收尾),false 表示还需继续。已经经过
+// convertStreamChunkWithUsage 的改写,逐条原样 emit 给客户端。
+//
+// 注意:emit 通过闭包完成,首次 emit 时由它去 WriteHeader(200) —— 即
+// 「commit 点」在第一次实际写出时发生,而不是 handler 入口。
+func handleChatStreamLine(
+	line string,
+	req *OpenAIRequest,
+	keepReasoning bool,
+	clientWantsUsage bool,
+	stats *logging.StreamStats,
+	doneSeen *bool,
+	emitLine func(string),
+) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "data: [DONE]" {
+		// 上游自带 DONE:落到 sendDone 等价路径(只发一次,通过 *doneSeen 幂等)。
+		if !*doneSeen {
+			*doneSeen = true
+			stats.DoneSeen = true
+			emitLine("data: [DONE]\n\n")
+		}
+		return true
+	}
+
+	if strings.HasPrefix(line, "data: ") {
+		var raw map[string]any
+		if json.Unmarshal([]byte(line[6:]), &raw) == nil {
+			if choices, ok := raw["choices"].([]any); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]any); ok {
+					if delta, ok := choice["delta"].(map[string]any); ok {
+						stats.ObserveDelta(delta, keepReasoning)
+					}
+					if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
+						stats.FinishReason = fr
+						stats.SawFinish = true
+					}
+				}
+			}
+		}
+	}
+
+	out, usage := convertStreamChunkWithUsage(line, keepReasoning, clientWantsUsage)
+	if out == "" {
+		// 空 choices chunk,但可能有 usage。
+		if usage != nil {
+			statsx.RecordChatUsage(req.Model, usage)
+		}
+		return false
+	}
+	if usage != nil && !*doneSeen {
+		statsx.RecordChatUsage(req.Model, usage)
+	}
+	emitLine(out + "\n")
+	return false
 }
 
 // ======================== Models Handler ========================

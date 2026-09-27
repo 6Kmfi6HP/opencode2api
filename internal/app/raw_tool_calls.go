@@ -573,6 +573,8 @@ type rawSSEReader struct {
 	converted bool
 	done      bool
 	closed    bool
+	closeOnce sync.Once
+	closeErr  error
 	chunkID   string
 	model     string
 	created   any
@@ -582,15 +584,21 @@ func wrapRawSSE(r io.ReadCloser) io.ReadCloser {
 	return &rawSSEReader{src: r, reader: bufio.NewReader(r)}
 }
 
+// Close 关闭上游源,从而解除任何进行中的 Read 阻塞。
+//
+// 注意 Reed–Close 死锁:Read 在持有 r.mu 期间会进 r.reader.ReadString(实
+// 际阻塞在 src.Read)。如果 Close 也要先抢 r.mu,就会被永远无法拿到的锁卡
+// 死——这就是 chat 流路径首字节看门狗触发的真实场景。所以这里**先**用
+// closeOnce 关闭 src(解除 Read 阻塞)**再**通过 once 写 closed 标志;
+// 之后的 Read 看到 src 已 EOF,自然走到 r.closed/r.done 的退出路径。
 func (r *rawSSEReader) Close() error {
-	r.mu.Lock()
-	if r.closed {
+	r.closeOnce.Do(func() {
+		r.closeErr = r.src.Close()
+		r.mu.Lock()
+		r.closed = true
 		r.mu.Unlock()
-		return nil
-	}
-	r.closed = true
-	r.mu.Unlock()
-	return r.src.Close()
+	})
+	return r.closeErr
 }
 
 func (r *rawSSEReader) Read(p []byte) (int, error) {
