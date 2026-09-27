@@ -8,39 +8,67 @@ import (
 	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"log/slog"
 	"net/http"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // ======================== Admin 管理页面 ========================
+
+type adminReloadResult struct {
+	sessionID string
+	freeCount int
+	goCount   int
+}
+
+var adminReloadGroup singleflight.Group
+
+func doAdminReload(reload func() adminReloadResult) adminReloadResult {
+	value, _, _ := adminReloadGroup.Do("admin-reload", func() (any, error) { return reload(), nil })
+	return value.(adminReloadResult)
+}
+
+func reloadOpenCodeState() adminReloadResult {
+	return doAdminReload(func() adminReloadResult {
+		sessionState := refreshOCSession()
+		fetched, err := fetchModels()
+		if err == nil && len(fetched) > 0 {
+			modelMu.Lock()
+			modelsCache = fetched
+			modelsLoaded = true
+			modelMu.Unlock()
+			slog.Info("free models refreshed", "count", len(fetched))
+		}
+		goFetched, goErr := fetchGoModels()
+		if goErr == nil && len(goFetched) > 0 {
+			modelMu.Lock()
+			goModelsCache = goFetched
+			modelMu.Unlock()
+			slog.Info("go catalog refreshed", "count", len(goFetched))
+		}
+		modelMu.RLock()
+		result := adminReloadResult{
+			sessionID: sessionState.sessionID,
+			freeCount: len(modelsCache),
+			goCount:   len(goModelsCache),
+		}
+		modelMu.RUnlock()
+		return result
+	})
+}
 
 func reloadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	refreshOCSession()
-	fetched, err := fetchModels()
-	if err == nil && len(fetched) > 0 {
-		modelMu.Lock()
-		modelsCache = fetched
-		modelsLoaded = true
-		modelMu.Unlock()
-		slog.Info("free models refreshed", "count", len(fetched))
-	}
-	goFetched, goErr := fetchGoModels()
-	if goErr == nil && len(goFetched) > 0 {
-		modelMu.Lock()
-		goModelsCache = goFetched
-		modelMu.Unlock()
-		slog.Info("go catalog refreshed", "count", len(goFetched))
-	}
+	result := reloadOpenCodeState()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"status":  "ok",
-		"session": ocSessionID,
-		"free":    len(modelsCache),
-		"go":      len(goModelsCache),
+		"session": result.sessionID,
+		"free":    result.freeCount,
+		"go":      result.goCount,
 	})
-
 }
 
 func adminConfigHandler(w http.ResponseWriter, r *http.Request) {

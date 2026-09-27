@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -110,9 +109,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	oldHTTPClient := httpClient
 	oldModelsCache := modelsCache
 	oldGoModelsCache := goModelsCache
-	oldOCClientVer := ocClientVer
-	oldOCSessionID := ocSessionID
-	oldOCProjectID := ocProjectID
+	oldOCState := ocSessionState.Load()
 	oldActiveSocks5 := activeSocks5
 	oldSocks5Client := socks5Client
 	oldSocks5ClientAddr := socks5ClientAddr
@@ -140,11 +137,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 	upstreamBaseURLs = normalizeBaseURLs(nil)
 	socks5Mu.Unlock()
 
-	ocOnce = sync.Once{}
-	ocOnce.Do(func() {})
-	ocClientVer = "test-version"
-	ocSessionID = "ses_test"
-	ocProjectID = "project_test"
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "test-version", sessionID: "ses_test", projectID: "project_test"})
 
 	t.Cleanup(func() {
 		httpClient = oldHTTPClient
@@ -160,10 +153,7 @@ func installFakeOpenCodeClient(t *testing.T, responses []fakeUpstreamResponse) *
 		socks5Proxies = oldSocks5Proxies
 		upstreamBaseURLs = oldUpstreamBaseURLs
 		socks5Mu.Unlock()
-		ocOnce = sync.Once{}
-		ocClientVer = oldOCClientVer
-		ocSessionID = oldOCSessionID
-		ocProjectID = oldOCProjectID
+		setOCSessionStateForTest(oldOCState)
 	})
 
 	return transport

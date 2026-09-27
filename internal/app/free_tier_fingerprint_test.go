@@ -77,7 +77,7 @@ func TestFreeTierFingerprint_SKKeyFreeModelNoTools(t *testing.T) {
 	modelsdev.SetFreeModelsForTest("big-pickle")
 	t.Cleanup(func() { modelsdev.SetFreeModelsForTest() })
 
-	ocClientVer = "1.18.31"
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-realkey0123456789abcdef"}
 	bodyMap := map[string]any{"messages": []any{}, "stream": false}
 	req, err := buildOCRequestWithSubpath("big-pickle", bodyMap, auth, false, "https://opencode.ai", "chat/completions", "ses_0123abcdef45ABCDEf01234567")
@@ -121,7 +121,7 @@ func TestFreeTierFingerprint_PublicPartialClientTools(t *testing.T) {
 	modelsdev.SetFreeModelsForTest("big-pickle")
 	t.Cleanup(func() { modelsdev.SetFreeModelsForTest() })
 
-	ocClientVer = "1.18.31"
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRoutePublic}
 	weather := map[string]any{
 		"type":     "function",
@@ -199,7 +199,7 @@ func mustJSON(v any) string {
 }
 
 func TestFreeTierFingerprint_SKKeyContributorFreeModel(t *testing.T) {
-	ocClientVer = "1.18.31"
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-realkey0123456789abcdef"}
 	bodyMap := map[string]any{"messages": []any{}, "stream": false}
 	req, err := buildOCRequestWithSubpath("muse-spark-1.3-contributor-free", bodyMap, auth, false, "https://opencode.ai", "chat/completions", "ses_12345678901234567890123")
@@ -217,7 +217,7 @@ func TestFreeTierFingerprint_SKKeyContributorFreeModel(t *testing.T) {
 // 客户端已带 bash(Anthropic 形状)时保留且不重复,仅追加余下三件;只强制 stream,
 // 不往 Anthropic schema 里塞 OpenAI 专属的 stream_options。
 func TestFreeTierFingerprint_SubpathMessages(t *testing.T) {
-	ocClientVer = "1.18.31"
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-realkey0123456789abcdef"}
 	bodyMap := map[string]any{
 		"messages":   []any{},
@@ -265,7 +265,7 @@ func TestFreeTierFingerprint_SubpathMessages(t *testing.T) {
 // 客户端已给的 stream_options 保留自有键,仅补 include_usage。
 // tools 断言兼容 Responses 形状(tools[].name)。
 func TestFreeTierFingerprint_SubpathResponses(t *testing.T) {
-	ocClientVer = "1.18.31"
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-realkey0123456789abcdef"}
 	bodyMap := map[string]any{
 		"input":  []any{},
@@ -299,7 +299,7 @@ func TestFreeTierFingerprint_SubpathResponses(t *testing.T) {
 //
 //	免费模型 + 其它子路径(count_tokens)不套门禁。
 func TestFreeTierFingerprint_PaidModelAndCountTokensSkipped(t *testing.T) {
-	ocClientVer = "1.18.31"
+	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-realkey0123456789abcdef"}
 
 	paidBody := map[string]any{"messages": []any{}, "stream": false}
