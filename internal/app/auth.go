@@ -151,12 +151,17 @@ func extractUpstreamAuth(r *http.Request) UpstreamAuth {
 	return UpstreamAuth{Mode: AuthRoutePublic, Source: source}
 }
 
-// 只认 sk- 开头的 opencode key；Anthropic sk-ant-* 不能转发上游。
+// isValidOpenCodeKey 只认 opencode 自己的 key 前缀（sk- 与 oc_sk- 都属同一
+// 发行网关，后者为线上运营实际格式）；Anthropic sk-ant- 及过短占位串
+// （no-key-required / placeholder 等）一律拒绝，回落 public。
 func isValidOpenCodeKey(token string) bool {
 	if strings.HasPrefix(token, "sk-ant-") {
 		return false
 	}
-	return strings.HasPrefix(token, "sk-") && len(token) > 15
+	if !strings.HasPrefix(token, "sk-") && !strings.HasPrefix(token, "oc_sk-") && !strings.HasPrefix(token, "oc_sk_") {
+		return false
+	}
+	return len(token) > len("sk-")+10 // 至少 3 位前缀 + 11 字节熵，防占位
 }
 
 func (auth UpstreamAuth) tier() TierType {
