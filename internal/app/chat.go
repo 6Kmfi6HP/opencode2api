@@ -280,6 +280,46 @@ func normalizeReasoningContent(fields map[string]any) {
 	}
 }
 
+// restoreChatChunkToolCase 把已解析的 chat chunk 里 delta/message 的
+// tool_calls[].function.name 小写占位名还原为 PascalCase(幂等,仅命中四件)。
+func restoreChatChunkToolCase(raw map[string]any) {
+	choices, ok := raw["choices"].([]any)
+	if !ok {
+		return
+	}
+	for _, c := range choices {
+		choice, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, key := range []string{"delta", "message"} {
+			fields, ok := choice[key].(map[string]any)
+			if !ok {
+				continue
+			}
+			tcs, ok := fields["tool_calls"].([]any)
+			if !ok {
+				continue
+			}
+			for _, rtc := range tcs {
+				tc, ok := rtc.(map[string]any)
+				if !ok {
+					continue
+				}
+				fn, ok := tc["function"].(map[string]any)
+				if !ok {
+					continue
+				}
+				if n, _ := fn["name"].(string); n != "" {
+					if r := restoreToolNameCase(n); r != n {
+						fn["name"] = r
+					}
+				}
+			}
+		}
+	}
+}
+
 // precedes tool calls is left alone when keepReasoning is true.
 func promoteMisplacedReasoning(fields map[string]any, keepReasoning bool) bool {
 	normalizeReasoningContent(fields)
@@ -386,7 +426,7 @@ func preserveChatPassthroughKeys(body []byte, req *OpenAIRequest) {
 // 这里的 "顺带提取" 只是免去了 usage 的第三次解析。
 // clientWantsUsage=false 时丢弃只含 usage 且 choices 为空的 chunk：那是网
 // 关为流统计向上游强制 include_usage=true 产出的，客户端未请求就不该收到。
-func convertStreamChunkWithUsage(line string, keepReasoning, clientWantsUsage bool) (string, map[string]any) {
+func convertStreamChunkWithUsage(line string, keepReasoning, clientWantsUsage bool, restoreCase bool) (string, map[string]any) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
 		return line, nil
@@ -404,6 +444,12 @@ func convertStreamChunkWithUsage(line string, keepReasoning, clientWantsUsage bo
 	var usage map[string]any
 	if u, ok := raw["usage"].(map[string]any); ok {
 		usage = u
+	}
+
+	// chat 直连流式 byte-relay:上游 tool_calls 名可能是注入 stub 的小写名,
+	// 仅 Claude 系客户端还原为 PascalCase,其余保持小写透传。
+	if restoreCase {
+		restoreChatChunkToolCase(raw)
 	}
 
 	choices, ok := raw["choices"].([]any)
@@ -715,6 +761,7 @@ func chatStreamRunOnce(
 	keepReasoning bool,
 	clientWantsUsage bool,
 ) (bool, error) {
+	restoreCase := shouldRestoreToolCase(ctx)
 	// 初始化 reader:reuse rd(其 bufio 已包含 peek 预读),否则在 rc 上新建。
 	var reader *streamReader
 	if len(peeked) == 0 {
@@ -834,7 +881,7 @@ func chatStreamRunOnce(
 			if trimmed := strings.TrimSpace(res.line); trimmed != "" {
 				// 残帧也算一次处理尝试:走到下面统一行处理。
 				res.err = nil // 清掉让下方逻辑把残行当完整行处理
-				if handleChatStreamLine(res.line, req, keepReasoning, clientWantsUsage, stats, &doneSeen, emitLine, wroteHeader) {
+				if handleChatStreamLine(res.line, req, keepReasoning, clientWantsUsage, restoreCase, stats, &doneSeen, emitLine, wroteHeader) {
 					// 残行内含 [DONE]:正常收尾
 					stats.Log(ctx, "chat")
 					return true, nil
@@ -872,7 +919,7 @@ func chatStreamRunOnce(
 			continue
 		}
 		// 处理一行:返回 true 表示这一行刚好是 [DONE],流应正常收尾。
-		if handleChatStreamLine(res.line, req, keepReasoning, clientWantsUsage, stats, &doneSeen, emitLine, wroteHeader) {
+		if handleChatStreamLine(res.line, req, keepReasoning, clientWantsUsage, restoreCase, stats, &doneSeen, emitLine, wroteHeader) {
 			stats.Log(ctx, "chat")
 			return true, nil
 		}
@@ -901,6 +948,7 @@ func handleChatStreamLine(
 	req *OpenAIRequest,
 	keepReasoning bool,
 	clientWantsUsage bool,
+	restoreCase bool,
 	stats *logging.StreamStats,
 	doneSeen *bool,
 	emitLine func(string),
@@ -934,7 +982,7 @@ func handleChatStreamLine(
 		}
 	}
 
-	out, usage := convertStreamChunkWithUsage(line, keepReasoning, clientWantsUsage)
+	out, usage := convertStreamChunkWithUsage(line, keepReasoning, clientWantsUsage, restoreCase)
 	if out == "" {
 		// 空 choices chunk,但可能有 usage。仅在已 commit 后才记录 usage;
 		// 否则本次 attempt 由 retry 取消时,usage 仍会被错误地统计进账号。

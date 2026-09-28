@@ -203,7 +203,7 @@ func TestJSONSchemaCleaningReturnsCopyAndPreservesConstraints(t *testing.T) {
 
 func TestChatUsageOnlyChunkIsForwardedWithFullUsage(t *testing.T) {
 	line := `data: {"id":"x","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5,"completion_tokens_details":{"reasoning_tokens":2}}}`
-	got, usage := convertStreamChunkWithUsage(line, true, true)
+	got, usage := convertStreamChunkWithUsage(line, true, true, true)
 	if got == "" {
 		t.Fatal("usage-only chunk was dropped")
 	}
@@ -254,7 +254,7 @@ func TestPromoteMisplacedReasoningKeepsCoTWhenThinkingEnabled(t *testing.T) {
 
 func TestChatStreamPromotesReasoningToContentWhenThinkingDisabled(t *testing.T) {
 	line := `data: {"choices":[{"delta":{"reasoning_content":"2"},"finish_reason":null}]}`
-	got, _ := convertStreamChunkWithUsage(line, false, true)
+	got, _ := convertStreamChunkWithUsage(line, false, true, true)
 	if !strings.Contains(got, `"content":"2"`) {
 		t.Fatalf("expected promoted content:\n%s", got)
 	}

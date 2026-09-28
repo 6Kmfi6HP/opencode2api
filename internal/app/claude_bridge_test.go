@@ -484,7 +484,7 @@ func TestClaudeBridge_StreamUsageChunk_ClientGate(t *testing.T) {
 	line := `data: {"id":"x","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`
 
 	// 客户端未请求 include_usage：usage chunk 抑制，但 usage 仍解析出来供统计。
-	out, usage := convertStreamChunkWithUsage(line, true, false)
+	out, usage := convertStreamChunkWithUsage(line, true, false, true)
 	if out != "" {
 		t.Fatalf("usage-only chunk should be dropped when client did not request it, got %q", out)
 	}
@@ -493,7 +493,7 @@ func TestClaudeBridge_StreamUsageChunk_ClientGate(t *testing.T) {
 	}
 
 	// 客户端请求了 include_usage：透传。
-	out2, usage2 := convertStreamChunkWithUsage(line, true, true)
+	out2, usage2 := convertStreamChunkWithUsage(line, true, true, true)
 	if out2 == "" {
 		t.Fatal("usage-only chunk should be forwarded when client requested it")
 	}
@@ -503,7 +503,7 @@ func TestClaudeBridge_StreamUsageChunk_ClientGate(t *testing.T) {
 
 	// 带 choices 的 chunk 永远透传。
 	line2 := `data: {"id":"x","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}`
-	out3, _ := convertStreamChunkWithUsage(line2, true, false)
+	out3, _ := convertStreamChunkWithUsage(line2, true, false, true)
 	if !strings.Contains(out3, `"content":"hi"`) {
 		t.Fatalf("content chunk should pass through, got %q", out3)
 	}

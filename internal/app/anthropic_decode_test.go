@@ -1776,8 +1776,8 @@ func TestConvertStreamChunkWithUsage_DeterministicID(t *testing.T) {
 	line1 := `data: {"id":"msg_xyz","choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}`
 	line2 := `data: {"id":"msg_xyz","choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}`
 
-	out1, _ := convertStreamChunkWithUsage(line1, false, true)
-	out2, _ := convertStreamChunkWithUsage(line2, false, true)
+	out1, _ := convertStreamChunkWithUsage(line1, false, true, true)
+	out2, _ := convertStreamChunkWithUsage(line2, false, true, true)
 
 	var chunk1, chunk2 map[string]any
 	json.Unmarshal([]byte(out1[6:]), &chunk1)
