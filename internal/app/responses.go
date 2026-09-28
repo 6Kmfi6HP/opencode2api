@@ -2321,6 +2321,7 @@ loop:
 											}
 											fn, _ := tc["function"].(map[string]any)
 											name, _ := fn["name"].(string)
+											name = restoreToolNameCase(name)
 											ns, _ := splitNamespaceKind(toolKinds[name])
 											call = map[string]any{
 												"output_index": outputIndex,

@@ -277,8 +277,10 @@ func TestAggregate_ToolCallsAssembledByIndex(t *testing.T) {
 		t.Fatalf("tool_calls = %#v, want 1", msg["tool_calls"])
 	}
 	fn := toolCalls[0].(map[string]any)["function"].(map[string]any)
-	if fn["name"] != "read" || fn["arguments"] != `{"file_path":"/etc/hosts"}` {
-		t.Fatalf("function = %#v, want read with joined arguments", fn)
+	// "read" 是免费层四件占位工具之一,聚合路径会还原为规范大小写(见
+	// restoreToolNameCase),避免 Claude Code 拒收小写 tool_use 名。
+	if fn["name"] != "Read" || fn["arguments"] != `{"file_path":"/etc/hosts"}` {
+		t.Fatalf("function = %#v, want Read (case-restored) with joined arguments", fn)
 	}
 	if choices0 := resp["choices"].([]any)[0].(map[string]any); choices0["finish_reason"] != "tool_calls" {
 		t.Fatalf("finish_reason = %v, want tool_calls", choices0["finish_reason"])

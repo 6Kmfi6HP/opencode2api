@@ -194,7 +194,7 @@ func chatMessagesToAnthropic(messages []Message) (string, []map[string]any) {
 			for _, tc := range msg.ToolCalls {
 				input := parseToolCallArguments(tc.Function.Arguments)
 				blocks = append(blocks, map[string]any{
-					"type": "tool_use", "id": tc.ID, "name": tc.Function.Name, "input": input,
+					"type": "tool_use", "id": tc.ID, "name": restoreToolNameCase(tc.Function.Name), "input": input,
 				})
 			}
 			appendBlocks("assistant", blocks)
@@ -896,7 +896,11 @@ func (st *anthropicToChatState) handleLine(line string) {
 			st.toolIndices[idx] = toolIdx
 			tool := &anthropicToolState{}
 			st.toolStates[idx] = tool
-			name, _ := cb["name"].(string)
+			// 免费层小写占位工具名在此还原为客户端注册的规范大小写
+			// (bash/glob/grep/read -> Bash/Glob/Grep/Read),避免 Claude
+			// Code 等大小写敏感客户端报 "No such tool available"。
+			rawName, _ := cb["name"].(string)
+			name := restoreToolNameCase(rawName)
 			id, _ := cb["id"].(string)
 			// 缓存 start 块的 initial input(常见 {});不要立刻 emit 给 chat 端
 			// —— OpenAI 客户端会 concat 所有 arguments 片段,若 start 下发了

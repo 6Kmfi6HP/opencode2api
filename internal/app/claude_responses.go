@@ -731,7 +731,9 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 			if callID == "" {
 				callID, _ = item["id"].(string)
 			}
-			name, _ := item["name"].(string)
+			rawName, _ := item["name"].(string)
+			// 免费层小写占位工具名还原为规范大小写(见 restoreToolNameCase)。
+			name := restoreToolNameCase(rawName)
 			if name == "" {
 				continue
 			}
@@ -829,7 +831,8 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 		content = append(content, ClaudeContent{Type: "text", Text: joinedText})
 	}
 	for _, tl := range tools {
-		content = append(content, ClaudeContent{Type: "tool_use", ID: tl.id, Name: tl.name, Input: tl.input})
+		// 免费层小写占位工具名还原为规范大小写(见 restoreToolNameCase)。
+		content = append(content, ClaudeContent{Type: "tool_use", ID: tl.id, Name: restoreToolNameCase(tl.name), Input: tl.input})
 	}
 	if len(content) == 0 {
 		content = append(content, ClaudeContent{Type: "text", Text: ""})
@@ -1284,7 +1287,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		emitEvent("content_block_start", map[string]any{
 			"type": "content_block_start", "index": b.claudeIndex,
 			"content_block": map[string]any{
-				"type": "tool_use", "id": b.toolID, "name": b.toolName, "input": map[string]any{},
+				"type": "tool_use", "id": b.toolID, "name": restoreToolNameCase(b.toolName), "input": map[string]any{},
 			},
 		})
 		if _, exists := indexOfToolOrder(toolOrder, b.claudeIndex); !exists {
