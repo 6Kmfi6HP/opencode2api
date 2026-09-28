@@ -1,6 +1,8 @@
 # Changelog
 
-## v0.14.12 (unreleased)
+## v0.14.17 (unreleased)
+
+- Fix streamed `tool_calls` landing outside `delta` on reasoning-heavy models (`fix(chat)`, issue #34): `muse-spark-*-contributor` intermittently emits stream `tool_calls` as a sibling of `delta` (`choices[0].tool_calls`) instead of inside it, so standard clients reading `delta.tool_calls` miss the call while `finish_reason` is still `tool_calls` and loop retries. New `hoistChoiceSiblingToolCalls` normalizes the shape at ingress (append after existing `delta.tool_calls`, idempotent) and is wired into every chat stream consumer: direct passthrough (`convertStreamChunkWithUsage`, before case-restore) + stats, `rawSSEReader` native-detect (reserialized), non-stream aggregator (`aggregateOpenAIStream`), `claudeStreamHandler`, `responsesStreamHandler`. Regression tests `TestChatStreamSiblingToolCallsHoistedIntoDelta` + end-to-end `TestChatStreamSiblingToolCalls_EndToEnd`. Live-verified on `muse-spark-1.3-contributor` (`stream:true` 7/7 clean, `delta.tool_calls` × 2 + `finish_reason=tool_calls`); note `stream:false` on the same model separately returns empty `content` with no `tool_calls` (independent issue, not covered).
 
 - Protocol parity vs sub2api `apicompat` (`fix(chat)`, `fix(claude)`):对照 Wei-Shaw/sub2api `backend/internal/pkg/apicompat` 全量审计三条转换链路并补齐 9 项差异,官方 Responses 流事件文档确认事件语义,真实流量三协议 9/9 验证通过。
   - chat→responses 请求体:`parallel_tool_calls` / `service_tier` 透传上游(顶层键经 `preserveChatPassthroughKeys` 从原始 body 回填 ExtraBody,类型化结构装不下;`extra_body` 显式键优先);`response_format`(`json_schema` 展平 / `json_object` 透传)映射为 `text.format`(此前直接丢弃,structured-output 约束在该路径失效)。

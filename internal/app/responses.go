@@ -2189,6 +2189,12 @@ loop:
 								}
 							} else {
 								choice, _ := choices[0].(map[string]any)
+								// issue #34:choice 级 tool_calls 归位进 delta 后再翻译。
+								for _, c := range choices {
+									if ch, ok := c.(map[string]any); ok {
+										hoistChoiceSiblingToolCalls(ch)
+									}
+								}
 								delta, _ := choice["delta"].(map[string]any)
 								finishReason, _ := choice["finish_reason"].(string)
 								if delta != nil {

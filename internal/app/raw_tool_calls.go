@@ -654,7 +654,12 @@ func (r *rawSSEReader) processLine(line string) {
 		}
 		return
 	}
+	// issue #34:归位过的流已是 native,跳过文本判定直接透传(归一化在下面)。
 	if r.native {
+		if normalized := normalizeRawChoiceLine(line); normalized != "" {
+			r.pending = append(r.pending, []byte(normalized))
+			return
+		}
 		r.pending = append(r.pending, []byte(line))
 		return
 	}
@@ -704,7 +709,23 @@ func (r *rawSSEReader) processLine(line string) {
 		r.pending = append(r.pending, []byte(line))
 		return
 	}
+	// issue #34:choice 级 tool_calls 先归一进 delta,再做 native/文本判定,否则
+	// 误放形状会漏过 native 检测并被当成纯文本透传。多 choice 时全部归位。
+	hoisted := false
+	for _, c := range choices {
+		if ch, ok := c.(map[string]any); ok {
+			if hoistChoiceSiblingToolCalls(ch) {
+				hoisted = true
+			}
+		}
+	}
 	delta, _ := choice["delta"].(map[string]any)
+	if hoisted {
+		// 归位改写了 choice 形状:重序列化后再走后续判定,避免误放原样透传。
+		if reb, err := json.Marshal(chunk); err == nil {
+			line = "data: " + string(reb) + "\n\n"
+		}
+	}
 	if r.converted {
 		if u, ok := chunk["usage"]; ok && u != nil {
 			r.pending = append(r.pending, []byte(r.makeUsageOnlyLine(chunk)))
@@ -906,6 +927,43 @@ func (r *rawSSEReader) makeDataChunk(body map[string]any) string {
 	}
 	b, _ := json.Marshal(base)
 	return "data: " + string(b) + "\n\n"
+}
+
+// normalizeRawChoiceLine 把一行 chat chunk 里 choices[0] 的 sibling tool_calls
+// 归位进 delta(issue #34),返回归一化后的行;无误放形状时返回 "" 表示原样透传。
+func normalizeRawChoiceLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "data:") {
+		return ""
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return ""
+	}
+	var chunk map[string]any
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		return ""
+	}
+	choices, ok := chunk["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return ""
+	}
+	changed := false
+	for _, c := range choices {
+		if choice, ok := c.(map[string]any); ok {
+			if hoistChoiceSiblingToolCalls(choice) {
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return ""
+	}
+	reb, err := json.Marshal(chunk)
+	if err != nil {
+		return ""
+	}
+	return "data: " + string(reb) + "\n\n"
 }
 
 func (r *rawSSEReader) finishAtEOF() {

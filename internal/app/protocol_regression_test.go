@@ -902,3 +902,157 @@ func TestRetryChatCompletionsWithoutCacheControl_NoRetryOnUnrelated400(t *testin
 		t.Fatalf("unexpected retry: rc=%v status=%d err=%v", right, st, err)
 	}
 }
+
+// TestChatStreamSiblingToolCallsHoistedIntoDelta 锁定 issue #34 回归:上游偶发
+// 把流式 tool_calls 放在 choices[0] 与 delta 平级(而非 delta 内部),标准客户端
+// 只读 delta.tool_calls 会漏掉工具调用。网关必须在所有 chat 流式消费点把它
+// 归位到 delta 内,而不是原样透传。
+func TestChatStreamSiblingToolCallsHoistedIntoDelta(t *testing.T) {
+	malformed := `data: {"id":"chatcmpl_x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Read","arguments":""}}],"finish_reason":null}]}`
+
+	// 1. 直连透传路径:convertStreamChunkWithUsage 必须归位。
+	out, _ := convertStreamChunkWithUsage(malformed, false, true, false)
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"delta"`
+			ToolCalls []any `json:"tool_calls"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(out[6:]), &chunk); err != nil {
+		t.Fatalf("chunk is not JSON: %q", out)
+	}
+	if len(chunk.Choices) != 1 || len(chunk.Choices[0].Delta.ToolCalls) != 1 {
+		t.Fatalf("delta.tool_calls not hoisted: %s", out)
+	}
+	if chunk.Choices[0].Delta.ToolCalls[0].ID != "call_1" || chunk.Choices[0].Delta.ToolCalls[0].Function.Name != "Read" {
+		t.Fatalf("hoisted tool call corrupted: %s", out)
+	}
+	if len(chunk.Choices[0].ToolCalls) != 0 {
+		t.Fatalf("sibling tool_calls must be removed: %s", out)
+	}
+
+	// 2. 非流聚合路径:aggregateOpenAIStream 必须归位(否则 finish_reason=tool_calls
+	//    但 message 里没有 tool_calls,调用方进重试死循环)。
+	sse := strings.Join([]string{
+		`data: {"id":"c","created":1,"choices":[{"index":0,"delta":{"role":"assistant","content":"I'll read that file."},"finish_reason":null}]}`,
+		malformed,
+		`data: {"id":"c","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	}, "\n")
+	got := aggregateOpenAIStream([]byte(sse), "m", false)
+	var agg struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					ID string `json:"id"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(got, &agg); err != nil {
+		t.Fatalf("aggregated body is not JSON: %s", got)
+	}
+	if agg.Choices[0].FinishReason != "tool_calls" || len(agg.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("aggregator dropped sibling tool call: %s", got)
+	}
+	if agg.Choices[0].Message.ToolCalls[0].ID != "call_1" {
+		t.Fatalf("aggregated tool call id wrong: %s", got)
+	}
+
+	// 3. claude 翻译路径:claudeStreamHandler 必须看到 delta 内的 tool call。
+	rr := httptest.NewRecorder()
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(sse)), "m", false)
+	claudeOut := rr.Body.String()
+	if !strings.Contains(claudeOut, `"name":"Read"`) || !strings.Contains(claudeOut, `call_1`) {
+		t.Fatalf("claude path dropped sibling tool call:\n%s", claudeOut)
+	}
+
+	// 4. responses 翻译路径:responsesStreamHandler 必须看到 delta 内的 tool call。
+	rr2 := httptest.NewRecorder()
+	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(sse)), Header: make(http.Header)}
+	responsesStreamHandler(rr2, nil, resp.Body, "m", "m", false, nil, nil, ResponsesAPIRequest{}, nil, nil)
+	respOut := rr2.Body.String()
+	if !strings.Contains(respOut, `"name":"Read"`) || !strings.Contains(respOut, `call_1`) {
+		t.Fatalf("responses path dropped sibling tool call:\n%s", respOut)
+	}
+}
+
+// TestChatStreamSiblingToolCalls_EndToEnd 黑盒:伪上游吐出 issue #34 的误放帧
+// (tool_calls 与 delta 平级),走完整 chatCompletionsHandler(direct chat 路径),
+// 断言客户端收到的每一帧里 tool_calls 都在 delta 内、sibling 计数为零。
+func TestChatStreamSiblingToolCalls_EndToEnd(t *testing.T) {
+	stubRetryConfig(t, 0, 5000)
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl_x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl_x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"I will read it."},"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl_x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"tool_calls":[{"index":0,"id":"call_01a0","type":"function","function":{"name":"Read","arguments":""}}],"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl_x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"tool_calls":[{"index":0,"type":"function","function":{"name":"","arguments":"{\"path\":\"C:/a.toml\"}"}}],"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl_x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`, "",
+	}, "\n")
+	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusOK, body: upstream, header: http.Header{"Content-Type": []string{"text/event-stream"}}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"fallback-model-free","stream":true,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`))
+	rec := httptest.NewRecorder()
+	chatCompletionsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	sibling, inside := 0, 0
+	sawCallID := false
+	for _, line := range strings.Split(body, "\n") {
+		payload, ok := strings.CutPrefix(strings.TrimSpace(line), "data: ")
+		if !ok || payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var frame struct {
+			Choices []struct {
+				Delta struct {
+					ToolCalls []struct {
+						ID string `json:"id"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				ToolCalls []any `json:"tool_calls"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &frame); err != nil {
+			t.Fatalf("client frame is not JSON: %q", payload)
+		}
+		for _, c := range frame.Choices {
+			if len(c.ToolCalls) > 0 {
+				sibling++
+			}
+			if len(c.Delta.ToolCalls) > 0 {
+				inside++
+				for _, tc := range c.Delta.ToolCalls {
+					if tc.ID == "call_01a0" {
+						sawCallID = true
+					}
+				}
+			}
+		}
+	}
+	if sibling != 0 {
+		t.Fatalf("client saw %d sibling tool_calls frames (must be 0):\n%s", sibling, body)
+	}
+	if inside != 2 {
+		t.Fatalf("client saw %d delta.tool_calls frames, want 2:\n%s", inside, body)
+	}
+	if !sawCallID {
+		t.Fatalf("tool call id call_01a0 missing from client stream:\n%s", body)
+	}
+	if !strings.Contains(body, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("missing tool_calls finish:\n%s", body)
+	}
+}

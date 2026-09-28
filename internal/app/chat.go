@@ -320,6 +320,40 @@ func restoreChatChunkToolCase(raw map[string]any) {
 	}
 }
 
+// hoistChoiceSiblingToolCalls 把 choices[i].tool_calls（与 delta 平级的误放形
+// 状,issue #34:上游偶发把流式 tool_calls 放在 delta 外面）归位到 delta 内部。
+// 已在 delta 内的条目保持在前,sibling 条目追加在后;delta 缺失时新建。幂等：
+// 归位后 sibling 键删除,重复调用无操作。返回是否发生过归位。
+func hoistChoiceSiblingToolCalls(choice map[string]any) bool {
+	if choice == nil {
+		return false
+	}
+	raw, ok := choice["tool_calls"]
+	if !ok {
+		return false
+	}
+	if raw == nil {
+		delete(choice, "tool_calls")
+		return true
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return false
+	}
+	delta, _ := choice["delta"].(map[string]any)
+	if delta == nil {
+		delta = map[string]any{}
+		choice["delta"] = delta
+	}
+	if existing, ok := delta["tool_calls"].([]any); ok {
+		delta["tool_calls"] = append(existing, arr...)
+	} else {
+		delta["tool_calls"] = arr
+	}
+	delete(choice, "tool_calls")
+	return true
+}
+
 // precedes tool calls is left alone when keepReasoning is true.
 func promoteMisplacedReasoning(fields map[string]any, keepReasoning bool) bool {
 	normalizeReasoningContent(fields)
@@ -444,6 +478,16 @@ func convertStreamChunkWithUsage(line string, keepReasoning, clientWantsUsage bo
 	var usage map[string]any
 	if u, ok := raw["usage"].(map[string]any); ok {
 		usage = u
+	}
+
+	// issue #34 先归位:上游偶发的 choice 级 tool_calls 进 delta 后,下面的
+	// 大小写还原才能看到它(还原只看 delta/message 内部)。
+	if choicesRaw, ok := raw["choices"].([]any); ok {
+		for _, c := range choicesRaw {
+			if choice, ok := c.(map[string]any); ok {
+				hoistChoiceSiblingToolCalls(choice)
+			}
+		}
 	}
 
 	// chat 直连流式 byte-relay:上游 tool_calls 名可能是注入 stub 的小写名,
@@ -969,6 +1013,12 @@ func handleChatStreamLine(
 		var raw map[string]any
 		if json.Unmarshal([]byte(line[6:]), &raw) == nil {
 			if choices, ok := raw["choices"].([]any); ok && len(choices) > 0 {
+				// issue #34:统计侧全部归位,误放形状的 tool call 也计入。
+				for _, c := range choices {
+					if ch, ok := c.(map[string]any); ok {
+						hoistChoiceSiblingToolCalls(ch)
+					}
+				}
 				if choice, ok := choices[0].(map[string]any); ok {
 					if delta, ok := choice["delta"].(map[string]any); ok {
 						stats.ObserveDelta(delta, keepReasoning)

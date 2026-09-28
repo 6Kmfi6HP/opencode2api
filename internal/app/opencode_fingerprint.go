@@ -315,6 +315,8 @@ func aggregateOpenAIStream(body []byte, modelID string, restoreCase bool) []byte
 		if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
 			finishReason = fr
 		}
+		// issue #34:choice 级 tool_calls 归位进 delta 后再按既有逻辑聚合。
+		hoistChoiceSiblingToolCalls(choice)
 		delta, _ := choice["delta"].(map[string]any)
 		if delta == nil {
 			continue
