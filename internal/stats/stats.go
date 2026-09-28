@@ -533,6 +533,8 @@ func ResetTokenStats() error {
 // seen across upstreams:
 //
 //	OpenAI/Anthropic: prompt_tokens_details.cached_tokens, cache_creation_input_tokens
+//	muse-spark 原生 responses: input_tokens_details.cached_tokens（与 prompt
+//	形态同义，先有谁用谁，不双计）
 //	DeepSeek:         prompt_cache_hit_tokens, prompt_cache_miss_tokens
 //
 // Returns (read, created).
@@ -546,6 +548,10 @@ func parseCacheUsage(usage map[string]any) (int64, int64) {
 	} else if v, ok := util.NumberAsFloat(usage["prompt_cache_hit_tokens"]); ok {
 		read += int64(v)
 	} else if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
+		if v, ok := util.NumberAsFloat(details["cached_tokens"]); ok {
+			read += int64(v)
+		}
+	} else if details, ok := usage["input_tokens_details"].(map[string]any); ok {
 		if v, ok := util.NumberAsFloat(details["cached_tokens"]); ok {
 			read += int64(v)
 		}

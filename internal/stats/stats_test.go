@@ -87,6 +87,27 @@ func TestParseCacheUsageResponsesAliasShape(t *testing.T) {
 	}
 }
 
+// TestParseCacheUsageMuseSparkRawShape 锁定原生透传路径（recordResponsesUsage
+// 直接把上游 responses usage 传给 RecordCacheUsage，不经过归一）：只有
+// input_tokens_details.cached_tokens 时也必须认出 read，否则 muse-spark 系
+// 经透传的缓存命中在 stats.json 里永远是 0。
+func TestParseCacheUsageMuseSparkRawShape(t *testing.T) {
+	read, created := parseCacheUsage(map[string]any{
+		"input_tokens": float64(749),
+		"input_tokens_details": map[string]any{
+			"cached_tokens": float64(625),
+		},
+		"output_tokens": float64(133),
+		"output_tokens_details": map[string]any{
+			"reasoning_tokens": float64(120),
+		},
+		"total_tokens": float64(882),
+	})
+	if read != 625 || created != 0 {
+		t.Fatalf("parseCacheUsage = (%d, %d), want (625, 0)", read, created)
+	}
+}
+
 func TestSaveAndLoadTokenStats(t *testing.T) {
 	setTokenStatsForTest(t, &TokenStatsData{
 		TotalRequests: 1,
