@@ -843,7 +843,9 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 	}
 
 	if refusalText != "" && !hasToolUse {
-		stopReason = "refusal"
+		// 同 claude.go:refusal 不在 Anthropic stop_reason 枚举内,终态按
+		// 完成归一(对齐 sub2api)。
+		stopReason = "end_turn"
 	} else if hasToolUse {
 		stopReason = "tool_use"
 	}

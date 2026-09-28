@@ -794,12 +794,24 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 		switch fr {
 		case "stop":
 			stopReason = "end_turn"
+			// block 存在性回退:finish_reason 缺失/错配但 content 已含 tool_use
+			// 时仍报 tool_use,否则客户端不回传工具结果、对话卡死(对齐 sub2api
+			// chatFinishReasonToAnthropicStopReason 的 default 分支)。
+			for _, c := range content {
+				if c.Type == "tool_use" {
+					stopReason = "tool_use"
+					break
+				}
+			}
 		case "length":
 			stopReason = "max_tokens"
 		case "tool_calls", "function_call":
 			stopReason = "tool_use"
 		case "content_filter":
-			stopReason = "refusal"
+			// refusal 不在 Anthropic stop_reason 枚举内(end_turn/max_tokens/
+			// stop_sequence/tool_use),严格客户端会拒收;拒绝文本已进 message
+			// 内容,终态按完成归一(对齐 sub2api responsesStatusToAnthropicStopReason)。
+			stopReason = "end_turn"
 		}
 	}
 

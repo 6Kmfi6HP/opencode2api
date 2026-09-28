@@ -356,6 +356,31 @@ func clientStreamUsageWanted(body []byte) bool {
 	return false
 }
 
+// preserveChatPassthroughKeys 把 OpenAIRequest 类型化结构装不下的顶层直通
+// 字段从原始 body 回填进 ExtraBody(只补缺,不覆盖 extra_body 内显式键),供
+// chat→responses 上游体透传(对齐 sub2api ChatCompletionsToResponses 的
+// ParallelToolCalls/ServiceTier)。没有这些键时不建 ExtraBody。
+func preserveChatPassthroughKeys(body []byte, req *OpenAIRequest) {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil || req == nil {
+		return
+	}
+	for _, key := range []string{"parallel_tool_calls", "service_tier"} {
+		v, ok := raw[key]
+		if !ok || v == nil {
+			continue
+		}
+		if req.ExtraBody != nil {
+			if _, exists := req.ExtraBody[key]; exists {
+				continue
+			}
+		} else {
+			req.ExtraBody = map[string]any{}
+		}
+		req.ExtraBody[key] = v
+	}
+}
+
 // convertStreamChunkWithUsage 转换流式 chunk，并在同一次解析中顺带返回 usage。
 // 注意：流循环（chat.go 的 stream 处理）仍会为流统计单独解析一次 chunk；
 // 这里的 "顺带提取" 只是免去了 usage 的第三次解析。
@@ -492,6 +517,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+	// OpenAIRequest 类型化结构装不下的顶层直通字段(parallel_tool_calls /
+	// service_tier)从原始 body 回填进 ExtraBody,供 chat→responses 上游体
+	// 透传(对齐 sub2api ChatCompletionsToResponses)。只补缺,不覆盖客户端
+	// 已显式放在 extra_body 内的同名键。
+	preserveChatPassthroughKeys(body, &req)
 	modelIn := req.Model
 	req.Model = resolveModelForAuth(auth, req.Model)
 	if req.Model == "" {

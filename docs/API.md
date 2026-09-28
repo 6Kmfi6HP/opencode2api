@@ -100,6 +100,8 @@
 - 显式零值的 `temperature`（闭区间 `0..2`）、`top_p`、`frequency_penalty`、`presence_penalty`
 - `max_output_tokens`、`stop`、`user`、`parallel_tool_calls`、`stream_options`、`store`
 - 函数工具、项目已有的内置工具、`tool_choice`、`reasoning`、`metadata`
+- Chat 经 `protocol_rules` 走原生 Responses 上游时：`parallel_tool_calls` / `service_tier` 透传上游；`response_format`（`json_schema` 展平 / `json_object` 透传 `type`）映射为 `text.format`；`custom_tool_call`（custom/freeform 工具）的 `input` 增量与 `done` 按同一 `tool_calls` index 累积；`incomplete` 按 `reason` 细分 `finish_reason`（`max_output_tokens`→`length`，`content_filter`→`content_filter`）；上游 `service_tier` 回写 chat 顶层；`response.done`（Realtime/WS 别名）与 `completed` 同等终结流
+- Chat 经 `protocol_rules` 走原生 Anthropic 上游时：thinking 生效即剥离 `temperature`/`top_p`（与 Claude 入站同口径，避免上游 400）
 - Anthropic-style `tool_result`（`call_id`，缺省时用 `tool_use_id`；`content` 支持 string、字符串数组、`{type:"text"|"input_text"|"output_text",text}` blocks；`is_error:true` 加 `Error: ` 前缀）
 - 正常终态 `response.completed`；长度截断终态 `response.incomplete`，reason 为 `max_output_tokens`
 

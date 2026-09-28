@@ -373,11 +373,26 @@ func chatToAnthropicBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[
 	}
 	maxTokens := resolveMaxTokens(rawBody, req, modelID)
 	body["max_tokens"] = maxTokens
-	if req.Temperature != nil {
-		body["temperature"] = *req.Temperature
+	// thinking 与采样参数互斥(对齐 sub2api 与本项目 convertClaudeRequest
+	// anthropic_protocol.go:119-144):thinking 生效(budget>0 将写入)时剥离
+	// temperature/top_p,避免上游 Anthropic 400。判定先行,写入分支据此跳过。
+	thinkingBudget := 0
+	if !config.ForceDisableThinking() && !isThinkingDisabled(req.Thinking) {
+		effort := req.ReasoningEffort
+		if effort == "" {
+			effort = reasoningEffortFromThinking(req.Thinking)
+		}
+		if effort != "" && effort != "none" {
+			thinkingBudget = effortToThinkingBudget(mappedReasoningEffort(effort))
+		}
 	}
-	if req.TopP != nil {
-		body["top_p"] = *req.TopP
+	if thinkingBudget <= 0 {
+		if req.Temperature != nil {
+			body["temperature"] = *req.Temperature
+		}
+		if req.TopP != nil {
+			body["top_p"] = *req.TopP
+		}
 	}
 	if stop := extraBodyValue(req, "stop"); stop != nil {
 		if arr, ok := stop.([]any); ok {
@@ -417,18 +432,10 @@ func chatToAnthropicBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[
 			body["tool_choice"] = choice
 		}
 	}
-	// thinking：effort 映射为预算；ForceDisableThinking 或客户端显式禁用则省略。
-	if !config.ForceDisableThinking() && !isThinkingDisabled(req.Thinking) {
-		effort := req.ReasoningEffort
-		if effort == "" {
-			effort = reasoningEffortFromThinking(req.Thinking)
-		}
-		if effort != "" && effort != "none" {
-			effort = mappedReasoningEffort(effort)
-			if budget := effortToThinkingBudget(effort); budget > 0 {
-				body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
-			}
-		}
+	// thinking 写入:预算已在上方预计算(thinkingBudget),与采样参数剥离
+	// 用同一判定,避免两处推导不一致。
+	if thinkingBudget > 0 {
+		body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": thinkingBudget}
 	}
 	b, err := json.Marshal(body)
 	if err != nil {

@@ -10,7 +10,9 @@ import (
 )
 
 // normalizeFinishReason maps Anthropic stop reasons onto the closed set used
-// by Chat Completions.
+// by Chat Completions. Unknown reasons fall back to "stop":Chat
+// finish_reason 是闭集合,透传上游新枚举(如 pause_turn)会污染下游(对齐
+// sub2api 各映射器的闭集合输出,无透传分支)。
 func normalizeFinishReason(reason string) string {
 	switch reason {
 	case "end_turn", "stop_sequence", "stop":
@@ -22,7 +24,7 @@ func normalizeFinishReason(reason string) string {
 	case "refusal", "content_filter":
 		return "content_filter"
 	default:
-		return reason
+		return "stop"
 	}
 }
 
@@ -51,8 +53,8 @@ func anthropicUsageToChat(usage map[string]any) map[string]any {
 		}
 	}
 	// Anthropic 缓存读/写 token 顶层键透传,并同时归入 chat 约定位置
-	// prompt_tokens_details.cached_tokens（对齐 sub2api 对 Chat Completions
-	// usage 的形状;原有顶层键透传保留,不改已有调用方行为）。
+	// prompt_tokens_details.cached_tokens / .cache_creation_tokens（对齐 sub2api
+	// 对 Chat Completions usage 的形状;原有顶层键透传保留,不改已有调用方行为）。
 	if v, ok := numberAsFloat(usage["cache_read_input_tokens"]); ok {
 		details, _ := out["prompt_tokens_details"].(map[string]any)
 		if details == nil {
@@ -60,6 +62,18 @@ func anthropicUsageToChat(usage map[string]any) map[string]any {
 		}
 		if existing, eok := numberAsFloat(details["cached_tokens"]); !eok || existing == 0 {
 			details["cached_tokens"] = v
+		}
+		out["prompt_tokens_details"] = details
+	}
+	// cache_creation_input_tokens 同样归位到 details(对齐 sub2api
+	// promptDetailsFromResponses),否则按 OpenAI 形状计费/统计时写缓存 token 丢失。
+	if v, ok := numberAsFloat(usage["cache_creation_input_tokens"]); ok {
+		details, _ := out["prompt_tokens_details"].(map[string]any)
+		if details == nil {
+			details = map[string]any{}
+		}
+		if existing, eok := numberAsFloat(details["cache_creation_tokens"]); !eok || existing == 0 {
+			details["cache_creation_tokens"] = v
 		}
 		out["prompt_tokens_details"] = details
 	}

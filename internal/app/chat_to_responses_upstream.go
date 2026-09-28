@@ -138,6 +138,31 @@ func chatToResponsesBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[
 	if instructions != "" {
 		body["instructions"] = instructions
 	}
+	// parallel_tool_calls / service_tier 透传到 Responses 上游(对齐 sub2api
+	// ChatCompletionsToResponses:ParallelToolCalls/ServiceTier)。
+	// rawBody(客户端原始顶层)优先,ExtraBody 次之;缺省不写,不改变上游默认。
+	if v, ok := rawBody["parallel_tool_calls"]; ok {
+		body["parallel_tool_calls"] = v
+	} else if req.ExtraBody != nil {
+		if v, ok := req.ExtraBody["parallel_tool_calls"]; ok {
+			body["parallel_tool_calls"] = v
+		}
+	}
+	if v, ok := rawBody["service_tier"].(string); ok && v != "" {
+		body["service_tier"] = v
+	} else if req.ExtraBody != nil {
+		if v, ok := req.ExtraBody["service_tier"].(string); ok && v != "" {
+			body["service_tier"] = v
+		}
+	}
+	// response_format(json_schema/json_object)映射为 Responses text.format
+	// (对齐 sub2api chatResponseFormatToResponsesTextFormat);非 json 形态
+	// (如 json_object 无 schema)透传 type 由上游按 Responses 语义解释。
+	if req.ResponseFormat != nil {
+		if format := chatResponseFormatToResponsesTextFormat(req.ResponseFormat); len(format) > 0 {
+			body["text"] = map[string]any{"format": format}
+		}
+	}
 	if req.Stream {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
@@ -209,6 +234,42 @@ func chatToResponsesBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[
 		return []byte(fmt.Sprintf(`{"model":%q,"input":[],"stream":%t}`, modelID, req.Stream))
 	}
 	return b
+}
+
+// chatResponseFormatToResponsesTextFormat 把 Chat response_format 映射为
+// Responses text.format(对齐 sub2api chatResponseFormatToResponsesTextFormat):
+// json_schema 形态展平为 Responses 侧 {type:"json_schema",name,schema,...};
+// json_object / text 等其它形态原样透传(由上游按 Responses 语义解释)。
+// 返回 nil 表示无可用格式(调用方省略 text 字段)。
+func chatResponseFormatToResponsesTextFormat(raw any) map[string]any {
+	if raw == nil {
+		return nil
+	}
+	b, err := json.Marshal(raw)
+	if err != nil || len(bytes.TrimSpace(b)) == 0 || string(bytes.TrimSpace(b)) == "null" {
+		return nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return nil
+	}
+	if typ, _ := obj["type"].(string); typ != "json_schema" {
+		return map[string]any{"type": obj["type"]}
+	}
+	schemaRaw, ok := obj["json_schema"]
+	if !ok {
+		return map[string]any{"type": obj["type"]}
+	}
+	var schema map[string]any
+	sb, err := json.Marshal(schemaRaw)
+	if err != nil {
+		return map[string]any{"type": obj["type"]}
+	}
+	if err := json.Unmarshal(sb, &schema); err != nil {
+		return map[string]any{"type": obj["type"]}
+	}
+	schema["type"] = "json_schema"
+	return schema
 }
 
 // responsesReasoningBody 构造上行 Responses 请求体的 reasoning 字段。
@@ -368,7 +429,7 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 // 是 JSON、空体或流中带 error 事件）时原样返回，交给上层既有处理（含
 // convertResponsesToChat 的 JSON 解析），因此幂等。
 func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning bool) []byte {
-	var id, outModel string
+	var id, outModel, serviceTier string
 	var contentBuilder, reasoningBuilder strings.Builder
 	var refusal string
 	type toolAcc struct {
@@ -460,7 +521,7 @@ func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning boo
 				continue
 			}
 			it, _ := item["type"].(string)
-			if it != "function_call" && it != "tool_call" {
+			if it != "function_call" && it != "tool_call" && it != "custom_tool_call" {
 				continue
 			}
 			callID, _ := item["call_id"].(string)
@@ -478,24 +539,31 @@ func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning boo
 			if args, _ := item["arguments"].(string); args != "" && acc.args == "" {
 				acc.args = args
 			}
-		case "response.function_call_arguments.delta", "response.tool_call_arguments.delta":
+		case "response.function_call_arguments.delta", "response.tool_call_arguments.delta", "response.custom_tool_call_input.delta":
 			oi, _ := evt["output_index"].(float64)
 			itemID, _ := evt["item_id"].(string)
 			acc := ensureTool(itemID, formatOutputIndex(oi))
 			if pj, _ := evt["delta"].(string); pj != "" {
 				acc.args += pj
 			}
-		case "response.function_call_arguments.done", "response.tool_call_arguments.done":
+		case "response.function_call_arguments.done", "response.tool_call_arguments.done", "response.custom_tool_call_input.done":
 			oi, _ := evt["output_index"].(float64)
 			itemID, _ := evt["item_id"].(string)
 			acc := ensureTool(itemID, formatOutputIndex(oi))
-			if completed, _ := evt["arguments"].(string); completed != "" {
+			completed, _ := evt["arguments"].(string)
+			if completed == "" {
+				completed, _ = evt["input"].(string)
+			}
+			if completed != "" {
 				acc.args = completed
 			}
-		case "response.completed", "response.incomplete":
+		case "response.completed", "response.incomplete", "response.done":
 			if resp, ok := evt["response"].(map[string]any); ok {
 				if u, ok := resp["usage"].(map[string]any); ok {
 					usage = u
+				}
+				if tier, _ := resp["service_tier"].(string); tier != "" {
+					serviceTier = tier
 				}
 				if rid, _ := resp["id"].(string); rid != "" {
 					id = rid
@@ -504,7 +572,15 @@ func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning boo
 					outModel = m
 				}
 				if status, _ := resp["status"].(string); status == "incomplete" {
-					finishReason = "length"
+					reason := ""
+					if details, ok := resp["incomplete_details"].(map[string]any); ok {
+						reason, _ = details["reason"].(string)
+					}
+					if reason == "content_filter" {
+						finishReason = "content_filter"
+					} else {
+						finishReason = "length"
+					}
 				}
 			}
 		}
@@ -569,6 +645,11 @@ func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning boo
 			"index": 0, "message": msg, "finish_reason": finishReason,
 		}},
 	}
+	// 上游计费层级透传到 chat 顶层(对齐流式 emitChunk 与 sub2api
+	// ChatCompletionsChunk.ServiceTier)。
+	if serviceTier != "" {
+		resp["service_tier"] = serviceTier
+	}
 	if usage != nil {
 		resp["usage"] = responsesUsageToChatBridge(usage)
 	}
@@ -611,7 +692,17 @@ func convertResponsesToChat(respBody []byte, model string, wantReasoning bool) [
 	var toolCalls []map[string]any
 	finishReason := "stop"
 	if status, _ := raw["status"].(string); status == "incomplete" {
-		finishReason = "length"
+		// incomplete 原因细分(对齐流式/聚合两条路径与 sub2api):
+		// max_output_tokens → length,content_filter → content_filter。
+		reason := ""
+		if details, ok := raw["incomplete_details"].(map[string]any); ok {
+			reason, _ = details["reason"].(string)
+		}
+		if reason == "content_filter" {
+			finishReason = "content_filter"
+		} else {
+			finishReason = "length"
+		}
 	}
 	output, _ := raw["output"].([]any)
 	for _, itemRaw := range output {
@@ -650,13 +741,17 @@ func convertResponsesToChat(respBody []byte, model string, wantReasoning bool) [
 					}
 				}
 			}
-		case "function_call", "tool_call":
+		case "function_call", "tool_call", "custom_tool_call":
 			callID, _ := item["call_id"].(string)
 			if callID == "" {
 				callID, _ = item["id"].(string)
 			}
 			name, _ := item["name"].(string)
+			// custom_tool_call 的完整输入在 "input" 键(对齐流式 done 路径)。
 			args, _ := item["arguments"].(string)
+			if args == "" {
+				args, _ = item["input"].(string)
+			}
 			toolCalls = append(toolCalls, map[string]any{
 				"id":   callID,
 				"type": "function",
@@ -694,6 +789,10 @@ func convertResponsesToChat(respBody []byte, model string, wantReasoning bool) [
 		"choices": []any{map[string]any{
 			"index": 0, "message": msg, "finish_reason": finishReason,
 		}},
+	}
+	// 上游计费层级透传到 chat 顶层(对齐流式/聚合路径与 sub2api)。
+	if tier, _ := raw["service_tier"].(string); tier != "" {
+		resp["service_tier"] = tier
 	}
 	if u, ok := raw["usage"]; ok && u != nil {
 		resp["usage"] = responsesUsageToChatBridge(u.(map[string]any))
@@ -785,6 +884,7 @@ type responsesToChatState struct {
 	stats         *logging.StreamStats
 	id            string
 	model         string
+	serviceTier   string // 上游 response.service_tier,回写 chat chunk 顶层(对齐 sub2api)
 	keepReasoning bool
 	includeUsage  bool
 	sentRole      bool
@@ -959,6 +1059,11 @@ func (st *responsesToChatState) emitChunk(delta map[string]any, finishReason str
 			"finish_reason": finishReasonOr(finishReason),
 		}},
 	}
+	// 上游 service_tier 透传到 chat chunk 顶层(对齐 sub2api
+	// makeChatDeltaChunk/ChatCompletionsChunk.ServiceTier)。
+	if st.serviceTier != "" {
+		chunk["service_tier"] = st.serviceTier
+	}
 	if usage != nil {
 		chunk["usage"] = usage
 	}
@@ -1073,6 +1178,11 @@ func (st *responsesToChatState) handleLine(line string) {
 			if m, _ := resp["model"].(string); m != "" {
 				st.model = m
 			}
+			// 上游计费层级:后续所有 chunk 顶层回写(对齐 sub2api
+			// resToChatHandleCompleted 的 ServiceTier 状态)。
+			if tier, _ := resp["service_tier"].(string); tier != "" {
+				st.serviceTier = tier
+			}
 			if u, ok := resp["usage"].(map[string]any); ok {
 				mergeUsage(st.fullUsage, u)
 			}
@@ -1105,8 +1215,11 @@ func (st *responsesToChatState) handleLine(line string) {
 		if item == nil {
 			return
 		}
+		// custom_tool_call(custom/freeform 工具,如新版 apply_patch)的参数
+		// 增量(response.custom_tool_call_input.delta)与 function_call 同形,
+		// 按同一工具槽位注册(对齐 sub2api resToChatHandleOutputItemAdded)。
 		switch item["type"] {
-		case "function_call", "tool_call":
+		case "function_call", "tool_call", "custom_tool_call":
 			st.sawTool = true
 			callID, toolIdx := st.registerToolKeys(evt, item)
 			st.toolAnnounced[toolIdx] = true
@@ -1116,7 +1229,7 @@ func (st *responsesToChatState) handleLine(line string) {
 				"function": map[string]any{"name": restoreToolNameCase(toString(item["name"])), "arguments": ""},
 			}}}, "", nil)
 		}
-	case "response.function_call_arguments.delta", "response.tool_call_arguments.delta":
+	case "response.function_call_arguments.delta", "response.tool_call_arguments.delta", "response.custom_tool_call_input.delta":
 		st.ensureRole()
 		toolIdx := st.eventToolIdx(evt)
 		if pj, _ := evt["delta"].(string); pj != "" {
@@ -1126,12 +1239,17 @@ func (st *responsesToChatState) handleLine(line string) {
 				"function": map[string]any{"name": "", "arguments": pj},
 			}}}, "", nil)
 		}
-	case "response.function_call_arguments.done", "response.tool_call_arguments.done":
+	case "response.function_call_arguments.done", "response.tool_call_arguments.done", "response.custom_tool_call_input.done":
 		st.ensureRole()
 		toolIdx := st.eventToolIdx(evt)
 		// done 携带完整 arguments JSON:只补发已下发前缀之后的差量,
 		// 避免客户端 concat 后重复（对齐 sub2api resToChatHandleFuncArgsDone）。
-		if completed, _ := evt["arguments"].(string); completed != "" {
+		// custom_tool_call_input.done 的完整输入在 "input" 键而非 "arguments"。
+		completed, _ := evt["arguments"].(string)
+		if completed == "" {
+			completed, _ = evt["input"].(string)
+		}
+		if completed != "" {
 			emitted := st.arguments[toolIdx]
 			if completed != emitted && strings.HasPrefix(completed, emitted) {
 				remainder := completed[len(emitted):]
@@ -1148,7 +1266,7 @@ func (st *responsesToChatState) handleLine(line string) {
 			return
 		}
 		switch item["type"] {
-		case "function_call", "tool_call":
+		case "function_call", "tool_call", "custom_tool_call":
 			st.sawTool = true
 			callID, toolIdx := st.registerToolKeys(evt, item)
 			// 没有 add/delta 出现过（罕见）:补一次首 chunk 宣告工具调用,
@@ -1170,13 +1288,27 @@ func (st *responsesToChatState) handleLine(line string) {
 				}
 			}
 		}
-	case "response.completed", "response.incomplete":
+	case "response.completed", "response.incomplete", "response.done":
 		if resp, ok := evt["response"].(map[string]any); ok {
 			if u, ok := resp["usage"].(map[string]any); ok {
 				mergeUsage(st.fullUsage, u)
 			}
+			// response.done(Realtime/WS 别名)同样可能携带 usage/service_tier。
+			if tier, _ := resp["service_tier"].(string); tier != "" {
+				st.serviceTier = tier
+			}
 			if status, _ := resp["status"].(string); status == "incomplete" {
-				st.finishReason = "length"
+				// incomplete 原因细分(对齐 sub2api resToChatHandleCompleted):
+				// max_output_tokens → length,content_filter → content_filter。
+				reason := ""
+				if details, ok := resp["incomplete_details"].(map[string]any); ok {
+					reason, _ = details["reason"].(string)
+				}
+				if reason == "content_filter" {
+					st.finishReason = "content_filter"
+				} else {
+					st.finishReason = "length"
+				}
 			} else if st.sawTool {
 				st.finishReason = "tool_calls"
 			} else {
@@ -1184,6 +1316,7 @@ func (st *responsesToChatState) handleLine(line string) {
 			}
 		}
 		st.finalize()
+	// response.failed 走错误分支:上游错误体在 evt["response"]["error"]。
 	case "response.failed", "error":
 		em, _ := evt["response"].(map[string]any)
 		message := "upstream error"
