@@ -98,11 +98,27 @@ func TestKeyPool_Sticky(t *testing.T) {
 	if got, want := stickySessionBase(a1, nil, hdr("sess-a"), "", false), "tok:user1|cli:"+hashSessionRouteKey("sess-a"); got != want {
 		t.Fatalf("stickySessionBase with session = %q, want %q", got, want)
 	}
-	if got := stickySessionBase(UpstreamAuth{}, nil, nil, "", false); got != stickyPublicFallback {
-		t.Fatalf("public fallback = %q", got)
+	if got := stickySessionBase(UpstreamAuth{}, nil, nil, "", false); got != "sess:" {
+		t.Fatalf("token-less fallback = %q", got)
 	}
 	if got := stickySessionBase(a1, nil, hdr("sess-a"), "", true); got != "tok:user1|cli:"+hashSessionRouteKey("sess-a")+keyPoolRetrySuffix {
 		t.Fatalf("stickySessionBase retry = %q", got)
+	}
+	// Admin（无 token）请求：不同网关会话必须散开（会话后缀驱动均衡）。
+	admin := UpstreamAuth{Mode: AuthRouteAdmin, Source: "admin"}
+	seenAdmin := map[string]bool{}
+	for _, sc := range []string{"scope-1", "scope-2", "scope-3", "scope-4", "scope-5", "scope-6", "scope-7", "scope-8"} {
+		_, id, _ := selectPoolKey(admin, "m", nil, nil, sc)
+		seenAdmin[id] = true
+	}
+	if len(seenAdmin) < 2 {
+		t.Fatalf("token-less admin requests with different scopes must spread, got only %v", seenAdmin)
+	}
+	// 同一 token-less 会话必须稳定命中同一 key。
+	_, idS1, _ := selectPoolKey(admin, "m", nil, nil, "scope-1")
+	_, idS2, _ := selectPoolKey(admin, "m", nil, nil, "scope-1")
+	if idS1 != idS2 {
+		t.Fatal("sticky must return same key for same token-less scope")
 	}
 	_ = a2
 }

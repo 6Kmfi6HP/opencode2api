@@ -131,19 +131,33 @@ func poolEnabled() bool {
 	return keypoolCfg.Enabled && len(keypoolEntries) > 0
 }
 
-// stickySessionBase is the pool's sticky routing key. It reuses the full
-// egress sticky key (stickyKeyForRequest: token + client-session suffix),
-// so keypool stickiness and egress stickiness share one identity: same
-// session pins both the same pooled key and the same egress path (prompt
-// cache affinity), while different sessions spread across the pool (load
-// balancing). isRetry selects the alternate slot for pool-failover retries
-// so a retry hashes away from the just-failed key; the alternate is itself
-// sticky (constant suffix) to preserve cache affinity among retries of the
-// same request.
+// stickySessionBase is the pool's sticky routing key. Identity is scoped by
+// downstream credential first, then by client session: same credential's
+// different sessions spread across the pool (session-level balancing), while
+// same session pins one pooled key (prompt cache affinity). Paid-token
+// requests use the full egress sticky key (token + client-session suffix) so
+// keypool stickiness and egress stickiness share one identity (same session
+// pins both the same pooled key and the same egress path). Token-less
+// (admin) requests have no per-credential signal, so the session suffix
+// alone drives the spread — seeded by the scope (x-opencode-session hash,
+// unique per gateway session) to avoid all token-less traffic collapsing
+// onto one pool slot. isRetry selects the alternate slot for pool-failover
+// retries so a retry hashes away from the just-failed key; the alternate is
+// itself sticky (constant suffix) to preserve cache affinity among retries
+// of the same request.
 func stickySessionBase(auth UpstreamAuth, bodyMap map[string]any, headers http.Header, ocScope string, isRetry bool) string {
 	key := stickyKeyForRequest(auth, bodyMap, headers, ocScope)
 	if isRetry {
 		key += keyPoolRetrySuffix
+	}
+	if auth.Token != "" {
+		return key
+	}
+	// Token-less: strip the shared public fallback so the session suffix
+	// alone decides the slot ("sess:<scope>" instead of
+	// "cli://public-shared|oc:<scope>").
+	if suffix, ok := strings.CutPrefix(key, stickyPublicFallback); ok {
+		key = "sess:" + strings.TrimPrefix(suffix, "|")
 	}
 	return key
 }
