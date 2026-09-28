@@ -1063,8 +1063,46 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 
 	respBody, readErr := io.ReadAll(io.LimitReader(rc, 32*1024*1024))
 	if readErr != nil {
-		markNativeResponsesFailure(modelID)
-		return false
+		// 不要 return false 让调用方落到 chat 翻译——muse-spark 系已在
+		// responses 记忆中,落 chat 必撞 ModelProtocolUnsupported。此时上游
+		// 已 2xx 但包体不可读,通常是网络中段被切;同一协议重试一次,失败
+		// 才吞掉并让外层短路错误写回。
+		logging.FromContext(ctx).Warn("claude-responses non-stream body read failed, retrying same protocol",
+			"model", modelID, "status", status, "err", readErr)
+		upstreamBody := claudeToResponsesBody(claudeReq, modelID)
+		rc2, status2, _, err2 := callOpenCodeEndpoint(ctx, "responses", upstreamBody, modelID, auth)
+		if err2 != nil || rc2 == nil {
+			markNativeResponsesFailure(modelID)
+			return false
+		}
+		defer rc2.Close()
+		respBody2, readErr2 := io.ReadAll(io.LimitReader(rc2, 32*1024*1024))
+		if readErr2 != nil {
+			markNativeResponsesFailure(modelID)
+			return false
+		}
+		if status2 >= 200 && status2 < 300 {
+			claudeBody := convertResponsesToClaude(respBody2, modelID, wantReasoning)
+			result := logging.SummarizeClaudeResult(claudeBody)
+			logging.LogResult(ctx, result)
+			var usageResp map[string]any
+			if json.Unmarshal(respBody2, &usageResp) == nil {
+				if u, ok := usageResp["usage"].(map[string]any); ok {
+					recordClaudeResponsesUsage(modelID, u)
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			logging.MaybeBodySummary(ctx, "claude responses response body (retry)", claudeBody)
+			_, _ = w.Write(claudeBody)
+			return true
+		}
+		// 同协议仍非 2xx:转换错误体后吞给客户端,不再落到 chat。
+		claudeErr := convertResponsesErrorToClaude(respBody2)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status2)
+		_, _ = w.Write(claudeErr)
+		return true
 	}
 
 	if status >= 200 && status < 300 {

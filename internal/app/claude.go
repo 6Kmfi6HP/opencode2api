@@ -1020,9 +1020,20 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		if forwardClaudeViaResponses(r.Context(), w, auth, claudeReq.Model, claudeReq, claudeReq.Stream, wantReasoningEarly) {
 			return
 		}
-		// 仅传输层错误才会到这里（上游 4xx/5xx 已转换写回）。继续回落到
-		// 常规 chat 翻译路径，做 best-effort 二次尝试。
-		slog.Warn("claude responses forward failed, falling back to chat", "model", claudeReq.Model, "via", protoSource)
+		// forward 失败的语义仅在「传输层 / 包体读取中断」时成立;该模型早已在
+		// responses 记忆中——claude 翻译路径把它落 chat 会撞上
+		// ModelProtocolUnsupported(muse-spark-1.3-contributor-free 在 chat
+		// completions 即被上游拒绝)。短路:写回结构化错误给客户端,不再触发
+		// chat 翻译路径。
+		slog.Warn("claude responses forward failed, refusing chat fallback for native-responses model",
+			"model", claudeReq.Model, "via", protoSource)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type":  "error",
+			"error": map[string]string{"type": "api_error", "message": "upstream responses passthrough failed; native-responses model cannot fall back to chat"},
+		})
+		return
 	}
 	if msg := validateClaudeDocumentBlocks(claudeReq.Messages); msg != "" {
 		writeProtocolValidation400(w, "claude", "", msg)
