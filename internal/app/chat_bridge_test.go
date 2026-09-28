@@ -491,6 +491,49 @@ func TestResponsesUsageToChat_CachedAliasAndDeepSeekPassthrough(t *testing.T) {
 	}
 }
 
+// TestResponsesUsageToChat_InputDetailsCachedAlias 锁定 muse-spark 回归：上游
+// 原生 responses 口径用 input_tokens_details.cached_tokens，下游
+// buildClaudeUsageCore / parseCacheUsage 只认 prompt_tokens_details 形态，
+// responsesUsageToChat 必须做别名归位，否则客户端 usage 与缓存统计双双丢 read。
+func TestResponsesUsageToChat_InputDetailsCachedAlias(t *testing.T) {
+	// 实测上游形状（cache_debug_stream_usage）：input_tokens 含 cached 部分。
+	usage := map[string]any{
+		"input_tokens":          float64(749),
+		"input_tokens_details":  map[string]any{"cached_tokens": float64(625)},
+		"output_tokens":         float64(243),
+		"output_tokens_details": map[string]any{"reasoning_tokens": float64(230)},
+		"total_tokens":          float64(992),
+	}
+	out := responsesUsageToChat(usage)
+	details, _ := out["prompt_tokens_details"].(map[string]any)
+	if details["cached_tokens"] != float64(625) {
+		t.Fatalf("cached_tokens = %#v, want 625", details["cached_tokens"])
+	}
+	// 归位后 buildClaudeUsageCore 应产出顶层 cache_read_input_tokens 并做
+	// readFromSplit 减法（input 749-625=124），避免 double-count。
+	claudeUsage := buildClaudeUsageCore(out)
+	if claudeUsage["cache_read_input_tokens"] != 625 {
+		t.Fatalf("cache_read_input_tokens = %#v, want 625", claudeUsage["cache_read_input_tokens"])
+	}
+	if claudeUsage["input_tokens"] != 124 {
+		t.Fatalf("input_tokens = %#v, want 124 (749-625)", claudeUsage["input_tokens"])
+	}
+
+	// prompt_tokens_details 先有值时 input 形态不再覆盖（先有谁用谁）。
+	usage2 := map[string]any{
+		"input_tokens":          float64(100),
+		"input_tokens_details":  map[string]any{"cached_tokens": float64(60)},
+		"prompt_tokens_details": map[string]any{"cached_tokens": float64(30)},
+		"output_tokens":         float64(10),
+		"total_tokens":          float64(110),
+	}
+	out2 := responsesUsageToChat(usage2)
+	d2, _ := out2["prompt_tokens_details"].(map[string]any)
+	if d2["cached_tokens"] != float64(60) {
+		t.Fatalf("cached_tokens = %#v, want 60 (input 形态优先)", d2["cached_tokens"])
+	}
+}
+
 // ======================== 回归协议用例（追加,不改既有语义） ========================
 
 // G8 EOF 兜底不影响既有 message_stop 正常路径:finish+usage+[DONE] 各恰好一次。

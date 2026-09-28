@@ -68,6 +68,25 @@ func TestParseCacheUsagePrefersCanonicalRead(t *testing.T) {
 	}
 }
 
+// TestParseCacheUsageResponsesAliasShape 锁定 muse-spark 回归的下游口径：
+// responsesUsageToChat 把 input_tokens_details.cached_tokens 归位到
+// prompt_tokens_details 后，parseCacheUsage 必须认出 read。
+func TestParseCacheUsageResponsesAliasShape(t *testing.T) {
+	read, created := parseCacheUsage(map[string]any{
+		"prompt_tokens": float64(749),
+		"total_tokens":  float64(992),
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": float64(625),
+		},
+		"input_tokens_details": map[string]any{
+			"cached_tokens": float64(625),
+		},
+	})
+	if read != 625 || created != 0 {
+		t.Fatalf("parseCacheUsage = (%d, %d), want (625, 0)", read, created)
+	}
+}
+
 func TestSaveAndLoadTokenStats(t *testing.T) {
 	setTokenStatsForTest(t, &TokenStatsData{
 		TotalRequests: 1,

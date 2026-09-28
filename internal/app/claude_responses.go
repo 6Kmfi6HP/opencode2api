@@ -911,6 +911,34 @@ func responsesUsageToChat(usage map[string]any) map[string]any {
 			out[k] = v
 		}
 	}
+	// cached_tokens 别名归位：muse-spark 等上游原生 responses 口径用
+	// input_tokens_details.cached_tokens，而下游 buildClaudeUsageCore /
+	// parseCacheUsage 只认 prompt_tokens_details.cached_tokens。先有谁用谁，
+	// 另一形态同步出来（与 responsesUsageToChatBridge 同口径）。
+	cached := 0.0
+	hasCached := false
+	if d, ok := usage["input_tokens_details"].(map[string]any); ok {
+		if v, ok := numberAsFloat(d["cached_tokens"]); ok {
+			cached = v
+			hasCached = true
+		}
+	}
+	if !hasCached {
+		if d, ok := out["prompt_tokens_details"].(map[string]any); ok {
+			if v, ok := numberAsFloat(d["cached_tokens"]); ok {
+				cached = v
+				hasCached = true
+			}
+		}
+	}
+	if hasCached {
+		details, _ := out["prompt_tokens_details"].(map[string]any)
+		if details == nil {
+			details = map[string]any{}
+		}
+		details["cached_tokens"] = cached
+		out["prompt_tokens_details"] = details
+	}
 	return out
 }
 
