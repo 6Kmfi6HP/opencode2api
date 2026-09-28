@@ -246,15 +246,16 @@ func (rw *responsesNameRewrites) shortenRecord(name string) string {
 	return shortened
 }
 
-// restore 把上游响应里的缩短名还原为客户端原始名；未知名字原样返回。
+// restore 把上游响应里的缩短名还原为客户端原始名；未被我们缩短过的名字
+// 再退到免费层占位工具的大小写还原（restoreToolNameCase），覆盖只注入了门禁
+// stub、没有任何缩短映射的原生透传路径；都不命中时原样返回。
 func (rw *responsesNameRewrites) restore(name string) string {
-	if rw == nil {
-		return name
+	if rw != nil {
+		if original, ok := rw.inbound[name]; ok {
+			return original
+		}
 	}
-	if original, ok := rw.inbound[name]; ok {
-		return original
-	}
-	return name
+	return restoreToolNameCase(name)
 }
 
 // shortenResponsesBodyNames 统一处理请求体中所有会出现 name 的位置：
@@ -332,7 +333,9 @@ func (rw *responsesNameRewrites) shortenResponsesBodyNames(body map[string]any) 
 // 只还原 rw.inbound 中登记过的名字，最大限度避免误改用户自然语言文本。
 // 返回是否发生改动。
 func (rw *responsesNameRewrites) restoreResponsesPayloadNames(v any) bool {
-	if rw == nil || len(rw.inbound) == 0 {
+	// 只保留 nil 守卫：身份映射也要进入，因为 restore 现在还会兜底做免费层
+	// 占位工具的大小写还原（rw.inbound 为空时 restore 退到 restoreToolNameCase）。
+	if rw == nil {
 		return false
 	}
 	changed := false

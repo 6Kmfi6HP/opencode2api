@@ -740,7 +740,9 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 					}
 				case "tool_use":
 					id, _ := blk["id"].(string)
-					name, _ := blk["name"].(string)
+					rawName, _ := blk["name"].(string)
+					// 免费层小写占位工具名还原为规范大小写(见 restoreToolNameCase)。
+					name := restoreToolNameCase(rawName)
 					input := blk["input"]
 					if input == nil {
 						input = map[string]any{}
@@ -783,7 +785,7 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 				content = append(content, ClaudeContent{
 					Type:  "tool_use",
 					ID:    tc.ID,
-					Name:  tc.Function.Name,
+					Name:  restoreToolNameCase(tc.Function.Name),
 					Input: input,
 				})
 			}
@@ -1496,7 +1498,10 @@ loop:
 													callID = "toolu_" + randomString(12)
 												}
 												fn, _ := tc["function"].(map[string]any)
-												name, _ := fn["name"].(string)
+												rawName, _ := fn["name"].(string)
+												// 免费层小写占位工具名还原为规范大小写
+												// (见 restoreToolNameCase)。
+												name := restoreToolNameCase(rawName)
 												toolCallAccumulator[upstreamIndex] = map[string]string{
 													"id":   callID,
 													"name": name,

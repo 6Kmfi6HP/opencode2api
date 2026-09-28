@@ -968,10 +968,13 @@ func TestDispatch_ChatToResponsesMemory(t *testing.T) {
 }
 
 func TestResponsesSSEToChatStream_ToolArgumentsShareIndex(t *testing.T) {
+	// 工具名用中性的 Bash(非小写占位名):本用例专测「同 output_index 的参数
+	// 共享」,与工具名大小写无关——小写 "bash" 会被免费层占位大小写还原为
+	// "Bash"(见 restoreToolNameCase),不应作为本用例的夹具值。
 	sse := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_7\",\"model\":\"gpt-x\"}}\n\n" +
-		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_a\",\"call_id\":\"call_a\",\"name\":\"bash\"}}\n\n" +
+		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_a\",\"call_id\":\"call_a\",\"name\":\"Bash\"}}\n\n" +
 		"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_a\",\"delta\":\"{\\\"cmd\\\":\\\"free -h\\\"}\"}\n\n" +
-		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_b\",\"call_id\":\"call_b\",\"name\":\"bash\"}}\n\n" +
+		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_b\",\"call_id\":\"call_b\",\"name\":\"Bash\"}}\n\n" +
 		// no item_id here: matched by output_index
 		"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"{\\\"cmd\\\":\\\"uptime\\\"}\"}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_7\"}}\n\n"
@@ -1017,10 +1020,10 @@ func TestResponsesSSEToChatStream_ToolArgumentsShareIndex(t *testing.T) {
 	if len(names) != 2 {
 		t.Fatalf("want 2 tool calls, got indices %v (arguments %v): %s", names, args, body)
 	}
-	if names[0] != "bash" || args[0] != `{"cmd":"free -h"}` {
+	if names[0] != "Bash" || args[0] != `{"cmd":"free -h"}` {
 		t.Fatalf("tool call 0 = %q %q", names[0], args[0])
 	}
-	if names[1] != "bash" || args[1] != `{"cmd":"uptime"}` {
+	if names[1] != "Bash" || args[1] != `{"cmd":"uptime"}` {
 		t.Fatalf("tool call 1 = %q %q", names[1], args[1])
 	}
 }

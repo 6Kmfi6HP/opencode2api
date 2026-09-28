@@ -473,7 +473,7 @@ func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning boo
 				acc.callID = callID
 			}
 			if n, _ := item["name"].(string); n != "" {
-				acc.name = n
+				acc.name = restoreToolNameCase(n)
 			}
 			if args, _ := item["arguments"].(string); args != "" && acc.args == "" {
 				acc.args = args
@@ -1113,7 +1113,7 @@ func (st *responsesToChatState) handleLine(line string) {
 			st.ensureRole()
 			st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
 				"index": toolIdx, "id": callID, "type": "function",
-				"function": map[string]any{"name": toString(item["name"]), "arguments": ""},
+				"function": map[string]any{"name": restoreToolNameCase(toString(item["name"])), "arguments": ""},
 			}}}, "", nil)
 		}
 	case "response.function_call_arguments.delta", "response.tool_call_arguments.delta":
@@ -1155,7 +1155,7 @@ func (st *responsesToChatState) handleLine(line string) {
 			// 并把 item 上的完整 arguments 作为单段增量发完。
 			if !st.toolAnnounced[toolIdx] {
 				st.toolAnnounced[toolIdx] = true
-				name := toString(item["name"])
+				name := restoreToolNameCase(toString(item["name"]))
 				st.ensureRole()
 				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
 					"index": toolIdx, "id": callID, "type": "function",
