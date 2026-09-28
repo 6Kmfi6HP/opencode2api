@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.14.11
+
+- Fix `input_tokens_details.cached_tokens` alias never reaching downstream cache stats (`fix(responses)`): muse-spark native responses upstreams report cache hits as `input_tokens_details.cached_tokens`, but `buildClaudeUsageCore` / `parseCacheUsage` only read the `prompt_tokens_details.cached_tokens` form — so client usage and gateway cache counters both dropped the read side. `responsesUsageToChat` now performs alias normalization (first-wins either direction, synced to the bridge converter's convention), restoring top-level `cache_read_input_tokens` + `readFromSplit` subtraction in Claude usage and cache-read recognition in stats. Regression tests in `chat_bridge_test.go` + `stats_test.go`.
+- Fix native-responses models falling back to the chat translation path after a responses forward failure (`fix(claude)`): `claudeMessagesHandler` unconditionally dropped through to the chat translator when `forwardClaudeViaResponses` returned false, but muse-spark models memorized as native-responses are rejected by upstream on `/zen/v1/chat/completions` with `ModelProtocolUnsupported` — the "fallback" turned a retryable transport blip into a guaranteed 400. The handler now short-circuits with a structured 502 (`native-responses model cannot fall back to chat`) instead of touching chat; non-stream mid-body read errors additionally retry once on the same protocol before giving up. Regression tests in `claude_no_chat_fallback_test.go`.
+
 ## v0.14.10
 
 - Fix Claude Code's `Error: No such tool available: glob/read` on free-tier models (`fix(opencode)`, PR #32). Root cause was self-inflicted, not the upstream rewriting names: `476314e` injected four **lowercase** placeholder tools (`bash`/`glob`/`grep`/`read`) to satisfy the 2026-09-18 free-tier fingerprint gate (requests missing any of them get 403). The model then called those lowercase names, but Claude Code registers `Bash`/`Glob`/`Grep`/`Read` **case-sensitively** and rejects the lowercase call. External twins: `router-for-me/CLIProxyAPI#1741`, `diegosouzapw/OmniRoute#11487`.
