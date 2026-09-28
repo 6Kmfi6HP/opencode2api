@@ -48,7 +48,7 @@ func TestRelayResponsesStream_EmptyEOF_RetriesOnce(t *testing.T) {
 	// 首轮 rc 已建立(空流),走带 DriveStreamWithRetry 的外层包装:首轮进入
 	// relayResponsesStream 会 peek 出 EOF,返回 errStreamIncompleteNoCommit,
 	// driver 用 upstreamCall 拿到第二份(健康)流再跑一遍。
-	relayResponsesToClient(context.Background(), rec, firstRC, http.StatusOK, hdr, "gpt-resp-retry-a", true, ResponsesAPIRequest{}, newResponsesNameRewrites(), UpstreamAuth{}, []byte(`{"model":"gpt-resp-retry-a","stream":true,"input":"hi"}`), upstreamCall)
+	relayResponsesToClient(context.Background(), rec, firstRC, http.StatusOK, hdr, "gpt-resp-retry-a", true, ResponsesAPIRequest{}, newResponsesNameRewrites(true), UpstreamAuth{}, []byte(`{"model":"gpt-resp-retry-a","stream":true,"input":"hi"}`), upstreamCall)
 
 	if callCount != 1 {
 		t.Fatalf("expected exactly one retry upstream call, got callCount=%d", callCount)
@@ -81,7 +81,7 @@ func TestRelayResponsesStream_PartialEOF_NoRetry(t *testing.T) {
 	hdr := http.Header{"Content-Type": []string{"text/event-stream"}}
 	relayResponsesToClient(context.Background(), rec,
 		io.NopCloser(strings.NewReader(partial)), http.StatusOK, hdr, "gpt-resp-retry-b", true,
-		ResponsesAPIRequest{}, newResponsesNameRewrites(), UpstreamAuth{}, []byte(`{"model":"gpt-resp-retry-b","stream":true,"input":"hi"}`), upstreamCall)
+		ResponsesAPIRequest{}, newResponsesNameRewrites(true), UpstreamAuth{}, []byte(`{"model":"gpt-resp-retry-b","stream":true,"input":"hi"}`), upstreamCall)
 
 	if callCount != 0 {
 		t.Fatalf("retry must not be consumed on partial EOF (already committed), got callCount=%d", callCount)

@@ -660,7 +660,7 @@ func scanClaudeUnsupportedBlocks(msgs []ClaudeMessage) map[string]int {
 	return counts
 }
 
-func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) []byte {
+func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool, restoreCase bool) []byte {
 	var chat struct {
 		ID      string `json:"id"`
 		Model   string `json:"model"`
@@ -741,8 +741,12 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 				case "tool_use":
 					id, _ := blk["id"].(string)
 					rawName, _ := blk["name"].(string)
-					// 免费层小写占位工具名还原为规范大小写(见 restoreToolNameCase)。
-					name := restoreToolNameCase(rawName)
+					// 免费层小写占位工具名仅对 Claude 系客户端还原为规范
+					// 大小写(见 restoreToolNameCase)。
+					name := rawName
+					if restoreCase {
+						name = restoreToolNameCase(rawName)
+					}
 					input := blk["input"]
 					if input == nil {
 						input = map[string]any{}
@@ -782,10 +786,14 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 				if input == nil {
 					input = map[string]any{}
 				}
+				toolName := tc.Function.Name
+				if restoreCase {
+					toolName = restoreToolNameCase(toolName)
+				}
 				content = append(content, ClaudeContent{
 					Type:  "tool_use",
 					ID:    tc.ID,
-					Name:  restoreToolNameCase(tc.Function.Name),
+					Name:  toolName,
 					Input: input,
 				})
 			}
@@ -1178,7 +1186,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claudeRespBody := openAIToClaudeResponse(respBody, claudeReq.Model, wantReasoning)
+	claudeRespBody := openAIToClaudeResponse(respBody, claudeReq.Model, wantReasoning, isClaudeCodeClient(r.Header.Get("User-Agent")))
 	result := logging.SummarizeClaudeResult(claudeRespBody)
 	if !wantReasoning {
 		var before map[string]any
@@ -1219,6 +1227,8 @@ func claudeStreamHandler(ctx context.Context, w http.ResponseWriter, respBody io
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
+
+	restoreCase := shouldRestoreToolCase(ctx)
 
 	flusher, _ := w.(http.Flusher)
 	stats := &logging.StreamStats{Start: time.Now()}
@@ -1522,9 +1532,12 @@ loop:
 												}
 												fn, _ := tc["function"].(map[string]any)
 												rawName, _ := fn["name"].(string)
-												// 免费层小写占位工具名还原为规范大小写
-												// (见 restoreToolNameCase)。
-												name := restoreToolNameCase(rawName)
+												// 免费层小写占位工具名仅对 Claude 系客户端
+												// 还原为规范大小写(见 restoreToolNameCase)。
+												name := rawName
+												if restoreCase {
+													name = restoreToolNameCase(rawName)
+												}
 												toolCallAccumulator[upstreamIndex] = map[string]string{
 													"id":   callID,
 													"name": name,

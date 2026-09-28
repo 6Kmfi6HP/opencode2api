@@ -1008,7 +1008,7 @@ func TestOpenAIToClaudeResponse_PrivateBlocksOrdered(t *testing.T) {
 		}],
 		"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
 	}`
-	out := openAIToClaudeResponse([]byte(chatBody), "m", true)
+	out := openAIToClaudeResponse([]byte(chatBody), "m", true, true)
 	var resp ClaudeResponse
 	if err := json.Unmarshal(out, &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -1050,7 +1050,7 @@ func TestOpenAIToClaudeResponse_WantReasoningFalseFiltersThinking(t *testing.T) 
 			"finish_reason":"stop"
 		}]
 	}`
-	out := openAIToClaudeResponse([]byte(chatBody), "m", false)
+	out := openAIToClaudeResponse([]byte(chatBody), "m", false, true)
 	var resp ClaudeResponse
 	json.Unmarshal(out, &resp)
 	// thinking filtered, text and tool_use kept
@@ -1080,7 +1080,7 @@ func TestOpenAIToClaudeResponse_WantReasoningFalseFiltersThinking(t *testing.T) 
 func TestOpenAIToClaudeResponse_IDRules(t *testing.T) {
 	// Valid msg_ ID preserved
 	chatBody1 := `{"id":"msg_abc123","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}]}`
-	out1 := openAIToClaudeResponse([]byte(chatBody1), "m", false)
+	out1 := openAIToClaudeResponse([]byte(chatBody1), "m", false, true)
 	var resp1 ClaudeResponse
 	json.Unmarshal(out1, &resp1)
 	if resp1.ID != "msg_abc123" {
@@ -1089,7 +1089,7 @@ func TestOpenAIToClaudeResponse_IDRules(t *testing.T) {
 
 	// Invalid ID (chatcmpl_) must not be leaked
 	chatBody2 := `{"id":"chatcmpl_xyz","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}]}`
-	out2 := openAIToClaudeResponse([]byte(chatBody2), "m", false)
+	out2 := openAIToClaudeResponse([]byte(chatBody2), "m", false, true)
 	var resp2 ClaudeResponse
 	json.Unmarshal(out2, &resp2)
 	if !strings.HasPrefix(resp2.ID, "msg_") {
@@ -1101,7 +1101,7 @@ func TestOpenAIToClaudeResponse_IDRules(t *testing.T) {
 
 	// resp_ ID must not leak
 	chatBody3 := `{"id":"resp_abc","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}]}`
-	out3 := openAIToClaudeResponse([]byte(chatBody3), "m", false)
+	out3 := openAIToClaudeResponse([]byte(chatBody3), "m", false, true)
 	var resp3 ClaudeResponse
 	json.Unmarshal(out3, &resp3)
 	if !strings.HasPrefix(resp3.ID, "msg_") {
@@ -1112,7 +1112,7 @@ func TestOpenAIToClaudeResponse_IDRules(t *testing.T) {
 func TestOpenAIToClaudeResponse_FallbackStringContent(t *testing.T) {
 	// No private field — fallback to string content + reasoning + tool_calls
 	chatBody := `{"id":"chatcmpl_z","choices":[{"message":{"role":"assistant","content":"Hello","reasoning_content":"thinking step","tool_calls":[{"id":"call_1","type":"function","function":{"name":"fn","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`
-	out := openAIToClaudeResponse([]byte(chatBody), "m", true)
+	out := openAIToClaudeResponse([]byte(chatBody), "m", true, true)
 	var resp ClaudeResponse
 	json.Unmarshal(out, &resp)
 	hasThinking := false
@@ -1144,7 +1144,7 @@ func TestOpenAIToClaudeResponse_FallbackStringContent(t *testing.T) {
 func TestOpenAIToClaudeResponse_NoFabricatedSignature(t *testing.T) {
 	// thinking block without signature — must not fabricate one
 	chatBody := `{"id":"msg_nosig","choices":[{"message":{"role":"assistant","content":"Hi","_opencode2api_anthropic_content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"Hi"}]},"finish_reason":"stop"}]}`
-	out := openAIToClaudeResponse([]byte(chatBody), "m", true)
+	out := openAIToClaudeResponse([]byte(chatBody), "m", true, true)
 	var resp ClaudeResponse
 	json.Unmarshal(out, &resp)
 	for _, c := range resp.Content {
@@ -1324,7 +1324,7 @@ func TestOpenAIToClaudeResponse_RedactedThinkingDataPassthrough(t *testing.T) {
 			"finish_reason":"stop"
 		}]
 	}`
-	out := openAIToClaudeResponse([]byte(chatBody), "m", true)
+	out := openAIToClaudeResponse([]byte(chatBody), "m", true, true)
 	var resp ClaudeResponse
 	json.Unmarshal(out, &resp)
 	found := false

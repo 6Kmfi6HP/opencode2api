@@ -35,7 +35,7 @@ func TestChatToAnthropicBody_BasicMapping(t *testing.T) {
 		}},
 		ToolChoice: "auto",
 	}
-	body := chatToAnthropicBody(req, "claude-x")
+	body := chatToAnthropicBody(req, "claude-x", true)
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestChatToAnthropicBody_ToolCallsAndResults(t *testing.T) {
 			{Role: "tool", ToolCallID: "call_1", Content: "windy"},
 		},
 	}
-	body := chatToAnthropicBody(req, "claude-x")
+	body := chatToAnthropicBody(req, "claude-x", true)
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
@@ -128,7 +128,7 @@ func TestChatToAnthropicBody_BadArgumentsFallback(t *testing.T) {
 			}}},
 		},
 	}
-	body := chatToAnthropicBody(req, "claude-x")
+	body := chatToAnthropicBody(req, "claude-x", true)
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
@@ -145,7 +145,7 @@ func TestChatToAnthropicBody_BadArgumentsFallback(t *testing.T) {
 func TestChatToAnthropicBody_MaxTokensDefaultAndCap(t *testing.T) {
 	// 缺省兜底 8192。
 	req := &OpenAIRequest{Model: "claude-x", Messages: []Message{{Role: "user", Content: "hi"}}}
-	body := chatToAnthropicBody(req, "claude-x")
+	body := chatToAnthropicBody(req, "claude-x", true)
 	var got map[string]any
 	json.Unmarshal(body, &got)
 	if got["max_tokens"] != float64(defaultAnthropicMaxTokens) {
@@ -158,7 +158,7 @@ func TestChatToAnthropicBody_MaxTokensDefaultAndCap(t *testing.T) {
 	config.Update(func(s *config.Snapshot) { s.MaxTokensCapPerModel = map[string]int{"claude-capped": 1000} })
 	mt := 5000
 	req2 := &OpenAIRequest{Model: "claude-capped", Messages: []Message{{Role: "user", Content: "hi"}}, MaxTokens: &mt}
-	body2 := chatToAnthropicBody(req2, "claude-capped")
+	body2 := chatToAnthropicBody(req2, "claude-capped", true)
 	var got2 map[string]any
 	json.Unmarshal(body2, &got2)
 	if got2["max_tokens"] != float64(1000) {
@@ -171,7 +171,7 @@ func TestChatToAnthropicBody_EffortToThinking(t *testing.T) {
 		Model: "claude-x", Messages: []Message{{Role: "user", Content: "hi"}},
 		ReasoningEffort: "high",
 	}
-	body := chatToAnthropicBody(req, "claude-x")
+	body := chatToAnthropicBody(req, "claude-x", true)
 	var got map[string]any
 	json.Unmarshal(body, &got)
 	thinking := got["thinking"].(map[string]any)
@@ -183,7 +183,7 @@ func TestChatToAnthropicBody_EffortToThinking(t *testing.T) {
 	oldSnap := config.Get()
 	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = oldSnap }) })
 	config.Update(func(s *config.Snapshot) { s.ForceDisableThinking = true })
-	body2 := chatToAnthropicBody(req, "claude-x")
+	body2 := chatToAnthropicBody(req, "claude-x", true)
 	var got2 map[string]any
 	json.Unmarshal(body2, &got2)
 	if _, exists := got2["thinking"]; exists {
@@ -894,7 +894,7 @@ func TestAggregateResponsesStreamToChat_NonStream(t *testing.T) {
 		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_agg\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
 
-	body := aggregateResponsesStreamToChat([]byte(sse), "muse-spark-1.3-contributor-free", false)
+	body := aggregateResponsesStreamToChat([]byte(sse), "muse-spark-1.3-contributor-free", false, true)
 
 	var out map[string]any
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -923,7 +923,7 @@ func TestAggregateResponsesStreamToChat_NonStream(t *testing.T) {
 
 	// 已是 JSON 时幂等（不二次聚合）
 	jsonBody := []byte(`{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2}}`)
-	if string(aggregateResponsesStreamToChat(jsonBody, "m", false)) != string(jsonBody) {
+	if string(aggregateResponsesStreamToChat(jsonBody, "m", false, true)) != string(jsonBody) {
 		t.Fatal("JSON input must pass through unchanged")
 	}
 }

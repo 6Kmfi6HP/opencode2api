@@ -219,12 +219,17 @@ func shortenResponsesName(name string) string {
 type responsesNameRewrites struct {
 	outbound map[string]string // original -> shortened
 	inbound  map[string]string // shortened -> original
+	// restoreStubCase 为 true(Claude 系客户端)时 restore fallback 才做
+	// 免费层小写占位名的大小写还原;其余保持小写透传。构造时一次性填定,
+	// 之后只读,无并发问题。
+	restoreStubCase bool
 }
 
-func newResponsesNameRewrites() *responsesNameRewrites {
+func newResponsesNameRewrites(restoreStubCase bool) *responsesNameRewrites {
 	return &responsesNameRewrites{
-		outbound: map[string]string{},
-		inbound:  map[string]string{},
+		outbound:        map[string]string{},
+		inbound:         map[string]string{},
+		restoreStubCase: restoreStubCase,
 	}
 }
 
@@ -247,15 +252,20 @@ func (rw *responsesNameRewrites) shortenRecord(name string) string {
 }
 
 // restore 把上游响应里的缩短名还原为客户端原始名；未被我们缩短过的名字
-// 再退到免费层占位工具的大小写还原（restoreToolNameCase），覆盖只注入了门禁
-// stub、没有任何缩短映射的原生透传路径；都不命中时原样返回。
+// 在 restoreStubCase 为 true(Claude 系客户端)时再退到免费层占位工具的
+// 大小写还原（restoreToolNameCase），覆盖只注入了门禁 stub、没有任何缩短
+// 映射的原生透传路径；都不命中时原样返回。
 func (rw *responsesNameRewrites) restore(name string) string {
 	if rw != nil {
 		if original, ok := rw.inbound[name]; ok {
 			return original
 		}
+		if rw.restoreStubCase {
+			return restoreToolNameCase(name)
+		}
+		return name
 	}
-	return restoreToolNameCase(name)
+	return name
 }
 
 // shortenResponsesBodyNames 统一处理请求体中所有会出现 name 的位置：
@@ -625,7 +635,7 @@ func clampPassThroughMaxTokens(v, cap int) int {
 // 客户端原始名）。非 muse-spark 模型或无法解析时，rewrites 为空但不返回 nil
 // 指针，调用方恒可用。
 func sanitizeResponsesPassthroughBody(rawBody []byte, modelID string) ([]byte, *responsesNameRewrites) {
-	rewrites := newResponsesNameRewrites()
+	rewrites := newResponsesNameRewrites(false)
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return rawBody, rewrites
@@ -854,6 +864,7 @@ func callResponsesWithEchoRepair(ctx context.Context, auth UpstreamAuth, modelID
 
 func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool, req ResponsesAPIRequest) bool {
 	rawBody, rewrites := sanitizeResponsesPassthroughBody(rawBody, modelID)
+	rewrites.restoreStubCase = shouldRestoreToolCase(ctx)
 	logging.FromContext(ctx).Info("responses passthrough probe max_output_tokens",
 		"model", modelID,
 		"max_output_tokens", passthroughMaxOutputTokens(rawBody),
@@ -881,6 +892,7 @@ func probeNativeResponses(ctx context.Context, w http.ResponseWriter, auth Upstr
 // 真正的传输层错误（无法拿到上游响应）时返回 false，调用方兜底写 502。
 func forwardNativeResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, rawBody []byte, stream bool, req ResponsesAPIRequest) bool {
 	rawBody, rewrites := sanitizeResponsesPassthroughBody(rawBody, modelID)
+	rewrites.restoreStubCase = shouldRestoreToolCase(ctx)
 	logging.FromContext(ctx).Info("responses passthrough max_output_tokens",
 		"model", modelID,
 		"max_output_tokens", passthroughMaxOutputTokens(rawBody),

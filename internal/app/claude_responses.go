@@ -641,7 +641,7 @@ func claudeToResponsesBody(ctx context.Context, claudeReq ClaudeRequest, modelID
 
 // responsesOutputToClaudeBlocks 把原生 Responses output 数组转为 Claude
 // content blocks。未知 item 类型降级为文本，不报错。
-func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeContent, string, bool) {
+func responsesOutputToClaudeBlocks(output []any, wantReasoning bool, restoreCase bool) ([]ClaudeContent, string, bool) {
 	content := []ClaudeContent{}
 	stopReason := "end_turn"
 	hasToolUse := false
@@ -736,8 +736,11 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 				callID, _ = item["id"].(string)
 			}
 			rawName, _ := item["name"].(string)
-			// 免费层小写占位工具名还原为规范大小写(见 restoreToolNameCase)。
-			name := restoreToolNameCase(rawName)
+			// 免费层小写占位工具名仅对 Claude 系客户端还原为规范大小写。
+			name := rawName
+			if restoreCase {
+				name = restoreToolNameCase(rawName)
+			}
 			if name == "" {
 				continue
 			}
@@ -835,8 +838,12 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 		content = append(content, ClaudeContent{Type: "text", Text: joinedText})
 	}
 	for _, tl := range tools {
-		// 免费层小写占位工具名还原为规范大小写(见 restoreToolNameCase)。
-		content = append(content, ClaudeContent{Type: "tool_use", ID: tl.id, Name: restoreToolNameCase(tl.name), Input: tl.input})
+		// 免费层小写占位工具名仅对 Claude 系客户端还原为规范大小写。
+		toolName := tl.name
+		if restoreCase {
+			toolName = restoreToolNameCase(tl.name)
+		}
+		content = append(content, ClaudeContent{Type: "tool_use", ID: tl.id, Name: toolName, Input: tl.input})
 	}
 	if len(content) == 0 {
 		content = append(content, ClaudeContent{Type: "text", Text: ""})
@@ -854,7 +861,7 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool) ([]ClaudeCo
 
 // convertResponsesToClaude 把原生 Responses 成功响应转为 Claude message。
 // 解析失败时返回最小可用空文本消息，不报错。
-func convertResponsesToClaude(respBody []byte, model string, wantReasoning bool) []byte {
+func convertResponsesToClaude(respBody []byte, model string, wantReasoning bool, restoreCase bool) []byte {
 	var resp struct {
 		ID     string         `json:"id"`
 		Output []any          `json:"output"`
@@ -865,7 +872,7 @@ func convertResponsesToClaude(respBody []byte, model string, wantReasoning bool)
 		slog.Warn("convertResponsesToClaude unmarshal failed", "error", err)
 		resp.Output = nil
 	}
-	content, stopReason, _ := responsesOutputToClaudeBlocks(resp.Output, wantReasoning)
+	content, stopReason, _ := responsesOutputToClaudeBlocks(resp.Output, wantReasoning, restoreCase)
 	// incomplete/max_output_tokens 映射。
 	if resp.Status == "incomplete" {
 		stopReason = "max_tokens"
@@ -1053,7 +1060,7 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 	if readErr != nil {
 		return false
 	}
-	claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning)
+	claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx))
 	result := logging.SummarizeClaudeResult(claudeBody)
 	logging.LogResult(ctx, result)
 	var usageResp map[string]any
@@ -1125,7 +1132,7 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 			if writeClaudeResponsesUpstreamError(ctx, w, modelID, respBody2) {
 				return true
 			}
-			claudeBody := convertResponsesToClaude(respBody2, modelID, wantReasoning)
+			claudeBody := convertResponsesToClaude(respBody2, modelID, wantReasoning, shouldRestoreToolCase(ctx))
 			result := logging.SummarizeClaudeResult(claudeBody)
 			logging.LogResult(ctx, result)
 			var usageResp map[string]any
@@ -1153,7 +1160,7 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 		if writeClaudeResponsesUpstreamError(ctx, w, modelID, respBody) {
 			return true
 		}
-		claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning)
+		claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx))
 		result := logging.SummarizeClaudeResult(claudeBody)
 		logging.LogResult(ctx, result)
 		var usageResp map[string]any
@@ -1243,6 +1250,7 @@ func peekFirstOutput(ctx context.Context, rc io.Reader, timeout time.Duration) p
 // peeked 非空时直接进入主循环（此调用已是某次 peek-commit 之后的干跑），
 // 不再二次 peek、不再做首字节看门狗（窗口已在第一次调用里耗尽）。
 func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, wantReasoning bool, peeked []streamReadResult) (bool, error) {
+	restoreCase := shouldRestoreToolCase(ctx)
 	var reader *streamReader
 	if len(peeked) == 0 {
 		peek := peekFirstOutput(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond)
@@ -1397,10 +1405,14 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		if b.toolID == "" {
 			b.toolID = "toolu_" + randomString(12)
 		}
+		toolName := b.toolName
+		if restoreCase {
+			toolName = restoreToolNameCase(b.toolName)
+		}
 		emitEvent("content_block_start", map[string]any{
 			"type": "content_block_start", "index": b.claudeIndex,
 			"content_block": map[string]any{
-				"type": "tool_use", "id": b.toolID, "name": restoreToolNameCase(b.toolName), "input": map[string]any{},
+				"type": "tool_use", "id": b.toolID, "name": toolName, "input": map[string]any{},
 			},
 		})
 		if _, exists := indexOfToolOrder(toolOrder, b.claudeIndex); !exists {

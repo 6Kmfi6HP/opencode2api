@@ -843,7 +843,7 @@ func TestSanitizeResponsesPassthroughBody_ShortensLongToolNames(t *testing.T) {
 func TestResponsesNameRewrites_RestoresShortenedNamesInResponses(t *testing.T) {
 	long := "mcp__codex_apps__plugin_management___update_app_permissionsXYZi000"
 	shortened := shortenResponsesName(long)
-	rw := newResponsesNameRewrites()
+	rw := newResponsesNameRewrites(true)
 	rw.shortenRecord(long)
 
 	// 模拟上游非流式响应
@@ -876,7 +876,7 @@ func TestResponsesNameRewrites_RestoresShortenedNamesInResponses(t *testing.T) {
 func TestNormalizeResponsesStreamLine_RestoresShortenedNameInEvents(t *testing.T) {
 	long := "mcp__codex_apps__plugin_management___update_app_permissionsXYZi000"
 	shortened := shortenResponsesName(long)
-	rw := newResponsesNameRewrites()
+	rw := newResponsesNameRewrites(true)
 	rw.shortenRecord(long)
 
 	states := map[int]*argsNormState{}

@@ -152,7 +152,7 @@ func imageURLToAnthropicBlock(url string) map[string]any {
 // system/developer 角色提取为 system（多条 "\n\n" 连接）；role=tool 转为
 // tool_result user 消息；assistant tool_calls 内联为 tool_use block。
 // 返回的 messages 已做连续同角色合并（Anthropic 要求交替）。
-func chatMessagesToAnthropic(messages []Message) (string, []map[string]any) {
+func chatMessagesToAnthropic(messages []Message, restoreCase bool) (string, []map[string]any) {
 	var systemParts []string
 	var out []map[string]any
 	appendBlocks := func(role string, blocks []map[string]any) {
@@ -193,8 +193,12 @@ func chatMessagesToAnthropic(messages []Message) (string, []map[string]any) {
 			}
 			for _, tc := range msg.ToolCalls {
 				input := parseToolCallArguments(tc.Function.Arguments)
+				toolName := tc.Function.Name
+				if restoreCase {
+					toolName = restoreToolNameCase(toolName)
+				}
 				blocks = append(blocks, map[string]any{
-					"type": "tool_use", "id": tc.ID, "name": restoreToolNameCase(tc.Function.Name), "input": input,
+					"type": "tool_use", "id": tc.ID, "name": toolName, "input": input,
 				})
 			}
 			appendBlocks("assistant", blocks)
@@ -357,12 +361,12 @@ func intFromAny(v any) (int, bool) {
 // chatToAnthropicBody 把 Chat Completions 请求转为 Anthropic Messages 请求体。
 // rawBody 可选：传入调用方的原始请求体 map,resolveMaxTokens 用它读
 // max_completion_tokens（类型化 OpenAIRequest 装不下的顶层字段）。
-func chatToAnthropicBody(req *OpenAIRequest, modelID string) []byte {
-	return chatToAnthropicBodyWithRaw(req, modelID, nil)
+func chatToAnthropicBody(req *OpenAIRequest, modelID string, restoreCase bool) []byte {
+	return chatToAnthropicBodyWithRaw(req, modelID, nil, restoreCase)
 }
 
-func chatToAnthropicBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[string]any) []byte {
-	system, messages := chatMessagesToAnthropic(req.Messages)
+func chatToAnthropicBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[string]any, restoreCase bool) []byte {
+	system, messages := chatMessagesToAnthropic(req.Messages, restoreCase)
 	body := map[string]any{
 		"model":    modelID,
 		"messages": messages,
@@ -489,7 +493,7 @@ func forwardChatViaAnthropic(w http.ResponseWriter, r *http.Request, auth Upstre
 		}
 	}
 	rawBody := rawRequestBodyMap(req)
-	upstreamBody := chatToAnthropicBodyWithRaw(req, req.Model, rawBody)
+	upstreamBody := chatToAnthropicBodyWithRaw(req, req.Model, rawBody, isClaudeCodeClient(r.Header.Get("User-Agent")))
 	log := logging.FromContext(ctx)
 	log.Info("chat via anthropic upstream",
 		"model", req.Model, "stream", req.Stream, "keep_reasoning", keepReasoning)
@@ -598,6 +602,9 @@ type anthropicToChatState struct {
 	toolCount  int
 	stopReason string
 	fullUsage  map[string]any
+	// restoreCase 为 true(Claude 系客户端)时把免费层小写占位工具名还原
+	// 为 PascalCase;其余客户端保持小写透传。
+	restoreCase bool
 	// reasoningTokens 由 thinking_delta 的字符数粗计(tokens≈字符/4)，仅当上游
 	// Anthropic usage 未提供 output_tokens_details.thinking_tokens 时兜底填
 	// completion_tokens_details.reasoning_tokens（上游精确值覆盖本近似）。
@@ -657,6 +664,7 @@ func anthropicSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		toolIndices:   map[int]int{},
 		toolStates:    map[int]*anthropicToolState{},
 		fullUsage:     map[string]any{},
+		restoreCase:   shouldRestoreToolCase(ctx),
 	}
 	defer func() {
 		st.stats.ToolCallCount = st.toolCount
@@ -903,11 +911,13 @@ func (st *anthropicToChatState) handleLine(line string) {
 			st.toolIndices[idx] = toolIdx
 			tool := &anthropicToolState{}
 			st.toolStates[idx] = tool
-			// 免费层小写占位工具名在此还原为客户端注册的规范大小写
-			// (bash/glob/grep/read -> Bash/Glob/Grep/Read),避免 Claude
-			// Code 等大小写敏感客户端报 "No such tool available"。
+			// 免费层小写占位工具名仅对 Claude 系客户端还原为规范大小写
+			// (bash/glob/grep/read -> Bash/Glob/Grep/Read),其余保持透传。
 			rawName, _ := cb["name"].(string)
-			name := restoreToolNameCase(rawName)
+			name := rawName
+			if st.restoreCase {
+				name = restoreToolNameCase(rawName)
+			}
 			id, _ := cb["id"].(string)
 			// 缓存 start 块的 initial input(常见 {});不要立刻 emit 给 chat 端
 			// —— OpenAI 客户端会 concat 所有 arguments 片段,若 start 下发了

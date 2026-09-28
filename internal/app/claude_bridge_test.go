@@ -453,7 +453,7 @@ func TestClaudeBridge_ConvertResponsesToClaude_ReasoningSignature(t *testing.T) 
 		{"type":"reasoning","summary":[{"type":"summary_text","text":"think so"}],"encrypted_content":"sig_abc"},
 		{"type":"message","content":[{"type":"output_text","text":"answer"}]}
 	]}`
-	out := convertResponsesToClaude([]byte(resp), "m", true)
+	out := convertResponsesToClaude([]byte(resp), "m", true, true)
 	var cr ClaudeResponse
 	if err := json.Unmarshal(out, &cr); err != nil {
 		t.Fatal(err)

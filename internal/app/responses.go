@@ -1782,6 +1782,7 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, rc io.Reader
 	if r != nil {
 		ctx = r.Context()
 	}
+	restoreCase := shouldRestoreToolCase(ctx)
 
 	// 初始化 reader:reuse rd(其 bufio 已包含 peek 预读),否则在 rc 上
 	// 新建并先做首字节 peek。peek 失败等价于「commit 前空流」,返回
@@ -2321,7 +2322,9 @@ loop:
 											}
 											fn, _ := tc["function"].(map[string]any)
 											name, _ := fn["name"].(string)
-											name = restoreToolNameCase(name)
+											if restoreCase {
+												name = restoreToolNameCase(name)
+											}
 											ns, _ := splitNamespaceKind(toolKinds[name])
 											call = map[string]any{
 												"output_index": outputIndex,

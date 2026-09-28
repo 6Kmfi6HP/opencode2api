@@ -406,7 +406,7 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 	}
 	// 免费层强制 stream:true 后，Responses 上游回的是 SSE;非流式 chat 客户端
 	// 需要单个 chat.completion JSON，先聚合（幂等：已是 JSON 时原样返回）。
-	respBody = aggregateResponsesStreamToChat(respBody, req.Model, keepReasoning)
+	respBody = aggregateResponsesStreamToChat(respBody, req.Model, keepReasoning, shouldRestoreToolCase(ctx))
 	outBody := convertResponsesToChat(respBody, req.Model, keepReasoning)
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
@@ -428,7 +428,7 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 // 是合并后的 JSON 而不是逐块转发的 chat SSE。body 不是 Responses SSE（如已
 // 是 JSON、空体或流中带 error 事件）时原样返回，交给上层既有处理（含
 // convertResponsesToChat 的 JSON 解析），因此幂等。
-func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning bool) []byte {
+func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning bool, restoreCase bool) []byte {
 	var id, outModel, serviceTier string
 	var contentBuilder, reasoningBuilder strings.Builder
 	var refusal string
@@ -534,7 +534,10 @@ func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning boo
 				acc.callID = callID
 			}
 			if n, _ := item["name"].(string); n != "" {
-				acc.name = restoreToolNameCase(n)
+				if restoreCase {
+					n = restoreToolNameCase(n)
+				}
+				acc.name = n
 			}
 			if args, _ := item["arguments"].(string); args != "" && acc.args == "" {
 				acc.args = args
@@ -896,6 +899,9 @@ type responsesToChatState struct {
 	finishReason  string // 终态 finish 原因(空 = 未定,finalize 时合成)
 	fullUsage     map[string]any
 	finalized     bool // 已写 [DONE]/终态帧（幂等）
+	// restoreCase 为 true(Claude 系客户端)时把免费层小写占位工具名还原
+	// 为 PascalCase;其余客户端保持小写透传。
+	restoreCase bool
 }
 
 // responsesSSEToChatStream 把上游 Responses SSE 翻译为 Chat SSE。
@@ -935,6 +941,7 @@ func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		toolAnnounced: map[int]bool{},
 		arguments:     map[int]string{},
 		fullUsage:     map[string]any{},
+		restoreCase:   shouldRestoreToolCase(ctx),
 	}
 	defer func() {
 		st.stats.ToolCallCount = st.toolCount
@@ -1224,9 +1231,13 @@ func (st *responsesToChatState) handleLine(line string) {
 			callID, toolIdx := st.registerToolKeys(evt, item)
 			st.toolAnnounced[toolIdx] = true
 			st.ensureRole()
+			toolName := toString(item["name"])
+			if st.restoreCase {
+				toolName = restoreToolNameCase(toolName)
+			}
 			st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
 				"index": toolIdx, "id": callID, "type": "function",
-				"function": map[string]any{"name": restoreToolNameCase(toString(item["name"])), "arguments": ""},
+				"function": map[string]any{"name": toolName, "arguments": ""},
 			}}}, "", nil)
 		}
 	case "response.function_call_arguments.delta", "response.tool_call_arguments.delta", "response.custom_tool_call_input.delta":
@@ -1273,7 +1284,10 @@ func (st *responsesToChatState) handleLine(line string) {
 			// 并把 item 上的完整 arguments 作为单段增量发完。
 			if !st.toolAnnounced[toolIdx] {
 				st.toolAnnounced[toolIdx] = true
-				name := restoreToolNameCase(toString(item["name"]))
+				name := toString(item["name"])
+				if st.restoreCase {
+					name = restoreToolNameCase(name)
+				}
 				st.ensureRole()
 				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
 					"index": toolIdx, "id": callID, "type": "function",

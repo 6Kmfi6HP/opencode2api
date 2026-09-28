@@ -22,7 +22,7 @@ import (
 // 响应按客户端流式偏好转回 Responses 形状。
 func forwardResponsesViaAnthropic(w http.ResponseWriter, r *http.Request, auth UpstreamAuth, chatReq *OpenAIRequest, wantReasoning bool) {
 	ctx := r.Context()
-	upstreamBody := chatToAnthropicBody(chatReq, chatReq.Model)
+	upstreamBody := chatToAnthropicBody(chatReq, chatReq.Model, isClaudeCodeClient(r.Header.Get("User-Agent")))
 	log := logging.FromContext(ctx)
 	log.Info("responses via anthropic upstream",
 		"model", chatReq.Model, "stream", chatReq.Stream, "keep_reasoning", wantReasoning)

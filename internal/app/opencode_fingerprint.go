@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"time"
@@ -14,18 +15,12 @@ import (
 // (顺序、描述、额外工具均无所谓,缺任一即 403 FreeTierError)。
 // 客户端(cherry studio / codex / 普通聊天)通常不带全这些工具,这里准备
 // 最小定义,由 ensureFreeTierTools 把缺失的补进请求。描述与参数结构可任意,
-// 仅需名字命中。
-//
-// 描述统一带 "Fingerprint only. Do NOT invoke this tool. " 前缀(anti-invoke):
-// 这四件小写占位工具会被模型看到并可能以 "read"/"glob" 等小写名发起调用,
-// 而 Claude Code 等客户端按大小写敏感匹配注册工具(PascalCase Bash/Read/...),
-// 会直接拒绝 unknown tool;显式禁止调用可降低误调率(兜底见 restoreToolNameCase)。
-const freeTierStubAntiInvokePrefix = "Fingerprint only. Do NOT invoke this tool. "
+// 仅需名字命中。大小写还原只对 Claude 系客户端生效,见 shouldRestoreToolCase。
 
 var freeTierRequiredTools = []map[string]any{
 	{"type": "function", "function": map[string]any{
 		"name":        "bash",
-		"description": freeTierStubAntiInvokePrefix + "Run a shell command and return its output",
+		"description": "Run a shell command and return its output",
 		"parameters": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"command": map[string]any{"type": "string", "description": "The shell command to execute"}},
@@ -34,7 +29,7 @@ var freeTierRequiredTools = []map[string]any{
 	}},
 	{"type": "function", "function": map[string]any{
 		"name":        "glob",
-		"description": freeTierStubAntiInvokePrefix + "Find files matching a glob pattern",
+		"description": "Find files matching a glob pattern",
 		"parameters": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The glob pattern to match files against"}},
@@ -43,7 +38,7 @@ var freeTierRequiredTools = []map[string]any{
 	}},
 	{"type": "function", "function": map[string]any{
 		"name":        "grep",
-		"description": freeTierStubAntiInvokePrefix + "Search file contents with a regular expression",
+		"description": "Search file contents with a regular expression",
 		"parameters": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The regular expression pattern to search for"}},
@@ -52,7 +47,7 @@ var freeTierRequiredTools = []map[string]any{
 	}},
 	{"type": "function", "function": map[string]any{
 		"name":        "read",
-		"description": freeTierStubAntiInvokePrefix + "Read the contents of a file",
+		"description": "Read the contents of a file",
 		"parameters": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"file_path": map[string]any{"type": "string", "description": "The path of the file to read"}},
@@ -62,12 +57,8 @@ var freeTierRequiredTools = []map[string]any{
 }
 
 // freeTierStubCanonicalCase 是四件免费层占位工具小写名到 Claude Code 风格
-// 规范大小写(PascalCase)的固定映射。免费层门禁只会引入这四个小写名,
-// Claude Code 客户端按大小写敏感拒绝小写 tool_use/policy,所以在响应路径上
-// 把恰好全小写的占位名还原回规范大小写即可,无需按请求维护动态映射——
-// 客户端即便注册的是其它大小写变体(如 codex 习惯的 snake/lower),门禁注入
-// 的 stub 也始终是这四个名字,而 Claude Code(唯一暴露为大小写敏感报错的
-// 客户端)注册的正是这组 PascalCase 名。
+// 规范大小写(PascalCase)的固定映射。仅对 Claude 系客户端生效,门控见
+// shouldRestoreToolCase;非 Claude 客户端保持小写透传。
 var freeTierStubCanonicalCase = map[string]string{
 	"bash": "Bash",
 	"glob": "Glob",
@@ -76,7 +67,8 @@ var freeTierStubCanonicalCase = map[string]string{
 }
 
 // restoreToolNameCase 把免费层占位工具的小写 tool_use 名(bash/glob/grep/read)
-// 还原为 Claude Code 注册的规范 PascalCase(Bash/Glob/Grep/Read)。其余名字
+// 还原为 Claude Code 注册的规范 PascalCase(Bash/Glob/Grep/Read)。只在
+// shouldRestoreToolCase 判定为 Claude 系客户端时由调用方启用;其余名字
 // (包括客户端本来就声明为小写的普通工具如 "weather",以及已按规范大小写的
 // 名字)一律原样返回——映射只命中四个精确小写串,幂等且无歧义。
 func restoreToolNameCase(name string) string {
@@ -86,28 +78,44 @@ func restoreToolNameCase(name string) string {
 	return name
 }
 
+// isClaudeCodeClient 判定 UA 是否属于 Claude 系客户端。UA 包含子串
+// "claude"(大小写不敏感)即视为 Claude 系。只用于工具名大小写还原门控。
+func isClaudeCodeClient(ua string) bool {
+	return strings.Contains(strings.ToLower(ua), "claude")
+}
+
+// shouldRestoreToolCase 决定本次请求是否在响应路径上还原免费层小写占位
+// 工具名。依据为下游客户端 UA(中间件 withClientHeadersFromRequest 已快照
+// 到 ctx)。拿不到 UA 时返回 false(默认不还原,保持小写透传)。
+func shouldRestoreToolCase(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	return isClaudeCodeClient(upstreamHeadersFromContext(ctx).Get("User-Agent"))
+}
+
 // freeTierRequiredToolsAnthropic 是 Anthropic Messages / OpenAI Responses
 // 协议形状(tools[].name / input_schema)下的同一组四件占位工具。
 var freeTierRequiredToolsAnthropic = []map[string]any{
-	{"name": "bash", "description": freeTierStubAntiInvokePrefix + "Run a shell command and return its output",
+	{"name": "bash", "description": "Run a shell command and return its output",
 		"input_schema": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"command": map[string]any{"type": "string", "description": "The shell command to execute"}},
 			"required":   []string{"command"},
 		}},
-	{"name": "glob", "description": freeTierStubAntiInvokePrefix + "Find files matching a glob pattern",
+	{"name": "glob", "description": "Find files matching a glob pattern",
 		"input_schema": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The glob pattern to match files against"}},
 			"required":   []string{"pattern"},
 		}},
-	{"name": "grep", "description": freeTierStubAntiInvokePrefix + "Search file contents with a regular expression",
+	{"name": "grep", "description": "Search file contents with a regular expression",
 		"input_schema": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The regular expression pattern to search for"}},
 			"required":   []string{"pattern"},
 		}},
-	{"name": "read", "description": freeTierStubAntiInvokePrefix + "Read the contents of a file",
+	{"name": "read", "description": "Read the contents of a file",
 		"input_schema": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"file_path": map[string]any{"type": "string", "description": "The path of the file to read"}},
@@ -120,25 +128,25 @@ var freeTierRequiredToolsAnthropic = []map[string]any{
 // 的 input_schema 形状不能用于 responses 子路径（上游按 FunctionTool 校验，
 // 缺 type/parameters 报 `did not match any supported type`）。
 var freeTierRequiredToolsResponses = []map[string]any{
-	{"type": "function", "name": "bash", "description": freeTierStubAntiInvokePrefix + "Run a shell command and return its output",
+	{"type": "function", "name": "bash", "description": "Run a shell command and return its output",
 		"parameters": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"command": map[string]any{"type": "string", "description": "The shell command to execute"}},
 			"required":   []string{"command"},
 		}},
-	{"type": "function", "name": "glob", "description": freeTierStubAntiInvokePrefix + "Find files matching a glob pattern",
+	{"type": "function", "name": "glob", "description": "Find files matching a glob pattern",
 		"parameters": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The glob pattern to match files against"}},
 			"required":   []string{"pattern"},
 		}},
-	{"type": "function", "name": "grep", "description": freeTierStubAntiInvokePrefix + "Search file contents with a regular expression",
+	{"type": "function", "name": "grep", "description": "Search file contents with a regular expression",
 		"parameters": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The regular expression pattern to search for"}},
 			"required":   []string{"pattern"},
 		}},
-	{"type": "function", "name": "read", "description": freeTierStubAntiInvokePrefix + "Read the contents of a file",
+	{"type": "function", "name": "read", "description": "Read the contents of a file",
 		"parameters": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"file_path": map[string]any{"type": "string", "description": "The path of the file to read"}},
@@ -254,7 +262,7 @@ func applyFreeTierFingerprint(bodyMap map[string]any, subpath, modelID string) {
 // 主体不是 OpenAI SSE(如上游直发 JSON、空响应或流中带 error 事件)时原样返回,
 // 由上层既有逻辑处理,因此已 2xx 的流式路径不会被双重聚合(调用方不会把
 // 聚合结果再喂回来)。
-func aggregateOpenAIStream(body []byte, modelID string) []byte {
+func aggregateOpenAIStream(body []byte, modelID string, restoreCase bool) []byte {
 	var id string
 	var created int64
 	var contentBuilder, reasoningBuilder strings.Builder
@@ -340,10 +348,14 @@ func aggregateOpenAIStream(body []byte, modelID string) []byte {
 				if fn, ok := tc["function"].(map[string]any); ok {
 					if n, ok := fn["name"].(string); ok && n != "" {
 						// 免费层模型看到注入的小写占位工具后可能以
-						// "bash"/"read" 等小写名发起 tool_call;聚合时
-						// 还原为客户端注册的规范大小写(Claude Code
-						// 大小写敏感拒收小写名)。
-						acc.name = restoreToolNameCase(n)
+						// "bash"/"read" 等小写名发起 tool_call;仅对 Claude
+						// 系客户端还原为规范大小写(Claude Code 大小写敏感
+						// 拒收小写名),其余客户端保持小写透传。
+						if restoreCase {
+							acc.name = restoreToolNameCase(n)
+						} else {
+							acc.name = n
+						}
 					}
 					if a, ok := fn["arguments"].(string); ok && a != "" {
 						acc.args.WriteString(a)

@@ -101,7 +101,7 @@ func TestChatToAnthropicBody_UsesResolveMaxTokens(t *testing.T) {
 
 	// 无显式 max_tokens → 8192 兜底（不再 "无 cap 就缺省"）。
 	req := &OpenAIRequest{Model: "claude-x", Messages: []Message{{Role: "user", Content: "hi"}}}
-	body := chatToAnthropicBodyWithRaw(req, "claude-x", nil)
+	body := chatToAnthropicBodyWithRaw(req, "claude-x", nil, true)
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
@@ -113,7 +113,7 @@ func TestChatToAnthropicBody_UsesResolveMaxTokens(t *testing.T) {
 	// 客户端给 max_completion_tokens=42 → clamp 到 128 下限,且优先于 max_tokens。
 	raw := map[string]any{"max_completion_tokens": float64(42), "max_tokens": float64(500)}
 	req2 := &OpenAIRequest{Model: "claude-x", Messages: []Message{{Role: "user", Content: "hi"}}}
-	body2 := chatToAnthropicBodyWithRaw(req2, "claude-x", raw)
+	body2 := chatToAnthropicBodyWithRaw(req2, "claude-x", raw, true)
 	var got2 map[string]any
 	if err := json.Unmarshal(body2, &got2); err != nil {
 		t.Fatal(err)
@@ -222,7 +222,7 @@ func TestChatMessagesToAnthropic_ToolPartsToBlocks(t *testing.T) {
 			map[string]any{"type": "unknown_part", "value": 1},
 		}},
 	}
-	_, out := chatMessagesToAnthropic(msgs)
+	_, out := chatMessagesToAnthropic(msgs, true)
 	if len(out) != 3 {
 		t.Fatalf("messages = %#v, want 3 (user/assistant/user+tool_result)", out)
 	}
@@ -252,7 +252,7 @@ func TestChatMessagesToAnthropic_ToolEmptyContentFallback(t *testing.T) {
 		}}},
 		{Role: "tool", ToolCallID: "c1", Content: ""},
 	}
-	_, out := chatMessagesToAnthropic(msgs)
+	_, out := chatMessagesToAnthropic(msgs, true)
 	blocks := out[1]["content"].([]map[string]any)
 	inner := blocks[0]["content"].([]map[string]any)
 	if len(inner) != 1 || inner[0]["text"] != "(empty)" {
@@ -267,7 +267,7 @@ func TestChatMessagesToAnthropic_AssistantBadArgumentsKeepRaw(t *testing.T) {
 			Function: FunctionCall{Name: "f", Arguments: `not json`},
 		}}},
 	}
-	_, out := chatMessagesToAnthropic(msgs)
+	_, out := chatMessagesToAnthropic(msgs, true)
 	blocks := out[0]["content"].([]map[string]any)
 	tu := blocks[0]
 	input := tu["input"].(map[string]any)

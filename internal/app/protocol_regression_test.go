@@ -301,7 +301,7 @@ func TestClaudeStreamFallbackEmitsTextWhenOnlyReasoningWithThinkingEnabled(t *te
 }
 
 func TestClaudeNonStreamPromotesEmptyContentFromReasoning(t *testing.T) {
-	body := openAIToClaudeResponse([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"2"},"finish_reason":"stop"}]}`), "m", false)
+	body := openAIToClaudeResponse([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"2"},"finish_reason":"stop"}]}`), "m", false, true)
 	var got ClaudeResponse
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
@@ -312,7 +312,7 @@ func TestClaudeNonStreamPromotesEmptyContentFromReasoning(t *testing.T) {
 }
 
 func TestClaudeNonStreamKeepsThinkingAndTextFallbackWhenReasoningEnabled(t *testing.T) {
-	body := openAIToClaudeResponse([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"step by step"},"finish_reason":"stop"}]}`), "m", true)
+	body := openAIToClaudeResponse([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"step by step"},"finish_reason":"stop"}]}`), "m", true, true)
 	var got ClaudeResponse
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)

@@ -52,11 +52,9 @@ func TestRestoreToolNameCase_Table(t *testing.T) {
 	}
 }
 
-// 注入侧 anti-invoke: 三种协议形状的免费层 stub 描述都必须带
-// "Fingerprint only. Do NOT invoke this tool. " 前缀,名字仍保持小写
-// (门禁要求小写名,不能改注入行为)。
-func TestFreeTierStubs_AntiInvokeDescription(t *testing.T) {
-	const prefix = "Fingerprint only. Do NOT invoke this tool. "
+// 注入侧: 三种协议形状的免费层 stub 描述都是纯功能描述(无 anti-invoke
+// 前缀),名字仍保持小写(门禁要求小写名,不能改注入行为)。
+func TestFreeTierStubs_PlainDescriptions(t *testing.T) {
 	check := func(t *testing.T, shape string, tm map[string]any) {
 		t.Helper()
 		name := freeTierToolNameOf(tm)
@@ -69,8 +67,11 @@ func TestFreeTierStubs_AntiInvokeDescription(t *testing.T) {
 		} else {
 			desc, _ = tm["description"].(string)
 		}
-		if !strings.HasPrefix(desc, prefix) {
-			t.Fatalf("%s stub %q description = %q, want prefix %q", shape, name, desc, prefix)
+		if desc == "" {
+			t.Fatalf("%s stub %q has empty description", shape, name)
+		}
+		if strings.Contains(desc, "Fingerprint only") || strings.Contains(desc, "Do NOT invoke") {
+			t.Fatalf("%s stub %q description %q still carries anti-invoke prefix (should be removed)", shape, name, desc)
 		}
 	}
 	for _, tm := range freeTierRequiredTools {
@@ -94,7 +95,7 @@ func TestAggregate_CaseRestore_StubNamesRestored(t *testing.T) {
 		`data: {"id":"c","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 		`data: [DONE]`,
 	}, "\n")
-	got := aggregateOpenAIStream([]byte(sse), "m")
+	got := aggregateOpenAIStream([]byte(sse), "m", true)
 	var resp map[string]any
 	if err := json.Unmarshal(got, &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -117,9 +118,9 @@ func TestAggregate_CaseRestore_StubNamesRestored(t *testing.T) {
 	}
 }
 
-// 端到端(请求→上游→聚合响应): 客户端声明 PascalCase 工具 Glob/Read,
-// 免费层注入小写 stub,上游 SSE 以小写名发起 tool_call,发给客户端的
-// 非流响应必须带 PascalCase 名。
+// 端到端(请求→上游→聚合响应): 默认 ctx(无 UA 快照,门控关闭)下,上游 SSE
+// 以小写名发起的 tool_call 保持小写透传;注入 Claude UA 快照的 ctx 下还原
+// 为 PascalCase。
 func TestAggregate_CaseRestore_EndToEndViaCallOpenCodeAPI(t *testing.T) {
 	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	sse := strings.Join([]string{
@@ -127,35 +128,46 @@ func TestAggregate_CaseRestore_EndToEndViaCallOpenCodeAPI(t *testing.T) {
 		`data: {"id":"c1","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 		`data: [DONE]`,
 	}, "\n")
-	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
-		{status: http.StatusOK, body: sse, header: http.Header{"Content-Type": []string{"text/event-stream"}}},
-	})
-	auth := UpstreamAuth{Mode: AuthRoutePublic}
-	// 客户端(Claude Code 形状)声明的 PascalCase 工具 Glob/Read;免费层指纹
-	// 门禁会再注入小写 stub(callOpenCodeAPI 内部 buildOCRequest 完成)。
 	reqBody := []byte(`{"model":"fallback-model-free","messages":[{"role":"user","content":"hi"}],"stream":false,"tools":[{"type":"function","function":{"name":"Glob","parameters":{"type":"object"}}},{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)
-	b, status, _, err := callOpenCodeAPI(context.Background(), reqBody, "fallback-model-free", auth)
-	if err != nil {
-		t.Fatalf("callOpenCodeAPI: %v (status=%d)", err, status)
+	auth := UpstreamAuth{Mode: AuthRoutePublic}
+	callOnce := func(t *testing.T, ctx context.Context) string {
+		t.Helper()
+		installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+			{status: http.StatusOK, body: sse, header: http.Header{"Content-Type": []string{"text/event-stream"}}},
+		})
+		b, status, _, err := callOpenCodeAPI(ctx, reqBody, "fallback-model-free", auth)
+		if err != nil {
+			t.Fatalf("callOpenCodeAPI: %v (status=%d)", err, status)
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(b, &resp); err != nil {
+			t.Fatalf("unmarshal response: %v; body=%s", err, b)
+		}
+		msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+		toolCalls, _ := msg["tool_calls"].([]any)
+		if len(toolCalls) != 1 {
+			t.Fatalf("tool_calls = %#v, want 1", msg["tool_calls"])
+		}
+		fn := toolCalls[0].(map[string]any)["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		return name
 	}
-	var resp map[string]any
-	if err := json.Unmarshal(b, &resp); err != nil {
-		t.Fatalf("unmarshal response: %v; body=%s", err, b)
+	// 无 UA 快照:门控关闭,保持小写透传。
+	if got := callOnce(t, context.Background()); got != "glob" {
+		t.Fatalf("gate-off tool_call name = %q, want glob (passthrough)", got)
 	}
-	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
-	toolCalls, _ := msg["tool_calls"].([]any)
-	if len(toolCalls) != 1 {
-		t.Fatalf("tool_calls = %#v, want 1", msg["tool_calls"])
-	}
-	fn := toolCalls[0].(map[string]any)["function"].(map[string]any)
-	if fn["name"] != "Glob" {
-		t.Fatalf("delivered tool_call name = %v, want Glob (client casing restored)", fn["name"])
+	// Claude UA 快照:门控开启,还原为 PascalCase。
+	h := http.Header{}
+	h.Set("User-Agent", "claude-cli/2.0.0")
+	ctxClaude := context.WithValue(context.Background(), opencodeUpstreamHeadersContextKey{}, h)
+	if got := callOnce(t, ctxClaude); got != "Glob" {
+		t.Fatalf("claude-UA tool_call name = %q, want Glob (restored)", got)
 	}
 }
 
 // chat 方向流式: 上游 Anthropic SSE 的 content_block_start(tool_use,"read")
-// 经 anthropicSSEToChatStream 发给 chat 客户端时,首块 delta 的 name 必须是 "Read";
-// 非 stub 名称原样透传。
+// 经 anthropicSSEToChatStream 发给 chat 客户端时,Claude UA 下首块 delta 的
+// name 必须是 "Read",无 UA 下保持 "read";非 stub 名称原样透传。
 func TestAnthropicSSEToChatStream_CaseRestoreToolUseStart(t *testing.T) {
 	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":3}}}\n\n" +
 		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\"}}\n\n" +
@@ -166,8 +178,11 @@ func TestAnthropicSSEToChatStream_CaseRestoreToolUseStart(t *testing.T) {
 		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n" +
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	h := http.Header{}
+	h.Set("User-Agent", "claude-cli/2.0.0")
+	ctxClaude := context.WithValue(context.Background(), opencodeUpstreamHeadersContextKey{}, h)
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
-		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, true, nil, nil)
+		anthropicSSEToChatStream(ctxClaude, w, strings.NewReader(sse), "claude-x", false, true, nil, nil)
 	})
 	if !strings.Contains(body, `"name":"Read"`) {
 		t.Fatalf("streaming chat response missing case-restored \"Read\": %s", body)
@@ -177,6 +192,13 @@ func TestAnthropicSSEToChatStream_CaseRestoreToolUseStart(t *testing.T) {
 	}
 	if !strings.Contains(body, `"name":"weather"`) {
 		t.Fatalf("non-stub tool name must pass through unchanged: %s", body)
+	}
+	// 门控关闭:保持小写透传。
+	bodyOff := drainSSEFromHandler(func(w http.ResponseWriter) {
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, true, nil, nil)
+	})
+	if !strings.Contains(bodyOff, `"name":"read"`) {
+		t.Fatalf("gate-off streaming chat response must keep lowercase stub name: %s", bodyOff)
 	}
 }
 
@@ -206,7 +228,10 @@ func TestClaudeResponsesStream_CaseRestoreToolUseStart(t *testing.T) {
 		``,
 	}, "\n")
 	rec := httptest.NewRecorder()
-	_, err := claudeResponsesStreamHandler(context.Background(), rec, strings.NewReader(sse), "m", false, nil)
+	h2 := http.Header{}
+	h2.Set("User-Agent", "claude-cli/2.0.0")
+	ctxClaude2 := context.WithValue(context.Background(), opencodeUpstreamHeadersContextKey{}, h2)
+	_, err := claudeResponsesStreamHandler(ctxClaude2, rec, strings.NewReader(sse), "m", false, nil)
 	if err != nil {
 		t.Fatalf("claudeResponsesStreamHandler: %v", err)
 	}
@@ -236,7 +261,7 @@ func TestConvertResponsesToClaude_CaseRestoreNonStream(t *testing.T) {
 		"usage": map[string]any{"input_tokens": 5, "output_tokens": 6, "total_tokens": 11},
 	}
 	raw, _ := json.Marshal(resp)
-	out := convertResponsesToClaude(raw, "m", false)
+	out := convertResponsesToClaude(raw, "m", false, true)
 	var claudeResp struct {
 		Content []struct {
 			Type string `json:"type"`
@@ -259,6 +284,32 @@ func TestConvertResponsesToClaude_CaseRestoreNonStream(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("tool_use[%d] name = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// 门控关闭:保持小写透传。
+	outOff := convertResponsesToClaude(raw, "m", false, false)
+	var offResp struct {
+		Content []struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(outOff, &offResp); err != nil {
+		t.Fatalf("unmarshal gate-off response: %v; body=%s", err, outOff)
+	}
+	var gotOff []string
+	for _, c := range offResp.Content {
+		if c.Type == "tool_use" {
+			gotOff = append(gotOff, c.Name)
+		}
+	}
+	wantOff := []string{"glob", "Read", "weather"}
+	if len(gotOff) != len(wantOff) {
+		t.Fatalf("gate-off tool_use names = %v, want %v", gotOff, wantOff)
+	}
+	for i := range wantOff {
+		if gotOff[i] != wantOff[i] {
+			t.Fatalf("gate-off tool_use[%d] name = %q, want %q", i, gotOff[i], wantOff[i])
 		}
 	}
 }
@@ -303,7 +354,7 @@ func TestRestoreAnthropicStreamLineCase_StubNameRestored(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := restoreAnthropicStreamLineCase(tc.in)
+			got := restoreAnthropicStreamLineCase(tc.in, true)
 			var evt map[string]any
 			if strings.HasPrefix(got, "data: ") {
 				if err := json.Unmarshal([]byte(strings.TrimRight(strings.TrimPrefix(got, "data: "), "\n")), &evt); err != nil {
@@ -334,7 +385,7 @@ func TestRestoreAnthropicBodyToolCase_StubNameRestored(t *testing.T) {
 		`{"type":"tool_use","id":"t1","name":"read","input":{"file_path":"/a"}},` +
 		`{"type":"tool_use","id":"t2","name":"weather","input":{}}` +
 		`],"usage":{"input_tokens":1,"output_tokens":1}}`)
-	out := restoreAnthropicBodyToolCase(body)
+	out := restoreAnthropicBodyToolCase(body, true)
 	var m map[string]any
 	if err := json.Unmarshal(out, &m); err != nil {
 		t.Fatalf("unmarshal: %v; body=%s", err, out)
@@ -350,8 +401,12 @@ func TestRestoreAnthropicBodyToolCase_StubNameRestored(t *testing.T) {
 		t.Fatalf("tool_use[1] name = %q, want weather (non-stub untouched)", n)
 	}
 	// 暂无命中时应幂等原样返回
-	if got := restoreAnthropicBodyToolCase(out); string(got) != string(out) {
+	if got := restoreAnthropicBodyToolCase(out, true); string(got) != string(out) {
 		t.Fatalf("second pass not idempotent")
+	}
+	// 门控关闭时直接透传,不做任何改写
+	if got := restoreAnthropicBodyToolCase(body, false); string(got) != string(body) {
+		t.Fatalf("restoreCase=false must pass through unchanged")
 	}
 }
 
@@ -359,7 +414,7 @@ func TestRestoreAnthropicBodyToolCase_StubNameRestored(t *testing.T) {
 // restore: 即使没有任何缩短映射(rw 为恒等),小写占位名也被大小写还原,
 // 覆盖 relayResponsesStream 的 normalizeResponsesStreamLine restore 兜底。
 func TestResponsesRewritesRestore_FallsBackToStubCase(t *testing.T) {
-	rw := newResponsesNameRewrites()
+	rw := newResponsesNameRewrites(true)
 	if got := rw.restore("glob"); got != "Glob" {
 		t.Fatalf("restore(glob) = %q, want Glob (stub case fallback)", got)
 	}
@@ -368,6 +423,11 @@ func TestResponsesRewritesRestore_FallsBackToStubCase(t *testing.T) {
 	}
 	if got := rw.restore("Read"); got != "Read" {
 		t.Fatalf("restore(Read) = %q, want Read (idempotent)", got)
+	}
+	// 门控关闭时 fallback 不还原,保持小写透传
+	rwOff := newResponsesNameRewrites(false)
+	if got := rwOff.restore("glob"); got != "glob" {
+		t.Fatalf("restore(glob) with gate off = %q, want glob (passthrough)", got)
 	}
 	// 已登记的缩短映射优先于 stub fallback
 	rw.outbound["MyLongTool"] = "x-shrt"

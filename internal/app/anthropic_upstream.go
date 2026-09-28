@@ -139,9 +139,11 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 	// 一次观察。
 	// peek 消费的首帧也要过大小写还原(帧尾常与首个 content_block_start 同行,
 	// 而主循环的还原按行生效),否则首个 tool_use 的 name 会被原样透小写。
+	// 仅 Claude 系客户端还原,其余保持小写透传。
+	restoreCase := shouldRestoreToolCase(ctx)
 	for _, res := range peek.Consumed {
 		if res.line != "" {
-			res.line = restoreAnthropicStreamLineCase(res.line)
+			res.line = restoreAnthropicStreamLineCase(res.line, restoreCase)
 		}
 		if _, err := io.WriteString(w, res.line); err != nil {
 			return true, err
@@ -209,10 +211,9 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 			pendingErr := result.err
 			if line != "" {
 				observeLine(line)
-				// 免费层占位工具名大小写还原:仅改写恰为小写占位名的
-				// tool_use name 帧,其余字节原样,保证客户端(大小写敏感)
-				// 不再把 stub 的 read/glob/bash/grep 当成未注册工具。
-				frameBuf.WriteString(restoreAnthropicStreamLineCase(line))
+				// 免费层占位工具名大小写还原:仅 Claude 系客户端改写恰为
+				// 小写占位名的 tool_use name 帧,其余字节原样。
+				frameBuf.WriteString(restoreAnthropicStreamLineCase(line, restoreCase))
 				// 空行 = 帧边界:整帧一次写出再 Flush。
 				if strings.TrimRight(line, "\r\n") == "" {
 					if err := flushFrame(); err != nil {
@@ -250,12 +251,16 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 }
 
 // restoreAnthropicStreamLineCase 对一行 SSE(含结尾 \n)做免费层占位工具的大小写
-// 还原:仅当它是 "data: " 帧、事件为 content_block_start / content_block_delta 且
-// 携带恰为小写占位名的 tool_use name 时改写该行,其余行(含 content_block_stop、
-// input_json_delta 的 partial_json 文本、非 data 行)原样返回。改写只命中 keep 的
+// 还原:仅当 restoreCase 为 true(Claude 系客户端)且它是 "data: " 帧、事件为
+// content_block_start / content_block_delta 并携带恰为小写占位名的 tool_use
+// name 时改写该行,其余行(含 content_block_stop、input_json_delta 的
+// partial_json 文本、非 data 行)原样返回。改写只命中 keep 的
 // 名字段,不动其它字节(换行风格、字段顺序保持上游原样),供 byte-relay 路径在
-// 写给客户端前调用。幂等。
-func restoreAnthropicStreamLineCase(line string) string {
+// 写给客户端前调用。幂等。restoreCase=false 时直接原样返回,不做 JSON 解析。
+func restoreAnthropicStreamLineCase(line string, restoreCase bool) string {
+	if !restoreCase {
+		return line
+	}
 	payload, ok := strings.CutPrefix(line, "data: ")
 	if !ok {
 		return line
@@ -338,11 +343,15 @@ func observeAnthropicStreamEvent(stats *logging.StreamStats, fullUsage map[strin
 }
 
 // restoreAnthropicBodyToolCase 对一个完整的 Anthropic Messages JSON body 做免费层
-// 占位工具名的大小写还原:遍历 content 数组,把恰为小写占位名(bash/glob/grep/
-// read)的 tool_use block 的 name 还原为规范 PascalCase,assistant / tool_result /
-// 其它块与所有其它字节原样。无法解析或无命中时原样返回(幂等)。供非流式
-// byte-relay 在写给客户端前调用。
-func restoreAnthropicBodyToolCase(body []byte) []byte {
+// 占位工具名的大小写还原:restoreCase 为 true(Claude 系客户端)时遍历 content
+// 数组,把恰为小写占位名(bash/glob/grep/read)的 tool_use block 的 name 还原为
+// 规范 PascalCase,assistant / tool_result / 其它块与所有其它字节原样。无法解析
+// 或无命中时原样返回(幂等)。restoreCase=false 时直接原样返回,不做 JSON 解析。
+// 供非流式 byte-relay 在写给客户端前调用。
+func restoreAnthropicBodyToolCase(body []byte, restoreCase bool) []byte {
+	if !restoreCase {
+		return body
+	}
 	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {
 		return body
@@ -396,9 +405,10 @@ func relayAnthropicBuffered(ctx context.Context, w http.ResponseWriter, rc io.Re
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	// 非流式直通路径在写回前还原免费层占位工具的小写 tool_use name，
-	// 与流式 byte-relay 的 restoreAnthropicStreamLineCase 对应（幂等）。
-	w.Write(restoreAnthropicBodyToolCase(body))
+	// 非流式直通路径在写回前还原免费层占位工具的小写 tool_use name(仅
+	// Claude 系客户端),与流式 byte-relay 的 restoreAnthropicStreamLineCase
+	// 对应（幂等）。
+	w.Write(restoreAnthropicBodyToolCase(body, shouldRestoreToolCase(ctx)))
 
 	if status >= 200 && status < 300 {
 		var raw map[string]any

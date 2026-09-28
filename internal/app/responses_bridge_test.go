@@ -439,7 +439,7 @@ func TestAnthropicSSE_EOFClosedIdempotently(t *testing.T) {
 func driveRelayResponsesStream(t *testing.T, sse string) string {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	relayResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), http.StatusOK, "m", ResponsesAPIRequest{}, newResponsesNameRewrites(), UpstreamAuth{}, nil, func(context.Context, []byte) (io.ReadCloser, int, http.Header, error) {
+	relayResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), http.StatusOK, "m", ResponsesAPIRequest{}, newResponsesNameRewrites(true), UpstreamAuth{}, nil, func(context.Context, []byte) (io.ReadCloser, int, http.Header, error) {
 		return nil, 0, nil, errors.New("no upstream")
 	})
 	return rec.Body.String()

@@ -87,7 +87,7 @@ func TestChatToAnthropicBody_ThinkingStripsSampling(t *testing.T) {
 		ReasoningEffort: "high",
 	}
 	var got map[string]any
-	if err := json.Unmarshal(chatToAnthropicBody(req, "claude-x"), &got); err != nil {
+	if err := json.Unmarshal(chatToAnthropicBody(req, "claude-x", true), &got); err != nil {
 		t.Fatal(err)
 	}
 	if _, exists := got["thinking"]; !exists {
@@ -105,7 +105,7 @@ func TestChatToAnthropicBody_ThinkingStripsSampling(t *testing.T) {
 		Temperature: &temp, TopP: &topP,
 	}
 	var got2 map[string]any
-	if err := json.Unmarshal(chatToAnthropicBody(plain, "claude-x"), &got2); err != nil {
+	if err := json.Unmarshal(chatToAnthropicBody(plain, "claude-x", true), &got2); err != nil {
 		t.Fatal(err)
 	}
 	if got2["temperature"] != temp || got2["top_p"] != topP {

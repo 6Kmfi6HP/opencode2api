@@ -188,7 +188,7 @@ func TestResponsesToClaude_BasicMapping(t *testing.T) {
 		],
 		"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}
 	}`
-	out := convertResponsesToClaude([]byte(respBody), "primary-model", true)
+	out := convertResponsesToClaude([]byte(respBody), "primary-model", true, true)
 	var claude ClaudeResponse
 	if err := json.Unmarshal(out, &claude); err != nil {
 		t.Fatalf("claude response is not JSON: %v, body=%s", err, string(out))
@@ -234,7 +234,7 @@ func TestResponsesToClaude_UnknownItemDowngradesToText(t *testing.T) {
 		],
 		"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
 	}`
-	out := convertResponsesToClaude([]byte(respBody), "m", true)
+	out := convertResponsesToClaude([]byte(respBody), "m", true, true)
 	var claude ClaudeResponse
 	json.Unmarshal(out, &claude)
 	foundText := false

@@ -235,17 +235,17 @@ func TestAggregate_callOpenCodeAPINonStreamAggregatesUpstreamSSE(t *testing.T) {
 // 聚合器凭空造出缺 usage/finish_reason 的假 completion 掩盖异常。
 func TestAggregate_DoneOnlyBodyPassThroughUnchanged(t *testing.T) {
 	raw := "data: [DONE]\n\n"
-	if got := aggregateOpenAIStream([]byte(raw), "m"); string(got) != raw {
+	if got := aggregateOpenAIStream([]byte(raw), "m", true); string(got) != raw {
 		t.Fatalf("[DONE]-only body = %q, want passthrough %q", got, raw)
 	}
-	if got := aggregateOpenAIStream(nil, "m"); len(got) != 0 {
+	if got := aggregateOpenAIStream(nil, "m", true); len(got) != 0 {
 		t.Fatalf("empty body = %q, want empty passthrough", got)
 	}
 }
 
 func TestAggregate_StreamWithErrorEventPassThrough(t *testing.T) {
 	raw := "data: {\"error\":{\"type\":\"creditserror\",\"message\":\"insufficient balance\"}}\ndata: [DONE]\n"
-	got := aggregateOpenAIStream([]byte(raw), "m")
+	got := aggregateOpenAIStream([]byte(raw), "m", true)
 	if string(got) != raw {
 		t.Fatalf("error-event body must pass through unchanged")
 	}
@@ -253,7 +253,7 @@ func TestAggregate_StreamWithErrorEventPassThrough(t *testing.T) {
 
 func TestAggregate_PlainJSONPassThrough(t *testing.T) {
 	raw := `{"id":"chatcmpl_plain","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`
-	got := aggregateOpenAIStream([]byte(raw), "m")
+	got := aggregateOpenAIStream([]byte(raw), "m", true)
 	if string(got) != raw {
 		t.Fatalf("plain JSON body must pass through unchanged")
 	}
@@ -266,7 +266,7 @@ func TestAggregate_ToolCallsAssembledByIndex(t *testing.T) {
 		`data: {"id":"c","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 		`data: [DONE]`,
 	}, "\n")
-	got := aggregateOpenAIStream([]byte(sse), "m")
+	got := aggregateOpenAIStream([]byte(sse), "m", true)
 	var resp map[string]any
 	if err := json.Unmarshal(got, &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -310,5 +310,52 @@ func TestOCVersion_NormalizeAgainstFreeTierFloor(t *testing.T) {
 				t.Fatalf("normalizeOCVersion(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// isClaudeCodeClient 表驱动: UA 含 "claude" 子串(大小写不敏感)即判 Claude 系。
+func TestIsClaudeCodeClient_Table(t *testing.T) {
+	cases := []struct {
+		name, ua string
+		want     bool
+	}{
+		{"claude code lowercase", "claude-cli/2.0.0", true},
+		{"Claude capital", "Claude-Code/2.0", true},
+		{"CLAUDE upper", "CLAUDE-CLI/1.5 (external, cli)", true},
+		{"substring in path", "myproxy/claude/v1", true},
+		{"empty", "", false},
+		{"whitespace only", "   ", false},
+		{"opencode", "opencode/1.18.31", false},
+		{"cherry studio", "Cherry-Studio/1.5.0", false},
+		{"generic", "curl/8.0", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isClaudeCodeClient(tc.ua); got != tc.want {
+				t.Fatalf("isClaudeCodeClient(%q) = %v, want %v", tc.ua, got, tc.want)
+			}
+		})
+	}
+}
+
+// shouldRestoreToolCase 门控: nil/无快照 ctx → false;快照 UA 含 claude → true。
+func TestShouldRestoreToolCase_Gate(t *testing.T) {
+	if shouldRestoreToolCase(nil) {
+		t.Fatal("nil ctx must return false")
+	}
+	if shouldRestoreToolCase(context.Background()) {
+		t.Fatal("ctx without header snapshot must return false")
+	}
+	h := http.Header{}
+	h.Set("User-Agent", "claude-cli/2.0.0")
+	ctxC := context.WithValue(context.Background(), opencodeUpstreamHeadersContextKey{}, h)
+	if !shouldRestoreToolCase(ctxC) {
+		t.Fatal("claude UA in snapshot must return true")
+	}
+	h2 := http.Header{}
+	h2.Set("User-Agent", "opencode/1.18.31")
+	ctxO := context.WithValue(context.Background(), opencodeUpstreamHeadersContextKey{}, h2)
+	if shouldRestoreToolCase(ctxO) {
+		t.Fatal("non-claude UA in snapshot must return false")
 	}
 }
