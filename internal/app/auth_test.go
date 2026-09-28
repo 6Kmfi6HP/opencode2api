@@ -72,7 +72,7 @@ func TestSelectPoolKey_AdminAutoPicked(t *testing.T) {
 		keypoolMu.Unlock()
 	}()
 
-	auth, keyID, pooled := selectPoolKey(UpstreamAuth{Mode: AuthRouteAdmin, Source: "admin"}, "big-pickle", 0)
+	auth, keyID, pooled := selectPoolKey(UpstreamAuth{Mode: AuthRouteAdmin, Source: "admin"}, "big-pickle", nil, nil, "", 0)
 	if !pooled || keyID != "k1" {
 		t.Fatalf("admin auth should be picked from pool: pooled=%v keyID=%q auth=%+v", pooled, keyID, auth)
 	}

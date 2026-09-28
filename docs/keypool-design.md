@@ -36,13 +36,17 @@
 ## 3. 选择器（`internal/app/keypool.go`，内存状态，仿 `socks5RRIndex` 原子模式）
 
 * `keyRRIndex atomic.Uint64`：`round_robin` 取 `Add % len`；`weighted` 取 `Add % totalWeight` 走权重区间；
-  `sticky` 取 `fnv32a(stickyKeyForRequest 同源串) % len`（与 egress sticky 同键，保证 prompt cache 亲和）。
+  `sticky` 取 `fnv32a(完整 egress sticky 键) % len`：`stickySessionBase(auth, bodyMap, headers, scope)`
+  = `stickyKeyForRequest` 全键（`tok:<客户端token>|cli:<客户端会话哈希>` 等，与 egress
+  完全同源），同一会话同时粘定同一池 key 与同一出口路径（prompt cache 亲和），
+  不同会话按哈希散开（会话级负载均衡）。`attempt>0` 的池 failover 重试混入常量
+  后缀 `|pool-retry`，跳离刚失败的 key（重试之间仍粘同一备选 key，保持亲和）。
 * 候选过滤：`enabled && group匹配 && now > cooldownUntil`；全冷却 → 放行最早过期的那把（不断服）。
 * 状态表（`keypoolMu` 守卫）：`{cooldownUntil, consecutiveFails}`；成功清零。
 
 ## 4. Failover（改 `opencode.go:582` 重试循环内两点，不建新子系统）
 
-* 每 attempt：`attemptAuth, keyID := selectPoolKey(auth, modelID, attempt)`，
+* 每 attempt：`attemptAuth, keyID := selectPoolKey(auth, modelID, bodyMap, headers, scope, attempt)`，
   以值拷贝传入 `selectUpstreamTarget` + `buildOCRequestWithSubpath` + `invalidateUpstreamTarget`
  （三处都收 `auth` 值类型，race-free；sticky egress 按池 key 绑定）。
 * 记账（`ReportKeyResult`）：

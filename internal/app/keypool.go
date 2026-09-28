@@ -131,13 +131,21 @@ func poolEnabled() bool {
 	return keypoolCfg.Enabled && len(keypoolEntries) > 0
 }
 
-// stickySessionBase mirrors stickyKeyForRequest's token part without
-// importing body context: account token wins, else the public fallback.
-func stickySessionBase(auth UpstreamAuth) string {
-	if auth.Token != "" {
-		return "tok:" + auth.Token
+// stickySessionBase is the pool's sticky routing key. It reuses the full
+// egress sticky key (stickyKeyForRequest: token + client-session suffix),
+// so keypool stickiness and egress stickiness share one identity: same
+// session pins both the same pooled key and the same egress path (prompt
+// cache affinity), while different sessions spread across the pool (load
+// balancing). isRetry selects the alternate slot for pool-failover retries
+// so a retry hashes away from the just-failed key; the alternate is itself
+// sticky (constant suffix) to preserve cache affinity among retries of the
+// same request.
+func stickySessionBase(auth UpstreamAuth, bodyMap map[string]any, headers http.Header, ocScope string, isRetry bool) string {
+	key := stickyKeyForRequest(auth, bodyMap, headers, ocScope)
+	if isRetry {
+		key += keyPoolRetrySuffix
 	}
-	return stickyPublicFallback
+	return key
 }
 
 func keyPoolGroupOK(group string, goSurface bool) bool {
@@ -153,11 +161,22 @@ func keyPoolGroupOK(group string, goSurface bool) bool {
 	}
 }
 
-// selectPoolKey picks a pooled key for this request.
+// keyPoolRetrySuffix is the constant sticky-hash salt for pool-failover
+// retries; see stickySessionBase.
+const keyPoolRetrySuffix = "|pool-retry"
+
+// selectPoolKey picks a pooled key for this request. scope carries the
+// already-derived transport scope (normalizedTransportScope) so sticky
+// hashing can reuse it without re-hashing the session; empty scope falls
+// back to the token-only form. attempt>0 (pool failover) shifts the sticky
+// slot so a retry does not re-land on the just-failed key.
 // ok=false means caller falls back to client-token passthrough
 // (pool disabled, public auth, or no surface candidate).
-func selectPoolKey(auth UpstreamAuth, modelID string, attempt ...int) (UpstreamAuth, string, bool) {
-	_ = attempt
+func selectPoolKey(auth UpstreamAuth, modelID string, bodyMap map[string]any, headers http.Header, scope string, attempt ...int) (UpstreamAuth, string, bool) {
+	try := 0
+	if len(attempt) > 0 {
+		try = attempt[0]
+	}
 	if auth.Mode == AuthRoutePublic {
 		return auth, "", false
 	}
@@ -236,7 +255,7 @@ func selectPoolKey(auth UpstreamAuth, modelID string, attempt ...int) (UpstreamA
 		}
 	case "sticky":
 		h := fnv.New32a()
-		_, _ = h.Write([]byte(stickySessionBase(auth)))
+		_, _ = h.Write([]byte(stickySessionBase(auth, bodyMap, headers, scope, try > 0)))
 		picked = pool[int(h.Sum32()%uint32(len(pool)))]
 	default: // round_robin
 		picked = pool[int(keypoolRRIndex.Add(1)-1)%len(pool)]

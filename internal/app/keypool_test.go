@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"testing"
 )
 
@@ -19,7 +20,7 @@ func TestKeyPool_RoundRobin(t *testing.T) {
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "client"}
 	var got []string
 	for range 6 {
-		_, id, ok := selectPoolKey(auth, "m")
+		_, id, ok := selectPoolKey(auth, "m", nil, nil, "")
 		if !ok {
 			t.Fatal("want ok")
 		}
@@ -32,7 +33,7 @@ func TestKeyPool_RoundRobin(t *testing.T) {
 		}
 	}
 	// Pooled auth replaces client token.
-	a, _, _ := selectPoolKey(auth, "m")
+	a, _, _ := selectPoolKey(auth, "m", nil, nil, "")
 	if a.Token == "client" {
 		t.Fatal("pooled auth must replace client token")
 	}
@@ -47,7 +48,7 @@ func TestKeyPool_Weighted(t *testing.T) {
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "c"}
 	counts := map[string]int{}
 	for range 8 {
-		_, id, ok := selectPoolKey(auth, "m")
+		_, id, ok := selectPoolKey(auth, "m", nil, nil, "")
 		if !ok {
 			t.Fatal("want ok")
 		}
@@ -63,16 +64,45 @@ func TestKeyPool_Sticky(t *testing.T) {
 	setKeyPool(KeyPool{Enabled: true, Strategy: "sticky", Keys: []UpstreamKey{{Key: "ka"}, {Key: "kb"}}})
 	a1 := UpstreamAuth{Mode: AuthRouteAuto, Token: "user1"}
 	a2 := UpstreamAuth{Mode: AuthRouteAuto, Token: "user2"}
-	_, id1a, _ := selectPoolKey(a1, "m")
-	_, id1b, _ := selectPoolKey(a1, "m")
+	_, id1a, _ := selectPoolKey(a1, "m", nil, nil, "")
+	_, id1b, _ := selectPoolKey(a1, "m", nil, nil, "")
 	if id1a != id1b {
 		t.Fatal("sticky must return same key for same session")
 	}
-	if got := stickySessionBase(a1); got != "tok:user1" {
+	// 同一 token、不同客户端会话必须散开（会话级负载均衡）。
+	hdr := func(sess string) http.Header {
+		return http.Header{headerClaudeSession: []string{sess}}
+	}
+	seen := map[string]bool{id1a: true}
+	for _, sess := range []string{"sess-a", "sess-b", "sess-c", "sess-d", "sess-e", "sess-f", "sess-g", "sess-h"} {
+		_, id, _ := selectPoolKey(a1, "m", nil, hdr(sess), "")
+		seen[id] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("same token with different sessions must spread across pool, got only %v", seen)
+	}
+	// 同一会话必须稳定命中同一 key（会话内缓存亲和）。
+	_, idA1, _ := selectPoolKey(a1, "m", nil, hdr("sess-a"), "")
+	_, idA2, _ := selectPoolKey(a1, "m", nil, hdr("sess-a"), "")
+	if idA1 != idA2 {
+		t.Fatal("sticky must return same key for same session headers")
+	}
+	// failover 重试必须跳离首选 key。
+	_, idR, _ := selectPoolKey(a1, "m", nil, hdr("sess-a"), "", 1)
+	if idR == idA1 {
+		t.Fatalf("pool retry should hash away from first-attempt key %q", idA1)
+	}
+	if got := stickySessionBase(a1, nil, nil, "", false); got != "tok:user1" {
 		t.Fatalf("stickySessionBase = %q", got)
 	}
-	if got := stickySessionBase(UpstreamAuth{}); got != stickyPublicFallback {
+	if got, want := stickySessionBase(a1, nil, hdr("sess-a"), "", false), "tok:user1|cli:"+hashSessionRouteKey("sess-a"); got != want {
+		t.Fatalf("stickySessionBase with session = %q, want %q", got, want)
+	}
+	if got := stickySessionBase(UpstreamAuth{}, nil, nil, "", false); got != stickyPublicFallback {
 		t.Fatalf("public fallback = %q", got)
+	}
+	if got := stickySessionBase(a1, nil, hdr("sess-a"), "", true); got != "tok:user1|cli:"+hashSessionRouteKey("sess-a")+keyPoolRetrySuffix {
+		t.Fatalf("stickySessionBase retry = %q", got)
 	}
 	_ = a2
 }
@@ -83,7 +113,7 @@ func TestKeyPool_Disabled(t *testing.T) {
 	if poolEnabled() {
 		t.Fatal("pool must be disabled")
 	}
-	if _, _, ok := selectPoolKey(UpstreamAuth{Mode: AuthRouteAuto, Token: "c"}, "m"); ok {
+	if _, _, ok := selectPoolKey(UpstreamAuth{Mode: AuthRouteAuto, Token: "c"}, "m", nil, nil, ""); ok {
 		t.Fatal("disabled pool must return ok=false")
 	}
 	setKeyPool(KeyPool{Enabled: true})
@@ -98,14 +128,14 @@ func TestKeyPool_CooldownSkip(t *testing.T) {
 	reportKeyResult("a", 429, nil)
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "c"}
 	for range 4 {
-		_, id, ok := selectPoolKey(auth, "m")
+		_, id, ok := selectPoolKey(auth, "m", nil, nil, "")
 		if !ok || id != "b" {
 			t.Fatalf("cooling key must be skipped, got %q ok=%v", id, ok)
 		}
 	}
 	// All cooling → earliest expiry still serves.
 	reportKeyResult("b", 500, nil)
-	if _, _, ok := selectPoolKey(auth, "m"); !ok {
+	if _, _, ok := selectPoolKey(auth, "m", nil, nil, ""); !ok {
 		t.Fatal("all-cooldown must fall back to earliest expiry, not fail")
 	}
 	// Success clears fails.
@@ -146,7 +176,7 @@ func TestKeyPool_GroupFilter(t *testing.T) {
 	goAuth := UpstreamAuth{Mode: AuthRouteGo, Token: "c"}
 	// zen surface: go-only key must never be picked.
 	for range 10 {
-		_, id, ok := selectPoolKey(zenAuth, "some-model")
+		_, id, ok := selectPoolKey(zenAuth, "some-model", nil, nil, "")
 		if !ok {
 			t.Fatal("want ok")
 		}
@@ -167,7 +197,7 @@ func TestKeyPool_GroupFilter(t *testing.T) {
 	})
 	goModel := "go-only-model"
 	for range 10 {
-		_, id, ok := selectPoolKey(goAuth, goModel)
+		_, id, ok := selectPoolKey(goAuth, goModel, nil, nil, "")
 		if !ok {
 			t.Fatal("want ok")
 		}
@@ -180,7 +210,7 @@ func TestKeyPool_GroupFilter(t *testing.T) {
 func TestKeyPool_PublicNeverPooled(t *testing.T) {
 	resetPool(t)
 	setKeyPool(KeyPool{Enabled: true, Keys: []UpstreamKey{{Key: "ka"}}})
-	if _, _, ok := selectPoolKey(UpstreamAuth{Mode: AuthRoutePublic}, "m"); ok {
+	if _, _, ok := selectPoolKey(UpstreamAuth{Mode: AuthRoutePublic}, "m", nil, nil, ""); ok {
 		t.Fatal("public must never use pool")
 	}
 }

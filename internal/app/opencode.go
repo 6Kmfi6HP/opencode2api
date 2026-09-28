@@ -621,7 +621,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		if strings.TrimSpace(ocSession) == "" {
 			ocSession = newOCSessionID()
 		}
-		attemptAuth, keyID, pooled := selectPoolKey(auth, modelID, attempt)
+		attemptAuth, keyID, pooled := selectPoolKey(auth, modelID, bodyMap, upstreamHeadersFromContext(ctx), normalizedTransportScope(ocSession), attempt)
 		targetAuth := auth
 		if pooled {
 			targetAuth = attemptAuth
