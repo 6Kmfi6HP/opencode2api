@@ -101,7 +101,14 @@ func sessionFromRequestContext(ctx context.Context, fallback string) string {
 	return fallback
 }
 
-func withSessionFromRequest(r *http.Request) *http.Request {
+// withClientHeadersFromRequest snapshots the downstream request's headers
+// into the context for sticky routing (upstreamHeadersFromContext), and
+// carries x-opencode-session as the transport scope. The snapshot is taken
+// before any body read so handlers that replace r.Body (readJSONRequestBody)
+// don't lose the headers; all client headers are preserved because
+// sessionHeaderValue matches the known session header names
+// case-insensitively (X-Claude-Code-Session-Id, Thread-Id, Session-Id…).
+func withClientHeadersFromRequest(r *http.Request) *http.Request {
 	headers := r.Header.Clone()
 	session := strings.TrimSpace(headers.Get(headerOpencodeSession))
 	ctx := context.WithValue(r.Context(), opencodeUpstreamHeadersContextKey{}, headers)
