@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -22,7 +23,7 @@ func TestClaudeToResponsesBody_InjectsCapWhenMaxTokensMissing(t *testing.T) {
 	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
 
 	claudeReq := ClaudeRequest{Model: "primary-model"}
-	body := claudeToResponsesBody(claudeReq, "primary-model")
+	body := claudeToResponsesBody(context.Background(), claudeReq, "primary-model")
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatalf("responses body is not JSON: %v", err)
@@ -42,7 +43,7 @@ func TestClaudeToResponsesBody_LiftsToFloorWhenNoCap(t *testing.T) {
 	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
 
 	claudeReq := ClaudeRequest{Model: "primary-model"}
-	body := claudeToResponsesBody(claudeReq, "primary-model")
+	body := claudeToResponsesBody(context.Background(), claudeReq, "primary-model")
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatalf("responses body is not JSON: %v", err)
@@ -79,7 +80,7 @@ func TestClaudeToResponsesBody_BasicMapping(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &claudeReq); err != nil {
 		t.Fatalf("unmarshal claude req: %v", err)
 	}
-	body := claudeToResponsesBody(claudeReq, "primary-model")
+	body := claudeToResponsesBody(context.Background(), claudeReq, "primary-model")
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatalf("responses body is not JSON: %v", err)
@@ -138,7 +139,7 @@ func TestClaudeToResponsesBody_LenientNo400(t *testing.T) {
 	if len(input) == 0 {
 		t.Fatal("lenient conversion should still produce input, got empty")
 	}
-	body := claudeToResponsesBody(claudeReq, "primary-model")
+	body := claudeToResponsesBody(context.Background(), claudeReq, "primary-model")
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatalf("body is not JSON: %v", err)
@@ -555,7 +556,7 @@ func TestClaudeToResponsesBody_EffortMaxNormalized(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &claudeReq); err != nil {
 		t.Fatal(err)
 	}
-	body := claudeToResponsesBody(claudeReq, "muse-spark-1.3-contributor")
+	body := claudeToResponsesBody(context.Background(), claudeReq, "muse-spark-1.3-contributor")
 	var req map[string]any
 	json.Unmarshal(body, &req)
 	reasoning, _ := req["reasoning"].(map[string]any)
@@ -697,7 +698,7 @@ func TestClaudeToResponsesBody_EffortNonMuseSparkRaw(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &claudeReq); err != nil {
 		t.Fatal(err)
 	}
-	body := claudeToResponsesBody(claudeReq, "gpt-5")
+	body := claudeToResponsesBody(context.Background(), claudeReq, "gpt-5")
 	var req map[string]any
 	json.Unmarshal(body, &req)
 	reasoning, _ := req["reasoning"].(map[string]any)
@@ -714,7 +715,7 @@ func TestClaudeToResponsesBody_ReasoningSummaryAuto(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &claudeReq); err != nil {
 		t.Fatal(err)
 	}
-	body := claudeToResponsesBody(claudeReq, "muse-spark-1.3-contributor")
+	body := claudeToResponsesBody(context.Background(), claudeReq, "muse-spark-1.3-contributor")
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
@@ -729,7 +730,7 @@ func TestClaudeToResponsesBody_ReasoningSummaryAuto(t *testing.T) {
 	}
 
 	// 非 muse-spark 模型同样补 summary:auto（可见 summary 由上游生成）。
-	body = claudeToResponsesBody(claudeReq, "gpt-x")
+	body = claudeToResponsesBody(context.Background(), claudeReq, "gpt-x")
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}

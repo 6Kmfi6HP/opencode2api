@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -278,7 +279,7 @@ func TestClaudeBridge_ToResponsesBody_FiltersBillingHeader(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &claudeReq); err != nil {
 		t.Fatal(err)
 	}
-	body := claudeToResponsesBody(claudeReq, "m")
+	body := claudeToResponsesBody(context.Background(), claudeReq, "m")
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatal(err)
@@ -297,7 +298,7 @@ func TestClaudeBridge_ToResponsesBody_FiltersBillingHeader(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw2), &cr2); err != nil {
 		t.Fatal(err)
 	}
-	body2 := claudeToResponsesBody(cr2, "m")
+	body2 := claudeToResponsesBody(context.Background(), cr2, "m")
 	var req2 map[string]any
 	if err := json.Unmarshal(body2, &req2); err != nil {
 		t.Fatal(err)
@@ -326,7 +327,7 @@ func TestClaudeBridge_ToResponsesBody_ToolResultImagesAndEmpty(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &claudeReq); err != nil {
 		t.Fatal(err)
 	}
-	body := claudeToResponsesBody(claudeReq, "m")
+	body := claudeToResponsesBody(context.Background(), claudeReq, "m")
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatal(err)
@@ -390,7 +391,7 @@ func TestClaudeBridge_ToResponsesBody_ParallelToolCallsAndClamp(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &cr); err != nil {
 		t.Fatal(err)
 	}
-	body := claudeToResponsesBody(cr, "m")
+	body := claudeToResponsesBody(context.Background(), cr, "m")
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatal(err)
@@ -409,7 +410,7 @@ func TestClaudeBridge_ToResponsesBody_ParallelToolCallsAndClamp(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw2), &cr2); err != nil {
 		t.Fatal(err)
 	}
-	body2 := claudeToResponsesBody(cr2, "m")
+	body2 := claudeToResponsesBody(context.Background(), cr2, "m")
 	var req2 map[string]any
 	if err := json.Unmarshal(body2, &req2); err != nil {
 		t.Fatal(err)
@@ -427,7 +428,7 @@ func TestClaudeBridge_ToResponsesBody_StoreFalseAndInclude(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &cr); err != nil {
 		t.Fatal(err)
 	}
-	body := claudeToResponsesBody(cr, "m")
+	body := claudeToResponsesBody(context.Background(), cr, "m")
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatal(err)

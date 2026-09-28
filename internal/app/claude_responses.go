@@ -549,7 +549,7 @@ func normalizeResponsesEffort(effort string) string {
 
 // claudeToResponsesBody 把 Claude 请求转为原生 Responses 请求体。永不报错，
 // 失败时返回最小可用体（model + input），避免 400。
-func claudeToResponsesBody(claudeReq ClaudeRequest, modelID string) []byte {
+func claudeToResponsesBody(ctx context.Context, claudeReq ClaudeRequest, modelID string) []byte {
 	instructions, input := claudeMessagesToResponsesInput(claudeReq.Messages, claudeReq.System)
 	body := map[string]any{
 		"model":  modelID,
@@ -618,9 +618,8 @@ func claudeToResponsesBody(claudeReq ClaudeRequest, modelID string) []byte {
 			body["metadata"] = m
 		}
 	}
-	if len(claudeReq.StopSequences) > 0 {
-		body["stop"] = append([]string(nil), claudeReq.StopSequences...)
-	}
+	// 注意：OpenAI Responses API 没有 stop 字段（StopSequences 无对应物，
+	// 上游忽略且属 spec 违例），故不透传，对齐 chatToResponsesBody。
 	// 互斥说明：Anthropic thinking 模式与 OpenAI Responses 的 gpt-5 族都
 	// 不接受 temperature/top_p 采样参数（"Unsupported parameter" 400），
 	// 因此 reasoningOn 时上面已跳过二者（对齐 sub2api AnthropicToResponses）。
@@ -630,7 +629,12 @@ func claudeToResponsesBody(claudeReq ClaudeRequest, modelID string) []byte {
 		fallback, _ := json.Marshal(map[string]any{"model": modelID, "input": input})
 		return fallback
 	}
-	return b
+	// 缓存 hint 注入：prompt_cache_retention + session 派生的
+	// prompt_cache_key（responses 专用，不写顶层 cache_control——不是合法
+	// Responses 字段，Console 等上游会整包 400）。对齐原生 passthrough 与
+	// chat→responses 路径；此前本函数缺失该注入，muse-spark 系经本路径的
+	// 流量永远吃不到上游 prefix-cache。
+	return applyResponsesCacheHintsToRawBody(b, modelID, ctx)
 }
 
 // ======================== Responses -> Claude 转换（lenient） ========================
@@ -942,6 +946,39 @@ func responsesUsageToChat(usage map[string]any) map[string]any {
 	return out
 }
 
+// isResponsesErrorBody 报告上游 Responses 包体是否为 error 形状
+// （{"type":"error",...} 或顶层 error 对象）。部分上游在 HTTP 200 里
+// 包 error（如模型侧生成失败），调用方命中时应走错误透传而非成功转换——
+// 否则 convertResponsesToClaude 解析失败只会吞成空文本消息。
+func isResponsesErrorBody(respBody []byte) bool {
+	var raw map[string]any
+	if json.Unmarshal(respBody, &raw) == nil {
+		if t, _ := raw["type"].(string); t == "error" {
+			return true
+		}
+		if _, ok := raw["error"].(map[string]any); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// writeClaudeResponsesUpstreamError 把 error 形上游包体转为 Claude 错误形状
+// 写回（状态码 502：上游 HTTP 2xx 但包 error，本质上游故障）。返回 true
+// 表示已写回，调用方直接 return true 即可。
+func writeClaudeResponsesUpstreamError(ctx context.Context, w http.ResponseWriter, modelID string, respBody []byte) bool {
+	if !isResponsesErrorBody(respBody) {
+		return false
+	}
+	logging.FromContext(ctx).Warn("claude-responses upstream 2xx body is error shape, relaying as 502",
+		"model", modelID)
+	claudeErr := convertResponsesErrorToClaude(respBody)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadGateway)
+	_, _ = w.Write(claudeErr)
+	return true
+}
+
 // convertResponsesErrorToClaude 把原生 Responses 错误体转为 Claude 错误形状。
 // 上游 message 尽量保留，不暴露内部错误串。
 func convertResponsesErrorToClaude(respBody []byte) []byte {
@@ -987,7 +1024,7 @@ func recordClaudeResponsesUsage(model string, usage map[string]any) {
 // responses 返回 2xx 时才转换写回并记住该模型；任何失败都返回 false 且不写
 // 任何响应，调用方保留原翻译路径错误原样返回。
 func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, claudeReq ClaudeRequest, stream bool, wantReasoning bool) bool {
-	upstreamBody := claudeToResponsesBody(claudeReq, modelID)
+	upstreamBody := claudeToResponsesBody(ctx, claudeReq, modelID)
 	rc, status, _, err := callOpenCodeEndpoint(ctx, "responses", upstreamBody, modelID, auth)
 	if err != nil || status < 200 || status >= 300 {
 		if rc != nil {
@@ -1034,7 +1071,7 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 // 写回；上游 4xx/5xx 转为 Claude 错误形状保真透传状态码；仅传输层错误
 // （拿不到上游响应）返回 false，调用方兜底。
 func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, claudeReq ClaudeRequest, stream bool, wantReasoning bool) bool {
-	upstreamBody := claudeToResponsesBody(claudeReq, modelID)
+	upstreamBody := claudeToResponsesBody(ctx, claudeReq, modelID)
 	rc, status, _, err := callOpenCodeEndpoint(ctx, "responses", upstreamBody, modelID, auth)
 	if err != nil {
 		markNativeResponsesFailure(modelID)
@@ -1069,7 +1106,7 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 		// 才吞掉并让外层短路错误写回。
 		logging.FromContext(ctx).Warn("claude-responses non-stream body read failed, retrying same protocol",
 			"model", modelID, "status", status, "err", readErr)
-		upstreamBody := claudeToResponsesBody(claudeReq, modelID)
+		upstreamBody := claudeToResponsesBody(ctx, claudeReq, modelID)
 		rc2, status2, _, err2 := callOpenCodeEndpoint(ctx, "responses", upstreamBody, modelID, auth)
 		if err2 != nil || rc2 == nil {
 			markNativeResponsesFailure(modelID)
@@ -1082,6 +1119,10 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 			return false
 		}
 		if status2 >= 200 && status2 < 300 {
+			// 上游 200 包 error 时透传 502，不吞成空消息。
+			if writeClaudeResponsesUpstreamError(ctx, w, modelID, respBody2) {
+				return true
+			}
 			claudeBody := convertResponsesToClaude(respBody2, modelID, wantReasoning)
 			result := logging.SummarizeClaudeResult(claudeBody)
 			logging.LogResult(ctx, result)
@@ -1106,6 +1147,10 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 	}
 
 	if status >= 200 && status < 300 {
+		// 上游 200 包 error 时透传 502，不吞成空消息。
+		if writeClaudeResponsesUpstreamError(ctx, w, modelID, respBody) {
+			return true
+		}
 		claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning)
 		result := logging.SummarizeClaudeResult(claudeBody)
 		logging.LogResult(ctx, result)
@@ -1165,7 +1210,7 @@ func claudeResponsesStreamWithRetry(ctx context.Context, w http.ResponseWriter, 
 			pending = nil
 			return rc, http.StatusOK, nil
 		}
-		rc, status, _, err := callOpenCodeEndpoint(ctx, "responses", claudeToResponsesBody(claudeReq, modelID), modelID, auth)
+		rc, status, _, err := callOpenCodeEndpoint(ctx, "responses", claudeToResponsesBody(ctx, claudeReq, modelID), modelID, auth)
 		return rc, status, err
 	}
 	runOnce := func(ctx context.Context, w http.ResponseWriter, rc io.Reader, _ []streamReadResult, _ *streamReader) (bool, error) {
