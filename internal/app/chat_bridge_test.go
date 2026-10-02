@@ -630,3 +630,74 @@ func TestChatToResponsesBody_ReasoningSummaryAuto(t *testing.T) {
 		t.Fatalf("reasoning = %#v, want {effort:ultra summary:auto}", r)
 	}
 }
+
+// Issue #35：客户端只带 max_completion_tokens（不带 max_tokens）时，cap 注入
+// 不得补 max_tokens —— OpenAI 已废弃 max_tokens 并要求二者互斥，zen 部分
+// 后端对并存严格 400 (cannot both be set)，注入造成偶发硬失败。
+func TestConvertRequest_NoMaxTokensInjectionWhenMaxCompletionTokensSet(t *testing.T) {
+	old := config.Get()
+	config.Update(func(s *config.Snapshot) {
+		s.MaxTokensCap = 200000
+		s.MaxTokensCapPerModel = map[string]int{"big-pickle": 200000}
+	})
+	t.Cleanup(func() { config.Update(func(s *config.Snapshot) { *s = old }) })
+
+	// 仅 max_completion_tokens（按 issue #35 原始线上 JSON 解析）：max_tokens
+	// 不出现，max_completion_tokens 原样转发。
+	req1 := &OpenAIRequest{}
+	if err := json.Unmarshal([]byte(`{
+		"model": "big-pickle",
+		"stream": true,
+		"max_completion_tokens": 32000,
+		"messages": [{"role": "user", "content": "hi"}]
+	}`), req1); err != nil {
+		t.Fatal(err)
+	}
+	out := convertRequest(req1)
+	if v, ok := out["max_tokens"]; ok {
+		t.Fatalf("max_tokens 不应被注入, got %#v", v)
+	}
+	if out["max_completion_tokens"] != 32000 {
+		t.Fatalf("max_completion_tokens = %#v, want 32000", out["max_completion_tokens"])
+	}
+
+	// 双字段均未设置：cap 注入照旧（无 conflict 风险）。
+	out2 := convertRequest(&OpenAIRequest{
+		Model:    "big-pickle",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if out2["max_tokens"] != 200000 {
+		t.Fatalf("max_tokens = %#v, want 200000 (cap 注入)", out2["max_tokens"])
+	}
+
+	// 仅 max_tokens：注入路径不介入，显式值照常收敛。
+	out3 := convertRequest(&OpenAIRequest{
+		Model:     "big-pickle",
+		Messages:  []Message{{Role: "user", Content: "hi"}},
+		MaxTokens: ptr(5000),
+	})
+	if out3["max_tokens"] != 5000 {
+		t.Fatalf("max_tokens = %#v, want 5000", out3["max_tokens"])
+	}
+	if _, ok := out3["max_completion_tokens"]; ok {
+		t.Fatalf("max_completion_tokens 不应出现")
+	}
+
+	// extra_body 携带 max_completion_tokens（SDK extra_body 顶层合并）：
+	// 同样不得注入 max_tokens，且客户端值原样上行。
+	req4 := &OpenAIRequest{}
+	if err := json.Unmarshal([]byte(`{
+		"model": "big-pickle",
+		"messages": [{"role": "user", "content": "hi"}],
+		"extra_body": {"max_completion_tokens": 4096}
+	}`), req4); err != nil {
+		t.Fatal(err)
+	}
+	out4 := convertRequest(req4)
+	if v, ok := out4["max_tokens"]; ok {
+		t.Fatalf("extra_body 场景 max_tokens 不应被注入, got %#v", v)
+	}
+	if out4["max_completion_tokens"] != float64(4096) {
+		t.Fatalf("max_completion_tokens = %#v (%T), want 4096 (extra_body 透传)", out4["max_completion_tokens"], out4["max_completion_tokens"])
+	}
+}

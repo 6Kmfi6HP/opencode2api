@@ -71,6 +71,7 @@
 - `stream`
 - `temperature`（闭区间 `0..2`）
 - `max_tokens`
+- `max_completion_tokens`（clamped 到 `[128, cap]`；已带该字段时不再注入 `max_tokens`，遵循 OpenAI 二者互斥约束，避免上游 400，issue #35）
 - `top_p`
 - `thinking`
 - `reasoning_effort`
