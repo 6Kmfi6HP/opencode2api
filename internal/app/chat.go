@@ -1461,11 +1461,17 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	if req.Temperature != nil {
 		converted["temperature"] = *req.Temperature
 	}
+	// 客户端已用现代的 max_completion_tokens（顶层 typed 字段或 extra_body，
+	// SDK extra_body 顶层合并的惯例）时不得注入 max_tokens —— OpenAI 已废弃
+	// max_tokens 且要求二者互斥，zen 部分后端对并存严格 400 (cannot both be
+	// set)，注入会把可成功的请求打成偶发硬失败（issue #35）。
+	clientHasMaxCompletionTokens := req.MaxCompletionTokens != nil ||
+		extraBodyValue(req, "max_completion_tokens") != nil
 	if req.MaxTokens != nil {
 		// clampMaxTokens 复用 anthropic_protocol.go 的 cap 收敛；
 		// chat 入站的 max_tokens 是客户端可选字段，下限收敛无害。
 		converted["max_tokens"] = clampMaxTokens(*req.MaxTokens, config.MaxTokensCapFor(req.Model))
-	} else if cap := config.MaxTokensCapFor(req.Model); cap > 0 {
+	} else if cap := config.MaxTokensCapFor(req.Model); cap > 0 && !clientHasMaxCompletionTokens {
 		// 未显式设置时注入 cap：与 responses 直通口径一致（cap 即上游默认
 		// 预算，避免上游按自身小默认截断）。
 		converted["max_tokens"] = cap
