@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -237,6 +238,21 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 				// 客户端连接已经处于 SSE 数据段。**绝不可再返回 (false, ...)**
 				// 否则 DriveStreamWithRetry 会用同一个 ResponseWriter 二次
 				// WriteHeader + 二次 replay peeked 字节,流被污染(I4/I7)。
+				// 按错误类型分流(对照 claude_responses P3 与 chat/responses
+				// 翻译路径的截断标记):只有干净 EOF(io.EOF)才合成 message_stop
+				// 正常关流;RST/unexpected EOF/墙钟超时等传输中断先补发 in-band
+				// error 事件——Claude Code 得以感知失败并重试该回合,而不是把
+				// 半截 tool_use/文本当完整回合记入历史。
+				if !errors.Is(pendingErr, io.EOF) {
+					logging.FromContext(ctx).Warn("anthropic passthrough stream interrupted mid-stream",
+						"model", modelID, "err", pendingErr)
+					if _, err := io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream stream interrupted before completion\"}}\n\n"); err != nil {
+						return true, err
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
 				if !sawMessageStop {
 					// 上游 EOF 但没关 message:展开成「合成 message_stop」让
 					// Claude SDK 正常关流。sawMessageStart=false 也照发——客

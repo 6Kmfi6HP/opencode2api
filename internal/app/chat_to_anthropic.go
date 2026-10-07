@@ -756,6 +756,18 @@ func anthropicSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 				// 此分支只在 peeked 全空且首行就是 EOF 时进入。
 				return false, true, errStreamIncompleteNoCommit
 			}
+			// 按错误类型分流(对照 claude_responses P3 / chat.go / responses.go
+			// 的截断标记):干净 EOF(io.EOF)才是流自然终止,finalize 合成
+			// stop+[DONE];RST/unexpected EOF/墙钟超时等传输中断不得伪造
+			// clean stop——补发 in-band error 帧 + [DONE],客户端得以感知
+			// 失败并重试该回合,而不是把半截 tool_use 当完整回合记入历史。
+			if !errors.Is(result.err, io.EOF) {
+				st.stats.SawFinish = false
+				slog.Warn("chat via anthropic stream interrupted mid-stream",
+					"model", model, "err", result.err)
+				st.emitErrorFrame("upstream stream interrupted before completion")
+				return true, true, nil
+			}
 			// 已写过任意字节(无论是否到 message_start) —— 收尾 finalize。
 			// 已有 role 输出后再 EOF:按finalize合成 stop chunk+[DONE],
 			// 保证 OpenAI SDK 不挂起（幂等）。
@@ -818,6 +830,31 @@ func (st *anthropicToChatState) finalize() {
 	st.stats.DoneSeen = true
 	st.stats.SawFinish = true
 	st.stats.FinishReason = st.stopReason
+}
+
+// emitErrorFrame 在已 commit 的流上补发 in-band 错误帧 + [DONE],形状对照
+// chat.go emitError 的 upstream_truncated(带 finish_reason=error 的 choices)。
+// 传输中断时使用,取代伪造 clean stop 的 finalize——客户端拿到完整(带错的)
+// 终止序列,得以感知失败并重试该回合。幂等:置 finalized 防止后续再 finalize。
+func (st *anthropicToChatState) emitErrorFrame(msg string) {
+	if st.finalized {
+		return
+	}
+	st.finalized = true
+	payload := map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    "upstream_truncated",
+		},
+		"choices": []any{map[string]any{"index": 0, "finish_reason": "error"}},
+	}
+	data, _ := json.Marshal(payload)
+	st.w.Write([]byte("data: " + string(data) + "\n\n"))
+	st.w.Write([]byte("data: [DONE]\n\n"))
+	if st.flusher != nil {
+		st.flusher.Flush()
+	}
+	st.stats.DoneSeen = false
 }
 
 // chatUsage 返回发给 chat 客户端的 usage：Anthropic 侧未携带
