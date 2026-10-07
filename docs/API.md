@@ -109,8 +109,7 @@
 ### Best-effort
 
 - Responses 会通过 Chat Completions 上游实现；内置工具被编码为函数工具后再还原。
-- 已确认只支持原生上游 `/responses` 端点的模型（静态预置、`native_responses_models` 配置项、运行时探测记忆）跳过 Chat 翻译，直接保真透传，上游 4xx/5xx 状态码与错误体原样返回。
-  唯一例外：上游因回放的 reasoning `encrypted_content` 不属于当前发起方而 400（`was not issued to this caller`，通常发生在 sticky 出口/域名改绑之后）时，网关会剥掉 `input` 中 reasoning item 的 `id` 与 `encrypted_content` 后重发一次；可见对话内容不变，仅不再回放旧推理密文。详见 `responses-compatibility-analysis.md` §9.7。
+- `/v1/responses` 入站只走翻译路径（Chat / Anthropic 上游），不透传到上游原生 `/responses` 端点。Chat 与 Claude Messages 入站在 Chat 翻译失败后仍会回退探测上游原生 `/responses`（请求与响应在网关内自动转换，路由见 `native_responses_models` 配置项）。
 - 仅在上游实际返回 reasoning 时生成 reasoning output item。
 - `input` 中的 top-level item 或 message content 可使用 `input_file`；支持 flat 字段 `file_data`、`file_id`、`file_url`、`filename` 以及 nested `input_file` object，并映射为 `{type:"file",file:{...}}`。模型不支持 file 模态时上游可能拒绝。
 
@@ -161,7 +160,7 @@ curl http://127.0.0.1:8000/v1/responses \
 - 映射为纯函数（sha256 派生）：同一原始名跨请求、跨网关重启、跨轮历史回放、跨 key 轮换重试恒得同一短名；`tool_choice` 与历史 `tool_use` 与 `tools[]` 三处必然一致。
 - 折叠/缩短结果与已声明合法名碰撞时确定性消歧（哈希形），双向映射保证还原。
 - 响应侧（流式 content_block、非流式 content、跨协议 Chat/Responses 转换）按相反映射还原，客户端看到的名字与所发逐字节一致；`mcp_servers[].name` 被缩短时，上游拼出的 `mcp__<缩短 server>__<tool>` 复合名同样还原。
-- 全部名字已合法时不改写任何字节（快路径）；muse-spark Responses 原生透传路径的超长名缩短复用同一机制并额外获得字符集折叠。
+- 全部名字已合法时不改写任何字节（快路径）；Claude/Chat 入站走 Responses 上游的桥接路径（`chat_to_responses_upstream.go` / `claude_responses.go`）的超长名缩短复用同一机制并额外获得字符集折叠。
 
 ### Best-effort / 显式丢弃（可观测）
 

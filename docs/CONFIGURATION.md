@@ -126,9 +126,9 @@ cp config.example.json config.json
 - `protocol`：`chat_completions` / `anthropic` / `responses` 三选一。
 - 规则按声明顺序匹配，**首个命中生效**；最多 64 条，pattern ≤128 字符且不含空白。
 
-**优先级**：显式规则 &gt; 运行时 native-responses 探测记忆 &gt; 默认 Chat Completions。未命中任何规则时行为与旧版本完全一致。`/v1/chat/completions` 入站仅应用显式规则（探测记忆仍走"翻译失败→探测→透传"回退，保证默认行为不变）；`/v1/messages` 与 `/v1/responses` 入站应用完整优先级。
+**优先级**：显式规则 &gt; 运行时 native-responses 探测记忆 &gt; 默认 Chat Completions。`/v1/chat/completions` 入站仅应用显式规则（探测记忆仍走"翻译失败→探测→透传"回退，保证默认行为不变）；`/v1/messages` 入站应用完整优先级；`/v1/responses` 入站只走翻译路径（原生 Responses 透传已移除），显式规则与探测记忆命中的 `responses` 协议同样落翻译路径。
 
-三种入站协议（Chat / Responses / Claude Messages）都可以路由到任意上游协议，请求与响应在网关内自动转换（流式 SSE、工具调用、推理内容、usage 统计均支持）。`/v1/messages/count_tokens` 命中 anthropic 规则时直连上游 `/zen/v1/messages/count_tokens` 取精确计数，未命中或上游失败回落本地启发式。
+Chat 与 Claude Messages 入站可以路由到任意上游协议，`/v1/responses` 入站只走 Chat/Anthropic 翻译路径；请求与响应在网关内自动转换（流式 SSE、工具调用、推理内容、usage 统计均支持）。`/v1/messages/count_tokens` 命中 anthropic 规则时直连上游 `/zen/v1/messages/count_tokens` 取精确计数，未命中或上游失败回落本地启发式。
 
 本批次行为补充（仅本版起）：
 
@@ -151,7 +151,7 @@ cp config.example.json config.json
 
 ### `native_responses_models`
 
-上游模型 ID 列表：这些模型已知只支持原生 Responses 端点，请求会跳过 Chat 翻译，直接透传到上游 `/responses`。除配置外，代理还内置了一份静态预置列表（`muse-spark-1.2/1.3-contributor` 及 `-free` 变体，因上游对其 `chat/completions` 通道整档 500、只剩 `/responses` 可用），并会在运行时探测确认后动态记忆更多模型；配置值与静态预置只增不减地合并，不会清掉运行时学到的模型；静态预置与配置下发的模型不会因连续失败被剔除，运行时学到的模型连续失败 5 次后会自动剔除并回落 Chat 翻译路径。
+上游模型 ID 列表：这些模型已知只支持原生 Responses 端点（上游对其 `chat/completions` 通道不可用）。`/v1/chat/completions` 与 `/v1/messages` 入站在 Chat 翻译失败后回退探测上游 `/responses`（请求与响应在网关内自动转换），探测成功后在内存中记住该模型，后续请求直接走 Responses 上游、不再先撞 Chat 失败；`/v1/responses` 入站只走翻译路径，不受本配置影响。除配置外，代理还内置了一份静态预置列表（`muse-spark-1.2/1.3-contributor` 及 `-free` 变体，因上游对其 `chat/completions` 通道整档 500、只剩 `/responses` 可用）；配置值与静态预置只增不减地合并，不会清掉运行时学到的模型；静态预置与配置下发的模型不会因连续失败被剔除，运行时学到的模型连续失败 5 次后会自动剔除并回落 Chat 翻译路径。
 
 > **注意**：受免费层指纹门限制，`muse-spark-*-contributor-free` 的 tools 必须是 Responses 形状（`{"type":"function","name",...}`），注入的缺失四件 bash/glob/grep/read 已自动按此形状补齐；Anthropic 形状的 `input_schema` 会被上游按 `did not match any supported type` 拒绝。
 

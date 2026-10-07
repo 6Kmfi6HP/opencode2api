@@ -672,3 +672,67 @@ func TestClaudeProbeViaResponses_NonStream_Restored(t *testing.T) {
 		t.Fatalf("probe response missing original name: %s", rec.Body.String())
 	}
 }
+
+func TestShortenResponsesName(t *testing.T) {
+	// <=64 的名字原样返回
+	short := "mcp__codex_apps__github___create_pull_request"
+	if got := shortenResponsesName(short); got != short {
+		t.Fatalf("short name changed: %q", got)
+	}
+	// 66 字符的真实超长插件名（plugin_management___update_app_permissions 形态）
+	long := "mcp__codex_apps__plugin_management___update_app_permissionsXYZi000"
+	if len([]rune(long)) != 66 {
+		t.Fatalf("test fixture must be 66 runes, got %d", len([]rune(long)))
+	}
+	got := shortenResponsesName(long)
+	if n := len([]rune(got)); n != responsesMaxNameLength {
+		t.Fatalf("shortened length = %d, want %d: %q", n, responsesMaxNameLength, got)
+	}
+	// 确定性
+	if shortenResponsesName(long) != got {
+		t.Fatal("shortenResponsesName must be deterministic")
+	}
+	// 相似名字产生不同缩短哈希，避免碰撞
+	other := "mcp__codex_apps__plugin_management___update_app_permissionsXYZj111"
+	if shortenResponsesName(other) == got {
+		t.Fatal("different long names must not collide")
+	}
+	// 多字节字符不在中间被截断
+	cjk := string(append([]rune("工具名-"), []rune(long)...))
+	if g := shortenResponsesName(cjk); len([]rune(g)) > responsesMaxNameLength {
+		t.Fatalf("multibyte name truncated beyond limit: %q (%d runes)", g, len([]rune(g)))
+	}
+}
+
+func TestResponsesNameRewrites_RestoresShortenedNamesInResponses(t *testing.T) {
+	long := "mcp__codex_apps__plugin_management___update_app_permissionsXYZi000"
+	shortened := shortenResponsesName(long)
+	rw := newResponsesNameRewrites(true)
+	rw.shortenRecord(long)
+
+	// 模拟上游非流式响应
+	resp := map[string]any{
+		"id": "resp_1",
+		"output": []any{
+			map[string]any{
+				"type": "function_call", "id": "fc_1", "call_id": "c1",
+				"name": shortened, "arguments": "{}",
+			},
+			map[string]any{
+				"type": "message", "role": "assistant",
+				"content": []any{map[string]any{"type": "output_text", "text": "echo " + shortened}},
+			},
+		},
+	}
+	if !rw.restoreResponsesPayloadNames(resp) {
+		t.Fatal("expected restore to change response")
+	}
+	out := resp["output"].([]any)
+	if got := out[0].(map[string]any)["name"].(string); got != long {
+		t.Fatalf("function_call name not restored: %q", got)
+	}
+	// 文本里自然出现的相同串不强制保护，但注册名之外的字段必须原样
+	if got := out[1].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string); got != "echo "+shortened {
+		t.Fatalf("text content must remain untouched: %q", got)
+	}
+}

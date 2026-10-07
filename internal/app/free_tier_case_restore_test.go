@@ -410,9 +410,8 @@ func TestRestoreAnthropicBodyToolCase_StubNameRestored(t *testing.T) {
 	}
 }
 
-// TestResponsesRewritesRestore_FallsBackToStubCase 验证 responses 原生透传的
-// restore: 即使没有任何缩短映射(rw 为恒等),小写占位名也被大小写还原,
-// 覆盖 relayResponsesStream 的 normalizeResponsesStreamLine restore 兜底。
+// TestResponsesRewritesRestore_FallsBackToStubCase 验证 responses 上游桥的
+// restore: 即使没有任何缩短映射(rw 为恒等),小写占位名也被大小写还原。
 func TestResponsesRewritesRestore_FallsBackToStubCase(t *testing.T) {
 	rw := newResponsesNameRewrites(true)
 	if got := rw.restore("glob"); got != "Glob" {
