@@ -507,7 +507,7 @@ func TestAnthropicSSEToResponsesStream_OutputIndexPerItem(t *testing.T) {
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 
 	rec := httptest.NewRecorder()
-	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", true)
+	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", true, nil, nil)
 
 	// emitEvent 是 map marshal,这里直接解析 data 行做结构化断言;item.id
 	// 是随机生成的不写死,依赖下面对 added/done 配对与 index 单调性的检查。
@@ -575,7 +575,7 @@ func TestAnthropicSSEToResponsesStream_EOFPreservesPartialText(t *testing.T) {
 	// 故意不写 content_block_stop / message_stop,直接 EOF。
 
 	rec := httptest.NewRecorder()
-	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", false)
+	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", false, nil, nil)
 	body := rec.Body.String()
 	// 终结事件必须带着 partial text;否则客户端按 response.completed.output 重组会丢尾。
 	if !strings.Contains(body, `"text":"abc"`) {
@@ -599,7 +599,7 @@ func TestAnthropicSSEToResponsesStream_EOFClosesOpenThinking(t *testing.T) {
 	// 故意不写 content_block_stop / message_stop,直接 EOF。
 
 	rec := httptest.NewRecorder()
-	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", true)
+	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", true, nil, nil)
 	body := rec.Body.String()
 
 	var addedReasoningID, doneReasoningID string
@@ -647,7 +647,7 @@ func TestAnthropicSSEToResponsesStream_EOFClosesOpenToolUse(t *testing.T) {
 	// 故意不写 content_block_stop / message_stop,直接 EOF(arguments 半成品)。
 
 	rec := httptest.NewRecorder()
-	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", false)
+	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", false, nil, nil)
 	body := rec.Body.String()
 
 	var addedCallID, doneCallID, argsDoneItemID string
@@ -702,7 +702,7 @@ func TestAnthropicSSEToResponsesStream_DuplicateBlockStartTerminates(t *testing.
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 
 	rec := httptest.NewRecorder()
-	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", false)
+	anthropicSSEToResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), "claude-x", false, nil, nil)
 	body := rec.Body.String()
 
 	if !strings.Contains(body, `"type":"response.failed"`) {

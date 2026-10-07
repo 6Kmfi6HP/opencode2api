@@ -299,7 +299,7 @@ type recordedEvent struct {
 func runAnthropicResponsesStream(t *testing.T, sse string) []recordedEvent {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	anthropicSSEToResponsesStream(context.Background(), rec, strings.NewReader(sse), "claude-x", true)
+	anthropicSSEToResponsesStream(context.Background(), rec, strings.NewReader(sse), "claude-x", true, nil, nil)
 	var events []recordedEvent
 	for _, line := range strings.Split(rec.Body.String(), "\n") {
 		line = strings.TrimSpace(line)
@@ -415,7 +415,7 @@ func TestAnthropicSSE_EOFClosedIdempotently(t *testing.T) {
 		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n" +
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
 	rec := httptest.NewRecorder()
-	anthropicSSEToResponsesStream(context.Background(), rec, strings.NewReader(sse), "claude-x", true)
+	anthropicSSEToResponsesStream(context.Background(), rec, strings.NewReader(sse), "claude-x", true, nil, nil)
 	body := rec.Body.String()
 	// 已发 message_start 但 EOF 未见 message_stop:补 response.completed(=close+
 	// message_delta + message_stop 等价终结)与 [DONE]。

@@ -79,7 +79,7 @@ func TestAnthropicSSEToResponsesStream(t *testing.T) {
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 
 	rec := httptest.NewRecorder()
-	anthropicSSEToResponsesStream(context.Background(), rec, strings.NewReader(sse), "claude-x", true)
+	anthropicSSEToResponsesStream(context.Background(), rec, strings.NewReader(sse), "claude-x", true, nil, nil)
 	body := rec.Body.String()
 
 	for _, want := range []string{
@@ -114,7 +114,7 @@ func TestAnthropicSSEToResponsesStream_IncompleteOnMaxTokens(t *testing.T) {
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":2}}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	rec := httptest.NewRecorder()
-	anthropicSSEToResponsesStream(context.Background(), rec, strings.NewReader(sse), "claude-x", false)
+	anthropicSSEToResponsesStream(context.Background(), rec, strings.NewReader(sse), "claude-x", false, nil, nil)
 	body := rec.Body.String()
 	if !strings.Contains(body, "response.incomplete") {
 		t.Fatalf("missing incomplete: %s", body)

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
 )
@@ -31,13 +33,34 @@ func forwardResponsesViaAnthropic(w http.ResponseWriter, r *http.Request, auth U
 		"model", chatReq.Model, "stream", chatReq.Stream, "keep_reasoning", wantReasoning)
 
 	if chatReq.Stream {
-		rc, status, _, err := callOpenCodeAnthropicEndpoint(ctx, upstreamBody, chatReq.Model, auth)
-		if err != nil || status < 200 || status >= 300 {
-			writeCrossProtocolError(w, status, err, rc, "responses")
+		// DriveStreamWithRetry 链路(与 chat→anthropic 同形):peek 失败
+		// (空流 EOF/读错/上游错误帧/首字节看门狗)按 StreamEmptyRetryMax 换
+		// key 重试;UpstreamErrorCapture 暂存非 2xx 响应,重试全失败后透传
+		// 上游真实 status+body。
+		upstreamCap := &UpstreamErrorCapture{}
+		callOnce := upstreamCap.WrapCallOnce(func(callCtx context.Context) (io.ReadCloser, int, error) {
+			nrc, nstatus, _, nerr := callOpenCodeAnthropicEndpoint(callCtx, upstreamBody, chatReq.Model, auth)
+			return nrc, nstatus, nerr
+		})
+		runOnce := func(runCtx context.Context, rw http.ResponseWriter, nrc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
+			return anthropicSSEToResponsesStream(runCtx, rw, nrc, chatReq.Model, wantReasoning, peeked, rd)
+		}
+		committed, streamErr := DriveStreamWithRetry(ctx, w, AnthropicProtocolHooks, callOnce, runOnce)
+		if committed {
 			return
 		}
-		defer rc.Close()
-		anthropicSSEToResponsesStream(ctx, w, rc, chatReq.Model, wantReasoning)
+		// 全部 attempt 都未 commit:尚未向客户端写过任何字节,落明确错误,
+		// 不伪装半截流。ctx 取消由调用方按客户端断开处理,原样透传。
+		if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
+			return
+		}
+		log.Warn("responses via anthropic stream empty after retries",
+			"model", chatReq.Model, "err", streamErr)
+		if upstreamCap.RC != nil && upstreamCap.Status != 0 {
+			writeCrossProtocolError(w, upstreamCap.Status, nil, upstreamCap.RC, "responses")
+			return
+		}
+		writeUpstreamError(w, http.StatusBadGateway, fmt.Errorf("upstream stream empty after retries"), "responses")
 		return
 	}
 
@@ -148,12 +171,28 @@ type responsesBlockState struct {
 	argDeltaSeen     bool
 }
 
-func anthropicSSEToResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, wantReasoning bool) {
+// anthropicSSEToResponsesStream 把上游 Anthropic Messages SSE 翻译为 Responses
+// SSE。peek 首帧在 WriteHeader 之前约束 commit 边界:空流 EOF/读错/上游错误
+// 帧/首字节超时都返回 (false, errStreamIncompleteNoCommit),由
+// DriveStreamWithRetry 换 key 重试。已 commit 后的读错误按错误类型分流:
+// 干净 EOF 合成 response.completed;RST/unexpected EOF/墙钟超时等传输中断
+// 按 response.failed 收尾(对照 responses.go 的截断标记),不伪造 completed。
+// 返回 (true, nil):已 commit;(false, err):未 commit,可重试。
+func anthropicSSEToResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, wantReasoning bool, peeked []streamReadResult, rd *streamReader) (bool, error) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
+	// WriteHeader 延迟到首行真正写出（避免 peek 阶段占用 200,让空流的
+	// attempt 可安全重试而不污染客户端）。
+	wroteHeader := false
+	writeHeaderOnce := func() {
+		if wroteHeader {
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		wroteHeader = true
+	}
 
 	st := &anthropicToResponsesState{
 		w:             w,
@@ -177,27 +216,79 @@ func anthropicSSEToResponsesStream(ctx context.Context, w http.ResponseWriter, r
 		st.stats.Log(ctx, "responses")
 	}()
 
-	reader := newStreamReader(ctx, rc, 0)
+	var reader *streamReader
+	if len(peeked) == 0 {
+		peek := PeekFirstFrame(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, AnthropicProtocolHooks)
+		if peek.Err != nil {
+			return false, peek.Err
+		}
+		peeked = peek.Consumed
+		reader = peek.Reader
+		if reader == nil {
+			// 上游 EOF 但已见完整帧（极少见：单帧流）。续读的 reader 直接
+			// 落在已 EOF 的 rc 上,主循环立即收 EOF 并走 ensureTerminal。
+			reader = newStreamReader(ctx, rc, 0)
+		}
+	} else if rd != nil {
+		reader = rd
+	} else {
+		reader = newStreamReader(ctx, rc, 0)
+	}
 	defer reader.Close()
+
+	// processResult 处理一行上游 SSE（err 非空表示当前行已是最后一行）。
+	// 关键不变量:一旦 writeHeaderOnce 触发,HTTP 头已发出,绝不能返回
+	// (false, ...) 否则 DriveStreamWithRetry 会用同一个 ResponseWriter 二次
+	// WriteHeader,流被污染(I4/I7)。
+	processResult := func(result streamReadResult) (done bool, retErr error) {
+		if result.line != "" {
+			st.stats.NoteChunk()
+			writeHeaderOnce()
+			st.handleLine(result.line)
+			// handleLine 发出终结事件(message_stop/error/重复 start 兜底)
+			// 后直接退出,不再消费上游后续行。
+			if st.terminalSent {
+				return true, nil
+			}
+		}
+		if result.err != nil {
+			if !wroteHeader {
+				// 真未 commit(一字未写)= 让 Drive retry。
+				return true, errStreamIncompleteNoCommit
+			}
+			if !errors.Is(result.err, io.EOF) {
+				// 传输中断:SawFinish 保持 false（stream_result 记
+				// truncated=true）,按 response.failed 收尾——客户端得以
+				// 感知失败并重试该回合,而不是把 status=completed 的半截
+				// 回合记入历史。
+				logging.FromContext(ctx).Warn("responses via anthropic stream interrupted mid-stream",
+					"model", model, "err", result.err)
+				st.ensureTerminalError("failed", "response.failed", "upstream stream interrupted before completion")
+				return true, nil
+			}
+			// 干净 EOF 未发 message_stop：补 response.completed 保证客户端终止。
+			st.ensureTerminal("completed", "response.completed")
+			return true, nil
+		}
+		return false, nil
+	}
+
+	// 先回放 peeked,再进入主循环。
+	pending := append([]streamReadResult(nil), peeked...)
+	for _, res := range pending {
+		done, err := processResult(res)
+		if done {
+			return wroteHeader, err
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return wroteHeader, ctx.Err()
 		case result := <-reader.Read():
-			pendingErr := result.err
-			if result.line != "" {
-				st.stats.NoteChunk()
-				st.handleLine(result.line)
-				// handleLine 发出终结事件(message_stop/error/重复 start 兜底)
-				// 后直接退出,不再消费上游后续行。
-				if st.terminalSent {
-					return
-				}
-			}
-			if pendingErr != nil {
-				// 上游 EOF 未发 message_stop：补 response.completed 保证客户端终止。
-				st.ensureTerminal("completed", "response.completed")
-				return
+			done, err := processResult(result)
+			if done {
+				return wroteHeader, err
 			}
 		}
 	}
@@ -218,12 +309,20 @@ func (st *anthropicToResponsesState) emitEvent(event string, data map[string]any
 	}
 }
 
-// ensureTerminal 幂等写出终结事件（completed/incomplete/failed）。
+// ensureTerminal 幂等写出终结事件（completed/incomplete）。
 // 上游断流时仍可能有未关闭的 content_block:全部按 output_index 升序收尾
 // (补各类 done 事件并回填 completedOutput),否则以终结事件为准重组 output
 // 的客户端会丢失尾部的 text/thinking/tool_use 内容,或留下永久 in_progress
 // 的 item(added 已发而 done 未到)。
 func (st *anthropicToResponsesState) ensureTerminal(status, event string) {
+	st.ensureTerminalError(status, event, "")
+}
+
+// ensureTerminalError 同 ensureTerminal,但允许在 response 对象上携带 error
+// 字段——传输中断按 failed 终止时使用(对照 responses.go emitResponseFailed)。
+// failed 终止不置 SawFinish/DoneSeen:stream_result 记 truncated=true,真实
+// 中断在日志侧保持可见。
+func (st *anthropicToResponsesState) ensureTerminalError(status, event, errMsg string) {
 	if st.terminalSent {
 		return
 	}
@@ -251,13 +350,18 @@ func (st *anthropicToResponsesState) ensureTerminal(status, event string) {
 	if status == "incomplete" {
 		response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 	}
+	if errMsg != "" {
+		response["error"] = map[string]any{"code": "server_error", "message": errMsg}
+	}
 	st.emitEvent(event, map[string]any{"response": response})
 	st.w.Write([]byte("data: [DONE]\n\n"))
 	if st.flusher != nil {
 		st.flusher.Flush()
 	}
-	st.stats.DoneSeen = true
-	st.stats.SawFinish = true
+	if errMsg == "" {
+		st.stats.DoneSeen = true
+		st.stats.SawFinish = true
+	}
 }
 
 // closeBlock 收尾单个 content_block:补发 done 事件并把 item 回填进
