@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.19
+
+- Add zh/EN language toggle to the admin web UI (`feat(admin)`, issue #16):登录页与管理面板右上角新增「EN/中文」切换按钮，200+ 条 UI 文案（标签、toast、表格头、错误消息、占位符）全部走 i18n 字典。语言解析顺序 `?lang=` → `localStorage("admin_lang")` → `navigator.language`，默认中文，zh 字典值与旧界面逐字节一致（存量用户零感知）。新增 `internal/app/web/i18n.js`（210 对 key + `t(key, params)` 运行时，`{name}` 占位符），由 `GET /i18n.js` 免鉴权提供（登录页需要）；`auth.go` 服务端注入的登录错误消息改为传稳定 key、前端经 `t()` 本地化渲染；nav-tabs 在中间宽度改为收缩/横滚，不再把 header-actions 挤出卡片。新增回归测试 `TestI18N_KeyParity` / `TestI18N_NoChineseInHTML` / `TestI18N_ReferencesResolve`（web_i18n_test.go）。已知取舍：5 处原本 `<code>` 包裹的内联等宽样式改为纯文本；批量导入 textarea 占位符由多行变单行。
+
 ## v0.14.18
 
 - Fix intermittent upstream 400 on Chat passthrough when the client sends only `max_completion_tokens` (`fix(chat)`, issue #35): the `max_tokens_cap` / `max_tokens_cap_per_model` budget injection unconditionally filled `max_tokens` whenever the client omitted it, and the resulting body then carried **both** `max_tokens` (=cap) and the client's `max_completion_tokens`. OpenAI deprecated `max_tokens` in favor of `max_completion_tokens` and requires them mutually exclusive; opencode zen 的部分后端实例严格校验并拒绝（`max_tokens and max_completion_tokens cannot both be set`），而另一些实例放行 —— 同一请求重放经常成功，表现为偶发失败且对 400 不做重试的客户端（如 ZCode）硬失败。`convertRequest` 现在在客户端已带 `max_completion_tokens` 时跳过 `max_tokens` 注入（双字段均未设置时仍注入 cap；显式 `max_tokens` 的收敛行为不变）。回归测试 `TestConvertRequest_NoMaxTokensInjectionWhenMaxCompletionTokensSet`（chat_bridge_test.go）。
