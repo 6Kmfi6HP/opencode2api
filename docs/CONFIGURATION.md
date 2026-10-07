@@ -297,11 +297,23 @@ claude→responses 流式链路的「空流兜底 + 首 token 前重试」。覆
 - `stream_first_byte_timeout_ms`:peek 窗口毫秒数,默认 `30000`(30s)。覆盖大多数上游 prefill 时间;`<=0` 关闭看门狗,仅 EOF/error 触发。
 
 **不重试的情况**(不改的承诺):
-- 已向客户端写过任何字节后 EOF/杀流——按 ParalonCloud Rule 2 合成正常 stop 收尾(已有产出交付给 agent)。
-- 仅有 thinking 没有 text 的 EOF——`reasoningFallback` 兜底把思考内容提升为 text,agent 拿到思考、不发 error。
+- 已向客户端写过任何字节后**干净 EOF**(io.EOF)——按 ParalonCloud Rule 2 合成正常 stop 收尾(已有产出交付给 agent)。
+- 仅有 thinking 没有 text 的干净 EOF——`reasoningFallback` 兜底把思考内容提升为 text,agent 拿到思考、不发 error。
 - 非流式请求(`stream: false`)走的是另一条路径,与本机制无关。
 
-> 真实运行验证:故意用反代在 5s 时杀 upstream tunnel,agent 端原本会 `stream ended without completion` 中断;开启本机制后第一次空流透明重试到下一个 key,整轮圆满完成。
+**传输中断诚实失败**(v0.14.22 起):已 commit 的流中途死亡按错误类型分流——只有干净 EOF 才合成正常收尾;RST / unexpected EOF / 墙钟超时等传输中断会补发 in-band `error` 事件(日志侧 `stream_result` 记 `truncated=true`),Claude Code 得以感知失败并重试该回合,不再把半截文本/非法 JSON 的 tool_use 当完整回合记入历史。
+
+**壳帧宽限窗与产出感知 peek**(v0.14.22 起):Responses 协议的 peek 不再把壳帧(`response.created/in_progress/queued/output_item.added/content_part.added`)与空终态帧判为产出——免费档限速把生成杀在不可见阶段时上游只发壳帧 + 零内容 `response.incomplete`(usage 报 output_tokens 但零内容),旧实现把它当成功流转发出 200 空消息且零重试。现在这类空流在未向客户端写字节前经 `stream_empty_retry_max` + `key_pool` 换 key 重试;首个壳帧后进入 `OPENCODE2API_SHELL_GRACE_MS` 宽限窗,到期仍只有壳帧则按健康慢流放行(thinking 类上游首 delta 迟到不误重试)。宽限窗 commit 后才到达的零内容 incomplete 会补发 in-band error;带内容的 incomplete/终态则把 `output[]` 里未经 delta 通道流出的内容收割补发(与非流式路径对齐),不再丢已产出内容。
+
+### 截断健壮性环境变量
+
+| 环境变量 | 默认 | 语义 |
+|---|---|---|
+| `OPENCODE2API_SHELL_GRACE_MS` | `5000` | Responses 壳帧宽限窗毫秒数:壳帧后等待产出帧的时长,到期仍只有壳帧按健康慢流放行;`0` 恢复「任意帧即 commit」的旧行为 |
+| `OPENCODE2API_UPSTREAM_TIMEOUT_SECS` | `900` | 上游 http.Client 墙钟超时秒数(Go `Timeout` 覆盖整个响应体流式读取);`<=0` 关闭整体墙钟,交由流中断分支 + 客户端断开兜底 |
+| `OPENCODE2API_POOL_PUBLIC` | on | public auth 下免费模型是否交由 `key_pool` 接管(round_robin 分摊每账号输出限额);`off` 回退 public 直连。池整体黑名单级失败时自动回落直连,绝不弄坏原本可用路径 |
+
+> 免费档限速说明:opencode.ai 免费层的 Output-token 限速是身份/出口级共享桶,承压窗口内外生波动。网关对 429 退避重试(Retry-After 优先,缺省 1s/2s/3s 递增,cap 5s),并在壳帧宽限窗内对「限速杀死型空流」换 key 重试——把空轮/截断收敛为延迟或明确报错,agent 任务不再无限停摆。
 
 ## 管理面板
 
