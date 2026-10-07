@@ -22,7 +22,10 @@ import (
 // 响应按客户端流式偏好转回 Responses 形状。
 func forwardResponsesViaAnthropic(w http.ResponseWriter, r *http.Request, auth UpstreamAuth, chatReq *OpenAIRequest, wantReasoning bool) {
 	ctx := r.Context()
-	upstreamBody := chatToAnthropicBody(chatReq, chatReq.Model, isClaudeCodeClient(r.Header.Get("User-Agent")))
+	// 工具名兼容：超长/非法字符 name 确定性缩短，映射注入 ctx 供响应呈现面
+	// 还原（该路径现状无占位名大小写还原，保持 restoreStubCase=false）。
+	upstreamBody, rewrites := sanitizeAnthropicUpstreamBody(chatToAnthropicBody(chatReq, chatReq.Model, isClaudeCodeClient(r.Header.Get("User-Agent"))), false)
+	ctx = withAnthropicNameRewrites(ctx, rewrites)
 	log := logging.FromContext(ctx)
 	log.Info("responses via anthropic upstream",
 		"model", chatReq.Model, "stream", chatReq.Stream, "keep_reasoning", wantReasoning)
@@ -50,6 +53,8 @@ func forwardResponsesViaAnthropic(w http.ResponseWriter, r *http.Request, auth U
 		writeUpstreamError(w, http.StatusBadGateway, fmt.Errorf("upstream read error"), "responses")
 		return
 	}
+	// 先还原缩短名（含 SSE 兜底），转换器天然携带客户端原始名。
+	respBody = restoreAnthropicResponseNames(respBody, rewrites)
 	responsesBody := convertAnthropicToResponses(respBody, chatReq.Model, wantReasoning)
 	result := logging.SummarizeChatResult(responsesBody)
 	logging.LogResult(ctx, result)
@@ -107,9 +112,12 @@ type anthropicToResponsesState struct {
 	id            string
 	model         string
 	wantReasoning bool
-	seq           int
-	outputIndex   int
-	fullUsage     map[string]any
+	// rewrites 携带本请求的缩短名还原映射（anthropic 上游边界注入 ctx）；
+	// nil 安全。
+	rewrites    *responsesNameRewrites
+	seq         int
+	outputIndex int
+	fullUsage   map[string]any
 	// 按 anthropic block index 跟踪打开中的 content_block。
 	// 每个 block 一个 struct,对应 claude.go anthropicBlockState 的形状;
 	// 不再用多个平行 map(避免 cleanup 时漏删某个 map 导致串扰)。
@@ -154,6 +162,7 @@ func anthropicSSEToResponsesStream(ctx context.Context, w http.ResponseWriter, r
 		id:            "resp_" + randomHex(16),
 		model:         model,
 		wantReasoning: wantReasoning,
+		rewrites:      nameRewritesFor(ctx),
 		blocks:        map[int]*responsesBlockState{},
 		fullUsage:     map[string]any{},
 	}
@@ -398,7 +407,11 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 			b.toolIdx = st.toolCount
 			st.toolCount++
 			callID, _ := cb["id"].(string)
+			// 上游 tool_use name 还原为客户端原始名（缩短名经 rewrites
+			// 映射），覆盖 output_item.added / output_item.done /
+			// response.completed 全部呈现面。
 			name, _ := cb["name"].(string)
+			name = st.rewrites.restore(name)
 			b.callID = callID
 			b.name = name
 			if inp, ok := cb["input"]; ok && inp != nil {

@@ -3,8 +3,6 @@ package app
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
@@ -192,26 +190,13 @@ func normalizeResponseOutputArguments(output []any) bool {
 // responsesMaxNameLength 是上游 Anthropic 风格 name 字段的硬性上限（字符数）。
 const responsesMaxNameLength = 64
 
-// shortenResponsesName 把超过 64 字符的 name 确定性缩短为 <=64。
-// 保留原名的尾部相关段（通常是工具动作名），前缀加 "x-" 与 16 位十六进制
-// 哈希，保证同名输入稳定得到同一缩短名（跨请求可观察、可缓存），不同名
-// 几乎不碰撞（哈希 64 bit）。<=64 的名字原样返回。
+// shortenResponsesName 把不满足上游约束（^[a-zA-Z0-9_-]{1,64}$）的 name
+// 确定性缩短为 <=64。已合法的名字原样返回；含非法字符（点号/空格/Unicode
+// 等）的短名折叠为 '_'；超长名保留原名的尾部相关段（通常是工具动作名），
+// 前缀加哈希后缀，保证同名输入稳定得到同一缩短名（跨请求可观察、可缓存），
+// 不同名几乎不碰撞（哈希 64 bit）。
 func shortenResponsesName(name string) string {
-	// 按 rune 截断，避免多字节字符被截坏（上限按字符而非字节解释）。
-	runes := []rune(name)
-	if len(runes) <= responsesMaxNameLength {
-		return name
-	}
-	sum := sha256.Sum256([]byte(name))
-	suffix := hex.EncodeToString(sum[:8]) // 16 hex chars
-	// 布局：[:keep] + "-" + suffix，总长恒为 64。
-	keep := responsesMaxNameLength - 1 - len(suffix) // 47
-	var b strings.Builder
-	b.Grow(responsesMaxNameLength)
-	b.WriteString(string(runes[:keep]))
-	b.WriteByte('-')
-	b.WriteString(suffix)
-	return b.String()
+	return shortenAnthropicToolName(name)
 }
 
 // responsesNameRewrites 记录出站缩短映射（original -> shortened）与
@@ -219,6 +204,15 @@ func shortenResponsesName(name string) string {
 type responsesNameRewrites struct {
 	outbound map[string]string // original -> shortened
 	inbound  map[string]string // shortened -> original
+	// mcpServers 登记缩短后的 server 名 -> 原始名，供响应侧 mcp__<server>__<tool>
+	// 复合名的前缀还原（mcp_servers[].name 被缩短时）。
+	mcpServers map[string]string
+	// mcpOutbound 登记原始 server 名 -> 缩短后名，供请求侧 mcp__<原始 server>__<tool>
+	// 复合名的历史回放改写（与 mcpServers 成对）。
+	mcpOutbound map[string]string
+	// taken 登记上游侧已占用的名字（合法直通 + 缩短结果），防折叠名与
+	// 声明过的合法名碰撞（"a.b" 折叠出的 "a_b" 抢注声明的 "a_b"）。
+	taken map[string]bool
 	// restoreStubCase 为 true(Claude 系客户端)时 restore fallback 才做
 	// 免费层小写占位名的大小写还原;其余保持小写透传。构造时一次性填定,
 	// 之后只读,无并发问题。
@@ -229,6 +223,9 @@ func newResponsesNameRewrites(restoreStubCase bool) *responsesNameRewrites {
 	return &responsesNameRewrites{
 		outbound:        map[string]string{},
 		inbound:         map[string]string{},
+		mcpServers:      map[string]string{},
+		mcpOutbound:     map[string]string{},
+		taken:           map[string]bool{},
 		restoreStubCase: restoreStubCase,
 	}
 }
@@ -237,28 +234,60 @@ func (rw *responsesNameRewrites) empty() bool {
 	return rw == nil || len(rw.outbound) == 0
 }
 
-// shortenRecord 缩短 name 并登记映射；<=64 或未变化时原样返回。
+// restoreNoop 还原侧快路径判定：无映射且不做占位名大小写还原 → 响应侧零
+// JSON 解析、字节原样。
+func (rw *responsesNameRewrites) restoreNoop() bool {
+	return rw == nil || (len(rw.inbound) == 0 && !rw.restoreStubCase)
+}
+
+// shortenRecord 缩短 name 并登记映射；已合法（直通快路径）时仅登记占用，
+// 不进映射（保持 inbound 空映射的快路径语义）。缩短结果与已占用名碰撞时
+// 确定性消歧。同一原名在同一请求内恒同一短名（tool_choice/历史与 tools[]
+// 必然一致）。
 func (rw *responsesNameRewrites) shortenRecord(name string) string {
+	if shortened, ok := rw.outbound[name]; ok {
+		return shortened // 缓存命中：同一原名恒同一短名
+	}
 	shortened := shortenResponsesName(name)
+	if name == "" {
+		// 上游要求 1-64；空名合成合法占位名，还原侧映射回 ""。
+		shortened = unnamedAnthropicToolName
+	}
 	if shortened == name {
+		if !rw.taken[name] {
+			rw.taken[name] = true // 合法名直通：仅登记占用，不进映射
+		}
 		return name
 	}
-	if existing, ok := rw.outbound[name]; ok && existing != "" {
-		return existing
+	if rw.taken[shortened] {
+		// 折叠名与直通名/已登记名碰撞（"a.b" 折叠出的 "a_b" 撞上声明的
+		// "a_b"）：确定性消歧为哈希形，双向映射保证两个原名都正确还原。
+		shortened = rw.disambiguate(name)
 	}
 	rw.outbound[name] = shortened
 	rw.inbound[shortened] = name
+	rw.taken[shortened] = true
 	return shortened
 }
 
 // restore 把上游响应里的缩短名还原为客户端原始名；未被我们缩短过的名字
 // 在 restoreStubCase 为 true(Claude 系客户端)时再退到免费层占位工具的
 // 大小写还原（restoreToolNameCase），覆盖只注入了门禁 stub、没有任何缩短
-// 映射的原生透传路径；都不命中时原样返回。
+// 映射的原生透传路径；mcp_servers[].name 被本请求缩短时，上游按缩短 server
+// 名拼出的 mcp__<short>__<tool> 复合名经前缀映射还原；都不命中时原样返回。
 func (rw *responsesNameRewrites) restore(name string) string {
 	if rw != nil {
 		if original, ok := rw.inbound[name]; ok {
 			return original
+		}
+		if len(rw.mcpServers) > 0 {
+			if after, ok := strings.CutPrefix(name, "mcp__"); ok {
+				if server, tool, found := strings.Cut(after, "__"); found {
+					if orig, ok := rw.mcpServers[server]; ok {
+						return "mcp__" + orig + "__" + tool
+					}
+				}
+			}
 		}
 		if rw.restoreStubCase {
 			return restoreToolNameCase(name)
@@ -270,9 +299,32 @@ func (rw *responsesNameRewrites) restore(name string) string {
 
 // shortenResponsesBodyNames 统一处理请求体中所有会出现 name 的位置：
 // tools[].name、tools[].function.name、tool_choice.name、input[].name
-// （function_call / custom_tool_call 等历史工具调用项）。返回是否发生改动。
+// （function_call / custom_tool_call 等历史工具调用项）。先做一轮 prepare
+// （合法直通名登记 taken，折叠名永不抢注声明过的合法名），再逐位置缩短。
+// 返回是否发生改动。
 func (rw *responsesNameRewrites) shortenResponsesBodyNames(body map[string]any) bool {
+	// prepare：合法直通名先占位 taken（仅登记，不改写）。
+	walkResponsesNames(body, func(name string) string {
+		if isAnthropicToolNameValid(name) {
+			rw.taken[name] = true
+		}
+		return name
+	})
+	changed := walkResponsesNames(body, rw.shortenRecord)
+	return changed
+}
+
+// walkResponsesNames 按 tools → tool_choice → input 的固定顺序遍历 body 中
+// 全部 name 位置并写回 mapFn 的返回值。返回是否发生改动。
+func walkResponsesNames(body map[string]any, mapFn func(string) string) bool {
 	changed := false
+	set := func(name string) string {
+		mapped := mapFn(name)
+		if mapped != name {
+			changed = true
+		}
+		return mapped
+	}
 	if tools, ok := body["tools"].([]any); ok {
 		for i, t := range tools {
 			tm, ok := t.(map[string]any)
@@ -280,19 +332,17 @@ func (rw *responsesNameRewrites) shortenResponsesBodyNames(body map[string]any) 
 				continue
 			}
 			if name, ok := tm["name"].(string); ok && name != "" {
-				if shortened := rw.shortenRecord(name); shortened != name {
+				if shortened := set(name); shortened != name {
 					tm["name"] = shortened
 					tools[i] = tm
-					changed = true
 				}
 			}
 			if fn, ok := tm["function"].(map[string]any); ok {
 				if name, ok := fn["name"].(string); ok && name != "" {
-					if shortened := rw.shortenRecord(name); shortened != name {
+					if shortened := set(name); shortened != name {
 						fn["name"] = shortened
 						tm["function"] = fn
 						tools[i] = tm
-						changed = true
 					}
 				}
 			}
@@ -302,19 +352,17 @@ func (rw *responsesNameRewrites) shortenResponsesBodyNames(body map[string]any) 
 		switch v := tc.(type) {
 		case map[string]any:
 			if name, ok := v["name"].(string); ok && name != "" {
-				if shortened := rw.shortenRecord(name); shortened != name {
+				if shortened := set(name); shortened != name {
 					v["name"] = shortened
 					body["tool_choice"] = v
-					changed = true
 				}
 			}
 			if fn, ok := v["function"].(map[string]any); ok {
 				if name, ok := fn["name"].(string); ok && name != "" {
-					if shortened := rw.shortenRecord(name); shortened != name {
+					if shortened := set(name); shortened != name {
 						fn["name"] = shortened
 						v["function"] = fn
 						body["tool_choice"] = v
-						changed = true
 					}
 				}
 			}
@@ -327,10 +375,9 @@ func (rw *responsesNameRewrites) shortenResponsesBodyNames(body map[string]any) 
 				continue
 			}
 			if name, ok := im["name"].(string); ok && name != "" {
-				if shortened := rw.shortenRecord(name); shortened != name {
+				if shortened := set(name); shortened != name {
 					im["name"] = shortened
 					input[i] = im
-					changed = true
 				}
 			}
 		}

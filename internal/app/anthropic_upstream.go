@@ -40,6 +40,13 @@ func forwardClaudeViaAnthropic(ctx context.Context, w http.ResponseWriter, auth 
 		if clampAnthropicProtocolMaxTokens(bodyMap, modelID) == 0 {
 			bodyMap["max_tokens"] = clampMaxTokens(defaultClaudeMaxTokens, config.MaxTokensCapFor(modelID))
 		}
+		// 工具名兼容：超长/非法字符 name 确定性缩短，消灭上游
+		// "`name` must be at most 64 characters" 类 400；映射注入 ctx 供
+		// 响应呈现面还原（重试重放同一已缩短 upstreamBody，跨 key 轮换稳定）。
+		rw := newResponsesNameRewrites(shouldRestoreToolCase(ctx))
+		if rw.shortenAnthropicBodyNames(bodyMap) {
+			ctx = withAnthropicNameRewrites(ctx, rw)
+		}
 		if b, err := json.Marshal(bodyMap); err == nil {
 			upstreamBody = b
 		}
@@ -137,13 +144,12 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 	// observeAnthropicStreamEvent 让 stats 与 message_start/stop 计数正确
 	// 累计——peek 消费过的帧不再二次进 reader.Read() 通道,所以这里必须补
 	// 一次观察。
-	// peek 消费的首帧也要过大小写还原(帧尾常与首个 content_block_start 同行,
-	// 而主循环的还原按行生效),否则首个 tool_use 的 name 会被原样透小写。
-	// 仅 Claude 系客户端还原,其余保持小写透传。
-	restoreCase := shouldRestoreToolCase(ctx)
+	// peek 消费的首帧也要过 name 还原(帧尾常与首个 content_block_start 同行,
+	// 而主循环的还原按行生效),否则首个 tool_use 的 name 会被原样透传。
+	rw := nameRewritesFor(ctx)
 	for _, res := range peek.Consumed {
 		if res.line != "" {
-			res.line = restoreAnthropicStreamLineCase(res.line, restoreCase)
+			res.line = restoreAnthropicStreamLine(res.line, rw)
 		}
 		if _, err := io.WriteString(w, res.line); err != nil {
 			return true, err
@@ -211,9 +217,9 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 			pendingErr := result.err
 			if line != "" {
 				observeLine(line)
-				// 免费层占位工具名大小写还原:仅 Claude 系客户端改写恰为
-				// 小写占位名的 tool_use name 帧,其余字节原样。
-				frameBuf.WriteString(restoreAnthropicStreamLineCase(line, restoreCase))
+				// name 还原(缩短名回原名 + 免费层占位名大小写,经 rw 统一
+				// 门控),未命中的行字节原样。
+				frameBuf.WriteString(restoreAnthropicStreamLine(line, rw))
 				// 空行 = 帧边界:整帧一次写出再 Flush。
 				if strings.TrimRight(line, "\r\n") == "" {
 					if err := flushFrame(); err != nil {
@@ -250,65 +256,9 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 	}
 }
 
-// restoreAnthropicStreamLineCase 对一行 SSE(含结尾 \n)做免费层占位工具的大小写
-// 还原:仅当 restoreCase 为 true(Claude 系客户端)且它是 "data: " 帧、事件为
-// content_block_start / content_block_delta 并携带恰为小写占位名的 tool_use
-// name 时改写该行,其余行(含 content_block_stop、input_json_delta 的
-// partial_json 文本、非 data 行)原样返回。改写只命中 keep 的
-// 名字段,不动其它字节(换行风格、字段顺序保持上游原样),供 byte-relay 路径在
-// 写给客户端前调用。幂等。restoreCase=false 时直接原样返回,不做 JSON 解析。
-func restoreAnthropicStreamLineCase(line string, restoreCase bool) string {
-	if !restoreCase {
-		return line
-	}
-	payload, ok := strings.CutPrefix(line, "data: ")
-	if !ok {
-		return line
-	}
-	trimmed := strings.TrimRight(payload, "\r\n")
-	if !strings.HasPrefix(trimmed, "{") {
-		return line
-	}
-	var evt map[string]any
-	if json.Unmarshal([]byte(trimmed), &evt) != nil {
-		return line
-	}
-	changed := false
-	if cb, ok := evt["content_block"].(map[string]any); ok {
-		if typ, _ := cb["type"].(string); typ == "tool_use" {
-			if n, _ := cb["name"].(string); n != "" {
-				if r := restoreToolNameCase(n); r != n {
-					cb["name"] = r
-					changed = true
-				}
-			}
-		}
-	}
-	// 兜底:某些上游把起始块放在 event.delta.content_block 而非顶层
-	// content_block;同样覆盖 delta 里偶发出现的 tool_use name。
-	if !changed {
-		if delta, ok := evt["delta"].(map[string]any); ok {
-			if cb, ok := delta["content_block"].(map[string]any); ok {
-				if typ, _ := cb["type"].(string); typ == "tool_use" {
-					if n, _ := cb["name"].(string); n != "" {
-						if r := restoreToolNameCase(n); r != n {
-							cb["name"] = r
-							changed = true
-						}
-					}
-				}
-			}
-		}
-	}
-	if !changed {
-		return line
-	}
-	b, err := json.Marshal(evt)
-	if err != nil {
-		return line
-	}
-	return "data: " + string(b) + "\n"
-}
+// restoreAnthropicStreamLineCase 与 restoreAnthropicBodyToolCase 的实现已抽入
+// name_compat.go（本文件保留调用点）；restoreAnthropicStreamLine /
+// restoreAnthropicBodyNames 为其带映射参数的一般化版本。
 
 // observeAnthropicStreamEvent 旁路解析一行 SSE，累计 usage 与流统计。
 func observeAnthropicStreamEvent(stats *logging.StreamStats, fullUsage map[string]any, line string) {
@@ -342,49 +292,6 @@ func observeAnthropicStreamEvent(stats *logging.StreamStats, fullUsage map[strin
 	}
 }
 
-// restoreAnthropicBodyToolCase 对一个完整的 Anthropic Messages JSON body 做免费层
-// 占位工具名的大小写还原:restoreCase 为 true(Claude 系客户端)时遍历 content
-// 数组,把恰为小写占位名(bash/glob/grep/read)的 tool_use block 的 name 还原为
-// 规范 PascalCase,assistant / tool_result / 其它块与所有其它字节原样。无法解析
-// 或无命中时原样返回(幂等)。restoreCase=false 时直接原样返回,不做 JSON 解析。
-// 供非流式 byte-relay 在写给客户端前调用。
-func restoreAnthropicBodyToolCase(body []byte, restoreCase bool) []byte {
-	if !restoreCase {
-		return body
-	}
-	var m map[string]any
-	if json.Unmarshal(body, &m) != nil {
-		return body
-	}
-	content, ok := m["content"].([]any)
-	if !ok {
-		return body
-	}
-	changed := false
-	for _, c := range content {
-		block, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if typ, _ := block["type"].(string); typ != "tool_use" {
-			continue
-		}
-		if n, _ := block["name"].(string); n != "" {
-			if r := restoreToolNameCase(n); r != n {
-				block["name"] = r
-				changed = true
-			}
-		}
-	}
-	if !changed {
-		return body
-	}
-	if b, err := json.Marshal(m); err == nil {
-		return b
-	}
-	return body
-}
-
 // relayAnthropicBuffered 非流式直通与直通路径错误透传（含流式请求下的上游
 // 非 2xx）：buffered 读回上游体，以 application/json + 原状态码保真写回，
 // 并解析 usage 记入 token 统计；上游错误体同时记入去重日志。
@@ -405,10 +312,10 @@ func relayAnthropicBuffered(ctx context.Context, w http.ResponseWriter, rc io.Re
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	// 非流式直通路径在写回前还原免费层占位工具的小写 tool_use name(仅
-	// Claude 系客户端),与流式 byte-relay 的 restoreAnthropicStreamLineCase
-	// 对应（幂等）。
-	w.Write(restoreAnthropicBodyToolCase(body, shouldRestoreToolCase(ctx)))
+	// 非流式直通路径在写回前还原 tool_use name(缩短名回原名 + 免费层占位
+	// 工具大小写,经 nameRewritesFor 统一门控),与流式 byte-relay 的
+	// restoreAnthropicStreamLine 对应（幂等）。
+	w.Write(restoreAnthropicBodyNames(body, nameRewritesFor(ctx)))
 
 	if status >= 200 && status < 300 {
 		var raw map[string]any

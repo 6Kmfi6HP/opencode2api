@@ -1033,7 +1033,11 @@ func recordClaudeResponsesUsage(model string, usage map[string]any) {
 // responses 返回 2xx 时才转换写回并记住该模型；任何失败都返回 false 且不写
 // 任何响应，调用方保留原翻译路径错误原样返回。
 func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, claudeReq ClaudeRequest, stream bool, wantReasoning bool) bool {
-	upstreamBody := claudeToResponsesBody(ctx, claudeReq, modelID)
+	// 工具名兼容：与 forwardClaudeViaResponses 同一缩短/还原（probe 请求带
+	// 超长名不再必败），映射注入 ctx 供流式/非流式响应还原。
+	rewrites := newResponsesNameRewrites(shouldRestoreToolCase(ctx))
+	ctx = withAnthropicNameRewrites(ctx, rewrites)
+	upstreamBody := sanitizeResponsesUpstreamBody(claudeToResponsesBody(ctx, claudeReq, modelID), rewrites)
 	rc, status, _, err := callOpenCodeEndpoint(ctx, "responses", upstreamBody, modelID, auth)
 	if err != nil || status < 200 || status >= 300 {
 		if rc != nil {
@@ -1060,6 +1064,9 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 	if readErr != nil {
 		return false
 	}
+	// 先还原缩短名（Responses 形 output[].function_call.name），转换器
+	// 天然携带客户端原始名。
+	respBody = restoreResponsesBodyNames(respBody, rewrites)
 	claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx))
 	result := logging.SummarizeClaudeResult(claudeBody)
 	logging.LogResult(ctx, result)
@@ -1080,7 +1087,12 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 // 写回；上游 4xx/5xx 转为 Claude 错误形状保真透传状态码；仅传输层错误
 // （拿不到上游响应）返回 false，调用方兜底。
 func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth UpstreamAuth, modelID string, claudeReq ClaudeRequest, stream bool, wantReasoning bool) bool {
-	upstreamBody := claudeToResponsesBody(ctx, claudeReq, modelID)
+	// 工具名兼容：超长/非法字符 name 确定性缩短（Responses 上游同 64 上限），
+	// 映射注入 ctx 供响应呈现面还原。重试重建的 body 用同一 rewrites
+	// （shortenRecord 缓存保证同名同短名）。
+	rewrites := newResponsesNameRewrites(shouldRestoreToolCase(ctx))
+	ctx = withAnthropicNameRewrites(ctx, rewrites)
+	upstreamBody := sanitizeResponsesUpstreamBody(claudeToResponsesBody(ctx, claudeReq, modelID), rewrites)
 	rc, status, _, err := callOpenCodeEndpoint(ctx, "responses", upstreamBody, modelID, auth)
 	if err != nil {
 		markNativeResponsesFailure(modelID)
@@ -1115,7 +1127,7 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 		// 才吞掉并让外层短路错误写回。
 		logging.FromContext(ctx).Warn("claude-responses non-stream body read failed, retrying same protocol",
 			"model", modelID, "status", status, "err", readErr)
-		upstreamBody := claudeToResponsesBody(ctx, claudeReq, modelID)
+		upstreamBody := sanitizeResponsesUpstreamBody(claudeToResponsesBody(ctx, claudeReq, modelID), rewrites)
 		rc2, status2, _, err2 := callOpenCodeEndpoint(ctx, "responses", upstreamBody, modelID, auth)
 		if err2 != nil || rc2 == nil {
 			markNativeResponsesFailure(modelID)
@@ -1132,6 +1144,7 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 			if writeClaudeResponsesUpstreamError(ctx, w, modelID, respBody2) {
 				return true
 			}
+			respBody2 = restoreResponsesBodyNames(respBody2, rewrites)
 			claudeBody := convertResponsesToClaude(respBody2, modelID, wantReasoning, shouldRestoreToolCase(ctx))
 			result := logging.SummarizeClaudeResult(claudeBody)
 			logging.LogResult(ctx, result)
@@ -1160,6 +1173,9 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 		if writeClaudeResponsesUpstreamError(ctx, w, modelID, respBody) {
 			return true
 		}
+		// 先还原缩短名（Responses 形 output[].function_call.name），转换器
+		// 天然携带客户端原始名。
+		respBody = restoreResponsesBodyNames(respBody, rewrites)
 		claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx))
 		result := logging.SummarizeClaudeResult(claudeBody)
 		logging.LogResult(ctx, result)
@@ -1219,7 +1235,12 @@ func claudeResponsesStreamWithRetry(ctx context.Context, w http.ResponseWriter, 
 			pending = nil
 			return rc, http.StatusOK, nil
 		}
-		rc, status, _, err := callOpenCodeEndpoint(ctx, "responses", claudeToResponsesBody(ctx, claudeReq, modelID), modelID, auth)
+		upstreamBody := claudeToResponsesBody(ctx, claudeReq, modelID)
+		// 重试重建的 body 过同一缩短（rewrites 缓存保证同名同短名）。
+		if rw := anthropicNameRewritesFromContext(ctx); rw != nil {
+			upstreamBody = sanitizeResponsesUpstreamBody(upstreamBody, rw)
+		}
+		rc, status, _, err := callOpenCodeEndpoint(ctx, "responses", upstreamBody, modelID, auth)
 		return rc, status, err
 	}
 	runOnce := func(ctx context.Context, w http.ResponseWriter, rc io.Reader, _ []streamReadResult, _ *streamReader) (bool, error) {
@@ -1478,6 +1499,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		emitText:        emitTextDelta,
 		emitThinking:    emitThinkingDelta,
 		emitTool:        emitToolDelta,
+		rewrites:        anthropicNameRewritesFromContext(ctx),
 		emitError:       emitError,
 	}
 
@@ -1680,6 +1702,9 @@ type claudeResponsesEmitter struct {
 	emitThinking    func(*claudeResponsesBlock, string)
 	emitTool        func(*claudeResponsesBlock, string)
 	emitError       func(string)
+	// rewrites 携带本请求的缩短名还原映射（anthropic/responses 上游边界
+	// 注入 ctx）；nil 安全（restore 原样返回）。
+	rewrites *responsesNameRewrites
 }
 
 // handleEvent translates a single Responses SSE event into Claude events.
@@ -1745,6 +1770,11 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 				callID, _ = item["id"].(string)
 			}
 			name, _ := item["name"].(string)
+			// 上游缩短名还原为客户端原始名（覆盖 content_block_start 的
+			// emit；emit 侧 restoreToolNameCase 兜底对还原后的原名幂等）。
+			if e.rewrites != nil {
+				name = e.rewrites.restore(name)
+			}
 			if outputIndex >= 0 {
 				b := e.getOrCreate(outputIndex, "tool")
 				if b.claudeIndex < 0 {

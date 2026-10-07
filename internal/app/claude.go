@@ -1538,10 +1538,15 @@ loop:
 												}
 												fn, _ := tc["function"].(map[string]any)
 												rawName, _ := fn["name"].(string)
+												// 工具名还原：ctx 携带缩短映射时经映射回原名
+												// （未来任何上游侧加缩短即自动安全，现状该
+												// 路径发 chat 上游无映射恒走 else 分支）；
 												// 免费层小写占位工具名仅对 Claude 系客户端
 												// 还原为规范大小写(见 restoreToolNameCase)。
 												name := rawName
-												if restoreCase {
+												if rw := anthropicNameRewritesFromContext(ctx); rw != nil {
+													name = rw.restore(rawName)
+												} else if restoreCase {
 													name = restoreToolNameCase(rawName)
 												}
 												toolCallAccumulator[upstreamIndex] = map[string]string{
