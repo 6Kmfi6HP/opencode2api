@@ -121,3 +121,69 @@ func TestWriteClaudeResponsesUpstreamError_PassthroughSuccess(t *testing.T) {
 		t.Fatalf("success shape must not be relayed as error")
 	}
 }
+
+// extractResponsesJsonFromSse: 免费层上游强制 stream:true,客户端非流时
+// 从 Responses SSE 提取 response.completed 的完整 response JSON;非 SSE
+// 原样返回(幂等)。
+func TestExtractResponsesJsonFromSse(t *testing.T) {
+	sse := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}` + "\n\n" +
+		"event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"hello"}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":10,"output_tokens":5}}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	got := extractResponsesJsonFromSse([]byte(sse))
+	var m map[string]any
+	if err := json.Unmarshal(got, &m); err != nil {
+		t.Fatalf("SSE not extracted to JSON: %v (%q)", err, string(got))
+	}
+	if id, _ := m["id"].(string); id != "resp_1" {
+		t.Fatalf("id = %v, want resp_1", m["id"])
+	}
+	if status, _ := m["status"].(string); status != "completed" {
+		t.Fatalf("status = %v, want completed", m["status"])
+	}
+	if _, ok := m["usage"]; !ok {
+		t.Fatalf("usage missing in extracted response")
+	}
+
+	// 已是 JSON 的 body 原样返回。
+	jsonBody := []byte(`{"id":"resp_2","status":"completed"}`)
+	if got := extractResponsesJsonFromSse(jsonBody); string(got) != string(jsonBody) {
+		t.Fatalf("JSON body must pass through, got %q", string(got))
+	}
+
+	// 空体原样返回。
+	if got := extractResponsesJsonFromSse(nil); len(got) != 0 {
+		t.Fatalf("empty body must pass through, got %q", string(got))
+	}
+
+	// SSE 里无 completed 事件(不完整流)时原样返回,交给上层既有处理。
+	partial := "event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n"
+	if got := extractResponsesJsonFromSse([]byte(partial)); string(got) != partial {
+		t.Fatalf("SSE without completed event must pass through, got %q", string(got))
+	}
+}
+
+// 免费层非流请求端到端:上游强制 stream:true 返回 SSE 时,非流分支聚合出
+// 完整 Claude JSON(而非空响应)。模拟 buildOCRequestWithSubpath 的强制流。
+func TestForwardClaudeViaResponses_NonStreamAggregatesForcedSSE(t *testing.T) {
+	sse := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_9","status":"in_progress"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_9","status":"completed","model":"muse-spark-1.3-contributor-free","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":12,"output_tokens":3}}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	body := extractResponsesJsonFromSse([]byte(sse))
+	claudeBody := convertResponsesToClaude(body, "muse-spark-1.3-contributor-free", false, false)
+	var out map[string]any
+	if err := json.Unmarshal(claudeBody, &out); err != nil {
+		t.Fatalf("aggregated SSE not convertible: %v", err)
+	}
+	content, _ := out["content"].([]any)
+	if len(content) == 0 {
+		t.Fatalf("aggregated body has no content blocks: %s", string(claudeBody))
+	}
+}

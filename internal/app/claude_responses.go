@@ -975,6 +975,48 @@ func isResponsesErrorBody(respBody []byte) bool {
 // writeClaudeResponsesUpstreamError 把 error 形上游包体转为 Claude 错误形状
 // 写回（状态码 502：上游 HTTP 2xx 但包 error，本质上游故障）。返回 true
 // 表示已写回，调用方直接 return true 即可。
+// extractResponsesJsonFromSse 处理免费层上游强制 stream:true 的场景：客户端
+// 声明非流式（stream:false）时上游仍返回 Responses SSE，非流分支直接
+// unmarshal 会失败（invalid character 'e'，body 以 event: 开头）并返回空
+// 响应。这里从 SSE 里提取最后一个 response.completed/incomplete/failed 事件
+// 的完整 response JSON（该事件自带 output/usage 全量），body 不是 Responses
+// SSE（已是 JSON、空体等）时原样返回，幂等。
+func extractResponsesJsonFromSse(body []byte) []byte {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || (!bytes.HasPrefix(trimmed, []byte("event:")) && !bytes.HasPrefix(trimmed, []byte("data:"))) {
+		return body
+	}
+	var last map[string]any
+	for _, rawLine := range bytes.Split(trimmed, []byte("\n")) {
+		line := bytes.TrimSpace(rawLine)
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[6:])
+		if string(payload) == "[DONE]" {
+			break
+		}
+		var evt map[string]any
+		if json.Unmarshal(payload, &evt) != nil {
+			continue
+		}
+		switch typ, _ := evt["type"].(string); typ {
+		case "response.completed", "response.incomplete", "response.failed":
+			if resp, ok := evt["response"].(map[string]any); ok {
+				last = resp
+			}
+		}
+	}
+	if last == nil {
+		return body
+	}
+	out, err := json.Marshal(last)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 func writeClaudeResponsesUpstreamError(ctx context.Context, w http.ResponseWriter, modelID string, respBody []byte) bool {
 	if !isResponsesErrorBody(respBody) {
 		return false
@@ -1065,6 +1107,8 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 	if readErr != nil {
 		return false
 	}
+	// 免费层上游强制 stream:true，客户端非流时先从 SSE 提取 response JSON。
+	respBody = extractResponsesJsonFromSse(respBody)
 	// 先还原缩短名（Responses 形 output[].function_call.name），转换器
 	// 天然携带客户端原始名。
 	respBody = restoreResponsesBodyNames(respBody, rewrites)
@@ -1141,6 +1185,8 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 			return false
 		}
 		if status2 >= 200 && status2 < 300 {
+			// 免费层上游强制 stream:true，客户端非流时先从 SSE 提取 response JSON。
+			respBody2 = extractResponsesJsonFromSse(respBody2)
 			// 上游 200 包 error 时透传 502，不吞成空消息。
 			if writeClaudeResponsesUpstreamError(ctx, w, modelID, respBody2) {
 				return true
@@ -1170,6 +1216,8 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 	}
 
 	if status >= 200 && status < 300 {
+		// 免费层上游强制 stream:true，客户端非流时先从 SSE 提取 response JSON。
+		respBody = extractResponsesJsonFromSse(respBody)
 		// 上游 200 包 error 时透传 502，不吞成空消息。
 		if writeClaudeResponsesUpstreamError(ctx, w, modelID, respBody) {
 			return true
