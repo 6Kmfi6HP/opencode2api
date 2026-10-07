@@ -109,8 +109,7 @@
 ### Best-effort
 
 - Responses 会通过 Chat Completions 上游实现；内置工具被编码为函数工具后再还原。
-- 已确认只支持原生上游 `/responses` 端点的模型（静态预置、`native_responses_models` 配置项、运行时探测记忆）跳过 Chat 翻译，直接保真透传，上游 4xx/5xx 状态码与错误体原样返回。
-  唯一例外：上游因回放的 reasoning `encrypted_content` 不属于当前发起方而 400（`was not issued to this caller`，通常发生在 sticky 出口/域名改绑之后）时，网关会剥掉 `input` 中 reasoning item 的 `id` 与 `encrypted_content` 后重发一次；可见对话内容不变，仅不再回放旧推理密文。详见 `responses-compatibility-analysis.md` §9.7。
+- `/v1/responses` 入站只走翻译路径（Chat / Anthropic 上游），不透传到上游原生 `/responses` 端点。Chat 与 Claude Messages 入站在 Chat 翻译失败后仍会回退探测上游原生 `/responses`（请求与响应在网关内自动转换，路由见 `native_responses_models` 配置项）。
 - 仅在上游实际返回 reasoning 时生成 reasoning output item。
 - `input` 中的 top-level item 或 message content 可使用 `input_file`；支持 flat 字段 `file_data`、`file_id`、`file_url`、`filename` 以及 nested `input_file` object，并映射为 `{type:"file",file:{...}}`。模型不支持 file 模态时上游可能拒绝。
 
@@ -154,6 +153,14 @@ curl http://127.0.0.1:8000/v1/responses \
 - JSON Schema 约束字段（包括 `additionalParameters`、`format`）
 - stop reason、usage 以及流式 content block 配对
 - `/v1/messages/count_tokens`：`protocol_rules` 命中 anthropic 上游时直连 `/zen/v1/messages/count_tokens` 透传取精确计数；未命中、仅命中 chat/responses 或上游失败时回落本地启发式（chat 上游对 thinking 的采样参数互斥剥参同样生效）
+
+### 工具名兼容（避免上游 `name` 400）
+
+- 上游 Anthropic Messages 强制 `tools[].name` / `tool_choice.name` / 历史 `tool_use.name` / `mcp_servers[].name` 满足 `^[a-zA-Z0-9_-]{1,64}$`。客户端合法发出的超长名（如 MCP 风格 `mcp__server__very_long_tool`）或含非法字符名（点号、空格、Unicode）会在发往 anthropic 上游前确定性改写：合法名直通不变；含非法字符的短名按 rune 折叠为 `_`（可读前缀保留）；超长名取折叠前缀 + 原名 sha256 后 8 字节十六进制（恒 64 字符）。
+- 映射为纯函数（sha256 派生）：同一原始名跨请求、跨网关重启、跨轮历史回放、跨 key 轮换重试恒得同一短名；`tool_choice` 与历史 `tool_use` 与 `tools[]` 三处必然一致。
+- 折叠/缩短结果与已声明合法名碰撞时确定性消歧（哈希形），双向映射保证还原。
+- 响应侧（流式 content_block、非流式 content、跨协议 Chat/Responses 转换）按相反映射还原，客户端看到的名字与所发逐字节一致；`mcp_servers[].name` 被缩短时，上游拼出的 `mcp__<缩短 server>__<tool>` 复合名同样还原。
+- 全部名字已合法时不改写任何字节（快路径）；Claude/Chat 入站走 Responses 上游的桥接路径（`chat_to_responses_upstream.go` / `claude_responses.go`）的超长名缩短复用同一机制并额外获得字符集折叠。
 
 ### Best-effort / 显式丢弃（可观测）
 

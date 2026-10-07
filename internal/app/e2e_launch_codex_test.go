@@ -19,19 +19,21 @@ import (
 // TestE2ELaunchCodex drives a real `opencode2api launch codex` subprocess (built
 // from this tree, or OPENCODE2API_BIN when prebuilt) with the real codex CLI as
 // the agent client, against an in-process fake upstream speaking the OpenAI
-// Responses SSE protocol. It asserts the full round trip:
+// chat completions SSE protocol. /v1/responses 只走翻译路径（原生透传已移除），
+// 所以 fake 上游说的是 chat/completions。It asserts the full round trip:
 //
-//  1. codex emits a streaming /responses request (stream=true, instructions set,
-//     store=false, include contains reasoning.encrypted_content); the proxy
-//     forwards it natively (protocol_rules "*" → responses passthrough).
-//  2. The proxy relays the Response SSE event sequence untouched
-//     (response.created → output_item.added → content_part/delta/done →
-//     response.completed with usage) and codex accepts it.
-//  3. Second turn: fake upstream streams a function_call (shell tool), codex
-//     executes `cat /etc/hostname` in a read-only sandbox and answers with a
-//     function_call_output echoing the original call_id, which the fake
-//     upstream must observe on turn 2 before replying "E2E_FILE_READ_OK".
-//  4. codex exits 0 after the final response.completed.
+//  1. codex emits a streaming /responses request (stream=true, instructions
+//     set); the proxy translates it into a /zen/v1/chat/completions request
+//     (default chat translation path).
+//  2. The proxy converts the chat SSE back into Responses events
+//     (response.created → output_item.added → function_call_arguments.delta/
+//     done → output_item.done → response.completed with usage) and codex
+//     accepts it.
+//  3. Second turn: fake upstream streams a tool_call (shell tool), codex
+//     executes `hostname` in a read-only sandbox and answers with a tool
+//     message echoing the original call_id, which the fake upstream must
+//     observe on turn 2 before replying "E2E_FILE_READ_OK".
+//  4. codex exits 0 after the final response.
 //
 // Requires the codex CLI on PATH (or ~/.local/bin/codex); skipped otherwise.
 func TestE2ELaunchCodex(t *testing.T) {
@@ -39,15 +41,12 @@ func TestE2ELaunchCodex(t *testing.T) {
 	binPath := buildE2EBinary(t)
 	port := freeTCPPort(t)
 
-	fake := newFakeResponsesUpstream(t)
+	fake := newFakeChatUpstream(t)
 
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "config.json")
 	cfg := map[string]any{
 		"upstream_base_urls": []string{fake.srv.URL},
-		"protocol_rules": []map[string]string{
-			{"pattern": "*", "protocol": "responses"},
-		},
 		// Point at the repo-tracked cache so launch skips the (test-blocked)
 		// network fetch of models.dev.
 		"text_only_models": []string{},
@@ -133,11 +132,10 @@ func TestE2ELaunchCodex(t *testing.T) {
 	}
 
 	turns := fake.Turns()
-	t.Logf("fake upstream saw %d /zen/v1/responses request(s)", len(turns))
+	t.Logf("fake upstream saw %d /zen/v1/chat/completions request(s)", len(turns))
 	for i, turn := range turns {
-		t.Logf("turn %d: stream=%v store=%v include=%v instructions_len=%d input_types=%v msg_roles=%v",
-			i, turn.Stream, ptrBoolStr(turn.Store), turn.Include, len(turn.Instructions),
-			turn.InputTypes, turn.FunctionOutputs)
+		t.Logf("turn %d: stream=%v model=%q tool_names=%v msg_roles=%v",
+			i, turn.Stream, turn.Model, turn.ToolNames, messageRoles(turn.Messages))
 	}
 
 	if exitErr != nil {
@@ -147,74 +145,43 @@ func TestE2ELaunchCodex(t *testing.T) {
 
 	if len(turns) < 2 {
 		dump()
-		t.Fatalf("fake upstream saw %d /zen/v1/responses request(s), want >= 2 (second turn proves codex consumed the streamed function_call and sent function_call_output back)", len(turns))
+		t.Fatalf("fake upstream saw %d /zen/v1/chat/completions request(s), want >= 2 (second turn proves codex consumed the streamed tool_call and sent the tool result back)", len(turns))
 	}
 
-	// Turn 1: codex must send a canonical Responses streaming request.
+	// Turn 1: the proxy must translate codex's Responses request into a chat
+	// completions request (instructions → system message, tools → function
+	// tools) and stream it upstream.
 	first := turns[0]
 	if !first.Stream {
 		t.Errorf("turn 1: stream = %v, want true", first.Stream)
 	}
-	if strings.TrimSpace(first.Instructions) == "" {
-		t.Error("turn 1: instructions empty; codex always sends its coding-agent system prompt")
+	if first.Model != "gpt-5-codex" {
+		t.Errorf("turn 1: model = %q, want gpt-5-codex", first.Model)
 	}
-	if first.Store == nil || *first.Store {
-		t.Errorf("turn 1: store = %v, want explicit false (codex is stateless)", ptrBoolStr(first.Store))
+	if len(first.Messages) == 0 || first.Messages[0].Role != "system" {
+		t.Errorf("turn 1: messages = %v, want system message first (codex instructions translated)", messageRoles(first.Messages))
 	}
-	if !containsStr(first.Include, "reasoning.encrypted_content") {
-		t.Errorf("turn 1: include = %v, want reasoning.encrypted_content", first.Include)
-	}
-	if !containsStr(first.InputTypes, "message") {
-		t.Errorf("turn 1: input item types = %v, want at least one message item", first.InputTypes)
+	if len(first.ToolNames) == 0 {
+		t.Errorf("turn 1: tools empty; codex function tools must be translated upstream")
 	}
 
-	// The SSE sequence codex consumed from the proxy is captured verbatim on
-	// the fake upstream side; assert the codex-required event chain shape.
-	assertEventsContain(t, "turn 1", first.Events, []string{
-		"response.created",
-		"response.output_item.added",
-		"response.function_call_arguments.delta",
-		"response.function_call_arguments.done",
-		"response.output_item.done",
-		"response.completed",
-	})
-	if first.CompletedUsage == nil {
-		t.Error("turn 1: response.completed carried no usage")
-	}
-
-	// Turn 2: codex must answer the function_call under the same call_id;
-	// the fake responded with the plain-text message "E2E_FILE_READ_OK".
+	// Turn 2: codex must answer the tool_call under the same call_id; the
+	// fake responded with the plain-text message "E2E_FILE_READ_OK".
 	second := turns[1]
-	if len(second.FunctionOutputs) == 0 {
+	toolMsg := firstToolMessage(second.Messages)
+	if toolMsg == nil {
 		dump()
-		t.Fatalf("turn 2: no function_call_output item in input; input types = %v", second.InputTypes)
+		t.Fatalf("turn 2: no tool message in chat messages; roles = %v", messageRoles(second.Messages))
 	}
-	out := second.FunctionOutputs[0]
-	if out.CallID != fakeCallID {
-		t.Errorf("turn 2: function_call_output.call_id = %q, want %q (echo of turn-1 shell call)", out.CallID, fakeCallID)
+	if toolMsg.ToolCallID != fakeCallID {
+		t.Errorf("turn 2: tool message tool_call_id = %q, want %q (echo of turn-1 shell call)", toolMsg.ToolCallID, fakeCallID)
 	}
-	if !strings.Contains(out.Output, "Process exited with code 0") {
+	if !strings.Contains(toolMsg.Content, "Process exited with code 0") {
 		// `hostname` runs under a read-only macOS sandbox; codex wraps the
 		// result as text starting with `Chunk ID` and ending in "Process
 		// exited with code 0". A zero exit code proves codex executed the
-		// function_call locally and produced an output.
-		t.Errorf("turn 2: function_call_output.output missing zero-exit marker; got %q", truncate(out.Output, 200))
-	}
-	assertEventsContain(t, "turn 2", second.Events, []string{
-		"response.created",
-		"response.output_item.added",
-		"response.content_part.added",
-		"response.output_text.delta",
-		"response.output_text.done",
-		"response.output_item.done",
-		"response.completed",
-	})
-	for i, evt := range second.Events {
-		if evt.Type == "response.output_text.delta" {
-			if _, ok := evt.Raw["logprobs"]; !ok {
-				t.Errorf("turn 2 event %d (response.output_text.delta) missing logprobs field", i)
-			}
-		}
+		// tool_call locally and produced an output.
+		t.Errorf("turn 2: tool message content missing zero-exit marker; got %q", truncate(toolMsg.Content, 200))
 	}
 
 	if !strings.Contains(string(stdout), "E2E_FILE_READ_OK") {
@@ -231,40 +198,30 @@ func TestE2ELaunchCodex(t *testing.T) {
 
 const fakeCallID = "call_e2e_1"
 
-type fakeSSEEvent struct {
-	Seq  int            `json:"sequence_number"`
-	Type string         `json:"type"`
-	Raw  map[string]any `json:"-"`
+type fakeChatMessage struct {
+	Role       string
+	Content    string
+	ToolCallID string
+	ToolNames  []string // assistant tool_calls function names
 }
 
-type fakeFunctionCallOutput struct {
-	CallID string
-	Output string
+type fakeChatTurn struct {
+	Stream    bool
+	Model     string
+	Messages  []fakeChatMessage
+	ToolNames []string // declared function tools
 }
 
-type fakeTurn struct {
-	Stream          bool
-	Store           *bool
-	Include         []string
-	Instructions    string
-	InputTypes      []string
-	MessageRoles    []string
-	FunctionOutputs []fakeFunctionCallOutput
-	Events          []fakeSSEEvent
-	CompletedUsage  map[string]any
-	Model           string
-}
-
-type fakeResponsesUpstream struct {
+type fakeChatUpstream struct {
 	t      *testing.T
 	srv    *httptest.Server
-	turns  []fakeTurn // only appended from handleResponses, read after process exit
+	turns  []fakeChatTurn // only appended from handleChatCompletions, read after process exit
 	models atomic.Int32
 }
 
-func newFakeResponsesUpstream(t *testing.T) *fakeResponsesUpstream {
+func newFakeChatUpstream(t *testing.T) *fakeChatUpstream {
 	t.Helper()
-	f := &fakeResponsesUpstream{t: t}
+	f := &fakeChatUpstream{t: t}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -272,13 +229,13 @@ func newFakeResponsesUpstream(t *testing.T) *fakeResponsesUpstream {
 
 // Turns snapshots the recorded requests. Safe to call only after the codex
 // subprocess has exited (handlers and the test goroutine no longer race).
-func (f *fakeResponsesUpstream) Turns() []fakeTurn {
-	cp := make([]fakeTurn, len(f.turns))
+func (f *fakeChatUpstream) Turns() []fakeChatTurn {
+	cp := make([]fakeChatTurn, len(f.turns))
 	copy(cp, f.turns)
 	return cp
 }
 
-func (f *fakeResponsesUpstream) handle(w http.ResponseWriter, r *http.Request) {
+func (f *fakeChatUpstream) handle(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && (r.URL.Path == "/zen/v1/models" || r.URL.Path == "/zen/go/v1/models"):
 		f.models.Add(1)
@@ -290,73 +247,67 @@ func (f *fakeResponsesUpstream) handle(w http.ResponseWriter, r *http.Request) {
 		// Two IDs: buildCodexModelCatalogSpecs needs at least the launched
 		// model in the startup catalog or codex receives no catalog at all.
 		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5-codex","object":"model"},{"id":"big-pickle","object":"model"}]}`))
-	case r.Method == http.MethodPost && r.URL.Path == "/zen/v1/responses":
-		f.handleResponses(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/zen/v1/chat/completions":
+		f.handleChatCompletions(w, r)
 	default:
 		http.Error(w, "unexpected path: "+r.Method+" "+r.URL.Path, http.StatusNotFound)
 	}
 }
 
-func (f *fakeResponsesUpstream) handleResponses(w http.ResponseWriter, r *http.Request) {
+func (f *fakeChatUpstream) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	var req map[string]any
+	var req struct {
+		Model    string `json:"model"`
+		Stream   bool   `json:"stream"`
+		Messages []struct {
+			Role       string `json:"role"`
+			Content    any    `json:"content"`
+			ToolCallID string `json:"tool_call_id"`
+			ToolCalls  []struct {
+				ID       string `json:"id"`
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"messages"`
+		Tools []struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	turn := fakeTurn{}
-	turn.Model, _ = req["model"].(string)
-	turn.Stream, _ = req["stream"].(bool)
-	if s, ok := req["store"].(bool); ok {
-		turn.Store = &s
-	}
-	turn.Instructions, _ = req["instructions"].(string)
-	if inc, ok := req["include"].([]any); ok {
-		for _, v := range inc {
-			if s, ok := v.(string); ok {
-				turn.Include = append(turn.Include, s)
-			}
+	turn := fakeChatTurn{Stream: req.Stream, Model: req.Model}
+	for _, tl := range req.Tools {
+		if tl.Function.Name != "" {
+			turn.ToolNames = append(turn.ToolNames, tl.Function.Name)
 		}
 	}
 	secondTurn := false
-	if input, ok := req["input"].([]any); ok {
-		for _, item := range input {
-			m, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			typ, _ := m["type"].(string)
-			turn.InputTypes = append(turn.InputTypes, typ)
-			switch typ {
-			case "message":
-				if role, ok := m["role"].(string); ok {
-					turn.MessageRoles = append(turn.MessageRoles, role)
-				}
-			case "function_call_output", "local_shell_call_output":
-				secondTurn = true
-				out := fakeFunctionCallOutput{}
-				out.CallID, _ = m["call_id"].(string)
-				if v, ok := m["output"].(string); ok {
-					out.Output = v
-				} else if raw, err := json.Marshal(m["output"]); err == nil && len(raw) > 0 && string(raw) != "null" {
-					out.Output = string(raw)
-				}
-				turn.FunctionOutputs = append(turn.FunctionOutputs, out)
+	for _, m := range req.Messages {
+		msg := fakeChatMessage{Role: m.Role, ToolCallID: m.ToolCallID}
+		if s, ok := m.Content.(string); ok {
+			msg.Content = s
+		} else if m.Content != nil {
+			if raw, err := json.Marshal(m.Content); err == nil {
+				msg.Content = string(raw)
 			}
 		}
-	}
-
-	events, completedResponse := buildTurnSSE(turn, secondTurn)
-	for _, evt := range events {
-		turn.Events = append(turn.Events, fakeSSEEvent{Seq: seqOf(evt), Type: typeOf(evt), Raw: evt})
-	}
-	if u, ok := completedResponse["usage"].(map[string]any); ok {
-		turn.CompletedUsage = u
+		for _, tc := range m.ToolCalls {
+			msg.ToolNames = append(msg.ToolNames, tc.Function.Name)
+		}
+		if m.Role == "tool" {
+			secondTurn = true
+		}
+		turn.Messages = append(turn.Messages, msg)
 	}
 	f.turns = append(f.turns, turn)
 
@@ -368,153 +319,79 @@ func (f *fakeResponsesUpstream) handleResponses(w http.ResponseWriter, r *http.R
 	if flusher != nil {
 		flusher.Flush()
 	}
-	for _, evt := range events {
-		name, _ := evt["type"].(string)
-		data, err := json.Marshal(evt)
-		if err != nil {
-			f.t.Errorf("marshal SSE event: %v", err)
-			return
+	chunk := func(delta map[string]any, finish string, usage map[string]any) bool {
+		c := map[string]any{
+			"id":      "chatcmpl_e2e",
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   req.Model,
 		}
-		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, data); err != nil {
-			return // client went away
+		if usage != nil {
+			c["choices"] = []any{}
+			c["usage"] = usage
+		} else {
+			c["choices"] = []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}
+		}
+		data, err := json.Marshal(c)
+		if err != nil {
+			f.t.Errorf("marshal SSE chunk: %v", err)
+			return false
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			return false // client went away
 		}
 		if flusher != nil {
 			flusher.Flush()
 		}
+		return true
 	}
+
+	_ = chunk(map[string]any{"role": "assistant"}, "", nil)
+	if !secondTurn {
+		// codex's shell tool answers as a function tool call named
+		// `exec_command` (its ToolSpec name); arguments are a JSON string
+		// with { cmd, workdir?, yield_time_ms?, max_output_tokens? }.
+		args := `{"cmd":"hostname","workdir":"/tmp","yield_time_ms":10000}`
+		// Stream the arguments in two chunks so codex exercises the delta path.
+		_ = chunk(map[string]any{"tool_calls": []any{map[string]any{
+			"index": 0, "id": fakeCallID, "type": "function",
+			"function": map[string]any{"name": "exec_command", "arguments": args[:len(args)/2]},
+		}}}, "", nil)
+		_ = chunk(map[string]any{"tool_calls": []any{map[string]any{
+			"index":    0,
+			"function": map[string]any{"arguments": args[len(args)/2:]},
+		}}}, "", nil)
+		_ = chunk(map[string]any{}, "tool_calls", nil)
+	} else {
+		_ = chunk(map[string]any{"content": "E2E_FILE_READ_OK"}, "", nil)
+		_ = chunk(map[string]any{}, "stop", nil)
+	}
+	_ = chunk(nil, "", map[string]any{
+		"prompt_tokens":     1200,
+		"completion_tokens": 42,
+		"total_tokens":      1242,
+	})
 	_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	if flusher != nil {
 		flusher.Flush()
 	}
 }
 
-// buildTurnSSE renders a canonical Responses streaming session for one turn.
-// Second turns (tool result submitted) answer with a plain assistant message;
-// the first turn issues a single local_shell_call (codex's native shell tool,
-// mapped to "local_shell_call" items by codex's ResponseItem serde).
-func buildTurnSSE(turn fakeTurn, secondTurn bool) (events []map[string]any, completedResponse map[string]any) {
-	respID := fmt.Sprintf("resp_e2e_%d", len(turn.InputTypes))
-	if secondTurn {
-		respID += "_t2"
+func messageRoles(msgs []fakeChatMessage) []string {
+	roles := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		roles = append(roles, m.Role)
 	}
-	createdAt := time.Now().Unix()
-	model := turn.Model
-	if model == "" {
-		model = "gpt-5-codex"
-	}
-	seq := 0
-	next := func() int { seq++; return seq }
-
-	responseShell := func(status string) map[string]any {
-		return map[string]any{
-			"id":         respID,
-			"object":     "response",
-			"created_at": createdAt,
-			"status":     status,
-			"background": false,
-			"error":      nil,
-			"model":      model,
-			"output":     []any{},
-		}
-	}
-	appendEvt := func(name string, payload map[string]any) {
-		payload["type"] = name
-		payload["sequence_number"] = next()
-		events = append(events, payload)
-	}
-
-	appendEvt("response.created", map[string]any{"response": responseShell("in_progress")})
-	appendEvt("response.in_progress", map[string]any{"response": responseShell("in_progress")})
-
-	var output []any
-	if !secondTurn {
-		// codex's shell tool ships as a `function_call` named `exec_command`
-		// (its ToolSpec name); arguments are a JSON string with
-		// { cmd, workdir?, yield_time_ms?, max_output_tokens? }.
-		fcID := "fc_" + fakeCallID
-		// `hostname` is a single binary with no /etc/hostname dependency,
-		// available and readable under codex's read-only macOS sandbox.
-		args := `{"cmd":"hostname","workdir":"/tmp","yield_time_ms":10000}`
-		itemInProgress := map[string]any{
-			"id": fcID, "type": "function_call", "status": "in_progress",
-			"call_id": fakeCallID, "name": "exec_command", "arguments": "",
-		}
-		appendEvt("response.output_item.added", map[string]any{"output_index": 0, "item": itemInProgress})
-		// Stream the arguments in two chunks so codex exercises the delta path.
-		appendEvt("response.function_call_arguments.delta", map[string]any{
-			"item_id": fcID, "output_index": 0, "delta": args[:len(args)/2],
-		})
-		appendEvt("response.function_call_arguments.delta", map[string]any{
-			"item_id": fcID, "output_index": 0, "delta": args[len(args)/2:],
-		})
-		appendEvt("response.function_call_arguments.done", map[string]any{
-			"item_id": fcID, "output_index": 0, "name": "exec_command", "arguments": args,
-		})
-		itemDone := map[string]any{
-			"id": fcID, "type": "function_call", "status": "completed",
-			"call_id": fakeCallID, "name": "exec_command", "arguments": args,
-		}
-		appendEvt("response.output_item.done", map[string]any{"output_index": 0, "item": itemDone})
-		output = append(output, itemDone)
-	} else {
-		msgID := respID + "_msg0"
-		text := "E2E_FILE_READ_OK"
-		msgInProgress := map[string]any{
-			"id": msgID, "type": "message", "status": "in_progress",
-			"role": "assistant", "content": []any{},
-		}
-		appendEvt("response.output_item.added", map[string]any{"output_index": 0, "item": msgInProgress})
-		part := map[string]any{
-			"type": "output_text", "text": "", "annotations": []any{}, "logprobs": []any{},
-		}
-		appendEvt("response.content_part.added", map[string]any{
-			"item_id": msgID, "output_index": 0, "content_index": 0, "part": part,
-		})
-		appendEvt("response.output_text.delta", map[string]any{
-			"item_id": msgID, "output_index": 0, "content_index": 0,
-			"delta": text, "logprobs": []any{},
-		})
-		appendEvt("response.output_text.done", map[string]any{
-			"item_id": msgID, "output_index": 0, "content_index": 0,
-			"text": text, "logprobs": []any{},
-		})
-		partDone := map[string]any{
-			"type": "output_text", "text": text, "annotations": []any{}, "logprobs": []any{},
-		}
-		appendEvt("response.content_part.done", map[string]any{
-			"item_id": msgID, "output_index": 0, "content_index": 0, "part": partDone,
-		})
-		msgDone := map[string]any{
-			"id": msgID, "type": "message", "status": "completed",
-			"role": "assistant", "content": []any{partDone},
-		}
-		appendEvt("response.output_item.done", map[string]any{"output_index": 0, "item": msgDone})
-		output = append(output, msgDone)
-	}
-
-	completedResponse = responseShell("completed")
-	completedResponse["output"] = output
-	completedResponse["usage"] = map[string]any{
-		"input_tokens":          1200,
-		"input_tokens_details":  map[string]any{"cached_tokens": 256},
-		"output_tokens":         42,
-		"output_tokens_details": map[string]any{"reasoning_tokens": 16},
-		"total_tokens":          1242,
-	}
-	appendEvt("response.completed", map[string]any{"response": completedResponse})
-	return events, completedResponse
+	return roles
 }
 
-func seqOf(evt map[string]any) int {
-	if v, ok := evt["sequence_number"].(int); ok {
-		return v
+func firstToolMessage(msgs []fakeChatMessage) *fakeChatMessage {
+	for i, m := range msgs {
+		if m.Role == "tool" {
+			return &msgs[i]
+		}
 	}
-	return -1
-}
-
-func typeOf(evt map[string]any) string {
-	s, _ := evt["type"].(string)
-	return s
+	return nil
 }
 
 // ======================== helpers ========================
@@ -644,53 +521,6 @@ func copyFile(t *testing.T, srcRel, dst string) {
 	if err := os.WriteFile(dst, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func containsStr(list []string, want string) bool {
-	for _, v := range list {
-		if v == want {
-			return true
-		}
-	}
-	return false
-}
-
-func assertEventsContain(t *testing.T, label string, events []fakeSSEEvent, wantOrder []string) {
-	t.Helper()
-	pos := 0
-	missing := []string{}
-	for _, want := range wantOrder {
-		found := false
-		for ; pos < len(events); pos++ {
-			if events[pos].Type == want {
-				found = true
-				pos++
-				break
-			}
-		}
-		if !found {
-			missing = append(missing, want)
-		}
-	}
-	if len(missing) > 0 {
-		got := make([]string, 0, len(events))
-		for _, e := range events {
-			got = append(got, e.Type)
-		}
-		t.Errorf("%s: event sequence missing %v; got %v", label, missing, got)
-	}
-	for i, e := range events {
-		if e.Seq <= 0 {
-			t.Errorf("%s event %d (%s): sequence_number missing or non-positive", label, i, e.Type)
-		}
-	}
-}
-
-func ptrBoolStr(b *bool) any {
-	if b == nil {
-		return "nil"
-	}
-	return *b
 }
 
 func tail(b []byte, n int) string {

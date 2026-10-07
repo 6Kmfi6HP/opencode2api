@@ -227,6 +227,10 @@ func forwardCountTokensViaAnthropic(ctx context.Context, claudeReq ClaudeRequest
 	}
 	bodyMap["model"] = resolvedModel
 	clampAnthropicProtocolMaxTokens(bodyMap, resolvedModel)
+	// 工具名兼容：超长/非法字符 name 确定性缩短（纯函数映射与 messages 路径
+	// 同名同短名，计数与后续 /v1/messages 实发一致）。响应仅 input_tokens，
+	// 无需还原。
+	newResponsesNameRewrites(false).shortenAnthropicBodyNames(bodyMap)
 	forwardBytes, err := json.Marshal(bodyMap)
 	if err == nil {
 		reqBody = forwardBytes

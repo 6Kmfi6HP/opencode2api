@@ -493,7 +493,11 @@ func forwardChatViaAnthropic(w http.ResponseWriter, r *http.Request, auth Upstre
 		}
 	}
 	rawBody := rawRequestBodyMap(req)
-	upstreamBody := chatToAnthropicBodyWithRaw(req, req.Model, rawBody, isClaudeCodeClient(r.Header.Get("User-Agent")))
+	// 工具名兼容：转换器输出的超长/非法字符 name 在上游边界统一缩短（转换器
+	// 零改动），映射注入 ctx 供响应呈现面还原。
+	restoreCase := isClaudeCodeClient(r.Header.Get("User-Agent"))
+	upstreamBody, rewrites := sanitizeAnthropicUpstreamBody(chatToAnthropicBodyWithRaw(req, req.Model, rawBody, restoreCase), restoreCase)
+	ctx = withAnthropicNameRewrites(ctx, rewrites)
 	log := logging.FromContext(ctx)
 	log.Info("chat via anthropic upstream",
 		"model", req.Model, "stream", req.Stream, "keep_reasoning", keepReasoning)
@@ -560,6 +564,11 @@ func forwardChatViaAnthropic(w http.ResponseWriter, r *http.Request, auth Upstre
 		return
 	}
 	// Anthropic message（或 SSE 缓冲）→ Chat，复用既有回归转换器。
+	// 先还原缩短名（含 SSE 兜底），转换器天然携带客户端原始名。有意行为
+	// 变化：Claude 系 UA 客户端在本路径非流式响应中也获得免费层占位名
+	// 大小写还原（bash/glob/grep/read → PascalCase），与流式路径及
+	// chat 上游聚合路径的既有还原契约对齐。
+	respBody = restoreAnthropicResponseNames(respBody, rewrites)
 	outBody, convErr := convertAnthropicToOpenAI(respBody, req.Model)
 	if convErr != nil {
 		writeUpstreamError(w, http.StatusBadGateway, convErr, "chat")
@@ -605,6 +614,9 @@ type anthropicToChatState struct {
 	// restoreCase 为 true(Claude 系客户端)时把免费层小写占位工具名还原
 	// 为 PascalCase;其余客户端保持小写透传。
 	restoreCase bool
+	// rewrites 携带本请求的缩短名还原映射（anthropic 上游边界注入 ctx）；
+	// nil 安全（restore 原样返回）。
+	rewrites *responsesNameRewrites
 	// reasoningTokens 由 thinking_delta 的字符数粗计(tokens≈字符/4)，仅当上游
 	// Anthropic usage 未提供 output_tokens_details.thinking_tokens 时兜底填
 	// completion_tokens_details.reasoning_tokens（上游精确值覆盖本近似）。
@@ -665,6 +677,7 @@ func anthropicSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		toolStates:    map[int]*anthropicToolState{},
 		fullUsage:     map[string]any{},
 		restoreCase:   shouldRestoreToolCase(ctx),
+		rewrites:      nameRewritesFor(ctx),
 	}
 	defer func() {
 		st.stats.ToolCallCount = st.toolCount
@@ -911,13 +924,11 @@ func (st *anthropicToChatState) handleLine(line string) {
 			st.toolIndices[idx] = toolIdx
 			tool := &anthropicToolState{}
 			st.toolStates[idx] = tool
-			// 免费层小写占位工具名仅对 Claude 系客户端还原为规范大小写
+			// 上游 tool_use name 还原为客户端原始名（缩短名经 rewrites
+			// 映射；免费层小写占位名仅对 Claude 系客户端还原为规范大小写
 			// (bash/glob/grep/read -> Bash/Glob/Grep/Read),其余保持透传。
 			rawName, _ := cb["name"].(string)
-			name := rawName
-			if st.restoreCase {
-				name = restoreToolNameCase(rawName)
-			}
+			name := st.rewrites.restore(rawName)
 			id, _ := cb["id"].(string)
 			// 缓存 start 块的 initial input(常见 {});不要立刻 emit 给 chat 端
 			// —— OpenAI 客户端会 concat 所有 arguments 片段,若 start 下发了

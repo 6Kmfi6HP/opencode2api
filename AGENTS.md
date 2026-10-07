@@ -23,7 +23,7 @@ Go API gateway that proxies OpenAI Chat, Responses, and Anthropic Messages to Op
 - Go 1.22, tabs, `gofmt`-clean; run `make fmt` before pushing.
 - Follow existing file layout: `*_protocol.go` for wire types, `*.go` for handlers, `*_test.go` beside code.
 - Exported symbols use `CamelCase`, locals short but clear; no single-letter globals.
-- Protocol fixes go in the matching converter (e.g. `responses_passthrough.go`), not `server.go`.
+- Protocol fixes go in the matching converter (e.g. `name_compat.go`, `responses_to_anthropic.go`), not `server.go`.
 
 ## Testing Guidelines
 

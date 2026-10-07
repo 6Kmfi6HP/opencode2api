@@ -3,9 +3,6 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"io"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -430,48 +427,5 @@ func TestAnthropicSSE_EOFClosedIdempotently(t *testing.T) {
 	}
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("EOF 未补 [DONE] 哨兵: %s", body)
-	}
-}
-
-// ======== C8. relayResponsesStream：吞中段 [DONE] + EOF 补 incomplete ========
-
-// driveRelayResponsesStream 直测 relayResponsesStream（仅构造 SSE + recorder）。
-func driveRelayResponsesStream(t *testing.T, sse string) string {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	relayResponsesStream(context.Background(), rec, io.NopCloser(strings.NewReader(sse)), http.StatusOK, "m", ResponsesAPIRequest{}, newResponsesNameRewrites(true), UpstreamAuth{}, nil, func(context.Context, []byte) (io.ReadCloser, int, http.Header, error) {
-		return nil, 0, nil, errors.New("no upstream")
-	})
-	return rec.Body.String()
-}
-
-func TestRelayResponsesStream_SwallowsMidDoneSentinel(t *testing.T) {
-	firstDone := "data: [DONE]\n\n"
-	secondDone := "data: [DONE]\n\n"
-	sse := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
-		firstDone + // 中段(在 completed 之前):吞掉
-		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n" +
-		secondDone // terminalSeen=true,正常转发
-	body := driveRelayResponsesStream(t, sse)
-	// 中段 [DONE](在 completed 之前)必须被吞掉,不写到下游;completed 之后的
-	// [DONE] 正常转发。故总数为 1(吞 1,发 1)。
-	if n := strings.Count(body, "data: [DONE]"); n != 1 {
-		t.Fatalf("body中 [DONE] 数量 = %d, want 1 (中段吞掉,仅 completed 后的 [DONE] 转发)", n)
-	}
-	if !strings.Contains(body, "event: response.completed") {
-		t.Fatalf("response.completed 未透传: %s", body)
-	}
-}
-
-func TestRelayResponsesStream_EOFAnywayEmitsIncomplete(t *testing.T) {
-	// 上游发完 delta 就 EOF(无 completed/failed/incomplete,也无 [DONE]):
-	// 补 response.incomplete + [DONE] 保证客户端正常结束。
-	sse := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"
-	body := driveRelayResponsesStream(t, sse)
-	if !strings.Contains(body, "event: response.incomplete") {
-		t.Fatalf("EOF 未补 response.incomplete: %s", body)
-	}
-	if !strings.Contains(body, "data: [DONE]") {
-		t.Fatalf("EOF 未补 [DONE]: %s", body)
 	}
 }
