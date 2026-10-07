@@ -9,14 +9,40 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+// upstreamTimeout 返回上游 http.Client 的墙钟超时。Go http.Client.Timeout
+// 覆盖整个响应体流式读取——单出口代理下任一超上限的 agent 长输出会被恰好
+// 在墙钟处掐断并显得像「正常结束」。env OPENCODE2API_UPSTREAM_TIMEOUT_SECS
+// （默认 900）；<=0 关闭整体墙钟（交由流中断分支 + 客户端断开兜底）。
+func upstreamTimeout() time.Duration {
+	secs := envIntOr("OPENCODE2API_UPSTREAM_TIMEOUT_SECS", 900)
+	if secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// envIntOr 读取整型环境变量，缺失/非法时返回缺省值。
+func envIntOr(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
 var httpClient = &http.Client{
-	Timeout: 300 * time.Second,
+	Timeout: upstreamTimeout(),
 	Transport: &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
