@@ -301,6 +301,44 @@ func TestCallOpenCodeEndpoint429KeepsStickyFirstThenRotates(t *testing.T) {
 	}
 }
 
+func TestPromptCacheKeyRecomputedAfterFingerprint(t *testing.T) {
+	// FIX-1: key 与终态对齐。handler 层按指纹前的 tools 算出 content key,
+	// buildOCRequestWithSubpathAndState 内指纹追加 stub 后必须重算,否则
+	// "哈希用的 tools"≠"实际发送的 tools",key 指向的分片与前缀对不上。
+	bodyMap := map[string]any{
+		"model":        "muse-spark-1.3-contributor-free",
+		"instructions": "sys",
+		"tools": []any{
+			map[string]any{"type": "function", "name": "Bash"},
+		},
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+		},
+	}
+	preKey := contentPromptCacheKey(bodyMap)
+	bodyMap["prompt_cache_key"] = preKey
+
+	auth := UpstreamAuth{Mode: AuthRoutePublic}
+	req1, err := buildOCRequestWithSubpathAndState("muse-spark-1.3-contributor-free", bodyMap, auth, false, "https://x.example.com", "responses", "sess", initOCSession())
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	_ = req1
+	keyAfter, _ := bodyMap["prompt_cache_key"].(string)
+	want := contentPromptCacheKey(bodyMap)
+	if keyAfter == "" || keyAfter != want {
+		t.Fatalf("prompt_cache_key = %q, want recomputed %q", keyAfter, want)
+	}
+	if keyAfter == preKey {
+		t.Fatalf("prompt_cache_key unchanged after fingerprint mutation (pre=%q)", preKey)
+	}
+	// 幂等:终态 body 再走一次, key 不变。
+	again := contentPromptCacheKey(bodyMap)
+	if again != keyAfter {
+		t.Fatalf("recomputed key unstable: %q vs %q", again, keyAfter)
+	}
+}
+
 func TestCallOpenCodeAPIKeyedAuthDoesNotCrossModelFallback(t *testing.T) {
 	tests := []struct {
 		name   string

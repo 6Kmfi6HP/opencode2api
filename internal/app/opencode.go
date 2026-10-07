@@ -486,6 +486,18 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	// chat/completions。客户端语义上的非流式由 callOpenCodeAPI 的本地聚合
 	// 还原(见 aggregateOpenAIStream)。
 	applyFreeTierFingerprint(bodyMap, subpath, modelID)
+	// key 与终态对齐: handler 层按指纹/sanitize 之前的 tools 算出 content
+	// key (oc2api:csha:),而免费层指纹在此处追加 stub,使"哈希用的
+	// tools"≠"实际发送的 tools"。免费层且无 token 时按终态 bodyMap 重算
+	// content key;客户端显式 key 与 session key (oc2api:<session>) 不动。
+	// 同输入→同终态→同 key,跨轮稳定;仅首轮 key 值相对之前变化一次。
+	if isFreeModel(modelID) && auth.Token == "" {
+		if key, _ := bodyMap["prompt_cache_key"].(string); key == "" || strings.HasPrefix(key, "oc2api:csha:") {
+			if recalculated := contentPromptCacheKey(bodyMap); recalculated != "" {
+				bodyMap["prompt_cache_key"] = recalculated
+			}
+		}
+	}
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
 		return nil, err
