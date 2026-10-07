@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -760,6 +761,20 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		if !canRetry {
 			break
 		}
+		// 429 重试退避：上游错误信息明确要求 "Please retry after a brief
+		// wait"，立即重发只会在同一限速窗口内反复撞限。Retry-After 优先
+		// （cap 5s），缺省 (attempt+1)s 递增；尊重 ctx 取消。
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if backoff := upstream429Backoff(attempt, resp.Header.Get("Retry-After")); backoff > 0 {
+				log.Info("upstream 429 backoff before retry",
+					"attempt", attempt, "backoff_ms", backoff.Milliseconds())
+				select {
+				case <-ctx.Done():
+					return nil, 0, nil, ctx.Err()
+				case <-time.After(backoff):
+				}
+			}
+		}
 		// 429/5xx 首次失败保 sticky:免费层 429 常为按出口 IP 的瞬时限流,
 		// 同出口重试保留 prompt 缓存亲和;仅当同一请求连续失败(attempt>=1)
 		// 才切断 sticky 换出口,说明该出口持续异常。transport_error 分支
@@ -784,6 +799,33 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		return nil, 0, nil, lastErr
 	}
 	return nil, 0, nil, fmt.Errorf("upstream request failed")
+}
+
+// upstream429Backoff 计算上游 429 后的重试退避。Retry-After 优先（cap 5s），
+// 缺省 (attempt+1)s 递增（1s/2s/3s，cap 5s）。包级 var 便于测试注入 0 延迟。
+var upstream429Backoff = func(attempt int, retryAfter string) time.Duration {
+	if d := parseRetryAfter(retryAfter); d > 0 {
+		return min(d, 5*time.Second)
+	}
+	return min(time.Duration(attempt+1)*time.Second, 5*time.Second)
+}
+
+// parseRetryAfter 解析 Retry-After 头（秒数或 HTTP 日期）；缺失/非法/过去
+// 时间返回 0（调用方退回递增缺省）。
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // callOpenCodeAnthropicEndpoint 把请求发往上游原生 Anthropic Messages 端点

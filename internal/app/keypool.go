@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -179,6 +180,15 @@ func keyPoolGroupOK(group string, goSurface bool) bool {
 // retries; see stickySessionBase.
 const keyPoolRetrySuffix = "|pool-retry"
 
+// publicPoolEnabled 决定 public auth 下的免费模型是否交由 keypool 接管。
+// 免费档 Output-token 限速是身份/出口级共享桶，public 匿名身份下全部流量
+// 挤同一个桶、配置的池 key 形同虚设；接管后 round_robin 分摊每账号限额。
+// 默认开启；OPENCODE2API_POOL_PUBLIC=off 回退 public 直连。
+func publicPoolEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("OPENCODE2API_POOL_PUBLIC")))
+	return v != "0" && v != "false" && v != "no" && v != "off"
+}
+
 // selectPoolKey picks a pooled key for this request. scope carries the
 // already-derived transport scope (normalizedTransportScope) so sticky
 // hashing can reuse it without re-hashing the session; empty scope falls
@@ -192,7 +202,11 @@ func selectPoolKey(auth UpstreamAuth, modelID string, bodyMap map[string]any, he
 		try = attempt[0]
 	}
 	if auth.Mode == AuthRoutePublic {
-		return auth, "", false
+		// 免费档 public 流量交由池接管（分摊每账号输出限额）；付费模型
+		// 与开关关闭时保持 public 直连。
+		if !publicPoolEnabled() || !isFreeModel(modelID) {
+			return auth, "", false
+		}
 	}
 	keypoolMu.RLock()
 	enabled := keypoolCfg.Enabled
@@ -232,6 +246,11 @@ func selectPoolKey(auth UpstreamAuth, modelID string, bodyMap map[string]any, he
 	}
 	pool := avail
 	if len(pool) == 0 {
+		// 池整体黑名单级失败（401/402 长冷却）时回落直连，不用死 key 硬撞
+		// ——尤其 public 接管后，直连本是原本可用的路径，绝不能弄坏。
+		if poolHardDead(candidates, states) {
+			return auth, "", false
+		}
 		// All cooling: serve the earliest-expiring one, never hard-fail.
 		earliest := candidates[0]
 		for _, c := range candidates[1:] {
@@ -278,6 +297,28 @@ func selectPoolKey(auth UpstreamAuth, modelID string, bodyMap map[string]any, he
 	out := auth
 	out.Token = picked.Key
 	return out, picked.ID, true
+}
+
+// poolHardDead 报告池是否整体进入黑名单级失败：全部候选 key 的
+// consecutiveFails 都达到 blacklistAfter（401/402 触发的长冷却）。此时
+// selectPoolKey 回落直连，而不是拿死 key 硬撞。candidates/states 由调用
+// 方在 RLock 下复制好传入；blacklistAfter 现读配置。
+func poolHardDead(candidates []UpstreamKey, states map[string]keypoolEntryState) bool {
+	if len(candidates) == 0 {
+		return false
+	}
+	keypoolMu.RLock()
+	blacklistAfter := keypoolCfg.BlacklistAfter
+	keypoolMu.RUnlock()
+	if blacklistAfter <= 0 {
+		blacklistAfter = keyPoolDefaultBlacklistAfter
+	}
+	for _, c := range candidates {
+		if s, ok := states[c.ID]; !ok || s.consecutiveFails < blacklistAfter {
+			return false
+		}
+	}
+	return true
 }
 
 // reportKeyResult records an upstream attempt for failover accounting.

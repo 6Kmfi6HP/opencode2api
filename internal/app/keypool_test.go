@@ -226,8 +226,10 @@ func TestKeyPool_GroupFilter(t *testing.T) {
 func TestKeyPool_PublicNeverPooled(t *testing.T) {
 	resetPool(t)
 	setKeyPool(KeyPool{Enabled: true, Keys: []UpstreamKey{{Key: "ka"}}})
+	// 付费模型 public 直连不变：池只接管免费模型（免费档限速是身份级
+	// 共享桶，免费模型才需要池分摊；paid 不在此列）。
 	if _, _, ok := selectPoolKey(UpstreamAuth{Mode: AuthRoutePublic}, "m", nil, nil, ""); ok {
-		t.Fatal("public must never use pool")
+		t.Fatal("public + paid model must never use pool")
 	}
 }
 
