@@ -982,6 +982,12 @@ func isResponsesErrorBody(respBody []byte) bool {
 // 响应。这里从 SSE 里提取最后一个 response.completed/incomplete/failed 事件
 // 的完整 response JSON（该事件自带 output/usage 全量），body 不是 Responses
 // SSE（已是 JSON、空体等）时原样返回，幂等。
+//
+// SSE 被中途截断/无终态帧时不再原样返回 SSE body（那会被上层 unmarshal
+// 吞成 200 空文本消息）：有 delta 内容时聚合为合成 response 对象
+// （status:"incomplete"，保留可恢复内容）；连 delta 都没有时合成 error
+// body，让上层 writeClaudeResponsesUpstreamError 转 502——客户端对 5xx
+// 自动重试整回合，优于 200 空消息被记入历史。
 func extractResponsesJsonFromSse(body []byte) []byte {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 || (!bytes.HasPrefix(trimmed, []byte("event:")) && !bytes.HasPrefix(trimmed, []byte("data:"))) {
@@ -990,10 +996,13 @@ func extractResponsesJsonFromSse(body []byte) []byte {
 	var last map[string]any
 	for _, rawLine := range bytes.Split(trimmed, []byte("\n")) {
 		line := bytes.TrimSpace(rawLine)
-		if !bytes.HasPrefix(line, []byte("data: ")) {
+		// 前缀一致性：同时接受 "data:" 与 "data: "（PeekFirstFrame 侧已
+		// 兼容无空格变体；上游帧格式变体下不再解析失败）。
+		payload, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok {
 			continue
 		}
-		payload := bytes.TrimSpace(line[6:])
+		payload = bytes.TrimSpace(payload)
 		if string(payload) == "[DONE]" {
 			break
 		}
@@ -1009,13 +1018,166 @@ func extractResponsesJsonFromSse(body []byte) []byte {
 		}
 	}
 	if last == nil {
-		return body
+		if syn := synthesizeResponsesFromDeltas(trimmed); syn != nil {
+			out, err := json.Marshal(syn)
+			if err == nil {
+				return out
+			}
+		}
+		return []byte(`{"error":{"message":"upstream stream ended without a complete response","type":"upstream_error"}}`)
 	}
 	out, err := json.Marshal(last)
 	if err != nil {
 		return body
 	}
 	return out
+}
+
+// synthesizeResponsesFromDeltas 把无终态帧的残缺 Responses SSE 聚合为合成
+// response 对象（status:"incomplete"）：text/refusal/reasoning delta 聚合为
+// message/reasoning item，function_call_arguments.delta 聚合为 function_call
+// item，usage/id/model 取自 response.* 帧（last wins）。无任何可聚合内容时
+// 返回 nil。
+func synthesizeResponsesFromDeltas(body []byte) map[string]any {
+	var respID, respModel string
+	var usage map[string]any
+	var contentText, reasoningText, refusal strings.Builder
+	type toolAcc struct {
+		callID, name, args string
+	}
+	tools := map[string]*toolAcc{}
+	toolOrder := []string{}
+	for _, rawLine := range bytes.Split(body, []byte("\n")) {
+		line := bytes.TrimSpace(rawLine)
+		payload, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok {
+			continue
+		}
+		payload = bytes.TrimSpace(payload)
+		if string(payload) == "[DONE]" {
+			break
+		}
+		var evt map[string]any
+		if json.Unmarshal(payload, &evt) != nil {
+			continue
+		}
+		itemID, _ := evt["item_id"].(string)
+		switch typ, _ := evt["type"].(string); typ {
+		case "response.created", "response.in_progress", "response.completed", "response.incomplete":
+			if resp, ok := evt["response"].(map[string]any); ok {
+				if id, _ := resp["id"].(string); id != "" {
+					respID = id
+				}
+				if m, _ := resp["model"].(string); m != "" {
+					respModel = m
+				}
+				if u, ok := resp["usage"].(map[string]any); ok {
+					usage = u
+				}
+			}
+		case "response.output_text.delta":
+			if t, _ := evt["delta"].(string); t != "" {
+				contentText.WriteString(t)
+			}
+		case "response.refusal.delta":
+			if t, _ := evt["delta"].(string); t != "" {
+				refusal.WriteString(t)
+			}
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			if t, _ := evt["delta"].(string); t != "" {
+				reasoningText.WriteString(t)
+			}
+		case "response.function_call_arguments.delta", "response.tool_call_arguments.delta":
+			if t, _ := evt["delta"].(string); t == "" || itemID == "" {
+				continue
+			}
+			acc := tools[itemID]
+			if acc == nil {
+				acc = &toolAcc{}
+				tools[itemID] = acc
+				toolOrder = append(toolOrder, itemID)
+			}
+			if t, _ := evt["delta"].(string); t != "" {
+				acc.args += t
+			}
+		case "response.output_item.added", "response.output_item.done":
+			item, _ := evt["item"].(map[string]any)
+			if item == nil {
+				continue
+			}
+			it, _ := item["type"].(string)
+			if it != "function_call" && it != "tool_call" {
+				continue
+			}
+			id, _ := item["id"].(string)
+			if id == "" {
+				continue
+			}
+			acc := tools[id]
+			if acc == nil {
+				acc = &toolAcc{}
+				tools[id] = acc
+				toolOrder = append(toolOrder, id)
+			}
+			if callID, _ := item["call_id"].(string); callID != "" {
+				acc.callID = callID
+			}
+			if n, _ := item["name"].(string); n != "" {
+				acc.name = n
+			}
+			if args, _ := item["arguments"].(string); args != "" && acc.args == "" {
+				acc.args = args
+			}
+		}
+	}
+	output := []any{}
+	if reasoningText.Len() > 0 {
+		output = append(output, map[string]any{
+			"type":    "reasoning",
+			"summary": []any{map[string]any{"type": "summary_text", "text": reasoningText.String()}},
+		})
+	}
+	if contentText.Len() > 0 || refusal.Len() != 0 {
+		parts := []any{}
+		if contentText.Len() > 0 {
+			parts = append(parts, map[string]any{"type": "output_text", "text": contentText.String()})
+		}
+		if refusal.Len() > 0 {
+			parts = append(parts, map[string]any{"type": "refusal", "refusal": refusal.String()})
+		}
+		output = append(output, map[string]any{"type": "message", "role": "assistant", "content": parts})
+	}
+	for _, id := range toolOrder {
+		acc := tools[id]
+		if acc == nil {
+			continue
+		}
+		callID := acc.callID
+		if callID == "" {
+			callID = id
+		}
+		args := acc.args
+		if args == "" {
+			args = "{}"
+		}
+		output = append(output, map[string]any{
+			"type": "function_call", "call_id": callID, "name": acc.name, "arguments": args,
+		})
+	}
+	if len(output) == 0 {
+		return nil
+	}
+	syn := map[string]any{"type": "response", "status": "incomplete", "output": output}
+	if respID != "" {
+		syn["id"] = respID
+	}
+	if respModel != "" {
+		syn["model"] = respModel
+	}
+	if usage != nil {
+		syn["usage"] = usage
+	}
+	return syn
 }
 
 func writeClaudeResponsesUpstreamError(ctx context.Context, w http.ResponseWriter, modelID string, respBody []byte) bool {

@@ -159,11 +159,41 @@ func TestExtractResponsesJsonFromSse(t *testing.T) {
 		t.Fatalf("empty body must pass through, got %q", string(got))
 	}
 
-	// SSE 里无 completed 事件(不完整流)时原样返回,交给上层既有处理。
+	// SSE 里无终态事件(不完整流)但带 delta 内容:聚合为合成 response
+	// 对象(status:"incomplete"),保留可恢复内容,不再原样返回 SSE body
+	// (那会被上层 unmarshal 吞成 200 空文本消息)。
 	partial := "event: response.output_text.delta\n" +
 		`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n"
-	if got := extractResponsesJsonFromSse([]byte(partial)); string(got) != partial {
-		t.Fatalf("SSE without completed event must pass through, got %q", string(got))
+	gotPartial := extractResponsesJsonFromSse([]byte(partial))
+	var partialResp map[string]any
+	if err := json.Unmarshal(gotPartial, &partialResp); err != nil {
+		t.Fatalf("partial SSE not synthesized to JSON: %v (%q)", err, string(gotPartial))
+	}
+	if status, _ := partialResp["status"].(string); status != "incomplete" {
+		t.Fatalf("synthesized status = %v, want incomplete", partialResp["status"])
+	}
+	out, _ := partialResp["output"].([]any)
+	if len(out) == 0 {
+		t.Fatalf("synthesized response lost delta content: %q", string(gotPartial))
+	}
+
+	// 壳帧-only 残缺流(无任何 delta 内容):合成 error body,上层转 502。
+	shellOnly := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_x","status":"in_progress"}}` + "\n\n"
+	gotShell := extractResponsesJsonFromSse([]byte(shellOnly))
+	if !isResponsesErrorBody(gotShell) {
+		t.Fatalf("shell-only SSE must synthesize error body, got %q", string(gotShell))
+	}
+
+	// "data:" 无空格变体也可解析(与 PeekFirstFrame 前缀一致)。
+	noSpaceSSE := `data:{"type":"response.completed","response":{"id":"resp_ns","status":"completed"}}` + "\n\n"
+	gotNoSpace := extractResponsesJsonFromSse([]byte(noSpaceSSE))
+	var nsResp map[string]any
+	if err := json.Unmarshal(gotNoSpace, &nsResp); err != nil {
+		t.Fatalf("data: no-space variant not parsed: %v (%q)", err, string(gotNoSpace))
+	}
+	if id, _ := nsResp["id"].(string); id != "resp_ns" {
+		t.Fatalf("no-space id = %v, want resp_ns", nsResp["id"])
 	}
 }
 
