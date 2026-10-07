@@ -748,9 +748,13 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		if !canRetry {
 			break
 		}
-		// 免费层 429 按出口 IP 限流,5xx 也可能是出口问题:
-		// 重试前切断 sticky,让同一会话换到下一个出口。
-		invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, sessionState.sessionID))
+		// 429/5xx 首次失败保 sticky:免费层 429 常为按出口 IP 的瞬时限流,
+		// 同出口重试保留 prompt 缓存亲和;仅当同一请求连续失败(attempt>=1)
+		// 才切断 sticky 换出口,说明该出口持续异常。transport_error 分支
+		// 保持立即 invalidate(真连接故障)。
+		if attempt >= 1 {
+			invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, sessionState.sessionID))
+		}
 		client.CloseIdleConnections()
 		retryCount++
 	}

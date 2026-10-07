@@ -259,6 +259,48 @@ func TestCallOpenCodeAPIRetriesSameModelWithoutFallback(t *testing.T) {
 	}
 }
 
+func TestCallOpenCodeEndpoint429KeepsStickyFirstThenRotates(t *testing.T) {
+	// FIX-3 429 保 sticky:首次 429 失败同出口重试(保 prompt 缓存亲和),
+	// 连续第二次失败才 invalidate 换出口。
+	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
+		{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
+		{status: http.StatusOK, body: `{"id":"chatcmpl_test","choices":[]}`},
+	})
+	// installFakeOpenCodeClient 把 upstreamBaseURLs 重置为单默认域名,
+	// 必须在它之后再设双域名,否则重试 URL 无从区分 sticky 保持/轮换。
+	withBaseURLs(t, []string{"https://a.example.com", "https://b.example.com"})
+	modelMu.Lock()
+	modelsCache = []ModelInfo{{ID: "primary-model"}}
+	modelMu.Unlock()
+
+	body, status, _, err := callOpenCodeAPI(context.Background(), []byte(`{"model":"primary-model","messages":[]}`), "primary-model", UpstreamAuth{Mode: AuthRoutePublic})
+	if err != nil {
+		t.Fatalf("upstream call error = %v", err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("upstream call status = %d, want %d", status, http.StatusOK)
+	}
+	if string(body) != `{"id":"chatcmpl_test","choices":[]}` {
+		t.Fatalf("upstream call body = %q, want success body", string(body))
+	}
+	if len(transport.requestedURLs) != 3 {
+		t.Fatalf("requested URLs = %#v, want 3 attempts", transport.requestedURLs)
+	}
+	// 同一请求的重试被多次 CloseIdleConnections 隔开并换出口后,sticky 重绑
+	// 必然落到不同 base(URL 第二段后按 baseURL 前缀区分)。
+	first, second, third := transport.requestedURLs[0], transport.requestedURLs[1], transport.requestedURLs[2]
+	if second != first {
+		t.Fatalf("first 429 retry should keep sticky egress, got %q then %q", first, second)
+	}
+	if third == second {
+		t.Fatalf("second consecutive 429 should rotate egress, got %q twice", second)
+	}
+	if transport.closeIdleCalls != 2 {
+		t.Fatalf("CloseIdleConnections calls = %d, want 2", transport.closeIdleCalls)
+	}
+}
+
 func TestCallOpenCodeAPIKeyedAuthDoesNotCrossModelFallback(t *testing.T) {
 	tests := []struct {
 		name   string
