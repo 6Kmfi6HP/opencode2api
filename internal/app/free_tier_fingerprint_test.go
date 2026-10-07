@@ -331,3 +331,33 @@ func TestFreeTierFingerprint_PaidModelAndCountTokensSkipped(t *testing.T) {
 		t.Fatalf("count_tokens saw stream_options: %#v", sent["stream_options"])
 	}
 }
+
+// CaseInsensitive: 客户端已带 PascalCase 四件(Bash/Glob/Grep/Read)时,
+// ensureFreeTierTools 不得重复注入小写 stub(三个 subpath 形状各一测)。
+func TestEnsureFreeTierTools_CaseInsensitiveNoDup(t *testing.T) {
+	mkFn := func(name string) map[string]any {
+		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+	}
+	mkBare := func(name string) map[string]any {
+		return map[string]any{"name": name}
+	}
+	cases := []struct {
+		subpath string
+		tools   []any
+	}{
+		{"chat/completions", []any{mkFn("Bash"), mkFn("Glob"), mkFn("Grep"), mkFn("Read")}},
+		{"messages", []any{mkBare("Bash"), mkBare("Glob"), mkBare("Grep"), mkBare("Read")}},
+		{"responses", []any{mkBare("Bash"), mkBare("Glob"), mkBare("Grep"), mkBare("Read")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.subpath, func(t *testing.T) {
+			bodyMap := map[string]any{"tools": tc.tools}
+			ensureFreeTierTools(bodyMap, tc.subpath)
+			rawTools, _ := bodyMap["tools"].([]any)
+			if len(rawTools) != 4 {
+				names := toolNames(t, bodyMap)
+				t.Fatalf("subpath %q: tools = %v, want 4 (no dup injection)", tc.subpath, names)
+			}
+		})
+	}
+}

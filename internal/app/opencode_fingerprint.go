@@ -187,27 +187,27 @@ func ensureFreeTierTools(bodyMap map[string]any, subpath string) {
 			continue
 		}
 		if name := freeTierToolNameOf(tm); name != "" {
-			existing[name] = true
+			existing[strings.ToLower(name)] = true
 		}
 	}
 	missing := make([]any, 0, len(freeTierRequiredTools))
 	switch subpath {
 	case "messages":
 		for _, tool := range freeTierRequiredToolsAnthropic {
-			if !existing[tool["name"].(string)] {
+			if !existing[strings.ToLower(tool["name"].(string))] {
 				missing = append(missing, tool)
 			}
 		}
 	case "responses":
 		for _, tool := range freeTierRequiredToolsResponses {
-			if !existing[tool["name"].(string)] {
+			if !existing[strings.ToLower(tool["name"].(string))] {
 				missing = append(missing, tool)
 			}
 		}
 	default: // chat/completions
 		for _, tool := range freeTierRequiredTools {
 			fn := tool["function"].(map[string]any)
-			if !existing[fn["name"].(string)] {
+			if !existing[strings.ToLower(fn["name"].(string))] {
 				missing = append(missing, tool)
 			}
 		}
