@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.14.20
+
+- Fix upstream 400 on over-length / illegal-char tool names at the anthropic upstream boundary (`fix(anthropic)`): 上游 Anthropic Messages API 强制 `tools[].name` / `tool_choice.name` / 历史 `tool_use.name` / `mcp_servers[].name` 满足 `^[a-zA-Z0-9_-]{1,64}$`，超长名（66 字符 MCP 风格名）或含非法字符名（点号、空格、Unicode）透传后被上游 400 拒绝。新增 `internal/app/name_compat.go` 确定性缩短/还原层，接入全部 5 条 anthropic 上游路径（claude 直通 / chat 入站 / responses 入站 / count_tokens / claude→responses）：缩短规则为纯函数（sha256 派生，合法名直通不变、含非法字符的短名按 rune 折叠为 `_`、超长名取折叠前缀 + 原名 sha256 后 8 字节十六进制恒 64 字符，同名输入恒同短名，tool_choice/历史 tool_use/tools[] 三处必然一致）；响应侧（流式 content_block 逐帧 / 非流式 content / 跨协议 Chat/Responses 转换）按相反映射还原，客户端可见名与所发逐字节一致，`mcp_servers[].name` 缩短时复合名双向映射；`taken` 集合 + prepare 两阶段遍历防折叠名抢注声明过的合法名、碰撞确定性消歧；全合法名快路径零改写。回归测试 `name_compat_test.go` 21 组 + 6 组真实 handler 集成回归。
+- Remove the Responses native passthrough; `/v1/responses` uses the translation path only (`refactor(responses)`): 删除 `responses_passthrough.go`（1602 行：透传中继/探测/浮点归一化/echo 修复/透传清洗）及其测试；`/v1/responses` 入站不再透传到上游原生 `/responses`，翻译失败直接原样返回上游错误。模型注册表 + 探测判定搬到 `native_responses_registry.go`，名称重写机制并入 `name_compat.go`——claude/chat 入站行为不变（翻译失败回退探测 + 运行时记忆保留），显式 `protocol_rules` 与故障剔除语义不变。**行为变化**：`muse-spark-1.2/1.3-contributor` 系列经 `/v1/responses` 入站不再可用（其 chat/completions 通道上游整档 500，此前靠透传兜底）；claude/chat 入站不受影响。`e2e_launch_codex_test.go` 的 fake upstream 改为 chat/completions 协议，验证翻译路径端到端（真实 codex CLI）；`docs/API.md` / `docs/CONFIGURATION.md` 同步。
+
 ## v0.14.19
 
 - Add zh/EN language toggle to the admin web UI (`feat(admin)`, issue #16):登录页与管理面板右上角新增「EN/中文」切换按钮，200+ 条 UI 文案（标签、toast、表格头、错误消息、占位符）全部走 i18n 字典。语言解析顺序 `?lang=` → `localStorage("admin_lang")` → `navigator.language`，默认中文，zh 字典值与旧界面逐字节一致（存量用户零感知）。新增 `internal/app/web/i18n.js`（210 对 key + `t(key, params)` 运行时，`{name}` 占位符），由 `GET /i18n.js` 免鉴权提供（登录页需要）；`auth.go` 服务端注入的登录错误消息改为传稳定 key、前端经 `t()` 本地化渲染；nav-tabs 在中间宽度改为收缩/横滚，不再把 header-actions 挤出卡片。新增回归测试 `TestI18N_KeyParity` / `TestI18N_NoChineseInHTML` / `TestI18N_ReferencesResolve`（web_i18n_test.go）。已知取舍：5 处原本 `<code>` 包裹的内联等宽样式改为纯文本；批量导入 textarea 占位符由多行变单行。
