@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>登录 - OPENCODE TO API</title>
+<title data-i18n="title.login"></title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -108,6 +108,13 @@ body {
   color: var(--text);
   border-color: var(--border-hover);
   transform: translateY(-1px);
+}
+#lang-toggle {
+  position: fixed;
+  top: 24px;
+  right: 74px;
+  width: auto;
+  padding: 0 12px;
 }
 .login-card {
   position: relative;
@@ -246,7 +253,8 @@ body {
 <canvas id="canvas-bg"></canvas>
 <div class="glow-accent"></div>
 
-<button class="theme-btn-float" onclick="toggleTheme()" title="切换明暗主题" aria-label="切换主题">
+<button id="lang-toggle" class="theme-btn-float" onclick="I18N_setLang(document.documentElement.lang === 'zh' ? 'en' : 'zh')" data-i18n-title="lang.toggle.title"><span data-i18n="lang.other"></span></button>
+<button class="theme-btn-float" onclick="toggleTheme()" data-i18n-title="btn.toggleTheme.title" aria-label="Toggle theme">
   <svg id="themeIconSun" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
   <svg id="themeIconMoon" style="display:none" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
 </button>
@@ -257,31 +265,38 @@ body {
       <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
     </div>
     <h1 class="login-title">OPENCODE TO API</h1>
-    <span class="login-sub">网关管理控制台鉴权</span>
+    <span class="login-sub" data-i18n="login.subtitle"></span>
   </div>
 
   <form method="post" action="/login">
     <div class="form-group">
       <div class="field-label">
-        <span>安全凭证 PASSWORD</span>
+        <span data-i18n="login.label.password"></span>
       </div>
       <div class="input-wrap">
-        <input type="password" name="password" id="pwd" class="input-field" placeholder="请输入管理员访问密码" autofocus required>
-        <button type="button" class="input-icon-btn" onclick="togglePasswordVisibility()" title="显示/隐藏密码">
+        <input type="password" name="password" id="pwd" class="input-field" data-i18n-placeholder="login.placeholder.password" autofocus required>
+        <button type="button" class="input-icon-btn" onclick="togglePasswordVisibility()" data-i18n-title="login.pwd.visibility.title">
           <svg id="eyeIcon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
         </button>
       </div>
     </div>
 
     <button type="submit" class="submit-btn">
-      <span>进入控制台</span>
+      <span data-i18n="login.submit"></span>
       <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
     </button>
     <div id="login-msg" class="msg-banner"></div>
   </form>
 </div>
 
+<script src="/i18n.js"></script>
 <script>
+// i18n: fill the theme toggle aria-label (i18n.js covers text/placeholder/title only).
+(function() {
+  var btn = document.querySelector('button[aria-label="Toggle theme"]');
+  if (btn && window.t) btn.setAttribute('aria-label', t('btn.toggleTheme.ariaLabel'));
+})();
+
 (function() {
   var t = localStorage.getItem('theme');
   if (!t) t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
@@ -371,6 +386,24 @@ function togglePasswordVisibility() {
     requestAnimationFrame(render);
   }
   render();
+})();
+(function() {
+  var MSG_KEYS = ['login.err.parse', 'login.err.password', 'login.err.session'];
+  function translateLoginMsg() {
+    var el = document.getElementById('login-msg');
+    if (!el) return;
+    var msg = (el.textContent || '').trim();
+    if (window.t && MSG_KEYS.indexOf(msg) !== -1) el.textContent = window.t(msg);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', translateLoginMsg);
+  } else {
+    translateLoginMsg();
+  }
+  var target = document.getElementById('login-msg');
+  if (target && window.MutationObserver) {
+    new MutationObserver(translateLoginMsg).observe(target, { childList: true, characterData: true, subtree: true });
+  }
 })();
 </script>
 </body>

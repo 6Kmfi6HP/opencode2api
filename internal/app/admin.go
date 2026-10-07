@@ -230,8 +230,18 @@ func renderLoginPage(w http.ResponseWriter, msg string) {
 	}
 }
 
+// adminI18nJSHandler 提供 admin UI 的 i18n 字典。它不带 requireAuth 注册
+// （见 server.go buildMux）：登录页在认证之前就要加载它来本地化。
+func adminI18nJSHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Write([]byte(adminI18nJS))
+}
+
 //go:embed web/login.html
 var adminLoginHTML string
 
 //go:embed web/admin.html
 var adminHTML string
+
+//go:embed web/i18n.js
+var adminI18nJS string
