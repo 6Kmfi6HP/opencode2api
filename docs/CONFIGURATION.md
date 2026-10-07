@@ -279,7 +279,7 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 
 ### `stream_empty_retry_max` / `stream_first_byte_timeout_ms`
 
-claude→responses 流式链路的「空流兜底 + 首 token 前重试」。覆盖两类常见上游故障:
+各上游翻译/直通链路的「空流兜底 + 首 token 前重试」——覆盖 claude→responses、chat→responses、chat→chat、chat→anthropic、claude→anthropic 直通、responses→anthropic（claude→chat 翻译路径仅截断标记，无 pre-commit 重试）。覆盖两类常见上游故障:
 
 - **prefill 阶段被宰**:上游代理(CF / nginx)在首个 token 前杀 tunnel,网关只收到一个干净的 EOF——按旧实现客户端会看到 `stream ended without completion`,agent 中断。
 - **挂死**:上游接受了连接但既不发数据也不关,客户端永久等待。
@@ -301,7 +301,7 @@ claude→responses 流式链路的「空流兜底 + 首 token 前重试」。覆
 - 仅有 thinking 没有 text 的干净 EOF——`reasoningFallback` 兜底把思考内容提升为 text,agent 拿到思考、不发 error。
 - 非流式请求(`stream: false`)走的是另一条路径,与本机制无关。
 
-**传输中断诚实失败**(v0.14.22 起):已 commit 的流中途死亡按错误类型分流——只有干净 EOF 才合成正常收尾;RST / unexpected EOF / 墙钟超时等传输中断会补发 in-band `error` 事件(日志侧 `stream_result` 记 `truncated=true`),Claude Code 得以感知失败并重试该回合,不再把半截文本/非法 JSON 的 tool_use 当完整回合记入历史。
+**传输中断诚实失败**(v0.14.22 起,现覆盖全部翻译/直通路径):已 commit 的流中途死亡按错误类型分流——只有干净 EOF 才合成正常收尾;RST / unexpected EOF / 墙钟超时等传输中断会补发 in-band 错误标记(日志侧 `stream_result` 记 `truncated=true`),Claude Code 得以感知失败并重试该回合,不再把半截文本/非法 JSON 的 tool_use 当完整回合记入历史。各路径的错误标记形状:claude→responses 与 claude→chat 补 `error` 事件、chat→chat 与 chat→anthropic 补 `upstream_truncated` 错误帧、responses→chat 与 responses→anthropic 按 `response.failed` 收尾、claude→anthropic 直通补 Anthropic `error` 事件。
 
 **壳帧宽限窗与产出感知 peek**(v0.14.22 起):Responses 协议的 peek 不再把壳帧(`response.created/in_progress/queued/output_item.added/content_part.added`)与空终态帧判为产出——免费档限速把生成杀在不可见阶段时上游只发壳帧 + 零内容 `response.incomplete`(usage 报 output_tokens 但零内容),旧实现把它当成功流转发出 200 空消息且零重试。现在这类空流在未向客户端写字节前经 `stream_empty_retry_max` + `key_pool` 换 key 重试;首个壳帧后进入 `OPENCODE2API_SHELL_GRACE_MS` 宽限窗,到期仍只有壳帧则按健康慢流放行(thinking 类上游首 delta 迟到不误重试)。宽限窗 commit 后才到达的零内容 incomplete 会补发 in-band error;带内容的 incomplete/终态则把 `output[]` 里未经 delta 通道流出的内容收割补发(与非流式路径对齐),不再丢已产出内容。
 
