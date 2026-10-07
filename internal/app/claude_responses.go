@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
@@ -1679,31 +1680,49 @@ loop:
 					flushFrame()
 				}
 				if !finalized {
-					switch {
-					case producedText || len(toolOrder) > 0:
-						// 上游干净 EOF 但缺 completed（如 muse-spark 系只发事件不发 DONE）：
-						// 合成正常结束，不报错。
-						stats.SawFinish = true
-						stats.FinishReason = "stop"
-						finished = true
-						doFinalize()
-					case reasoningFallback.Len() > 0:
-						// 仅 thinking 无 text/tool：上游在思考阶段被杀。
-						// reasoningFallback 无条件累积（见 emitThinkingDelta），
-						// finalize 里「空回复保护」会把它提升为文本块——agent
-						// 至少拿到思考内容，不会空手中断。
-						stats.SawFinish = true
-						stats.FinishReason = "stop"
-						stats.PromotedReasoning = true
-						finished = true
-						doFinalize()
-					default:
-						// 完全空流且已过了 peek 阶段（说明 peek 时见过壳
-						// 事件，之后才断）：保持显式 error，不默默吞掉。
+					// 干净 EOF（io.EOF）才是流自然终止；RST/unexpected EOF/
+					// http.Client 墙钟超时都是传输中断——不得伪造「正常结束」，
+					// 否则 Claude Code 把半截文本/非法 JSON 的 tool_use 当完整
+					// 回合记入历史（对照 chat.go/responses.go 的截断标记，
+					// claude-responses 是唯一此前不标记的翻译路径）。
+					if cleanEOF := errors.Is(res.err, io.EOF); !cleanEOF {
+						// 传输中断：SawFinish 保持 false（stream_result 记
+						// truncated=true），补发 in-band error 让客户端感知
+						// 失败、得以重试该回合。
 						stats.SawFinish = false
-						logging.FromContext(ctx).Warn("claude-responses stream ended without content",
-							"model", model, "text_chars", stats.TextChars, "reasoning_chars", stats.ReasoningChars)
-						emitError("upstream ended stream before any content (empty completion)")
+						logging.FromContext(ctx).Warn("claude-responses stream interrupted mid-stream",
+							"model", model, "text_chars", stats.TextChars, "reasoning_chars", stats.ReasoningChars,
+							"tool_calls", len(toolOrder), "err", res.err)
+						emitError("upstream stream interrupted before completion")
+						finished = true
+						doFinalize()
+					} else {
+						switch {
+						case producedText || len(toolOrder) > 0:
+							// 上游干净 EOF 但缺 completed（如 muse-spark 系只发事件不发 DONE）：
+							// 合成正常结束，不报错。
+							stats.SawFinish = true
+							stats.FinishReason = "stop"
+							finished = true
+							doFinalize()
+						case reasoningFallback.Len() > 0:
+							// 仅 thinking 无 text/tool：上游在思考阶段被杀。
+							// reasoningFallback 无条件累积（见 emitThinkingDelta），
+							// finalize 里「空回复保护」会把它提升为文本块——agent
+							// 至少拿到思考内容，不会空手中断。
+							stats.SawFinish = true
+							stats.FinishReason = "stop"
+							stats.PromotedReasoning = true
+							finished = true
+							doFinalize()
+						default:
+							// 完全空流且已过了 peek 阶段（说明 peek 时见过壳
+							// 事件，之后才断）：保持显式 error，不默默吞掉。
+							stats.SawFinish = false
+							logging.FromContext(ctx).Warn("claude-responses stream ended without content",
+								"model", model, "text_chars", stats.TextChars, "reasoning_chars", stats.ReasoningChars)
+							emitError("upstream ended stream before any content (empty completion)")
+						}
 					}
 				}
 				break loop
