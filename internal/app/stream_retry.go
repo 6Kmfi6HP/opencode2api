@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,12 +45,36 @@ func responsesIsErrorEvent(payload []byte) bool {
 
 // responsesIsProductiveEvent reports whether a Responses-protocol SSE frame
 // carries meaningful content ([DONE]/whitespace do not count).
+//
+// 壳帧（created/in_progress/queued/output_item.added/content_part.added）
+// 不判产出：限速杀死等场景下上游只发壳帧 + 零内容终态就断流，若壳帧即
+// commit，空流重试就永远轮不到。终态帧只在 output 携带内容时判产出
+// （空终态交给主循环/收割判定）。非 JSON 帧保守判产出，不误伤裸 JSON 流。
 func responsesIsProductiveEvent(payload []byte) bool {
 	t := strings.TrimSpace(string(payload))
 	if t == "" || t == "[DONE]" {
 		return false
 	}
-	return !responsesIsErrorEvent(payload)
+	if responsesIsErrorEvent(payload) {
+		return false
+	}
+	var evt map[string]any
+	if json.Unmarshal(payload, &evt) != nil {
+		return true
+	}
+	switch typ, _ := evt["type"].(string); typ {
+	case "response.created", "response.in_progress", "response.queued",
+		"response.output_item.added", "response.content_part.added":
+		return false
+	case "response.completed", "response.incomplete":
+		if resp, ok := evt["response"].(map[string]any); ok {
+			out, _ := resp["output"].([]any)
+			return len(out) > 0
+		}
+		return false
+	default:
+		return true
+	}
 }
 
 // chatIsErrorEvent reports whether a chat-completion SSE frame is an error
@@ -230,6 +256,22 @@ type PeekOutcome struct {
 	Reader *streamReader
 }
 
+// responsesShellGraceMs 返回 Responses 壳帧宽限窗（毫秒）。壳帧不再判产出
+// commit，宽限到期仍只有壳帧时按健康慢流放行——既让限速杀死的空流在未向
+// 客户端写字节前可重试，又不把 thinking>壳帧时长的健康流误判成空流重试。
+// 默认 5000；0 恢复「任意帧即 commit」的旧行为（关掉产出感知）。
+func responsesShellGraceMs() int {
+	v := strings.TrimSpace(os.Getenv("OPENCODE2API_SHELL_GRACE_MS"))
+	if v == "" {
+		return 5000
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 5000
+	}
+	return n
+}
+
 // PeekFirstFrame 在向上游拿到 200、但还未向客户端 WriteHeader 之前「窥
 // 视」首个**完整 SSE 帧**(空行收尾；流末尾则接受 EOF 收尾)。
 //
@@ -244,6 +286,18 @@ type PeekOutcome struct {
 // 绝不截断在帧中间——否则 handler 侧的 bufio 续读会把当前帧的剩余行
 // 与后续帧拼错。
 func PeekFirstFrame(ctx context.Context, rc io.Reader, timeout time.Duration, hooks StreamProtocolHooks) PeekOutcome {
+	return PeekFirstFrameWithGrace(ctx, rc, timeout, 0, hooks)
+}
+
+// PeekFirstFrameWithGrace 是 PeekFirstFrame 的宽限窗变体：grace>0 且 hooks
+// 带 IsProductiveEvent 时进入「产出感知」模式——壳帧（无内容事件）不再判
+// 产出 commit，首个壳帧到达后开 grace 宽限窗，窗内等到产出帧才 commit；
+// 宽限到期仍只有壳帧则按健康慢流放行（thinking 类上游首 delta 迟到）。
+// grace=0 时与 PeekFirstFrame 逐行为一致（任意非 [DONE] 帧即 commit）。
+//
+// 返回约定与 PeekFirstFrame 相同；宽限放行同样返回 (Consumed, Reader)，
+// 主循环从帧边界继续，不丢壳帧。
+func PeekFirstFrameWithGrace(ctx context.Context, rc io.Reader, timeout, grace time.Duration, hooks StreamProtocolHooks) PeekOutcome {
 	reader := newStreamReader(ctx, rc, 0)
 	// 不要 defer Close:成功路径里调用方会续用这个 reader(它的 bufio
 	// 里可能已经预读了后续行);只有失败路径在这里显式关闭。
@@ -256,27 +310,66 @@ func PeekFirstFrame(ctx context.Context, rc io.Reader, timeout time.Duration, ho
 		defer timer.Stop()
 	}
 
+	productiveAware := grace > 0 && hooks.IsProductiveEvent != nil
+	// graceCh 为 nil 时 select 永不命中；startGrace（首个壳帧结算时调用
+	// 一次）才创建计时器——宽限窗从壳帧起算，不因后续壳帧重置（thinking
+	// 类上游会持续发 in_progress 壳帧，重置会让宽限窗永不触发）。
+	var graceCh <-chan time.Time
+	var graceTimer *time.Timer
+	if productiveAware {
+		defer func() {
+			if graceTimer != nil {
+				graceTimer.Stop()
+			}
+		}()
+	}
+	startGrace := func() {}
+
 	var consumed []streamReadResult
 	var frameBuf []string
-	// hasFrame：已经见过至少一个完整 data 帧（含 ERROR 帧——错误帧也是「有产出」）。
+	// hasFrame：已经见过至少一个完整**产出** data 帧。产出感知关闭时
+	// 任意非 [DONE] 帧都算（含错误帧——错误帧也是「有产出」）；开启时
+	// 由 hooks.IsProductiveEvent 判定。
 	hasFrame := false
 	// errorEvent：已见帧里存在错误事件。
 	errorEvent := false
+	// shellSeen：产出感知下已见过壳帧（无内容事件）。
+	shellSeen := false
+
+	if productiveAware {
+		graceStarted := false
+		startGrace = func() {
+			if graceStarted {
+				return
+			}
+			graceStarted = true
+			graceTimer = time.NewTimer(grace)
+			graceCh = graceTimer.C
+		}
+	}
 
 	// flushFrame 在当前帧边界（空行或 EOF）结算 frameBuf：判定 hasFrame /
-	// errorEvent，并原样把整帧追加进 consumed。
+	// errorEvent，并原样把整帧追加进 consumed。产出感知下首个壳帧后开
+	// 宽限窗。
 	flushFrame := func() {
 		for _, dl := range frameBuf {
 			t := strings.TrimSpace(dl)
 			if t == "" || t == "[DONE]" {
 				continue
 			}
-			hasFrame = true
 			if !errorEvent && hooks.IsErrorEvent != nil && hooks.IsErrorEvent([]byte(t)) {
 				errorEvent = true
 			}
+			if productiveAware && hooks.IsProductiveEvent != nil && !hooks.IsProductiveEvent([]byte(t)) {
+				shellSeen = true
+				continue
+			}
+			hasFrame = true
 		}
 		frameBuf = nil
+		if shellSeen && !hasFrame && !errorEvent {
+			startGrace()
+		}
 	}
 
 	for {
@@ -290,6 +383,12 @@ func PeekFirstFrame(ctx context.Context, rc io.Reader, timeout time.Duration, ho
 		case <-timeoutCh:
 			reader.Close()
 			return PeekOutcome{Err: errStreamIncompleteNoCommit}
+		case <-graceCh:
+			// 壳帧宽限到期仍无产出/错误帧：按健康慢流放行（commit），
+			// 不误重试。尚无任何帧时继续等（首字节看门狗兜底）。
+			if shellSeen && !hasFrame && !errorEvent {
+				return PeekOutcome{Consumed: consumed, Reader: reader}
+			}
 		case res := <-reader.Read():
 			consumed = append(consumed, res)
 			trimmed := strings.TrimSpace(res.line)
@@ -318,11 +417,12 @@ func PeekFirstFrame(ctx context.Context, rc io.Reader, timeout time.Duration, ho
 				}
 				return PeekOutcome{Consumed: consumed, Reader: reader}
 			}
+			if errorEvent {
+				// 错误帧：立即按未 commit 处理（fail fast，先于宽限窗）。
+				reader.Close()
+				return PeekOutcome{Consumed: consumed, Err: errStreamIncompleteNoCommit}
+			}
 			if hasFrame {
-				if errorEvent {
-					reader.Close()
-					return PeekOutcome{Consumed: consumed, Err: errStreamIncompleteNoCommit}
-				}
 				return PeekOutcome{Consumed: consumed, Reader: reader}
 			}
 		}

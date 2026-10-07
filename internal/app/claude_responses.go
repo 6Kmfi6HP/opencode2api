@@ -1303,10 +1303,12 @@ func claudeResponsesStreamWithRetry(ctx context.Context, w http.ResponseWriter, 
 type peekOutcome = PeekOutcome
 
 // peekFirstOutput 是 PeekFirstFrame 绑到 ResponsesProtocolHooks 上的薄封装，
-// 保留以兼容既有调用点。语义不变：窥视首个完整 SSE 帧,有产出非错误→commit；
-// 错误帧 / 空流 / EOF / 超时 → errStreamIncompleteNoCommit。
+// 保留以兼容既有调用点。语义：窥视首个完整 SSE 帧,有产出非错误→commit；
+// 错误帧 / 空流 / EOF / 超时 → errStreamIncompleteNoCommit。带壳帧宽限窗：
+// 壳帧（created 等）不再判产出 commit，宽限到期仍只有壳帧按健康慢流放行
+// ——限速杀死的空流（created+incomplete 零内容）在未写字节前可重试。
 func peekFirstOutput(ctx context.Context, rc io.Reader, timeout time.Duration) peekOutcome {
-	return PeekFirstFrame(ctx, rc, timeout, ResponsesProtocolHooks)
+	return PeekFirstFrameWithGrace(ctx, rc, timeout, time.Duration(responsesShellGraceMs())*time.Millisecond, ResponsesProtocolHooks)
 }
 
 // claudeResponsesStreamHandler 把上游 Responses SSE 翻译为 Claude SSE。
@@ -1542,6 +1544,9 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		blocks:          blocks,
 		producedText:    &producedText,
 		stats:           stats,
+		streamedItems:   map[string]bool{},
+		streamedOutIdx:  map[int]bool{},
+		wantReasoning:   wantReasoning,
 		getOrCreate:     getOrCreateBlock,
 		ensureStart:     ensureStart,
 		adoptResponseID: adoptResponseID,
@@ -1550,6 +1555,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		emitTool:        emitToolDelta,
 		rewrites:        anthropicNameRewritesFromContext(ctx),
 		emitError:       emitError,
+		producedContent: func() bool { return producedText || len(toolOrder) > 0 },
 	}
 
 	defer func() {
@@ -1745,6 +1751,12 @@ type claudeResponsesEmitter struct {
 	producedText *bool
 	stats        *logging.StreamStats
 
+	// 终态 output[] 收割的去重登记：已通过 delta 通道流出过的 item
+	// （按 item_id 与 output_index 双键）不再补发，防止重复。
+	streamedItems  map[string]bool
+	streamedOutIdx map[int]bool
+	wantReasoning  bool
+
 	getOrCreate     func(int, string) *claudeResponsesBlock
 	ensureStart     func()
 	adoptResponseID func(map[string]any)
@@ -1752,9 +1764,151 @@ type claudeResponsesEmitter struct {
 	emitThinking    func(*claudeResponsesBlock, string)
 	emitTool        func(*claudeResponsesBlock, string)
 	emitError       func(string)
+	// producedContent 报告主循环是否已有任何产出（文本 delta 或工具块），
+	// 供终态分支区分「零内容 incomplete」与正常收尾。
+	producedContent func() bool
 	// rewrites 携带本请求的缩短名还原映射（anthropic/responses 上游边界
 	// 注入 ctx）；nil 安全（restore 原样返回）。
 	rewrites *responsesNameRewrites
+}
+
+// markStreamed 在 delta 事件发出后登记该 item 已流出（去重键：item_id +
+// output_index 双记，覆盖上游只给其一的形态）。
+func (e *claudeResponsesEmitter) markStreamed(itemID string, outputIndex int) {
+	if itemID != "" {
+		e.streamedItems[itemID] = true
+	}
+	if outputIndex >= 0 {
+		e.streamedOutIdx[outputIndex] = true
+	}
+}
+
+// harvestTerminalOutput 把终态事件 output[] 里未经 delta 通道流出的内容补
+// 发给客户端（镜像非流式 responsesOutputToClaudeBlocks 的遍历面）：限速
+// 杀死等场景下上游把已产出内容嵌在终态 output 里，delta 通道为空——不收
+// 割就丢内容。返回是否补发了任何内容。
+func (e *claudeResponsesEmitter) harvestTerminalOutput(resp map[string]any) bool {
+	out, ok := resp["output"].([]any)
+	if !ok {
+		return false
+	}
+	emitted := false
+	for oi, raw := range out {
+		im, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := im["id"].(string)
+		// 已通过 delta 通道流出的 item 不重复补发（双键去重）。
+		if id != "" && e.streamedItems[id] {
+			continue
+		}
+		resolvedOI := oi
+		if id != "" {
+			if oi2, ok2 := e.itemToOutput[id]; ok2 {
+				resolvedOI = oi2
+			}
+		}
+		if e.streamedOutIdx[resolvedOI] || e.streamedOutIdx[oi] {
+			continue
+		}
+		typ, _ := im["type"].(string)
+		switch typ {
+		case "reasoning":
+			var texts []string
+			if summary, ok := im["summary"].([]any); ok {
+				for _, s := range summary {
+					if sm, ok := s.(map[string]any); ok {
+						if t, _ := sm["text"].(string); t != "" {
+							texts = append(texts, t)
+						}
+					}
+				}
+			}
+			// 兼容 summary 为字符串的非标准形态。
+			if len(texts) == 0 {
+				if s, _ := im["summary"].(string); s != "" {
+					texts = append(texts, s)
+				}
+			}
+			b := e.getOrCreate(resolvedOI, "thinking")
+			for _, t := range texts {
+				e.emitThinking(b, t)
+				emitted = true
+			}
+			if sig, _ := im["encrypted_content"].(string); sig != "" {
+				b.signature = sig
+			}
+		case "message":
+			c, _ := im["content"].([]any)
+			b := e.getOrCreate(resolvedOI, "text")
+			for _, rc := range c {
+				cm, ok := rc.(map[string]any)
+				if !ok {
+					continue
+				}
+				if t, _ := cm["text"].(string); t != "" {
+					e.emitText(b, t)
+					emitted = true
+				} else if t, _ := cm["output_text"].(string); t != "" {
+					e.emitText(b, t)
+					emitted = true
+				}
+			}
+		case "function_call", "tool_call":
+			callID, _ := im["call_id"].(string)
+			if callID == "" {
+				callID, _ = im["id"].(string)
+			}
+			name, _ := im["name"].(string)
+			if e.rewrites != nil {
+				name = e.rewrites.restore(name)
+			}
+			b := e.getOrCreate(resolvedOI, "tool")
+			if callID != "" {
+				b.toolID = callID
+			}
+			if name != "" {
+				b.toolName = name
+			}
+			if args, _ := im["arguments"].(string); args != "" {
+				e.emitTool(b, args)
+				emitted = true
+			}
+		case "apply_patch_call", "shell_call":
+			callID, _ := im["call_id"].(string)
+			if callID == "" {
+				callID, _ = im["id"].(string)
+			}
+			name := "apply_patch"
+			if typ == "shell_call" {
+				name = "shell"
+			}
+			b := e.getOrCreate(resolvedOI, "tool")
+			if callID != "" {
+				b.toolID = callID
+			}
+			b.toolName = name
+			if args, _ := im["arguments"].(string); args != "" {
+				e.emitTool(b, args)
+				emitted = true
+			}
+		default:
+			if typ == "" {
+				continue
+			}
+			if t := extractTextFromContentParts(im["content"]); t != "" {
+				e.emitText(e.getOrCreate(resolvedOI, "text"), t)
+				emitted = true
+				continue
+			}
+			if b, err := json.Marshal(im); err == nil {
+				e.emitText(e.getOrCreate(resolvedOI, "text"), string(b))
+				emitted = true
+			}
+		}
+	}
+	return emitted
 }
 
 // handleEvent translates a single Responses SSE event into Claude events.
@@ -1905,6 +2059,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		*e.producedText = true
 		b := e.getOrCreate(oi, "text")
 		e.emitText(b, delta)
+		e.markStreamed(itemID, oi)
 	case "response.refusal.delta":
 		oi := outputIndex
 		if oi < 0 {
@@ -1923,6 +2078,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		*e.producedText = true
 		b := e.getOrCreate(oi, "text")
 		e.emitText(b, delta)
+		e.markStreamed(itemID, oi)
 	case "response.function_call_arguments.delta":
 		oi := outputIndex
 		if oi < 0 {
@@ -1938,6 +2094,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		e.stats.NoteChunk()
 		b := e.getOrCreate(oi, "tool")
 		e.emitTool(b, delta)
+		e.markStreamed(itemID, oi)
 	case "response.reasoning_summary_text.delta":
 		oi := outputIndex
 		if oi < 0 {
@@ -1950,6 +2107,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		e.stats.NoteChunk()
 		b := e.getOrCreate(oi, "thinking")
 		e.emitThinking(b, delta)
+		e.markStreamed(itemID, oi)
 	case "response.reasoning_text.delta":
 		oi := outputIndex
 		if oi < 0 {
@@ -1967,6 +2125,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		e.stats.NoteChunk()
 		b := e.getOrCreate(oi, "thinking")
 		e.emitThinking(b, delta)
+		e.markStreamed(itemID, oi)
 	case "response.output_text.done", "response.refusal.done", "response.function_call_arguments.done", "response.reasoning_summary_part.done", "response.reasoning_summary_text.done", "response.content_part.done", "response.output_item.done":
 		// 结束标记：统一在 completed 处关块，避免半流提前关块后同 index 又来 delta。
 		return
@@ -2015,6 +2174,9 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 					}
 				}
 			}
+			// 终态 output[] 内容收割（done-only / usage-有值-无 delta 形态）：
+			// 未走 delta 通道的内容补发，与非流式路径对齐。
+			e.harvestTerminalOutput(resp)
 		} else if u, ok := evt["usage"].(map[string]any); ok {
 			for k, v := range u {
 				e.fullUsage[k] = v
@@ -2026,12 +2188,25 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 		*e.finished = true
 	case "response.incomplete":
 		resp, _ := evt["response"].(map[string]any)
+		harvested := false
 		if resp != nil {
 			if u, ok := resp["usage"].(map[string]any); ok {
 				for k, v := range u {
 					e.fullUsage[k] = v
 				}
 			}
+			// 终态 output[] 内容收割：限速杀死时上游可能把已产出内容嵌在
+			// 终态 output 里而 delta 通道为空——不补发就是空轮。
+			harvested = e.harvestTerminalOutput(resp)
+		}
+		// 零内容 incomplete（免费档限速把生成杀在不可见阶段的典型形态，
+		// usage 报 output_tokens 但零内容事件）：不合成「max_tokens 空轮」，
+		// 补发 in-band error 让客户端感知失败、得以重试该回合；SawFinish
+		// 保持 false，日志侧 truncated=true 可见。
+		if !harvested && !e.producedContent() {
+			e.emitError("upstream returned incomplete with no content (generation killed)")
+			*e.finished = true
+			return
 		}
 		*e.stopReason = "max_tokens"
 		e.stats.SawFinish = true
@@ -2071,6 +2246,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 			*e.producedText = true
 			b := e.getOrCreate(oi, "text")
 			e.emitText(b, d)
+			e.markStreamed(itemID, oi)
 		}
 	}
 
