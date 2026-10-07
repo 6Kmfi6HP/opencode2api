@@ -27,16 +27,21 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
+		// 保留原始查询串（如 ?lang=en）：登录页 i18n.js 的语言解析优先读取 URL ?lang=。
+		dest := "/login"
+		if r.URL.RawQuery != "" {
+			dest += "?" + r.URL.RawQuery
+		}
 		cookie, err := r.Cookie("session")
 		if err != nil || cookie.Value == "" {
-			http.Redirect(w, r, "/login", http.StatusFound)
+			http.Redirect(w, r, dest, http.StatusFound)
 			return
 		}
 		sessionsMu.Lock()
 		_, ok := sessions[cookie.Value]
 		sessionsMu.Unlock()
 		if !ok {
-			http.Redirect(w, r, "/login", http.StatusFound)
+			http.Redirect(w, r, dest, http.StatusFound)
 			return
 		}
 		next(w, r)
@@ -66,16 +71,18 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodPost {
 		if err := r.ParseForm(); err != nil {
-			renderLoginPage(w, "表单解析失败")
+			// 传 i18n 字典 key（web/i18n.js），login.html 端用 t(key) 渲染，
+			// 服务端不再注入中文文案。
+			renderLoginPage(w, "login.err.parse")
 			return
 		}
 		if r.FormValue("password") != adminPassword {
-			renderLoginPage(w, "密码错误")
+			renderLoginPage(w, "login.err.password")
 			return
 		}
 		token, err := generateToken()
 		if err != nil {
-			renderLoginPage(w, "创建会话失败")
+			renderLoginPage(w, "login.err.session")
 			return
 		}
 		sessionsMu.Lock()

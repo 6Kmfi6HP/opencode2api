@@ -135,6 +135,8 @@ func buildMux() *http.ServeMux {
 	// 管理/统计路由只在 admin API 启用时注册。launch 模式默认 adminPassword=""
 	// → 不注册这些端点，避免本地代理被无意暴露。
 	if adminAPIEnabled() {
+		// i18n 字典不带鉴权：登录页在认证前就要加载它。
+		mux.HandleFunc("/i18n.js", logging.Middleware(adminI18nJSHandler))
 		mux.HandleFunc("/login", logging.Middleware(loginHandler))
 		mux.HandleFunc("/logout", logging.Middleware(logoutHandler))
 		mux.HandleFunc("/api/config", logging.Middleware(requireAuth(adminConfigHandler)))
