@@ -407,7 +407,14 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 	// 免费层强制 stream:true 后，Responses 上游回的是 SSE;非流式 chat 客户端
 	// 需要单个 chat.completion JSON，先聚合（幂等：已是 JSON 时原样返回）。
 	respBody = aggregateResponsesStreamToChat(respBody, req.Model, keepReasoning, shouldRestoreToolCase(ctx))
-	outBody := convertResponsesToChat(respBody, req.Model, keepReasoning)
+	// 聚合已产出 chat.completion 形时直接使用：convertResponsesToChat 按
+	// 原生 Responses 形读 raw["output"]，对聚合结果会抹空正文（content:""
+	// 而 usage 有值）。仅聚合未生效（非 SSE 原样返回，如付费模型直返 JSON）
+	// 时才走第二次转换。
+	outBody := respBody
+	if !isChatCompletionBody(respBody) {
+		outBody = convertResponsesToChat(respBody, req.Model, keepReasoning)
+	}
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
@@ -661,6 +668,25 @@ func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning boo
 		return body
 	}
 	return out
+}
+
+// isChatCompletionBody 报告 body 是否已是 chat.completion 形 JSON（聚合器
+// 的产物）。聚合器对非 SSE 输入原样返回，此时仍是原生 Responses JSON，
+// 需要第二次转换；判不出来时返回 false 走转换（幂等安全侧）。
+func isChatCompletionBody(body []byte) bool {
+	var raw struct {
+		Object  string `json:"object"`
+		Choices []any  `json:"choices"`
+		Output  []any  `json:"output"`
+	}
+	if json.Unmarshal(body, &raw) != nil {
+		return false
+	}
+	if raw.Object == "chat.completion" {
+		return true
+	}
+	// object 缺失但带 choices 且无 output：聚合形态兜底。
+	return len(raw.Choices) > 0 && raw.Output == nil
 }
 
 // formatOutputIndex 格式化 Responses output_index（number）为稳定 key。
