@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.14.22
+
+- Fix muse-spark free-tier intermittent empty turns / truncation (`fix(responses)`, `fix(keypool)`, `fix(chat)`, `fix(httpclient)`): 免费档共享 Output-token 限速承压时，上游以 HTTP 200 + `response.created→response.incomplete`（零内容、usage 报 reasoning tokens）杀死请求；`PeekFirstFrame` 壳帧即 commit（`IsProductiveEvent` 是零调用死代码）+ `response.incomplete` 分支无零内容检查 → 客户端拿 200 空消息 `stop_reason=max_tokens`、零重试零报错，Claude Code 把空轮记入历史、agent 任务停摆（表现为「任务永远无法完成」）。六层修复（18-agent 排查对抗验证 0 驳回；mock 上游确定性复现闭环：empty_incomplete 从「200 空轮零重试」变为「pre-commit 换 key 重试 → 仍空 → 502 诚实失败」；真实网关 keypool 接管生效，`upstream_attempt` 出现 key_id 轮动）：
+  - 产出感知 commit + 壳帧宽限窗（`fix(responses)`）：壳帧（created/in_progress/queued/output_item.added/content_part.added）与空 output 终态帧不再判产出 commit；首个壳帧后进入 `OPENCODE2API_SHELL_GRACE_MS`（默认 5000，`0` 恢复「任意帧即 commit」旧行为）宽限窗，到期仍只有壳帧按健康慢流放行（thinking 类上游首 delta 迟到不误重试）。限速杀死型空流在未向客户端写字节前经 `stream_empty_retry_max` + key_pool 换 key 重试；宽限窗 commit 后才到达的零内容 incomplete 补发 in-band error。
+  - 终态 `output[]` 内容收割（`fix(responses)`）：`response.completed/incomplete` 分支补遍历 output、把未经 delta 通道流出的内容收割补发（reasoning summary 文本与 encrypted_content→signature、message output_text、function_call/shell_call arguments，与非流式路径对齐），`streamedItems`/`streamedOutIdx` 双键去重防重复补发；带内容的 incomplete 不再丢已产出内容。
+  - 传输中断诚实失败（`fix(responses)`）：已 commit 的流中途死亡按错误类型分流——只有干净 EOF（`io.EOF`）才合成正常收尾（PartialEOF/ThinkingOnlyEOF 既有行为不变）；RST / unexpected EOF / 墙钟超时等传输中断补发 in-band `error` 事件，`stream_result` 记 `truncated=true`，Claude Code 得以感知失败并重试该回合，不再把半截文本/非法 JSON 的 tool_use 当完整回合记入历史。
+  - 非流式残缺 SSE 兜底（`fix(responses)`）：免费层对所有请求强制 `stream:true`，非流客户端拿到被截断的 SSE（无终态帧）时——含 delta 内容则聚合为合成 response（`status:"incomplete"`）保留部分内容，连 delta 都没有则 502 诚实失败（Claude Code 对 5xx 自动重试整回合，优于 200 空消息被记入历史）；`"data:"` 无空格前缀与 PeekFirstFrame 对齐。
+  - public auth 接入 key_pool（`fix(keypool)`）：免费模型 public 直连改为交由 key_pool round_robin 分摊每账号输出限额（kill-switch `OPENCODE2API_POOL_PUBLIC`，默认 on；池整体黑名单级失败自动回落 public 直连，绝不弄坏原本可用路径）。注意上线后 prompt 缓存亲和一次性重排（sticky 哈希基从 public-shared 变 token-based）。
+  - 429 退避重试（`fix(keypool)`）：`callOpenCodeEndpoint` 的 429 重发加递增退避（Retry-After 头优先、缺省 1s/2s/3s 递增、cap 5s、尊重 ctx 取消），不再立即重发放大限速。
+  - 上游墙钟超时可配置（`fix(httpclient)`）：`OPENCODE2API_UPSTREAM_TIMEOUT_SECS`（默认 900）。Go `http.Client.Timeout` 覆盖整个响应体流式读取——单出口 socks5 下任一 >5min 的 agent 长输出在恰好 300s 被掐且完全不可见；现为 900 可调，`<=0` 关闭整体墙钟。
+  - chat 非流分支双重转换修复（`fix(chat)`）：`forwardChatViaResponses` 非流分支聚合结果已是 chat.completion 形时直接使用，不再走第二次 `convertResponsesToChat` 按原生 Responses 形读 `raw["output"]`（不存在）→ 正文被抹成空串而 usage 报 completion_tokens。
+  - 回归测试 `muse_truncation_fix_test.go` 20 条（表驱动 + 端到端 mock 上游）；`docs/CONFIGURATION.md` 补三个环境变量与「壳帧宽限窗/产出感知 peek/传输中断诚实失败」行为说明；完整排查报告 `muse-truncation-report.md`（6 条根因、复现证据、验证缺口）。
+
+- Fail loud on mid-stream transport death across anthropic upstream paths (`fix(anthropic)`, `fix(responses)`): claude→chat / chat→chat / responses→chat 翻译路径此前已各自 fail loud，最后三条伪造干净收尾的 anthropic 上游路径补齐（回归 `anthropic_truncation_fix_test.go` 10 条，含端到端空流换 key 重试）：
+  - claude→anthropic 直通 `pipeAnthropicStream`（`fix(anthropic)`）：只有干净 EOF 才合成 `message_stop` 正常关流；RST / unexpected EOF / 墙钟超时先补发 in-band Anthropic `error` 事件再关流——此前任何读错误都伪造 `message_stop`，Claude Code 把半截 tool_use/文本当完整回合记入历史。
+  - chat→anthropic `anthropicSSEToChatStream`（`fix(anthropic)`）：commit 后读错误按类型分流，干净 EOF 保持 finalize 合成 stop+[DONE]；传输中断补发 `upstream_truncated` 错误帧 + `[DONE]`（形状对照 chat.go emitError），不伪造 `finish_reason=stop`。
+  - responses→anthropic `anthropicSSEToResponsesStream`（`fix(responses)`）：流式分支接入 `DriveStreamWithRetry`（与 chat→anthropic 同形）——此前整条路径无 peek，200 即占用、空流零重试；peek 首帧前置 + WriteHeader 延迟到首行，空流 EOF/读错/上游错误帧/首字节超时经 `stream_empty_retry_max` 换 key 重试；传输中断按 `response.failed` 收尾（response 带 error 字段、不置 SawFinish/DoneSeen，`stream_result` 记 `truncated=true`），不伪造 `status=completed`；重试全失败经 UpstreamErrorCapture 透传上游真实 status+body。
+
+- Truncation-robustness knobs documented (`docs`): `OPENCODE2API_SHELL_GRACE_MS` / `OPENCODE2API_UPSTREAM_TIMEOUT_SECS` / `OPENCODE2API_POOL_PUBLIC` 三个环境变量与各路径截断标记形状（error 事件 / upstream_truncated 帧 / response.failed）说明。
+
 ## v0.14.21
 
 - Fix free-tier 403 for Claude Code clients on tool-bearing requests (`fix(fingerprint)`): 上游免费层门禁按小写名**精确匹配**（大小写敏感），客户端（Claude Code）带 PascalCase `Bash`/`Glob`/`Grep`/`Read` 四件时，`ensureFreeTierTools` 的命中检查把 PascalCase 也算作已存在、跳过小写 stub 追加——上游门禁只认小写名，整档 403 `FreeTierError`（2026-10-07 public 实测）。`existing` 建键改为只记精确小写名，PascalCase 命中检查通过后仍追加小写 stub（终态 = 4 原工具位置保留 + 4 小写 stub，三个协议 subpath 同步）。回归测试 `TestEnsureFreeTierTools_CaseInsensitiveNoDup`（改为断言追加）+ `TestEnsureFreeTierTools_LowercaseNoDup`（小写幂等）。
