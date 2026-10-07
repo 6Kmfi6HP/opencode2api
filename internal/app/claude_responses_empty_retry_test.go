@@ -52,6 +52,13 @@ func stubNativeModel(t *testing.T, modelID string) {
 		applyConfig(AppConfig{ModelAlias: oldModelAlias})
 		nativeResponsesModels.Lock()
 		delete(nativeResponsesModels.ids, modelID)
+		// 传静态预置模型 ID 的测试会删掉 defaultNativeResponsesModels
+		// 预载的条目；恢复之，避免污染后续测试（静态 pattern 只支持
+		// 尾缀 *，静态断言依赖 ids map）。内联加载：不能调
+		// ensureNativeResponsesDefaults——它再次 Lock 同一把锁会死锁。
+		for m := range defaultNativeResponsesModels {
+			nativeResponsesModels.ids[m] = true
+		}
 		nativeResponsesModels.Unlock()
 	})
 }
