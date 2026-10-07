@@ -171,6 +171,10 @@ func freeTierToolNameOf(t map[string]any) string {
 // 缺失的**逐项**补上(只补缺失项、保留客户端已有工具的原始位置与形状,
 // 四件按 bash,glob,grep,read 顺序追加在后),而不是"客户端带了任一工具就整包
 // 跳过"——上游按"有无四件"整体判定,部分带齐与完全不带一样会被 403。
+// 上游门禁按小写名精确匹配(大小写敏感),因此追加的 stub 一律小写:Claude
+// Code 的 PascalCase(Bash/Glob/Grep/Read)在建 existing 键时统一小写做命中
+// 检查,但命中不代表门禁通过——仍需追加小写 stub(2026-10-07 public 实测:
+// 只带 PascalCase 四件被 403 FreeTierError 整档拒)。
 // subpath == "messages" 用 Anthropic 的裸 name+input_schema 形状；
 // subpath == "responses" 用 OpenAI Responses 的 type:function+parameters 形状；
 // chat/completions 沿用 OpenAI 嵌套 function 形状。tools 已补齐时不动。
@@ -180,14 +184,16 @@ func ensureFreeTierTools(bodyMap map[string]any, subpath string) {
 		return
 	}
 	rawTools, _ := bodyMap["tools"].([]any)
+	// existing 只记录精确小写名:上游门禁按小写名精确匹配(大小写敏感),
+	// PascalCase(Bash 等)命中不代表门禁通过,仍需追加小写 stub。
 	existing := make(map[string]bool, len(rawTools)+len(freeTierRequiredTools))
 	for _, t := range rawTools {
 		tm, ok := t.(map[string]any)
 		if !ok {
 			continue
 		}
-		if name := freeTierToolNameOf(tm); name != "" {
-			existing[strings.ToLower(name)] = true
+		if name := freeTierToolNameOf(tm); name != "" && name == strings.ToLower(name) {
+			existing[name] = true
 		}
 	}
 	missing := make([]any, 0, len(freeTierRequiredTools))
@@ -195,20 +201,39 @@ func ensureFreeTierTools(bodyMap map[string]any, subpath string) {
 	case "messages":
 		for _, tool := range freeTierRequiredToolsAnthropic {
 			if !existing[strings.ToLower(tool["name"].(string))] {
-				missing = append(missing, tool)
+				fixed := map[string]any{
+					"name":         strings.ToLower(tool["name"].(string)),
+					"description":  tool["description"],
+					"input_schema": tool["input_schema"],
+				}
+				missing = append(missing, fixed)
 			}
 		}
 	case "responses":
 		for _, tool := range freeTierRequiredToolsResponses {
 			if !existing[strings.ToLower(tool["name"].(string))] {
-				missing = append(missing, tool)
+				fixed := map[string]any{
+					"type":        tool["type"],
+					"name":        strings.ToLower(tool["name"].(string)),
+					"description": tool["description"],
+					"parameters":  tool["parameters"],
+				}
+				missing = append(missing, fixed)
 			}
 		}
 	default: // chat/completions
 		for _, tool := range freeTierRequiredTools {
 			fn := tool["function"].(map[string]any)
 			if !existing[strings.ToLower(fn["name"].(string))] {
-				missing = append(missing, tool)
+				fixed := map[string]any{
+					"type": "function",
+					"function": map[string]any{
+						"name":        strings.ToLower(fn["name"].(string)),
+						"description": fn["description"],
+						"parameters":  fn["parameters"],
+					},
+				}
+				missing = append(missing, fixed)
 			}
 		}
 	}

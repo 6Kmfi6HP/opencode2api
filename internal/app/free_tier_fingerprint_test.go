@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
@@ -332,8 +333,10 @@ func TestFreeTierFingerprint_PaidModelAndCountTokensSkipped(t *testing.T) {
 	}
 }
 
-// CaseInsensitive: 客户端已带 PascalCase 四件(Bash/Glob/Grep/Read)时,
-// ensureFreeTierTools 不得重复注入小写 stub(三个 subpath 形状各一测)。
+// LowercaseStub: 客户端已带 PascalCase 四件(Bash/Glob/Grep/Read)时,
+// ensureFreeTierTools 必须追加小写 stub(上游免费层门禁按小写名精确匹配,
+// 大小写敏感;2026-10-07 public 实测:只带 PascalCase 四件被 403 整档拒)。
+// 终态 tools = 4 原工具(PascalCase,位置保留) + 4 小写 stub。
 func TestEnsureFreeTierTools_CaseInsensitiveNoDup(t *testing.T) {
 	mkFn := func(name string) map[string]any {
 		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
@@ -348,6 +351,52 @@ func TestEnsureFreeTierTools_CaseInsensitiveNoDup(t *testing.T) {
 		{"chat/completions", []any{mkFn("Bash"), mkFn("Glob"), mkFn("Grep"), mkFn("Read")}},
 		{"messages", []any{mkBare("Bash"), mkBare("Glob"), mkBare("Grep"), mkBare("Read")}},
 		{"responses", []any{mkBare("Bash"), mkBare("Glob"), mkBare("Grep"), mkBare("Read")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.subpath, func(t *testing.T) {
+			bodyMap := map[string]any{"tools": tc.tools}
+			ensureFreeTierTools(bodyMap, tc.subpath)
+			rawTools, _ := bodyMap["tools"].([]any)
+			if len(rawTools) != 8 {
+				names := toolNames(t, bodyMap)
+				t.Fatalf("subpath %q: tools = %v, want 8 (4 PascalCase + 4 lowercase stub)", tc.subpath, names)
+			}
+			// 前 4 个保持原 PascalCase,后 4 个为小写 stub 且顺序固定。
+			lower := map[string]bool{}
+			for i, tl := range rawTools {
+				name := freeTierToolNameOf(tl.(map[string]any))
+				if i < 4 {
+					continue
+				}
+				if name != strings.ToLower(name) {
+					t.Fatalf("subpath %q: stub %d = %q, want lowercase", tc.subpath, i, name)
+				}
+				lower[name] = true
+			}
+			for _, want := range []string{"bash", "glob", "grep", "read"} {
+				if !lower[want] {
+					t.Fatalf("subpath %q: missing lowercase stub %q", tc.subpath, want)
+				}
+			}
+		})
+	}
+}
+
+// LowercaseHit: 客户端已带小写四件时不追加(幂等),三个 subpath 各一测。
+func TestEnsureFreeTierTools_LowercaseNoDup(t *testing.T) {
+	mkFn := func(name string) map[string]any {
+		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+	}
+	mkBare := func(name string) map[string]any {
+		return map[string]any{"name": name}
+	}
+	cases := []struct {
+		subpath string
+		tools   []any
+	}{
+		{"chat/completions", []any{mkFn("bash"), mkFn("glob"), mkFn("grep"), mkFn("read")}},
+		{"messages", []any{mkBare("bash"), mkBare("glob"), mkBare("grep"), mkBare("read")}},
+		{"responses", []any{mkBare("bash"), mkBare("glob"), mkBare("grep"), mkBare("read")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.subpath, func(t *testing.T) {
