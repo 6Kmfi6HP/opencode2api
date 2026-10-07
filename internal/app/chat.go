@@ -2002,6 +2002,19 @@ func contentPromptCacheKey(m map[string]any) string {
 	if len(parts) == 0 {
 		return ""
 	}
+	if cacheDebugEnabled() {
+		attrs := []any{"parts", len(parts)}
+		for i, p := range parts {
+			idx := strings.Index(p, ":")
+			name, body := p, p
+			if idx >= 0 {
+				name, body = p[:idx], p[idx+1:]
+			}
+			attrs = append(attrs, fmt.Sprintf("part%d", i), name+"="+hashTextPrefix(body))
+			attrs = append(attrs, fmt.Sprintf("part%d_len", i), len(body))
+		}
+		slog.Info("cache_debug_key_parts", attrs...)
+	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 	return "oc2api:csha:" + hex.EncodeToString(sum[:16])
 }

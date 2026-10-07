@@ -1018,6 +1018,7 @@ func recordClaudeResponsesUsage(model string, usage map[string]any) {
 	if usage == nil {
 		return
 	}
+	logCacheDebugUsage("claude-responses", model, usage)
 	chatUsage := responsesUsageToChat(usage)
 	u := statsx.TokenUsage{}.FromMap(chatUsage)
 	pt, ct, tt := u.PromptTokens, u.CompletionTokens, u.TotalTokens
@@ -1507,6 +1508,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		stats.ToolCallCount = len(toolOrder)
 		stats.Log(ctx, "claude-responses")
 		if len(fullUsage) > 0 {
+			logCacheDebugUsage("claude-responses", model, fullUsage)
 			chatUsage := responsesUsageToChat(fullUsage)
 			u := statsx.TokenUsage{}.FromMap(chatUsage)
 			pt, ct, tt := u.PromptTokens, u.CompletionTokens, u.TotalTokens

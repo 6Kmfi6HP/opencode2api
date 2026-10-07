@@ -54,5 +54,25 @@ func logCacheDebugUsage(protocol string, model string, upstreamUsage map[string]
 			attrs = append(attrs, "prompt_cached_tokens", v)
 		}
 	}
+	if itd, ok := upstreamUsage["input_tokens_details"].(map[string]any); ok {
+		if v, ok := itd["cached_tokens"]; ok {
+			attrs = append(attrs, "input_cached_tokens", v)
+		}
+	}
+	// 上游偶发返回 Responses 原生以外的 usage 键:未知键原样打出(值已是
+	// 数字计数,无隐私),避免"有缓存字段但白名单没列"时误判为零命中。
+	known := map[string]bool{
+		"cache_read_input_tokens": true, "cache_creation_input_tokens": true,
+		"prompt_cache_hit_tokens": true, "prompt_cache_miss_tokens": true,
+		"input_tokens": true, "output_tokens": true, "prompt_tokens": true,
+		"completion_tokens": true, "total_tokens": true,
+		"prompt_tokens_details": true, "input_tokens_details": true,
+		"output_tokens_details": true,
+	}
+	for k, v := range upstreamUsage {
+		if !known[k] {
+			attrs = append(attrs, k, v)
+		}
+	}
 	slog.Info("cache_debug_usage", attrs...)
 }
