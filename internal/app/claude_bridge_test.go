@@ -314,6 +314,11 @@ func TestClaudeBridge_ToResponsesBody_ToolResultImagesAndEmpty(t *testing.T) {
 		"model":"m",
 		"max_tokens":128,
 		"messages":[
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"toolu_1","name":"get_img","input":{}},
+				{"type":"tool_use","id":"toolu_2","name":"get_empty","input":{}},
+				{"type":"tool_use","id":"toolu_3","name":"get_err","input":{}}
+			]},
 			{"role":"user","content":[
 				{"type":"tool_result","tool_use_id":"toolu_1","content":[
 					{"type":"text","text":"here is the image"},
@@ -473,8 +478,127 @@ func TestClaudeBridge_ConvertResponsesToClaude_ReasoningSignature(t *testing.T) 
 	if thinking.Thinking != "think so" {
 		t.Fatalf("thinking = %q", thinking.Thinking)
 	}
-	if thinking.Signature != "sig_abc" {
-		t.Fatalf("signature = %q, want sig_abc", thinking.Signature)
+	// F1（对齐 bifrost）：encrypted_content 不再塞进 thinking.signature，
+	// 而是独立 redacted_thinking 块（Data 字段），两者共存保住 roundtrip。
+	if thinking.Signature != "" {
+		t.Fatalf("thinking signature should be empty after F1, got %q", thinking.Signature)
+	}
+	var redacted *ClaudeContent
+	for i := range cr.Content {
+		if cr.Content[i].Type == "redacted_thinking" {
+			redacted = &cr.Content[i]
+		}
+	}
+	if redacted == nil {
+		t.Fatalf("redacted_thinking block missing: %#v", cr.Content)
+	}
+	if redacted.Data != "sig_abc" {
+		t.Fatalf("redacted data = %q, want sig_abc", redacted.Data)
+	}
+}
+
+// F1 补充：encrypted-only reasoning（无 summary）同样发出 redacted_thinking。
+func TestClaudeBridge_ReasoningEncryptedOnly_RedactedBlock(t *testing.T) {
+	resp := `{"id":"msg_x3","model":"m","status":"completed","output":[
+		{"type":"reasoning","encrypted_content":"sig_only"},
+		{"type":"message","content":[{"type":"output_text","text":"answer"}]}
+	]}`
+	out := convertResponsesToClaude([]byte(resp), "m", true, true)
+	var cr ClaudeResponse
+	if err := json.Unmarshal(out, &cr); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range cr.Content {
+		if b.Type == "redacted_thinking" && b.Data == "sig_only" {
+			return
+		}
+	}
+	t.Fatalf("encrypted-only reasoning should emit redacted_thinking: %#v", cr.Content)
+}
+
+// F3：交错 text/function_call/text 按上游 output 原序输出，不再合并重排。
+func TestClaudeBridge_ResponseOutput_PreservesOrder(t *testing.T) {
+	resp := `{"id":"msg_x4","model":"m","status":"completed","output":[
+		{"type":"message","content":[{"type":"output_text","text":"first"}]},
+		{"type":"function_call","call_id":"call_1","name":"do_thing","arguments":"{}"},
+		{"type":"message","content":[{"type":"output_text","text":"second"}]}
+	]}`
+	out := convertResponsesToClaude([]byte(resp), "m", false, true)
+	var cr ClaudeResponse
+	if err := json.Unmarshal(out, &cr); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, b := range cr.Content {
+		switch b.Type {
+		case "text":
+			order = append(order, "text:"+b.Text)
+		case "tool_use":
+			order = append(order, "tool:"+b.Name)
+		}
+	}
+	want := []string{"text:first", "tool:do_thing", "text:second"}
+	if len(order) != len(want) {
+		t.Fatalf("order = %#v, want %#v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("order = %#v, want %#v", order, want)
+		}
+	}
+	if cr.StopReason != "tool_use" {
+		t.Fatalf("stop_reason = %q, want tool_use", cr.StopReason)
+	}
+}
+
+// F5：孤儿 tool_result（有 ID 无配对 tool_use）降级为用户文本。
+func TestClaudeBridge_OrphanToolResult_DemotesToText(t *testing.T) {
+	var claudeReq ClaudeRequest
+	raw := `{"model":"m","messages":[{"role":"user","content":[
+		{"type":"tool_result","tool_use_id":"ghost_1","content":"lost output"}
+	]}]}`
+	if err := json.Unmarshal([]byte(raw), &claudeReq); err != nil {
+		t.Fatal(err)
+	}
+	_, input := claudeMessagesToResponsesInput(claudeReq.Messages, nil)
+	for _, it := range input {
+		if m, ok := it.(map[string]any); ok && m["type"] == "function_call_output" {
+			t.Fatalf("orphan tool_result should not emit function_call_output: %#v", input)
+		}
+	}
+	found := false
+	for _, it := range input {
+		if m, ok := it.(map[string]any); ok && m["type"] == "message" {
+			if c, ok := m["content"].([]any); ok {
+				for _, p := range c {
+					if pm, ok := p.(map[string]any); ok {
+						if s, _ := pm["text"].(string); strings.Contains(s, "Tool result: ") && strings.Contains(s, "lost output") {
+							found = true
+						}
+					}
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("orphan tool_result should demote to user text: %#v", input)
+	}
+}
+
+// F6：tool_use ID 清洗（非法字符替换、64 字符上限）。
+func TestSanitizeAnthropicToolUseID(t *testing.T) {
+	if got := sanitizeAnthropicToolUseID("toolu_abc-123_X"); got != "toolu_abc-123_X" {
+		t.Fatalf("valid id changed: %q", got)
+	}
+	if got := sanitizeAnthropicToolUseID("a b/c"); got != "a_b_c" {
+		t.Fatalf("illegal chars not replaced: %q", got)
+	}
+	long := strings.Repeat("x", 100)
+	if got := sanitizeAnthropicToolUseID(long); len(got) != 64 {
+		t.Fatalf("long id len = %d, want 64", len(got))
+	}
+	if got := sanitizeAnthropicToolUseID(""); got != "" {
+		t.Fatalf("empty id should stay empty: %q", got)
 	}
 }
 
