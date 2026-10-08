@@ -1096,7 +1096,7 @@ func TestConvertRequest_NoMaxTokensInjectionWhenMaxCompletionTokensSet(t *testin
 }
 
 // TestChatToResponsesBody_LongToolCallIDCappedAndPaired 回归
-//（input[N].call_id must be <= 64）：chat→responses 上游路径的 tool 消息
+// （input[N].call_id must be <= 64）：chat→responses 上游路径的 tool 消息
 // call_id 之前未清洗——客户端回放合法但 >64 的 tool_call_id 原样进
 // input[].call_id 被上游 400。现在 tool 侧与 assistant 侧同用
 // sanitizeAnthropicToolUseID：两侧 <=64 且保持配对。

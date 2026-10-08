@@ -702,7 +702,7 @@ func TestClaudeBridge_ClientStreamUsageWanted(t *testing.T) {
 }
 
 // TestClaudeBridge_ToResponsesBody_LongToolUseIDCappedAndPaired 回归
-//（input[N].call_id must be <= 64）：tool_result 侧之前只走
+// （input[N].call_id must be <= 64）：tool_result 侧之前只走
 // sanitizeToolUseID——该函数对合法字符集 id 不做长度截断，>64 的合法
 // tool_use_id 原样进 input[].call_id 被上游 400。现在与 tool_use 侧同用
 // sanitizeAnthropicToolUseID：两侧 <=64 且保持配对。
