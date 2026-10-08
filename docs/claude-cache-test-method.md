@@ -13,6 +13,11 @@
    （现象：回了 `TURN_ONE_OK` 但网关 `cache_debug_key_parts` 计数不涨）。
    不要手配 `ANTHROPIC_AUTH_TOKEN=sk-123` 类 env（`launch_env.go` 已证明它会劫持
    Claude Code 网络栈）。一切以 `--settings` 文件为准。
+   ⚠️ 2026-10-08 实测修正：CLI 2.1.293 下 `--settings` 的 env 会被全局
+   `~/.claude/settings.json` 盖住（网关零流量）。此时改用 env 直驱：
+   `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_API_KEY` 三件套
+   与 `--model` 显式指定，实测有效（计数增长可验证）。
+   多轮 agents 测试还必须全程相同 `--allowedTools`，否则 tools 变化换缓存分片。
 3. 两轮必须同会话：首轮 `--session-id $UUID`，次轮 `--resume $UUID`。
 4. 网关必须带 `OPENCODE2API_CACHE_DEBUG=1` 启动，且是最新 `bin/opencode2api`
    （`make build` 后重启才生效）。
@@ -97,3 +102,18 @@ grep -a "upstream_attempt" opencode2api.log | tail -n 4 | grep -oE "key_id=k[0-9
 - 验证（本测试法）：尾部 `+5KB` 时 `pck` 不变、池 key 钉住、
   轮 2 `7025/16984≈41%` 命中。回归测试
   `TestContentPromptCacheKey_StableHeadIgnoresAppendedTail`。
+
+## 5. 背景：2026-10-08 稳态 80%+ 修复
+
+- 现象：agents 多轮稳态上限 ~22%——`instructions` 每轮尾部追加让上游前缀
+  缓存从增长点截断（cached 恒 ≈ instructions tokens，tools 之后全 miss）；
+  tools 全量哈希跨轮漂移换缓存分片。
+- 修复（`internal/app/instructions_stable.go`）：
+  ① `clipInstructionsToStablePrefix` 按会话注册首轮 instructions 原文，
+  后续请求钉住首轮前缀、尾部追加段挪到 input 末条 user 消息（前缀缓存
+  只看公共前缀，尾部易变不影响头部命中）；
+  ② pck tools 分支改哈希工具名集合（`toolsNamesKey`），schema 漂移不换分片。
+- 验证（本测试法，muse-spark-1.3-contributor-free，4 轮复杂 agents 任务、
+  同会话 resume、全程相同 `--allowedTools`）：总命中率 **87.4%**，
+  稳态单请求 **91-99%**，`instr_full_len` 全程恒定，池 key 全程钉住。
+  回归测试 `TestClipInstructionsToStablePrefix` 等。
