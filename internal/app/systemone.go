@@ -52,8 +52,10 @@ func systemoneHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 复用统一的 (baseURL, 代理客户端) 选择：socks5 轮询 / 多域名 sticky /
 	// paid 直连等策略与其它上游路径一致。整个请求固定使用同一份会话快照。
+	// ocScope 统一为哈希形式(对齐 callOpenCodeEndpoint 主路径);此处非 agent
+	// 会话,保持全局 session,不进映射表。
 	sessionState := initOCSession()
-	baseURL, client := selectUpstreamTarget(auth, bodyMap, nil, sessionState.sessionID)
+	baseURL, client := selectUpstreamTarget(auth, bodyMap, nil, normalizedTransportScope(sessionState.sessionID))
 	upReq, err := buildOCRequestWithSubpathAndState(resolvedModel, bodyMap, auth, false, baseURL, "systemone", sessionState.sessionID, sessionState)
 	if err != nil {
 		http.Error(w, "Failed to build upstream request", http.StatusInternalServerError)

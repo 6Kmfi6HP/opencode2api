@@ -252,10 +252,144 @@ func refreshOCSession() *opencodeSessionState {
 			projectID:     randomHex(40),
 		}
 		ocSessionState.Store(state)
+		// 新全局世代生效即清空下游映射表: 专属 session 是在旧全局世代下
+		// 分配的,换世代后全部重新分配(加锁,singleflight 外的读方仍在)。
+		resetOCSessionMap()
 		slog.Info("opencode session ready", "version", state.clientVersion, "session_id", state.sessionID, "project_id", state.projectID)
 		return state, nil
 	})
 	return value.(*opencodeSessionState)
+}
+
+// ======================== 下游会话 → 上游 session 映射表 ========================
+
+// 背景(2026-10-08 查证上游 anomalyco/opencode v2 真实语义): 上游 zen handler
+// 只读 x-opencode-session,该值直接决定上游 provider 粘性(stickyId)与计费
+// 归因;真实 opencode 客户端每个 agent 会话独立发 x-opencode-session。本网关
+// 此前全部流量共用进程全局 session(ocSessionState.sessionID)→ 上游侧是
+// "超级会话": 所有下游 agent 钉同一 provider 粘性、计费归因混合、429 解绑
+// 影响全体。这层有界映射表让不同下游会话在上游是不同 session。
+
+// ocSessionMapping 下游身份 → 专属上游 session 条目,lastUsed 滑动续期。
+type ocSessionMapping struct {
+	sessionID string
+	lastUsed  time.Time
+}
+
+const (
+	// ocSessionMapMaxEntries 有界条目数,对齐 stickyMaxEntries(256):
+	// 下游 agent 会话数不可控,无界表随时间无限增长。
+	ocSessionMapMaxEntries = 256
+	// ocSessionMapTTL 滑动 TTL: 每次 lookup 刷新 lastUsed,2h 无流量的
+	// 下游会话视为结束,其专属 session 不再保留。
+	ocSessionMapTTL = 2 * time.Hour
+)
+
+var (
+	ocSessionMapMu sync.Mutex
+	ocSessionMap   = map[string]*ocSessionMapping{}
+)
+
+// ocSessionMapEnabled 决定是否按下游会话身份分拆上游 session。默认开启;
+// OPENCODE2API_OC_SESSION_MAP=off/0/false/no 回退到全局单一 session(现状),
+// env 解析模式对齐 stickyByBodyEnabled。
+func ocSessionMapEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("OPENCODE2API_OC_SESSION_MAP")))
+	return v != "0" && v != "false" && v != "no" && v != "off"
+}
+
+// downstreamSessionKey 提取下游会话身份并哈希为映射表 key。信号优先级:
+//
+//	a. 客户端会话头(X-Claude-Code-Session-Id / Thread-Id / Session-Id,
+//	   复用 sessionHeaderValue 大小写不敏感匹配;下划线拼写 Thread_id /
+//	   Session_id 经 http 规范化后是不同 key,由独立常量覆盖);
+//	b. body "user" 字段(chat req.User / Claude metadata.user →
+//	   ExtraBody["user"],见 anthropic_protocol.go narrowClaudeMetadataUser);
+//	c. auth.Token 非空时叠加 "tok:" 作用域前缀,防跨账号同名信号串扰;
+//	无任何信号返回 "",走全局兜底。
+//
+// 信号全文 sha256 取前 8 字节 hex(对齐 hashSessionRouteKey),原文不落表
+// 不落日志: 下游会话头可能内嵌账号语义数据。
+// 注意: 下游显式 x-opencode-session 不进映射——它在 callOpenCodeEndpoint
+// 的解析顺序里优先于映射并原样透传(opencodeSessionContextKey 机制不变)。
+func downstreamSessionKey(auth UpstreamAuth, bodyMap map[string]any, headers http.Header) string {
+	signal := ""
+	for _, name := range []string{
+		headerClaudeSession, headerCodexThread1, headerCodexThread2,
+		headerCodexSession1, headerCodexSession2,
+	} {
+		if v := sessionHeaderValue(headers, name); v != "" {
+			signal = v
+			break
+		}
+	}
+	if signal == "" {
+		if u, ok := bodyMap["user"].(string); ok {
+			signal = strings.TrimSpace(u)
+		}
+	}
+	if signal == "" {
+		return ""
+	}
+	key := hashSessionRouteKey(signal)
+	if auth.Token != "" {
+		key = "tok:" + hashSessionRouteKey(auth.Token) + "|" + key
+	}
+	return key
+}
+
+// lookupOrCreateOCSession 查找或创建下游身份专属的上游 session。锁内创建
+// 防并发重复: 纯内存随机 ID,锁内完成的代价低于 per-key singleflight 的
+// bookkeeping。淘汰对齐 httpclient.go lookupOrCreateSticky 的清理模式:
+// 先懒清过期条目(滑动 TTL),未命中且满时再淘汰最久未用,表有界 256。
+func lookupOrCreateOCSession(key string) string {
+	ocSessionMapMu.Lock()
+	defer ocSessionMapMu.Unlock()
+	now := time.Now()
+	if len(ocSessionMap) > 0 {
+		for k, e := range ocSessionMap {
+			if now.Sub(e.lastUsed) > ocSessionMapTTL {
+				delete(ocSessionMap, k)
+			}
+		}
+	}
+	if e, ok := ocSessionMap[key]; ok {
+		e.lastUsed = now
+		return e.sessionID
+	}
+	if len(ocSessionMap) >= ocSessionMapMaxEntries {
+		// 满时淘汰最久未用,循环兜住超额历史状态,插入后保持有界 256。
+		for len(ocSessionMap) >= ocSessionMapMaxEntries {
+			var oldestKey string
+			var oldest time.Time
+			for k, e := range ocSessionMap {
+				if oldestKey == "" || e.lastUsed.Before(oldest) {
+					oldestKey, oldest = k, e.lastUsed
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(ocSessionMap, oldestKey)
+		}
+	}
+	id := newOCSessionID()
+	ocSessionMap[key] = &ocSessionMapping{sessionID: id, lastUsed: now}
+	return id
+}
+
+// resetOCSessionMap 清空映射表,refreshOCSession 换全局世代时调用。
+func resetOCSessionMap() {
+	ocSessionMapMu.Lock()
+	ocSessionMap = map[string]*ocSessionMapping{}
+	ocSessionMapMu.Unlock()
+}
+
+// ocSessionMapSize 锁内读映射表条目数,供 admin 可观测。
+func ocSessionMapSize() int {
+	ocSessionMapMu.Lock()
+	defer ocSessionMapMu.Unlock()
+	return len(ocSessionMap)
 }
 
 // ======================== 模型 ========================
@@ -464,7 +598,11 @@ func startModelRefresh() {
 
 func buildOCRequest(modelID string, bodyMap map[string]any, auth UpstreamAuth) (*http.Request, error) {
 	state := initOCSession()
-	baseURL, _ := selectUpstreamTarget(auth, bodyMap, nil, state.sessionID)
+	// ocScope 统一为哈希形式(对齐 callOpenCodeEndpoint 主路径): 裸
+	// sessionID 含会话语义,不作本地路由原文。此处无请求上下文,保持全局
+	// session,不进映射表。
+	scope := normalizedTransportScope(state.sessionID)
+	baseURL, _ := selectUpstreamTarget(auth, bodyMap, nil, scope)
 	return buildOCRequestWithSubpathAndState(modelID, bodyMap, auth, auth.shouldUseGoEndpoint(modelID), baseURL, "chat/completions", state.sessionID, state)
 }
 
@@ -651,19 +789,36 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		maxAttempts = keypoolMaxAttempts()
 	}
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	// 下游专属会话解析(auth/bodyMap/headers 跨重试恒定 → 循环外一次解析,
+	// 同一请求的重试钉在同一专属 session,维持 sticky egress)。优先级:
+	//  1) 下游显式 x-opencode-session 原样透传(opencodeSessionContextKey
+	//     机制不变,不进映射);
+	//  2) 映射开关开且下游身份可提取 → ocSessionMap 命中/新建专属 ses_
+	//     (锁内创建防并发重复),让不同下游会话在上游是不同 session;
+	//  3) 全局 sessionState.sessionID(现状兜底);
+	//  4) 裸进程内回退值才现造临时会话不回写(现状)。
+	upstreamHeaders := upstreamHeadersFromContext(ctx)
+	ocSession := sessionFromRequestContext(ctx, "")
+	if ocSession == "" && ocSessionMapEnabled() {
+		if key := downstreamSessionKey(auth, bodyMap, upstreamHeaders); key != "" {
+			ocSession = lookupOrCreateOCSession(key)
+		}
+	}
+	if ocSession == "" {
+		ocSession = sessionState.sessionID
+	}
+	if strings.TrimSpace(ocSession) == "" {
 		// 仅"裸进程内回退值"才现造一次会话,避免同一请求的重试在
 		// newOCSessionID() 兜底下换 session 破坏 sticky egress。
-		ocSession := sessionFromRequestContext(ctx, sessionState.sessionID)
-		if strings.TrimSpace(ocSession) == "" {
-			ocSession = newOCSessionID()
-		}
-		attemptAuth, keyID, pooled := selectPoolKey(auth, modelID, bodyMap, upstreamHeadersFromContext(ctx), normalizedTransportScope(ocSession), attempt)
+		ocSession = newOCSessionID()
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		attemptAuth, keyID, pooled := selectPoolKey(auth, modelID, bodyMap, upstreamHeaders, normalizedTransportScope(ocSession), attempt)
 		targetAuth := auth
 		if pooled {
 			targetAuth = attemptAuth
 		}
-		upstreamHeaders := upstreamHeadersFromContext(ctx)
 		baseURL, client := selectUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, normalizedTransportScope(ocSession))
 		lastBaseURL = baseURL
 		up, err := buildOCRequestWithSubpathAndState(modelID, bodyMap, targetAuth, useGoEndpoint, baseURL, endpointSubpath, ocSession, sessionState)
@@ -702,7 +857,9 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 			log.Info("upstream_attempt", args...)
 			if canRetry {
 				client.CloseIdleConnections()
-				invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, sessionState.sessionID))
+				// 解析后的 ocSession 与本次 attempt 绑定 sticky 用的是同一个
+				// 值,mapped 专属 session 下解绑才指向真实条目。
+				invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, ocSession)
 				retryCount++
 				continue
 			}
@@ -797,7 +954,8 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		// 才切断 sticky 换出口,说明该出口持续异常。transport_error 分支
 		// 保持立即 invalidate(真连接故障)。
 		if attempt >= 1 {
-			invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, sessionFromRequestContext(ctx, sessionState.sessionID))
+			// 同上: 用解析后的 ocSession,与本次绑定 sticky 的键一致。
+			invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, ocSession)
 		}
 		client.CloseIdleConnections()
 		retryCount++
