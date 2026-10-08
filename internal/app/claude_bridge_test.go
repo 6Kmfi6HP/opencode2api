@@ -383,6 +383,59 @@ func TestClaudeBridge_ToResponsesBody_ToolResultImagesAndEmpty(t *testing.T) {
 	}
 }
 
+// TestClaudeBridge_ToResponsesBody_ToolIDsSanitizeAndPair 钉死 Anthropic 入站
+// function_call.call_id / function_call_output.call_id 的确定性清洗：同一原始
+// ID 在两侧清洗到相同值才能配对（Anthropic 字符集外的 id 经清洗后仍配对）。
+func TestClaudeBridge_ToResponsesBody_ToolIDsSanitizeAndPair(t *testing.T) {
+	badID := "functions.x:0"
+	var claudeReq ClaudeRequest
+	raw := `{
+		"model":"m",
+		"max_tokens":128,
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"` + badID + `","name":"shell","input":{"cmd":"ls"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"` + badID + `","content":"ok"}
+			]}
+		]
+	}`
+	if err := json.Unmarshal([]byte(raw), &claudeReq); err != nil {
+		t.Fatal(err)
+	}
+	body := claudeToResponsesBody(context.Background(), claudeReq, "m")
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatal(err)
+	}
+	input, _ := req["input"].([]any)
+	var callID, outputID string
+	for _, it := range input {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch m["type"] {
+		case "function_call":
+			callID, _ = m["call_id"].(string)
+		case "function_call_output":
+			outputID, _ = m["call_id"].(string)
+		}
+	}
+	if callID == "" || callID == badID {
+		t.Fatalf("function_call call_id not sanitized: %q", callID)
+	}
+	if outputID != callID {
+		t.Fatalf("pairing broken: function_call %q vs function_call_output %q", callID, outputID)
+	}
+	for _, r := range callID {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			t.Fatalf("sanitized id %q has illegal rune %q", callID, r)
+		}
+	}
+}
+
 func TestClaudeBridge_ToResponsesBody_ParallelToolCallsAndClamp(t *testing.T) {
 	old := config.Update(func(s *config.Snapshot) {
 		s.MaxTokensCap = 0
@@ -458,7 +511,7 @@ func TestClaudeBridge_ConvertResponsesToClaude_ReasoningSignature(t *testing.T) 
 		{"type":"reasoning","summary":[{"type":"summary_text","text":"think so"}],"encrypted_content":"sig_abc"},
 		{"type":"message","content":[{"type":"output_text","text":"answer"}]}
 	]}`
-	out := convertResponsesToClaude([]byte(resp), "m", true, true)
+	out := convertResponsesToClaude([]byte(resp), "m", true, true, nil)
 	var cr ClaudeResponse
 	if err := json.Unmarshal(out, &cr); err != nil {
 		t.Fatal(err)
@@ -503,7 +556,7 @@ func TestClaudeBridge_ReasoningEncryptedOnly_RedactedBlock(t *testing.T) {
 		{"type":"reasoning","encrypted_content":"sig_only"},
 		{"type":"message","content":[{"type":"output_text","text":"answer"}]}
 	]}`
-	out := convertResponsesToClaude([]byte(resp), "m", true, true)
+	out := convertResponsesToClaude([]byte(resp), "m", true, true, nil)
 	var cr ClaudeResponse
 	if err := json.Unmarshal(out, &cr); err != nil {
 		t.Fatal(err)
@@ -523,7 +576,7 @@ func TestClaudeBridge_ResponseOutput_PreservesOrder(t *testing.T) {
 		{"type":"function_call","call_id":"call_1","name":"do_thing","arguments":"{}"},
 		{"type":"message","content":[{"type":"output_text","text":"second"}]}
 	]}`
-	out := convertResponsesToClaude([]byte(resp), "m", false, true)
+	out := convertResponsesToClaude([]byte(resp), "m", false, true, nil)
 	var cr ClaudeResponse
 	if err := json.Unmarshal(out, &cr); err != nil {
 		t.Fatal(err)

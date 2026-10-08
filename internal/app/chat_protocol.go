@@ -10,19 +10,25 @@ import (
 )
 
 // normalizeFinishReason maps Anthropic stop reasons onto the closed set used
-// by Chat Completions. Unknown reasons fall back to "stop":Chat
-// finish_reason 是闭集合,透传上游新枚举(如 pause_turn)会污染下游(对齐
-// sub2api 各映射器的闭集合输出,无透传分支)。
+// by Chat Completions. Unknown reasons fall back to "stop".Chat
+// finish_reason 是闭集合,透传上游新枚举会污染下游(对齐 sub2api 各映射器的
+// 闭集合输出,无透传分支)。特例:
+//   - model_context_window_exceeded 是截断,归 "length"(对齐 Bifrost
+//     anthropicFinishReasonToBifrost 的 length 折叠),不再按 unknown 落 stop;
+//   - pause_turn/compaction 表示未完结且无 chat 等价物,置空不报完成态
+//     (对齐 Bifrost anthropicResponsesStatus:mapped=false → status unset)。
 func normalizeFinishReason(reason string) string {
 	switch reason {
 	case "end_turn", "stop_sequence", "stop":
 		return "stop"
-	case "max_tokens", "length":
+	case "max_tokens", "length", "model_context_window_exceeded":
 		return "length"
 	case "tool_use", "tool_calls", "function_call":
 		return "tool_calls"
 	case "refusal", "content_filter":
 		return "content_filter"
+	case "pause_turn", "compaction":
+		return ""
 	default:
 		return "stop"
 	}
@@ -77,6 +83,51 @@ func anthropicUsageToChat(usage map[string]any) map[string]any {
 		}
 		out["prompt_tokens_details"] = details
 	}
+	// cache_creation object 的 5m/1h 明细归位到
+	// prompt_tokens_details.cached_write_token_details（对齐 Bifrost
+	// ChatCachedWriteTokenDetails）;扁平 cache_creation_input_tokens 缺失时以
+	// 5m+1h 合成,保证计费/统计不丢写缓存分量（此前整段丢失）。
+	if cc, ok := usage["cache_creation"].(map[string]any); ok {
+		five, fiveOK := numberAsFloat(cc["ephemeral_5m_input_tokens"])
+		one, oneOK := numberAsFloat(cc["ephemeral_1h_input_tokens"])
+		if fiveOK || oneOK {
+			details, _ := out["prompt_tokens_details"].(map[string]any)
+			if details == nil {
+				details = map[string]any{}
+			}
+			writeDetails, _ := details["cached_write_token_details"].(map[string]any)
+			if writeDetails == nil {
+				writeDetails = map[string]any{}
+			}
+			if fiveOK {
+				if existing, eok := numberAsFloat(writeDetails["cached_write_tokens_5m"]); !eok || existing == 0 {
+					writeDetails["cached_write_tokens_5m"] = five
+				}
+			}
+			if oneOK {
+				if existing, eok := numberAsFloat(writeDetails["cached_write_tokens_1h"]); !eok || existing == 0 {
+					writeDetails["cached_write_tokens_1h"] = one
+				}
+			}
+			details["cached_write_token_details"] = writeDetails
+			out["prompt_tokens_details"] = details
+			if _, hasFlat := numberAsFloat(usage["cache_creation_input_tokens"]); !hasFlat {
+				total := 0.0
+				if fiveOK {
+					total += five
+				}
+				if oneOK {
+					total += one
+				}
+				if total > 0 {
+					// 扁平写缓存键缺失：以 5m+1h 合成,计费/统计
+					// (parseCacheUsage) 只认扁平键。
+					out["cache_creation_input_tokens"] = total
+					details["cache_creation_tokens"] = total
+				}
+			}
+		}
+	}
 	// 上游发 output_tokens_details.thinking_tokens 时归位到 chat 的
 	// completion_tokens_details.reasoning_tokens。
 	if outDetails, ok := usage["output_tokens_details"].(map[string]any); ok {
@@ -89,6 +140,28 @@ func anthropicUsageToChat(usage map[string]any) map[string]any {
 				details["reasoning_tokens"] = v
 			}
 			out["completion_tokens_details"] = details
+		}
+	}
+	// 上游 server_tool_use.web_search_requests（服务端 web 搜索计费）归位到
+	// chat 的 tool_usage.web_search.num_requests 与
+	// completion_tokens_details.num_search_queries（对齐 Bifrost
+	// buildAnthropicPassthroughUsage——两处同值流出,原有顶层 server_tool_use
+	// 透传保留）。
+	if stu, ok := usage["server_tool_use"].(map[string]any); ok {
+		if n, ok := numberAsFloat(stu["web_search_requests"]); ok && n > 0 {
+			details, _ := out["completion_tokens_details"].(map[string]any)
+			if details == nil {
+				details = map[string]any{}
+			}
+			if existing, eok := numberAsFloat(details["num_search_queries"]); !eok || existing == 0 {
+				details["num_search_queries"] = n
+			}
+			out["completion_tokens_details"] = details
+			if _, has := out["tool_usage"]; !has {
+				out["tool_usage"] = map[string]any{
+					"web_search": map[string]any{"num_requests": n},
+				}
+			}
 		}
 	}
 	delete(out, "input_tokens")
@@ -157,10 +230,16 @@ func validateRequestTemperature(w http.ResponseWriter, t *float64, protocol stri
 	return true
 }
 
-// applyErrorPrefix prepends the stable "Error: " marker used by both the
-// Anthropic Messages and Responses request paths when a tool_result carries
-// is_error:true. It avoids producing a duplicate prefix when the output text
-// already starts with "Error:" (e.g. an upstream that echoes the error).
+// applyErrorPrefix prepends the stable "Error: " marker used by the Responses
+// request path when a tool_result carries is_error:true — the Responses
+// function_call_output wire shape has no error field, so the text prefix is
+// the only carrier there (OpenAI-compatible providers reject unknown input
+// item parameters, so adding a nonstandard field risks a 400). The Anthropic
+// Messages request path maps is_error onto the native tool_result.is_error
+// instead of calling this (Message.IsError, see claudeToOpenAIMessages), and
+// the Chat-bound tool_result content stays un-deformed. It avoids producing a
+// duplicate prefix when the output text already starts with "Error:" (e.g. an
+// upstream that echoes the error).
 func applyErrorPrefix(text string) string {
 	if strings.HasPrefix(text, "Error:") {
 		return text

@@ -111,7 +111,7 @@ func TestClaudeStream_PartialEOF_NoFinish_ErrorOnly(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "error") {
 		t.Fatalf("expected error event, got:\n%s", rr.Body.String())
@@ -152,7 +152,7 @@ func TestClaudeStream_UsageOnlyEnd_SynthesizesStop(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if hasEvent(events, "error") {
 		t.Fatalf("must not error on usage-terminated stream:\n%s", rr.Body.String())
@@ -178,7 +178,7 @@ func TestClaudeStream_DoneNoFinishWithUsage_SynthesizesStop(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if hasEvent(events, "error") {
 		t.Fatalf("must not error on [DONE] with usage-terminated stream:\n%s", rr.Body.String())
@@ -196,7 +196,7 @@ func TestClaudeStream_DoneNoFinish_ErrorOnly(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "error") {
 		t.Fatalf("expected error event for [DONE] without finish:\n%s", rr.Body.String())
@@ -214,7 +214,7 @@ func TestClaudeStream_InBandError_ErrorOnly(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "error") {
 		t.Fatalf("expected error event for in-band error:\n%s", rr.Body.String())
@@ -239,7 +239,7 @@ func TestClaudeStream_ReaderError_ErrorOnly(t *testing.T) {
 		data: "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
 	}
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, er, "m", false)
+	claudeStreamHandler(context.Background(), rr, er, "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "error") {
 		t.Fatalf("expected error event for reader error:\n%s", rr.Body.String())
@@ -257,7 +257,7 @@ func TestClaudeStream_BadJSON_ErrorOnly(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "error") {
 		t.Fatalf("expected error event for bad JSON:\n%s", rr.Body.String())
@@ -279,7 +279,7 @@ func TestClaudeStream_NormalFinishWithUsage(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if hasEvent(events, "error") {
 		t.Fatalf("must not emit error on normal finish:\n%s", rr.Body.String())
@@ -319,7 +319,7 @@ func TestClaudeStream_KeepalivePingBeforeFirstChunk(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		claudeStreamHandler(context.Background(), tsr, sr, "m", false)
+		claudeStreamHandler(context.Background(), tsr, sr, "m", false, nil)
 		close(done)
 	}()
 
@@ -348,7 +348,7 @@ func TestClaudeStream_ContextCancel_QuietExit(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		claudeStreamHandler(ctx, tsr, sr, "m", false)
+		claudeStreamHandler(ctx, tsr, sr, "m", false, nil)
 		close(done)
 	}()
 
@@ -378,7 +378,7 @@ func TestClaudeStream_FinishNoTrailingNewline_EOF(t *testing.T) {
 		`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if hasEvent(events, "error") {
 		t.Fatalf("must not emit error when finish chunk has no trailing newline:\n%s", rr.Body.String())
@@ -398,7 +398,7 @@ func TestClaudeStream_PartialDeltaThenReaderError(t *testing.T) {
 		data: `data: {"choices":[{"delta":{"content":"partial delta"},"finish_reason":null}]}` + "\n\n",
 	}
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, er, "m", false)
+	claudeStreamHandler(context.Background(), rr, er, "m", false, nil)
 	body := rr.Body.String()
 	// The partial delta content should be present
 	if !strings.Contains(body, "partial delta") {
@@ -670,7 +670,7 @@ func TestClaudeStream_FinishThenInBandError(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "error") {
 		t.Fatalf("expected error event after finish+in-band error: %s", rr.Body.String())
@@ -691,7 +691,7 @@ func TestClaudeStream_FinishThenReaderError(t *testing.T) {
 		}, "\n"),
 	}
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, er, "m", false)
+	claudeStreamHandler(context.Background(), rr, er, "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "error") {
 		t.Fatalf("expected error event after finish+reader error: %s", rr.Body.String())

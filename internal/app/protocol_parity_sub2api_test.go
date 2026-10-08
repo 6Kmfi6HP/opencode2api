@@ -108,8 +108,25 @@ func TestChatToAnthropicBody_ThinkingStripsSampling(t *testing.T) {
 	if err := json.Unmarshal(chatToAnthropicBody(plain, "claude-x", true), &got2); err != nil {
 		t.Fatal(err)
 	}
-	if got2["temperature"] != temp || got2["top_p"] != topP {
+	// thinking 关闭时采样参数保留;同时携带收成单参（Anthropic 不允许两者
+	// 同发,优先 temperature,对齐 Bifrost chat.go:427-434）。
+	if got2["temperature"] != temp {
 		t.Fatalf("sampling params must be kept when thinking off: %#v", got2)
+	}
+	if _, exists := got2["top_p"]; exists {
+		t.Fatalf("top_p must collapse away when temperature present: %#v", got2)
+	}
+
+	topOnly := &OpenAIRequest{
+		Model: "claude-x", Messages: []Message{{Role: "user", Content: "hi"}},
+		TopP: &topP,
+	}
+	var got3 map[string]any
+	if err := json.Unmarshal(chatToAnthropicBody(topOnly, "claude-x", true), &got3); err != nil {
+		t.Fatal(err)
+	}
+	if got3["top_p"] != topP {
+		t.Fatalf("top-only passthrough must keep top_p: %#v", got3)
 	}
 }
 
@@ -132,15 +149,25 @@ func TestAnthropicUsageToChat_CacheCreation(t *testing.T) {
 
 // TestNormalizeFinishReason_UnknownClosed 未知 stop_reason 必须闭集合
 // 回退为 stop(对齐 sub2api),不得透传污染 finish_reason。
+// model_context_window_exceeded 是截断,归 length(对齐 Bifrost 映射表);
+// pause_turn/compaction 表示未完结且无 chat 等价物,置空不报完成态。
 func TestNormalizeFinishReason_UnknownClosed(t *testing.T) {
-	if normalizeFinishReason("pause_turn") != "stop" {
-		t.Fatalf("pause_turn → %q, want stop", normalizeFinishReason("pause_turn"))
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"pause_turn", ""},
+		{"compaction", ""},
+		{"model_context_window_exceeded", "length"},
+		{"tool_use", "tool_calls"},
+		{"refusal", "content_filter"},
+		{"stop_sequence", "stop"},
+		{"totally_unknown", "stop"},
 	}
-	if normalizeFinishReason("model_context_window_exceeded") != "stop" {
-		t.Fatal("unknown reason must close to stop")
-	}
-	if normalizeFinishReason("tool_use") != "tool_calls" {
-		t.Fatal("known mapping must be stable")
+	for _, tc := range cases {
+		if got := normalizeFinishReason(tc.in); got != tc.want {
+			t.Fatalf("normalizeFinishReason(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

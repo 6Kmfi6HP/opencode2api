@@ -1,16 +1,30 @@
 package app
 
 // responseOutcome is shared by streaming and non-streaming builders so their
-// top-level and item statuses cannot drift apart.
+// top-level and item statuses cannot drift apart. Status "" = 无 Responses
+// 等价物,status 置空不发(对齐 Bifrost *string omitempty 的 unset 语义)。
 type responseOutcome struct {
 	Status            string
 	Event             string
 	IncompleteDetails any
 }
 
+// responsesOutcome maps a chat-style finish_reason to the Responses status /
+// terminal event / incomplete_details(对齐 Bifrost
+// responsesStatusFromChatFinishReason 与 anthropicResponsesStatus):
+//   - 截断类:finish_reason=length 与 Anthropic 的
+//     model_context_window_exceeded 都报 incomplete/max_output_tokens;
+//   - content_filter 报 incomplete/content_filter;
+//   - pause_turn/compaction 表示未完结且无 Responses 等价物,status 置空
+//     不报完成态。
 func responsesOutcome(finishReason string) responseOutcome {
-	if finishReason == "length" {
+	switch finishReason {
+	case "length", "model_context_window_exceeded":
 		return responseOutcome{Status: "incomplete", Event: "response.incomplete", IncompleteDetails: map[string]any{"reason": "max_output_tokens"}}
+	case "content_filter":
+		return responseOutcome{Status: "incomplete", Event: "response.incomplete", IncompleteDetails: map[string]any{"reason": "content_filter"}}
+	case "pause_turn", "compaction":
+		return responseOutcome{}
 	}
 	return responseOutcome{Status: "completed", Event: "response.completed"}
 }

@@ -50,8 +50,10 @@ func sanitizeAnthropicToolUseID(id string) string {
 //     "[document attached]" 文本，不报错。
 //   - tool_use 缺 name 时跳过该 block；tool_result 缺 tool_use_id 时降级为
 //     user 文本，不报错。
-//   - redacted_thinking 无文本等价物，静默丢弃，不报错。
-//   - top_k / cache_control / signature / context_management 等无对应物，
+//   - thinking/redacted_thinking 回放为 reasoning item：文本落 summary、
+//     signature/密文落 encrypted_content（对齐 Bifrost 的 summary 与
+//     encrypted_content 双存）；文本与密文都缺时才丢弃，不报错。
+//   - top_k / cache_control / context_management 等无对应物，
 //     直接丢弃并记入 request_plan 日志，不报错。
 
 // isAnthropicBillingHeader 报告 Claude Code 注入的计费头块（对齐 sub2api
@@ -245,16 +247,44 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 						pending = append(pending, responsesTextPart(role, "[document attached]"))
 					}
 				case "thinking":
-					// 跳过 thinking 回放:CLI 按 Anthropic 惯例只保留最后一轮
-					// thinking,旧轮丢弃,导致 reasoning item 的位置/有无逐请求
-					// 漂移,上游前缀缓存从首个 reasoning item 就断(实测命中率
-					// 封顶 ~50%)。上游(GLM 系)推理在请求内自含,回放历史
-					// thinking 无增益,丢弃后历史 item 序列跨轮稳定。
+					// 历史推理回放（对齐 Bifrost responses.go:760-850 的
+					// summary 与 encrypted_content 双存）：assistant 轮的
+					// thinking 文本落 summary，signature（上游经 include
+					// reasoning.encrypted_content 返回的密文）落
+					// encrypted_content——推理型上游按两者恢复多轮推理状态。
+					// 只跳不回放会丢历史推理；文本与密文都缺时才丢弃。非
+					// assistant 轮的 thinking 块无对应物，丢弃。
+					if role != "assistant" {
+						continue
+					}
 					flushPending()
-					continue
+					text, _ := block["thinking"].(string)
+					sig, _ := block["signature"].(string)
+					if text == "" && sig == "" {
+						continue
+					}
+					item := map[string]any{"type": "reasoning", "summary": []any{}}
+					if text != "" {
+						item["summary"] = []any{map[string]any{"type": "summary_text", "text": text}}
+					}
+					if sig != "" {
+						item["encrypted_content"] = sig
+					}
+					input = append(input, item)
 				case "redacted_thinking":
-					// 无文本等价物，丢弃，不报错。
-					continue
+					// 密文负载（无文本等价物）落 encrypted_content 回放,不再
+					// 静默丢弃——至少保留 encrypted 半,上游按密文恢复加密推理
+					// 状态。非 assistant 轮同上丢弃。
+					if role != "assistant" {
+						continue
+					}
+					if data, _ := block["data"].(string); data != "" {
+						flushPending()
+						input = append(input, map[string]any{
+							"type":              "reasoning",
+							"encrypted_content": data,
+						})
+					}
 				case "tool_use":
 					flushPending()
 					emitToolImages()
@@ -265,7 +295,12 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 						continue
 					}
 					if id == "" {
+						// 缺 id 补随机值（多条缺 id 时避免撞 id）；
+						// 非法字符 id 清洗为 Anthropic 兼容值（确定性函数保证
+						// 与后续 tool_result 侧清洗到相同值才能配对）。
 						id = "toolu_" + randomString(12)
+					} else {
+						id = sanitizeToolUseID(id)
 					}
 					// F6：清洗 tool_use id（对齐 bifrost SanitizeAnthropicToolUseIDPtr）。
 					id = sanitizeAnthropicToolUseID(id)
@@ -322,8 +357,9 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 						continue
 					}
 					input = append(input, map[string]any{
+						// 清洗 id（与 tool_use 侧同一确定性函数，保证配对）。
 						"type":    "function_call_output",
-						"call_id": toolUseID,
+						"call_id": sanitizeToolUseID(toolUseID),
 						"output":  text,
 					})
 					// tool_result 内的 image/document part 提取为独立 user
@@ -906,9 +942,9 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool, restoreCase
 	}
 
 	if refusalText != "" && !hasToolUse {
-		// 同 claude.go:refusal 不在 Anthropic stop_reason 枚举内,终态按
-		// 完成归一(对齐 sub2api)。
-		stopReason = "end_turn"
+		// refusal 是合法 Anthropic stop_reason(对齐 Bifrost 映射表),与
+		// claude.go 流式路径保持同一终态,不折叠成 end_turn。
+		stopReason = "refusal"
 	} else if hasToolUse {
 		stopReason = "tool_use"
 	}
@@ -917,21 +953,40 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool, restoreCase
 
 // convertResponsesToClaude 把原生 Responses 成功响应转为 Claude message。
 // 解析失败时返回最小可用空文本消息，不报错。
-func convertResponsesToClaude(respBody []byte, model string, wantReasoning bool, restoreCase bool) []byte {
+func convertResponsesToClaude(respBody []byte, model string, wantReasoning bool, restoreCase bool, stopSequences []string) []byte {
 	var resp struct {
-		ID     string         `json:"id"`
-		Output []any          `json:"output"`
-		Status string         `json:"status"`
-		Usage  map[string]any `json:"usage"`
+		ID                string `json:"id"`
+		Output            []any  `json:"output"`
+		Status            string `json:"status"`
+		IncompleteDetails *struct {
+			Reason string `json:"reason"`
+		} `json:"incomplete_details"`
+		Usage map[string]any `json:"usage"`
 	}
 	if err := json.Unmarshal(respBody, &resp); err != nil {
 		slog.Warn("convertResponsesToClaude unmarshal failed", "error", err)
 		resp.Output = nil
 	}
 	content, stopReason, _ := responsesOutputToClaudeBlocks(resp.Output, wantReasoning, restoreCase)
-	// incomplete/max_output_tokens 映射。
+	// incomplete 原因细分(对齐 Bifrost anthropicStopReasonFromIncompleteDetails):
+	// content_filter → refusal,max_output_tokens(及未知原因)→ max_tokens。
 	if resp.Status == "incomplete" {
-		stopReason = "max_tokens"
+		if resp.IncompleteDetails != nil && resp.IncompleteDetails.Reason == "content_filter" {
+			stopReason = "refusal"
+		} else {
+			stopReason = "max_tokens"
+		}
+	}
+	// stop_sequence 往返:Responses 上游无 stop 字段（请求侧不透传,见
+	// claudeToResponsesBody）,输出以停止串结尾只是自然生成的巧合;最小往返
+	// 仍恢复该终止形态(对齐 Bifrost anthropicStopReasonWithSequence:仅
+	// end_turn 升级,不猜测)。
+	stopSequence := (*string)(nil)
+	if stopReason == "end_turn" {
+		if seq := claudeStopSequenceMatch(claudeResponseText(content), stopSequences); seq != nil {
+			stopReason = "stop_sequence"
+			stopSequence = seq
+		}
 	}
 	claudeResp := ClaudeResponse{
 		ID:           normalizeClaudeMessageID(resp.ID),
@@ -939,8 +994,8 @@ func convertResponsesToClaude(respBody []byte, model string, wantReasoning bool,
 		Role:         "assistant",
 		Content:      content,
 		Model:        model,
-		StopReason:   stopReason,
-		StopSequence: nil,
+		StopReason:   ClaudeStopReason(stopReason),
+		StopSequence: stopSequence,
 	}
 	if resp.Usage != nil {
 		claudeResp.Usage = buildClaudeMessageUsage(responsesUsageToChat(resp.Usage))
@@ -1330,7 +1385,7 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 	// 先还原缩短名（Responses 形 output[].function_call.name），转换器
 	// 天然携带客户端原始名。
 	respBody = restoreResponsesBodyNames(respBody, rewrites)
-	claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx))
+	claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx), claudeReq.StopSequences)
 	result := logging.SummarizeClaudeResult(claudeBody)
 	logging.LogResult(ctx, result)
 	var usageResp map[string]any
@@ -1410,7 +1465,7 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 				return true
 			}
 			respBody2 = restoreResponsesBodyNames(respBody2, rewrites)
-			claudeBody := convertResponsesToClaude(respBody2, modelID, wantReasoning, shouldRestoreToolCase(ctx))
+			claudeBody := convertResponsesToClaude(respBody2, modelID, wantReasoning, shouldRestoreToolCase(ctx), claudeReq.StopSequences)
 			result := logging.SummarizeClaudeResult(claudeBody)
 			logging.LogResult(ctx, result)
 			var usageResp map[string]any
@@ -1443,7 +1498,7 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 		// 先还原缩短名（Responses 形 output[].function_call.name），转换器
 		// 天然携带客户端原始名。
 		respBody = restoreResponsesBodyNames(respBody, rewrites)
-		claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx))
+		claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx), claudeReq.StopSequences)
 		result := logging.SummarizeClaudeResult(claudeBody)
 		logging.LogResult(ctx, result)
 		var usageResp map[string]any
@@ -1511,7 +1566,7 @@ func claudeResponsesStreamWithRetry(ctx context.Context, w http.ResponseWriter, 
 		return rc, status, err
 	}
 	runOnce := func(ctx context.Context, w http.ResponseWriter, rc io.Reader, _ []streamReadResult, _ *streamReader) (bool, error) {
-		return claudeResponsesStreamHandler(ctx, w, rc, modelID, wantReasoning, nil)
+		return claudeResponsesStreamHandler(ctx, w, rc, modelID, wantReasoning, nil, claudeReq.StopSequences)
 	}
 	return DriveStreamWithRetry(ctx, w, ResponsesProtocolHooks, callOnce, runOnce)
 }
@@ -1539,7 +1594,7 @@ func peekFirstOutput(ctx context.Context, rc io.Reader, timeout time.Duration) p
 //
 // peeked 非空时直接进入主循环（此调用已是某次 peek-commit 之后的干跑），
 // 不再二次 peek、不再做首字节看门狗（窗口已在第一次调用里耗尽）。
-func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, wantReasoning bool, peeked []streamReadResult) (bool, error) {
+func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc io.Reader, model string, wantReasoning bool, peeked []streamReadResult, stopSequences []string) (bool, error) {
 	restoreCase := shouldRestoreToolCase(ctx)
 	var reader *streamReader
 	if len(peeked) == 0 {
@@ -1710,12 +1765,16 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		}
 	}
 	_ = startToolBlock
+	// textAccumulator 聚合全部文本 delta,供 stop_sequence 往返在收尾时
+	// 判定输出是否以停止串结尾(对齐 Bifrost anthropicStopReasonWithSequence)。
+	var textAccumulator strings.Builder
 	emitTextDelta := func(b *claudeResponsesBlock, text string) {
 		if text == "" {
 			return
 		}
 		stats.TextChars += len(text)
 		fullTextLen += len(text)
+		textAccumulator.WriteString(text)
 		producedText = true
 		startTextBlock(b)
 		emitEvent("content_block_delta", map[string]any{
@@ -1800,7 +1859,18 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 			return
 		}
 		finalized = true
-		finalizeClaudeResponsesStream(emitEvent, blocks, toolOrder, msgID, model, fullUsage, stopReason, reasoningFallback.String(), producedText)
+		// stop_sequence 往返:仅 end_turn 升级且无工具调用(对齐 Bifrost
+		// anthropicStopReasonWithSequence);Responses 上游不透传 stop(见
+		// claudeToResponsesBody),输出以停止串结尾只是自然生成的巧合,最小
+		// 往返仍恢复该终止形态。
+		finalStopSequence := (*string)(nil)
+		if stopReason == "end_turn" && len(toolOrder) == 0 {
+			if seq := claudeStopSequenceMatch(textAccumulator.String(), stopSequences); seq != nil {
+				stopReason = "stop_sequence"
+				finalStopSequence = seq
+			}
+		}
+		finalizeClaudeResponsesStream(emitEvent, blocks, toolOrder, msgID, model, fullUsage, stopReason, reasoningFallback.String(), producedText, finalStopSequence)
 	}
 	flushFrame := func() {
 		defer func() {
@@ -2017,6 +2087,18 @@ func (e *claudeResponsesEmitter) markStreamed(itemID string, outputIndex int) {
 	if outputIndex >= 0 {
 		e.streamedOutIdx[outputIndex] = true
 	}
+}
+
+// responsesIncompleteStopReason 按 incomplete_details.reason 细分 incomplete
+// 的 stop_reason(对齐 Bifrost anthropicStopReasonFromIncompleteDetails):
+// content_filter → refusal,其余(max_output_tokens 及未知)按截断 max_tokens。
+func responsesIncompleteStopReason(resp map[string]any) string {
+	if details, ok := resp["incomplete_details"].(map[string]any); ok {
+		if reason, _ := details["reason"].(string); reason == "content_filter" {
+			return "refusal"
+		}
+	}
+	return "max_tokens"
 }
 
 // harvestTerminalOutput 把终态事件 output[] 里未经 delta 通道流出的内容补
@@ -2374,7 +2456,10 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 				}
 			}
 			if status, ok := resp["status"].(string); ok && status == "incomplete" {
-				*e.stopReason = "max_tokens"
+				// incomplete 原因细分(对齐 Bifrost
+				// anthropicStopReasonFromIncompleteDetails):content_filter →
+				// refusal,其余按截断 max_tokens;与非流式路径同一终态。
+				*e.stopReason = responsesIncompleteStopReason(resp)
 			}
 			// 从完整 output 推导 tool_use 终止（流式 delta 可能漏 name）；同时
 			// 把 reasoning item 的 encrypted_content 落到对应 thinking block 的
@@ -2444,7 +2529,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 			*e.finished = true
 			return
 		}
-		*e.stopReason = "max_tokens"
+		*e.stopReason = responsesIncompleteStopReason(resp)
 		e.stats.SawFinish = true
 		e.stats.FinishReason = "length"
 		e.stats.DoneSeen = true
@@ -2487,7 +2572,7 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 	}
 
 }
-func finalizeClaudeResponsesStream(emit func(string, any), blocks map[int]*claudeResponsesBlock, toolOrder []int, msgID, model string, fullUsage map[string]any, stopReason, reasoningFallback string, producedText bool) {
+func finalizeClaudeResponsesStream(emit func(string, any), blocks map[int]*claudeResponsesBlock, toolOrder []int, msgID, model string, fullUsage map[string]any, stopReason, reasoningFallback string, producedText bool, stopSequence *string) {
 	// 下一个可用 claude 序号：不再用固定 9999 兜底（同流多段/大序号时可能
 	// 与既有块冲突），取当前最大序号 +1。
 	nextIndex := 0
@@ -2543,7 +2628,7 @@ func finalizeClaudeResponsesStream(emit func(string, any), blocks map[int]*claud
 	// 占位块（claudeIndex==-1，从未真正开块）无需关闭。
 	emit("message_delta", map[string]any{
 		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
+		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": stopSequence},
 		"usage": buildClaudeDeltaUsage(responsesUsageToChat(fullUsage)),
 	})
 	emit("message_stop", map[string]any{"type": "message_stop"})

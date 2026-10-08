@@ -38,6 +38,32 @@ type Message struct {
 	Name             string     `json:"name,omitempty"`
 	ReasoningContent *string    `json:"reasoning_content,omitempty"`
 	Refusal          *string    `json:"refusal,omitempty"`
+	// ReasoningDetails 是 assistant 消息的 typed 推理槽位（对齐 Bifrost
+	// ChatReasoningDetails，wire 形 reasoning_details[]）。reasoning.text 携带
+	// 思考文本+签名，reasoning.encrypted 携带不可解密的密文负载（Anthropic
+	// redacted_thinking）。chat→anthropic 出站按块回放到 assistant 消息头部
+	// （thinking-head 要求），密文不再 JSON-stringify 进文本泄漏。
+	ReasoningDetails []ReasoningDetail `json:"reasoning_details,omitempty"`
+	// IsError carries a tool result's failure marker internally. The OpenAI
+	// wire format has no tool-error field, and OpenAI-compatible providers
+	// reject unknown message parameters, so the field is never serialized
+	// (json:"-"). Converters that emit an error-capable shape — Anthropic
+	// tool_result.is_error — map it there instead; converters to the OpenAI
+	// wire leave it out (Bifrost strips its ChatToolMessage.IsError from the
+	// OpenAI wire for the same reason).
+	IsError *bool `json:"-"`
+}
+
+// ReasoningDetail 是一条推理详情：reasoning.text = 可显示的思考文本+签名，
+// reasoning.encrypted = Anthropic redacted_thinking 的不透明密文（仅可原样
+// 回放，上游按 data 解密校验）。
+type ReasoningDetail struct {
+	Index     int    `json:"index"`
+	Type      string `json:"type"` // "reasoning.text" | "reasoning.encrypted"
+	Text      string `json:"text,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	// Data 承载 reasoning.encrypted 的密文负载（Anthropic redacted_thinking）。
+	Data string `json:"data,omitempty"`
 }
 
 type ToolCall struct {
@@ -366,16 +392,29 @@ type ClaudeTool struct {
 	CacheControl any    `json:"cache_control,omitempty"`
 }
 
+// ClaudeStopReason 是 Anthropic stop_reason 枚举的字符串类型。MarshalJSON
+// 保持 Anthropic 的 required-null 响应契约:空串编出 null(对齐 Bifrost
+// AnthropicStopReason),严格客户端拒收 ""。
+type ClaudeStopReason string
+
+// MarshalJSON 编码 stop_reason:空串编出 null 而非 ""。
+func (r ClaudeStopReason) MarshalJSON() ([]byte, error) {
+	if r == "" {
+		return []byte("null"), nil
+	}
+	return json.Marshal(string(r))
+}
+
 type ClaudeResponse struct {
-	ID           string          `json:"id"`
-	Type         string          `json:"type"`
-	Role         string          `json:"role"`
-	Content      []ClaudeContent `json:"content"`
-	Model        string          `json:"model"`
-	StopReason   string          `json:"stop_reason"`
-	StopSequence *string         `json:"stop_sequence"`
-	StopDetails  any             `json:"stop_details,omitempty"`
-	Usage        ClaudeUsage     `json:"usage,omitempty"`
+	ID           string           `json:"id"`
+	Type         string           `json:"type"`
+	Role         string           `json:"role"`
+	Content      []ClaudeContent  `json:"content"`
+	Model        string           `json:"model"`
+	StopReason   ClaudeStopReason `json:"stop_reason"`
+	StopSequence *string          `json:"stop_sequence,omitempty"`
+	StopDetails  any              `json:"stop_details,omitempty"`
+	Usage        ClaudeUsage      `json:"usage,omitempty"`
 }
 
 type ClaudeUsage map[string]any

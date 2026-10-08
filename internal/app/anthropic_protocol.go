@@ -99,9 +99,36 @@ func convertClaudeRequest(req ClaudeRequest) (OpenAIRequest, []string) {
 	if effort := effortFromOutputConfig(req.OutputConfig); effort != "" {
 		out.ReasoningEffort = effort
 	}
-	// Normalize adaptive thinking to an enabled object so budget/effort fields survive.
+	// thinking 翻译按机型收口（对齐 Bifrost
+	// core/providers/anthropic/chat.go:771-809）。恒归一成 enabled 会把
+	// adaptive-only 机型（Opus 4.7+/Sonnet 5+/Fable 系）必拒的
+	// enabled+budget 发出去——budget_tokens thinking 在这些机型上已移除：
+	//   - 收到 enabled(+budget)：重写为 adaptive，effort 由 output_config.effort
+	//     或 budget 折算（Bifrost chat.go:780-782 + setEffortOnOutputConfig）。
+	//   - 收到 adaptive：保留 adaptive 语义；budget 不能随 adaptive 发送（上游
+	//     拒绝该组合），折算为 effort。
+	// 其余机型保持既有 enabled 归一，budget/effort 字段存活。
 	if m, ok := req.Thinking.(map[string]any); ok {
-		if t, _ := m["type"].(string); t == "adaptive" {
+		t, _ := m["type"].(string)
+		adaptiveOnly := adaptiveOnlyThinkingModel(out.Model)
+		rewriteAdaptive := func() map[string]any {
+			adaptive := map[string]any{"type": "adaptive"}
+			effort := out.ReasoningEffort
+			if effort == "" {
+				effort = reasoningEffortFromThinking(m)
+			}
+			if effort != "" {
+				adaptive["effort"] = effort
+				// effort 同时落在 reasoning_effort（chat 面的 effort 旋钮,
+				// convertRequest 据此透传），budget_tokens 已从 adaptive 上移除。
+				out.ReasoningEffort = effort
+			}
+			return adaptive
+		}
+		switch {
+		case t == "adaptive" && adaptiveOnly:
+			out.Thinking = rewriteAdaptive()
+		case t == "adaptive":
 			normalized := map[string]any{"type": "enabled"}
 			for _, key := range []string{"budget_tokens", "effort"} {
 				if v, exists := m[key]; exists && v != nil {
@@ -114,6 +141,8 @@ func convertClaudeRequest(req ClaudeRequest) (OpenAIRequest, []string) {
 				}
 			}
 			out.Thinking = normalized
+		case t == "enabled" && adaptiveOnly:
+			out.Thinking = rewriteAdaptive()
 		}
 	}
 	// thinking 与采样参数互斥（对齐 sub2api）：上游 Anthropic thinking 模式

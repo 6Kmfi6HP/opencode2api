@@ -276,13 +276,374 @@ func TestChatMessagesToAnthropic_AssistantBadArgumentsKeepRaw(t *testing.T) {
 	}
 }
 
+// ======================== 工具链：ID 清洗 / 孤儿降级 / is_error ========================
+
+// TestChatMessagesToAnthropic_ToolIDsSanitizeAndPair 钉死 tool_use.id 与
+// tool_result.tool_use_id 的确定性清洗：同一原始 ID 在两侧必须清洗到相同值
+// 才能配对（Anthropic 要求 ID 仅 [A-Za-z0-9_-]，"functions.x:0" 类照发必 400）。
+func TestChatMessagesToAnthropic_ToolIDsSanitizeAndPair(t *testing.T) {
+	badID := "functions.x:0"
+	msgs := []Message{
+		{Role: "user", Content: "run it"},
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID: badID, Type: "function",
+			Function: FunctionCall{Name: "shell", Arguments: `{"cmd":"ls"}`},
+		}}},
+		{Role: "tool", ToolCallID: badID, Content: "ok"},
+	}
+	_, out := chatMessagesToAnthropic(msgs, true)
+	if len(out) != 3 {
+		t.Fatalf("messages = %#v, want 3", out)
+	}
+	asst := out[1]
+	blocks, _ := asst["content"].([]map[string]any)
+	var toolUseID string
+	for _, b := range blocks {
+		if b["type"] == "tool_use" {
+			toolUseID, _ = b["id"].(string)
+		}
+	}
+	if toolUseID == "" || toolUseID == badID {
+		t.Fatalf("tool_use id not sanitized: %q", toolUseID)
+	}
+	usr := out[2]
+	blocks, _ = usr["content"].([]map[string]any)
+	if len(blocks) != 1 || blocks[0]["type"] != "tool_result" {
+		t.Fatalf("tool_result block missing: %#v", usr["content"])
+	}
+	resultID, _ := blocks[0]["tool_use_id"].(string)
+	if resultID != toolUseID {
+		t.Fatalf("pairing broken: tool_use %q vs tool_result %q", toolUseID, resultID)
+	}
+	// Anthropic 字符集：仅 [A-Za-z0-9_-]。
+	for _, r := range resultID {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			t.Fatalf("sanitized id %q has illegal rune %q", resultID, r)
+		}
+	}
+}
+
+// TestChatMessagesToAnthropic_OrphanToolResultDegradesToUserText 钉死孤儿
+// tool_result（空 tool_use_id）降级为普通 user 文本——空 ID 照发必 400。
+func TestChatMessagesToAnthropic_OrphanToolResultDegradesToUserText(t *testing.T) {
+	msgs := []Message{
+		{Role: "tool", ToolCallID: "", Content: "orphan output"},
+		{Role: "user", Content: "next"},
+	}
+	_, out := chatMessagesToAnthropic(msgs, true)
+	// 合并后只有一条 user 消息,内容为降级文本 + 原始 user 文本;绝不含 tool_result。
+	if len(out) != 1 {
+		t.Fatalf("messages = %#v, want 1 merged user message", out)
+	}
+	blocks, _ := out[0]["content"].([]map[string]any)
+	texts := ""
+	for _, b := range blocks {
+		if b["type"] == "tool_result" {
+			t.Fatalf("orphan tool_result must not be forwarded: %#v", blocks)
+		}
+		if t2, _ := b["text"].(string); t2 != "" {
+			texts += t2 + "\n"
+		}
+	}
+	if !strings.Contains(texts, "orphan output") {
+		t.Fatalf("orphan output lost: %#v", blocks)
+	}
+}
+
+// TestChatMessagesToAnthropic_EmptyIDToolCallSkipped 钉死空 id 的 tool call
+// 被跳过（无法配对,照发 tool_use 空 id 必 400）。
+func TestChatMessagesToAnthropic_EmptyIDToolCallSkipped(t *testing.T) {
+	msgs := []Message{
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID: "", Type: "function",
+			Function: FunctionCall{Name: "f", Arguments: `{}`},
+		}}},
+	}
+	_, out := chatMessagesToAnthropic(msgs, true)
+	// assistant 消息无剩余内容 → 整条消失,不发 tool_use。
+	if len(out) != 0 {
+		t.Fatalf("messages = %#v, want 0 (empty-id tool call dropped)", out)
+	}
+}
+
+// TestChatMessagesToAnthropic_IsErrorFlagToToolResult 钉死 Message.IsError →
+// tool_result.is_error:true（错误语义不再用 "Error: " 文本前缀污染内容）。
+func TestChatMessagesToAnthropic_IsErrorFlagToToolResult(t *testing.T) {
+	isErr := true
+	clean := false
+	msgs := []Message{
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID: "call_e", Type: "function",
+			Function: FunctionCall{Name: "f", Arguments: `{}`},
+		}}},
+		{Role: "tool", ToolCallID: "call_e", Content: "boom", IsError: &isErr},
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID: "call_o", Type: "function",
+			Function: FunctionCall{Name: "f", Arguments: `{}`},
+		}}},
+		{Role: "tool", ToolCallID: "call_o", Content: "fine", IsError: &clean},
+	}
+	_, out := chatMessagesToAnthropic(msgs, true)
+	// out[1] 含 call_e 的 tool_result（is_error:true），out[3] 含 call_o 的。
+	toolResult := func(m map[string]any) map[string]any {
+		blocks, _ := m["content"].([]map[string]any)
+		for _, b := range blocks {
+			if b["type"] == "tool_result" {
+				return b
+			}
+		}
+		return nil
+	}
+	errResult := toolResult(out[1])
+	if errResult == nil {
+		t.Fatalf("tool_result missing: %#v", out[1])
+	}
+	if errResult["is_error"] != true {
+		t.Fatalf("is_error = %#v, want true", errResult["is_error"])
+	}
+	if inner, _ := errResult["content"].([]map[string]any); len(inner) != 1 || inner[0]["text"] != "boom" {
+		t.Fatalf("content polluted: %#v", errResult["content"])
+	}
+	okResult := toolResult(out[3])
+	if okResult == nil {
+		t.Fatalf("tool_result missing: %#v", out[3])
+	}
+	if _, has := okResult["is_error"]; has {
+		t.Fatalf("is_error should be absent without the flag: %#v", okResult)
+	}
+}
+
+// TestParseToolCallArguments_CompactPassthroughKeepsKeyOrder 钉死合法 JSON
+// 对象 arguments 的紧凑透传——原始键序保留（map 往返会重排键序,破坏上游
+// 前缀缓存），坏 JSON 仍兜底 {"_raw": ...} 不丢数据。
+func TestParseToolCallArguments_CompactPassthroughKeepsKeyOrder(t *testing.T) {
+	tests := []struct {
+		name string
+		args string
+		want string // 期望 marshal 后的 input 字节
+	}{
+		{"空串补 {}", "", `{}`},
+		{"合法对象透传", `{"cmd":"ls","cwd":"/tmp"}`, `{"cmd":"ls","cwd":"/tmp"}`},
+		{"空白被压缩", "{ \"cmd\" : \"ls\" }", `{"cmd":"ls"}`},
+		{"坏 JSON 兜底 _raw", `not json`, `{"_raw":"not json"}`},
+		{"数组兜底 _raw", `[1,2]`, `{"_raw":"[1,2]"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := parseToolCallArguments(tc.args)
+			b, err := json.Marshal(input)
+			if err != nil {
+				t.Fatalf("marshal input: %v", err)
+			}
+			if string(b) != tc.want {
+				t.Fatalf("input = %s, want %s", b, tc.want)
+			}
+		})
+	}
+	// 键序保留：非字母序的原始键序在 marshal 后不被重排。
+	raw := `{"z_last":1,"a_first":2}`
+	b, _ := json.Marshal(parseToolCallArguments(raw))
+	if string(b) != raw {
+		t.Fatalf("key order destroyed: %s, want %s", b, raw)
+	}
+}
+
+// ======================== 工具链：tool_choice 转换 / allowed_tools / parallel ========================
+
+// toolChoiceBody 是 allowed_tools/parallel 用例的公共请求形状。
+func toolChoiceBody(toolChoice any, extra parallelExtra) *OpenAIRequest {
+	req := &OpenAIRequest{
+		Model:      "claude-x",
+		Messages:   []Message{{Role: "user", Content: "hi"}},
+		ToolChoice: toolChoice,
+	}
+	if extra != nil {
+		req.ExtraBody = map[string]any(extra)
+	}
+	return req
+}
+
+type parallelExtra map[string]any
+
+func decodeToolChoice(t *testing.T, req *OpenAIRequest) (map[string]any, []string) {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal(chatToAnthropicBodyWithRaw(req, "claude-x", nil, false), &body); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	if tools, ok := body["tools"].([]any); ok {
+		for _, tl := range tools {
+			if m, ok := tl.(map[string]any); ok {
+				if n, _ := m["name"].(string); n != "" {
+					names = append(names, n)
+				}
+			}
+		}
+	}
+	tc, _ := body["tool_choice"].(map[string]any)
+	return tc, names
+}
+
+// TestChatToAnthropicBody_AllowedToolsRestrictsDeclarations 钉死 allowed_tools
+// 按声明收窄工具列表（绝不静默放行全量工具）：mode=required → any。
+func TestChatToAnthropicBody_AllowedToolsRestrictsDeclarations(t *testing.T) {
+	req := toolChoiceBody(map[string]any{
+		"type": "allowed_tools", "mode": "required",
+		"tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "tool_a"}}},
+	}, nil)
+	req.Tools = []Tool{
+		{Type: "function", Function: ToolFunction{Name: "tool_a"}},
+		{Type: "function", Function: ToolFunction{Name: "tool_b"}},
+	}
+	tc, names := decodeToolChoice(t, req)
+	if strings.Join(names, ",") != "tool_a" {
+		t.Fatalf("tool names = %#v, want [tool_a] (tool_b must not be forwarded)", names)
+	}
+	if tc["type"] != "any" {
+		t.Fatalf(`mode "required" means a tool must be called: %#v`, tc)
+	}
+}
+
+// TestChatToAnthropicBody_AllowedToolsAutoModeDoesNotForceACall 钉死 mode=auto
+// → tool_choice auto（不得强制 any）。
+func TestChatToAnthropicBody_AllowedToolsAutoModeDoesNotForceACall(t *testing.T) {
+	req := toolChoiceBody(map[string]any{
+		"type": "allowed_tools", "mode": "auto",
+		"tools": []any{map[string]any{"function": map[string]any{"name": "tool_a"}}},
+	}, nil)
+	req.Tools = []Tool{
+		{Type: "function", Function: ToolFunction{Name: "tool_a"}},
+		{Type: "function", Function: ToolFunction{Name: "tool_b"}},
+	}
+	tc, names := decodeToolChoice(t, req)
+	if strings.Join(names, ",") != "tool_a" {
+		t.Fatalf("tool names = %#v, want [tool_a]", names)
+	}
+	if tc["type"] != "auto" {
+		t.Fatalf(`mode "auto" must not force a tool call: %#v`, tc)
+	}
+}
+
+// TestChatToAnthropicBody_AllowedToolsUnknownNamesPermitNothing 钉死空交集
+// → tool_choice none（绝不静默放行全量工具）。
+func TestChatToAnthropicBody_AllowedToolsUnknownNamesPermitNothing(t *testing.T) {
+	req := toolChoiceBody(map[string]any{
+		"type": "allowed_tools", "mode": "required",
+		"tools": []any{map[string]any{"function": map[string]any{"name": "not_declared"}}},
+	}, nil)
+	req.Tools = []Tool{
+		{Type: "function", Function: ToolFunction{Name: "tool_a"}},
+		{Type: "function", Function: ToolFunction{Name: "tool_b"}},
+	}
+	tc, names := decodeToolChoice(t, req)
+	if len(names) != 0 {
+		t.Fatalf("no declared tool was allowed, so none may be forwarded: %#v", names)
+	}
+	if tc["type"] != "none" {
+		t.Fatalf(`empty intersection must land on tool_choice none: %#v`, tc)
+	}
+}
+
+// TestChatToAnthropicBody_ParallelToolCallsFalseDisablesParallelUse 钉死
+// parallel_tool_calls:false → disable_parallel_tool_use:true（含无 tool_choice
+// 时的 auto 载体）。
+func TestChatToAnthropicBody_ParallelToolCallsFalseDisablesParallelUse(t *testing.T) {
+	reqTools := []Tool{{Type: "function", Function: ToolFunction{Name: "tool_a"}}}
+
+	t.Run("with an explicit tool choice", func(t *testing.T) {
+		req := toolChoiceBody(map[string]any{"type": "auto"}, parallelExtra{"parallel_tool_calls": false})
+		req.Tools = reqTools
+		tc, _ := decodeToolChoice(t, req)
+		if tc == nil {
+			t.Fatal("tool_choice missing")
+		}
+		if tc["disable_parallel_tool_use"] != true {
+			t.Fatalf("disable_parallel_tool_use = %#v, want true", tc["disable_parallel_tool_use"])
+		}
+	})
+	t.Run("with no tool choice of its own", func(t *testing.T) {
+		req := toolChoiceBody(nil, parallelExtra{"parallel_tool_calls": false})
+		req.Tools = reqTools
+		tc, _ := decodeToolChoice(t, req)
+		if tc == nil {
+			t.Fatal("the flag has nowhere to live without a tool_choice")
+		}
+		if tc["type"] != "auto" {
+			t.Fatalf("auto is Anthropic's default, so this adds no restriction: %#v", tc)
+		}
+		if tc["disable_parallel_tool_use"] != true {
+			t.Fatalf("disable_parallel_tool_use = %#v, want true", tc["disable_parallel_tool_use"])
+		}
+	})
+	t.Run("tool_choice none skips the flag", func(t *testing.T) {
+		req := toolChoiceBody(map[string]any{"type": "none"}, parallelExtra{"parallel_tool_calls": false})
+		req.Tools = reqTools
+		tc, _ := decodeToolChoice(t, req)
+		if tc["type"] != "none" {
+			t.Fatalf("tool_choice type = %#v, want none", tc["type"])
+		}
+		if _, has := tc["disable_parallel_tool_use"]; has {
+			t.Fatalf("none means no tool may run; flag is meaningless: %#v", tc)
+		}
+	})
+}
+
+// TestChatToAnthropicBody_ParallelToolCallsTrueSendsNothing 钉死
+// parallel_tool_calls:true / 缺省不发 disable_parallel_tool_use。
+func TestChatToAnthropicBody_ParallelToolCallsTrueSendsNothing(t *testing.T) {
+	reqTools := []Tool{{Type: "function", Function: ToolFunction{Name: "tool_a"}}}
+	for _, extra := range []parallelExtra{
+		{"parallel_tool_calls": true},
+		{},
+	} {
+		req := toolChoiceBody(nil, extra)
+		req.Tools = reqTools
+		tc, _ := decodeToolChoice(t, req)
+		if _, has := tc["disable_parallel_tool_use"]; has {
+			t.Fatalf("parallel default must not set disable_parallel_tool_use: %#v", tc)
+		}
+	}
+}
+
+// TestChatToAnthropicBody_AnyAndCustomToolChoice 钉死 tool_choice any →
+// {"type":"any"}、custom → auto（此前二者被静默丢弃）。
+func TestChatToAnthropicBody_AnyAndCustomToolChoice(t *testing.T) {
+	reqTools := []Tool{{Type: "function", Function: ToolFunction{Name: "tool_a"}}}
+	tests := []struct {
+		name     string
+		choice   any
+		wantType string
+	}{
+		{"any 透传", map[string]any{"type": "any"}, "any"},
+		{"custom 映射 auto", map[string]any{"type": "custom"}, "auto"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := toolChoiceBody(tt.choice, nil)
+			req.Tools = reqTools
+			tc, _ := decodeToolChoice(t, req)
+			if tc == nil {
+				t.Fatalf("tool_choice dropped for %v", tt.choice)
+			}
+			if tc["type"] != tt.wantType {
+				t.Fatalf("tool_choice type = %#v, want %q", tc["type"], tt.wantType)
+			}
+		})
+	}
+}
+
 // ======================== G5: 图片 content edge cases ========================
 
 func TestChatTextToAnthropicContent_ImageEdgeCases(t *testing.T) {
-	// 空 url 与非法 data URI 都丢弃；全部丢光时回填 [image attached] 占位文本。
+	// 空 url、畸形 data URI（无 media type）与白名单外 scheme（file://）都
+	// 丢弃；全部丢光时回填 [image attached] 占位文本。合法的非 base64 data
+	// URI（如 data:image/svg+xml,...）不再直接丢弃——走 url source 透传
+	//（对齐 Bifrost ExtractURLTypeInfo,见 TestImageURLToAnthropicBlock_SchemeWhitelist）。
 	blocks, ok := chatTextToAnthropicContent([]any{
 		map[string]any{"type": "image_url", "image_url": map[string]any{"url": ""}},
 		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:;not-base64,xxxx"}},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "file:///etc/passwd"}},
 	})
 	if !ok {
 		t.Fatal("content 为空却未回填占位文本")
@@ -342,7 +703,7 @@ func TestAnthropicToChat_TextStartPreEmitsInitialText(t *testing.T) {
 	}
 }
 
-func TestAnthropicToChat_SignatureAndRedactedAreSkipped(t *testing.T) {
+func TestAnthropicToChat_SignatureAndRedactedLandInReasoningDetails(t *testing.T) {
 	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-x\"}}\n\n" +
 		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n" +
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-abc\"}}\n\n" +
@@ -352,8 +713,37 @@ func TestAnthropicToChat_SignatureAndRedactedAreSkipped(t *testing.T) {
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
 		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", true, false, nil, nil)
 	})
-	if strings.Contains(body, "sig-abc") || strings.Contains(body, "reasoning_content") {
+	// reasoning_content 只接思考文本,签名/密文不拼进文本通道。
+	if strings.Contains(body, "reasoning_content") {
 		t.Fatalf("signature/redacted 不应进入 reasoning_content: %s", body)
+	}
+	// typed 槽位（reasoning_details）承载签名与密文供回放（对齐 Bifrost
+	// reasoning.encrypted/reasoning.text details）。
+	if !strings.Contains(body, `"signature":"sig-abc"`) {
+		t.Fatalf("signature 未落 reasoning_details: %s", body)
+	}
+	if !strings.Contains(body, `"type":"reasoning.text"`) {
+		t.Fatalf("signature detail 缺 reasoning.text 类型: %s", body)
+	}
+	if !strings.Contains(body, `"data":"xyz"`) {
+		t.Fatalf("redacted 密文未落 reasoning_details: %s", body)
+	}
+	if !strings.Contains(body, `"type":"reasoning.encrypted"`) {
+		t.Fatalf("redacted detail 缺 reasoning.encrypted 类型: %s", body)
+	}
+}
+
+func TestAnthropicToChat_ReasoningDetailsSuppressedWithoutKeepReasoning(t *testing.T) {
+	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-x\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"xyz\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	body := drainSSEFromHandler(func(w http.ResponseWriter) {
+		anthropicSSEToChatStream(context.Background(), w, strings.NewReader(sse), "claude-x", false, false, nil, nil)
+	})
+	// keepReasoning=false：typed 推理槽位与 reasoning_content 同一抑制契约。
+	if strings.Contains(body, "reasoning_details") || strings.Contains(body, "reasoning_content") {
+		t.Fatalf("keepReasoning=false 时 reasoning_details 应被抑制: %s", body)
 	}
 }
 

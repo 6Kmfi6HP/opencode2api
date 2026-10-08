@@ -449,7 +449,7 @@ func TestClaudeStreamHandlerRawDSML(t *testing.T) {
 		``,
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, wrapRawSSE(io.NopCloser(strings.NewReader(upstream))), "m", false)
+	claudeStreamHandler(context.Background(), rr, wrapRawSSE(io.NopCloser(strings.NewReader(upstream))), "m", false, nil)
 	events := parseSSEEvents(t, rr.Body.String())
 	if !hasEvent(events, "content_block_start") {
 		t.Fatalf("missing content_block_start:\n%s", rr.Body.String())

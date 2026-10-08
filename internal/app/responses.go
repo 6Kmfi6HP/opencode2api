@@ -25,7 +25,7 @@ func responsesInputToMessages(input any, instructions string) []Message {
 	case string:
 		messages = append(messages, Message{Role: "user", Content: v})
 	case []any:
-		functionOutputs := collectFunctionOutputs(v)
+		functionOutputs, functionOutputErrors := collectFunctionOutputs(v)
 		// Pre-collect call IDs present in this input array so output items
 		// whose matching call is also present are not independently appended
 		// (the call branch emits the paired tool message). Standalone outputs
@@ -113,7 +113,15 @@ func responsesInputToMessages(input any, instructions string) []Message {
 						if !hasOutput {
 							output = "[tool output missing]"
 						}
-						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
+						toolMsg := Message{Role: "tool", ToolCallID: callID, Content: output}
+						if functionOutputErrors[callID] {
+							// 错误语义由内部标记携带（不烤进文本）：
+							// Anthropic 上游转为 tool_result.is_error:true；
+							// OpenAI wire 不序列化（json:"-"，Bifrost 同策略）。
+							callIsError := true
+							toolMsg.IsError = &callIsError
+						}
+						messages = append(messages, toolMsg)
 					}
 				case "function_call_output", "tool_result", "apply_patch_call_output", "shell_call_output":
 					callID, _ := elem["call_id"].(string)
@@ -149,7 +157,13 @@ func responsesInputToMessages(input any, instructions string) []Message {
 						if !hasOutput {
 							output = "[tool output missing]"
 						}
-						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
+						toolMsg := Message{Role: "tool", ToolCallID: callID, Content: output}
+						if functionOutputErrors[callID] {
+							// 错误语义由内部标记携带（不烤进文本），同上。
+							standaloneIsError := true
+							toolMsg.IsError = &standaloneIsError
+						}
+						messages = append(messages, toolMsg)
 					}
 					continue
 				case "reasoning":
@@ -373,11 +387,12 @@ func normalizeAnthropicToolPairing(messages []Message) []Message {
 				}
 				// 非法 arguments（parseToolCallArguments 兜底 _raw）连同其
 				// output 一并删除，防上游 400 死循环。
-				parsed := parseToolCallArguments(tc.Function.Arguments)
-				if _, raw := parsed["_raw"]; raw {
-					droppedCalls++
-					delete(results, tc.ID) // 已消费 → 不再作为孤儿再匹配
-					continue
+				if m, isMap := parseToolCallArguments(tc.Function.Arguments).(map[string]any); isMap {
+					if _, raw := m["_raw"]; raw {
+						droppedCalls++
+						delete(results, tc.ID) // 已消费 → 不再作为孤儿再匹配
+						continue
+					}
 				}
 				kept = append(kept, tc)
 			}
@@ -753,8 +768,15 @@ var toolResultOutputKind = map[string]struct{}{
 	"tool_result":             {},
 }
 
-func collectFunctionOutputs(items []any) map[string]string {
+// collectFunctionOutputs collects the textual outputs of tool/function output
+// items keyed by call id, plus the set of call ids whose item carried
+// is_error:true. The error flag is returned separately instead of being baked
+// into the text as an "Error: " prefix: the text stays un-deformed, and
+// converters that emit an error-capable shape (Anthropic tool_result) map the
+// flag to is_error:true.
+func collectFunctionOutputs(items []any) (map[string]string, map[string]bool) {
 	outputs := map[string]string{}
+	errored := map[string]bool{}
 	for _, item := range items {
 		elem, ok := item.(map[string]any)
 		if !ok {
@@ -777,11 +799,14 @@ func collectFunctionOutputs(items []any) map[string]string {
 		if present {
 			outputs[callID] = text
 		}
+		if isError, _ := elem["is_error"].(bool); isError {
+			errored[callID] = true
+		}
 		// When no payload is present, the key is left absent so the caller
 		// surfaces "[tool output missing]" — the raw wrapper JSON is never
 		// stored as the output.
 	}
-	return outputs
+	return outputs, errored
 }
 
 // normalizeToolResultOutput is the single helper that extracts a textual
@@ -791,6 +816,11 @@ func collectFunctionOutputs(items []any) map[string]string {
 // {type:"text"|"input_text"|"output_text", text:"..."} blocks joined by
 // newlines in original order. The boolean reports whether a payload was
 // present (an empty string is a legitimate provided output).
+//
+// is_error is NOT baked into the text as an "Error: " prefix (that pollutes
+// the content the model reads and the Anthropic-bound tool_result already has
+// a native is_error:true carrier). Callers read elem["is_error"] separately —
+// see collectFunctionOutputs.
 func normalizeToolResultOutput(elem map[string]any) (string, bool) {
 	var text string
 	present := false
@@ -809,15 +839,7 @@ func normalizeToolResultOutput(elem map[string]any) (string, bool) {
 		text = joinToolResultContent(c)
 		present = true
 	}
-	if !present {
-		return "", false
-	}
-	// Apply is_error prefix here so the collected map already carries error
-	// semantics, independent of call/output ordering in the array.
-	if isError, _ := elem["is_error"].(bool); isError {
-		text = applyErrorPrefix(text)
-	}
-	return text, true
+	return text, present
 }
 
 // joinToolResultContent renders an Anthropic tool_result content value to text.
@@ -1838,6 +1860,9 @@ func responsesStreamHandler(w http.ResponseWriter, r *http.Request, rc io.Reader
 	createdSent := false
 	terminalStatus := "completed"
 	terminalEvent := "response.completed"
+	// terminalIncompleteDetails 与非流式 responsesOutcome 同源:incomplete 时
+	// 携带对应 reason(max_output_tokens / content_filter)。
+	var terminalIncompleteDetails any
 	itemStatus := "completed"
 	finished := false
 	// Some upstreams (e.g. muse-spark-1.2-contributor-free) terminate a stream
@@ -2393,12 +2418,17 @@ loop:
 									if usage, ok := chunk["usage"].(map[string]any); ok {
 										totalUsage = usage
 									}
-									if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
+									if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" || finishReason == "model_context_window_exceeded" {
 										finished = true
-										if finishReason == "length" {
-											terminalStatus = "incomplete"
-											terminalEvent = "response.incomplete"
-											itemStatus = "incomplete"
+										// 终态 status 与非流式 responsesOutcome 同源,不得
+										// 漂移:length / model_context_window_exceeded 报
+										// incomplete/max_output_tokens,content_filter 报
+										// incomplete/content_filter。
+										if outcome := responsesOutcome(finishReason); outcome.Status == "incomplete" {
+											terminalStatus = outcome.Status
+											terminalEvent = outcome.Event
+											itemStatus = outcome.Status
+											terminalIncompleteDetails = outcome.IncompleteDetails
 										}
 										// Do not emit done events yet: a trailing error
 										// must still produce response.failed without any
@@ -2513,7 +2543,11 @@ loop:
 		"output":             output,
 	}
 	if terminalStatus == "incomplete" {
-		completedResponse["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		if terminalIncompleteDetails != nil {
+			completedResponse["incomplete_details"] = terminalIncompleteDetails
+		} else {
+			completedResponse["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		}
 	}
 	applyResponsesRequestEcho(completedResponse, originalReq)
 	if len(tools) > 0 {
@@ -2613,12 +2647,17 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 	responses := map[string]any{
 		"id":                 normalizedID,
 		"object":             "response",
-		"status":             status,
 		"background":         false,
 		"error":              nil,
 		"incomplete_details": outcome.IncompleteDetails,
 		"model":              model,
 		"created_at":         chat.Created,
+	}
+	// status 置空时不发(对齐 Bifrost Status *string omitempty 的 unset 语义):
+	// pause_turn/compaction 等 Anthropic 未完结 stop_reason 无 Responses
+	// 等价物,不报完成态。
+	if status != "" {
+		responses["status"] = status
 	}
 	if len(tools) > 0 {
 		responses["tools"] = tools
@@ -2640,13 +2679,16 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		output = append(output, reasoningItem)
 	}
 	if len(messageContent) > 0 {
-		output = append(output, map[string]any{
+		item := map[string]any{
 			"id":      outputID,
 			"type":    "message",
-			"status":  status,
 			"role":    "assistant",
 			"content": messageContent,
-		})
+		}
+		if status != "" {
+			item["status"] = status
+		}
+		output = append(output, item)
 	}
 	for _, tc := range toolCalls {
 		kind := toolKinds[tc.Function.Name]
@@ -2654,7 +2696,9 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		if ns, ok := splitNamespaceKind(kind); ok {
 			item["namespace"] = ns
 		}
-		item["status"] = status
+		if status != "" {
+			item["status"] = status
+		}
 		output = append(output, item)
 	}
 	// 空输出补一条空 message：Responses 客户端（Codex/官方 SDK）期望非空
@@ -2673,12 +2717,12 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 }
 
 // emptyAssistantMessageItem 构造条 status 一致的空 output_text message。
+// status 置空时不发 status 键(不报完成态,对齐 Bifrost unset 语义)。
 func emptyAssistantMessageItem(outputID, status string) map[string]any {
-	return map[string]any{
-		"id":     outputID,
-		"type":   "message",
-		"status": status,
-		"role":   "assistant",
+	item := map[string]any{
+		"id":   outputID,
+		"type": "message",
+		"role": "assistant",
 		"content": []any{map[string]any{
 			"type":        "output_text",
 			"text":        "",
@@ -2686,6 +2730,10 @@ func emptyAssistantMessageItem(outputID, status string) map[string]any {
 			"logprobs":    []any{},
 		}},
 	}
+	if status != "" {
+		item["status"] = status
+	}
+	return item
 }
 
 // chatUsageMapToResponses 把 Chat Completions usage（上游 zen/go 口径）转
@@ -2738,6 +2786,32 @@ func chatUsageMapToResponses(u map[string]any) map[string]any {
 		cached = readInt(c)
 	}
 	detailsOut["cached_tokens"] = cached
+	// 缓存写明细往返（对齐 Bifrost ChatPromptTokensDetails.CachedWriteTokenDetails）：
+	// chat usage 携带的 cache_creation 5m/1h 拆分（anthropicUsageToChat 归位到
+	// prompt_tokens_details.cached_write_token_details 的部分已随 detailsOut
+	// 透传）连同顶层 cache_creation object 一并归位到 input_tokens_details,
+	// 不再整段丢弃。
+	if cc, ok := u["cache_creation"].(map[string]any); ok {
+		five, fiveOK := numberAsFloat(cc["ephemeral_5m_input_tokens"])
+		one, oneOK := numberAsFloat(cc["ephemeral_1h_input_tokens"])
+		if fiveOK || oneOK {
+			writeDetails, _ := detailsOut["cached_write_token_details"].(map[string]any)
+			if writeDetails == nil {
+				writeDetails = map[string]any{}
+			}
+			if fiveOK {
+				if existing, eok := numberAsFloat(writeDetails["cached_write_tokens_5m"]); !eok || existing == 0 {
+					writeDetails["cached_write_tokens_5m"] = five
+				}
+			}
+			if oneOK {
+				if existing, eok := numberAsFloat(writeDetails["cached_write_tokens_1h"]); !eok || existing == 0 {
+					writeDetails["cached_write_tokens_1h"] = one
+				}
+			}
+			detailsOut["cached_write_token_details"] = writeDetails
+		}
+	}
 	usage["input_tokens_details"] = detailsOut
 	if v, ok := u["completion_tokens"]; ok {
 		usage["output_tokens"] = v
