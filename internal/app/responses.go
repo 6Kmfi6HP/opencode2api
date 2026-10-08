@@ -1393,10 +1393,35 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	respReq.Model = mapPublicToFreeModel(auth, respReq.Model)
 
 	// 协议路由：显式规则 > native-responses 运行时记忆 > 默认 chat。
-	// 本端点只走翻译路径（上游原生 /responses 透传已移除）；anthropic 分支
-	// 延迟到 chatReq 构建完成后调用（复用 messages 转换结果）；chat 分支保持
-	// 既有翻译路径。规则/记忆命中的 "responses" 协议同样落翻译路径。
+	// responses 分支为既有透传（muse-spark 系上游 chat 通道整档 500/整档
+	// ModelProtocolUnsupported，落 chat 翻译必撞）；anthropic 分支延迟到
+	// chatReq 构建完成后调用（复用 messages 转换结果）；chat 分支保持既有
+	// 翻译路径。
 	upstreamProto := resolveUpstreamProtocol(respReq.Model)
+	if upstreamProto == upstreamProtocolResponses {
+		slog.Info("responses passthrough (remembered)",
+			"model_in", modelIn, "model", respReq.Model, "stream", respReq.Stream)
+		// 原生 /responses 透传:顶层 cache_control 不是合法 Responses 字段,只注入
+		// prompt_cache_key/retention（Console 等上游对未知顶层参数整包 400)。
+		body = applyResponsesCacheHintsToRawBody(body, respReq.Model, r.Context())
+		if cacheDebugEnabled() {
+			var m map[string]any
+			if err := json.Unmarshal(body, &m); err == nil {
+				if v, ok := m["prompt_cache_key"]; ok {
+					slog.Info("cache_debug_passthrough_body", "model", respReq.Model, "prompt_cache_key_present", v != "")
+				}
+			}
+		}
+		if forwardNativeResponses(r.Context(), w, auth, respReq.Model, body, respReq.Stream, respReq) {
+			return
+		}
+		// 仅传输层错误（拿不到上游响应）才会到这里，上游 4xx/5xx 已由
+		// forward 原样透传状态码与错误信息。
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream connection error"}})
+		return
+	}
 
 	// 多模态路由
 
@@ -1629,6 +1654,11 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(st)
 				return
 			}
+			// 翻译路径失败：探测上游原生 responses，成功则透传并记住该模型。
+			// 类型化转换错误（上游有明确错误信息）不探测，原样返回。
+			if shouldProbeNativeResponses(status, err) && probeNativeResponses(r.Context(), w, auth, chatReq.Model, body, true, respReq) {
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
 			if len(transErrBody) > 0 {
@@ -1701,6 +1731,11 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil || status < 200 || status >= 300 {
+		// 翻译路径失败：探测上游原生 responses，成功则透传并记住该模型。
+		// 类型化转换错误（上游有明确错误信息）不探测，原样返回。
+		if shouldProbeNativeResponses(status, err) && probeNativeResponses(r.Context(), w, auth, chatReq.Model, body, false, respReq) {
+			return
+		}
 		if err != nil {
 			writeUpstreamError(w, status, err, "responses")
 		} else {

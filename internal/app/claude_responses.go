@@ -9,12 +9,33 @@ import (
 	"github.com/6Kmfi6HP/opencode2api/internal/config"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// sanitizeAnthropicToolUseID 清洗 tool_use / call_id，使其满足 Anthropic
+// tool_use id 约束（字母数字、下划线、连字符，64 字符上限）。非法字符替换为
+// 下划线并截断哈希后缀保证唯一性。语义对齐 bifrost SanitizeAnthropicToolUseIDPtr
+// （来源：maximhq/bifrost, Apache-2.0），用 stdlib fnv 替代 xxhash，无新依赖。
+var sanitizeAnthropicToolUseIDPattern = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
+
+func sanitizeAnthropicToolUseID(id string) string {
+	if id == "" {
+		return id
+	}
+	cleaned := sanitizeAnthropicToolUseIDPattern.ReplaceAllString(id, "_")
+	if len(cleaned) <= 64 {
+		return cleaned
+	}
+	h := fnv.New64a()
+	h.Write([]byte(id))
+	return cleaned[:47] + "_" + fmt.Sprintf("%016x", h.Sum64())
+}
 
 // ======================== Claude -> Responses 原生转换（lenient） ========================
 //
@@ -81,6 +102,32 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 		instructionParts = append(instructionParts, stripVolatileCountersText(sysText))
 	}
 	input := []any{} // 非 nil 空数组，避免上游对 null 的严格校验
+
+	// F5：预收集本轮已知的 tool_use ID（有 name 的才算有效配对目标），
+	// tool_result 的 tool_use_id 不在其中时视为孤儿块，降级为用户文本
+	// （对齐 bifrost toolResultBlockToText：Anthropic 拒收孤儿块）。
+	knownToolUseIDs := map[string]struct{}{}
+	for _, msg := range msgs {
+		blocks, ok := msg.Content.([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range blocks {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if block["type"] != "tool_use" {
+				continue
+			}
+			if name, _ := block["name"].(string); name == "" {
+				continue
+			}
+			if id, _ := block["id"].(string); id != "" {
+				knownToolUseIDs[sanitizeAnthropicToolUseID(id)] = struct{}{}
+			}
+		}
+	}
 
 	// tool_result 中的 image/document 提取为独立的 user message item（紧跟在
 	// function_call_output 之后），而不是把 "[image attached]" 字符串塞进
@@ -255,6 +302,9 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 					} else {
 						id = sanitizeToolUseID(id)
 					}
+					// F6：清洗 tool_use id（对齐 bifrost SanitizeAnthropicToolUseIDPtr）。
+					id = sanitizeAnthropicToolUseID(id)
+					knownToolUseIDs[id] = struct{}{}
 					args := "{}"
 					if rawInput, exists := block["input"]; exists && rawInput != nil {
 						if s, ok := rawInput.(string); ok && s != "" {
@@ -270,6 +320,9 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 						"call_id":   id,
 						"name":      name,
 						"arguments": args,
+						// F2：回放的 assistant 侧 item 写 status completed
+						//（对齐 bifrost；严格校验器拒收无 status 回放，#7074）。
+						"status": "completed",
 					})
 				case "tool_result":
 					flushPending()
@@ -290,6 +343,16 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 							"type":    "message",
 							"role":    "user",
 							"content": []any{map[string]any{"type": "input_text", "text": text}},
+						})
+						continue
+					}
+					// F5：有 ID 但本轮无配对 tool_use（孤儿块，Anthropic 拒收），
+					// 降级为带前缀的用户文本（对齐 bifrost toolResultBlockToText）。
+					if _, paired := knownToolUseIDs[sanitizeAnthropicToolUseID(toolUseID)]; !paired {
+						input = append(input, map[string]any{
+							"type":    "message",
+							"role":    "user",
+							"content": []any{map[string]any{"type": "input_text", "text": "Tool result: " + text}},
 						})
 						continue
 					}
@@ -695,30 +758,54 @@ func claudeToResponsesBody(ctx context.Context, claudeReq ClaudeRequest, modelID
 
 // responsesOutputToClaudeBlocks 把原生 Responses output 数组转为 Claude
 // content blocks。未知 item 类型降级为文本，不报错。
+//
+// 保序：按 output 数组原序逐项 emit（对齐 bifrost
+// convertBifrostReasoningToAnthropicThinking / ToAnthropicResponsesResponse，
+// 及 Anthropic 侧 convertAnthropicContentBlocksToResponsesMessagesOrdered），
+// 同一 message item 内的多段文本 join 为单块，不跨 item 合并。
+//
+// reasoning 落点（对齐 bifrost）：可见 summary 每段独立 thinking 块；
+// encrypted_content 独立 redacted_thinking 块（Data 字段），两者可共存；
+// encrypted_content 不再塞进 thinking.signature（该签名语义上属于 thinking
+// 文本）。来源：maximhq/bifrost (Apache-2.0) convertBifrostReasoningToAnthropicThinking。
 func responsesOutputToClaudeBlocks(output []any, wantReasoning bool, restoreCase bool) ([]ClaudeContent, string, bool) {
 	content := []ClaudeContent{}
 	stopReason := "end_turn"
 	hasToolUse := false
-	// reasoningTexts 由 reasoning item 的 summary 文本（多段 "\n" 连接）组成，
-	// 每个 reasoning item 对应一个 thinking 块，带上该 item 的
-	// encrypted_content 作为 signature（双块共存各落其位）。
-	type reasoningPart struct {
-		text      string
-		signature string
-	}
-	var reasoningTexts []reasoningPart
-	var reasoningEncryptedOnly []string
-	var textParts []string
 	var refusalText string
+	// reasoningFallback 收集全部 reasoning 文本（无论 wantReasoning），供
+	// 空回复保护提升为文本。
+	var reasoningFallback []string
 
-	// 先收集 reasoning / refusal / text / tool_use，保序输出：
-	// thinking -> text -> tool_use（与 openAIToClaudeResponse 的 fallback 顺序一致）。
-	type toolUseItem struct {
-		id    string
-		name  string
-		input any
+	// toolUseFromFunctionCall 把 function_call 系 item 转为 tool_use 待发项。
+	// 免费层小写占位工具名仅对 Claude 系客户端还原为规范大小写。
+	toolUseFromFunctionCall := func(item map[string]any) (ClaudeContent, bool) {
+		callID, _ := item["call_id"].(string)
+		if callID == "" {
+			callID, _ = item["id"].(string)
+		}
+		// F6：清洗上游 call_id（对齐 bifrost SanitizeAnthropicToolUseIDPtr）。
+		callID = sanitizeAnthropicToolUseID(callID)
+		rawName, _ := item["name"].(string)
+		name := rawName
+		if restoreCase {
+			name = restoreToolNameCase(rawName)
+		}
+		if name == "" {
+			return ClaudeContent{}, false
+		}
+		argsStr, _ := item["arguments"].(string)
+		var input any
+		if argsStr != "" {
+			if err := json.Unmarshal([]byte(argsStr), &input); err != nil {
+				input = map[string]any{"_raw": argsStr}
+			}
+		}
+		if input == nil {
+			input = map[string]any{}
+		}
+		return ClaudeContent{Type: "tool_use", ID: callID, Name: name, Input: input}, true
 	}
-	var tools []toolUseItem
 
 	for _, raw := range output {
 		item, ok := raw.(map[string]any)
@@ -728,12 +815,6 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool, restoreCase
 		typ, _ := item["type"].(string)
 		switch typ {
 		case "reasoning":
-			// 双块共存映射（对齐 Bifrost responses.go:760-850 的 summary 与
-			// encrypted_content 双存）：summary 文本落 thinking 块的思考文本,
-			// encrypted_content 落 signature,各自落位。不再只让首块带签名——
-			// 多段 summary 时其余块丢失签名,回放链丢一半;与流式路径（一个
-			// reasoning item → 一个 thinking 块,signature 关块前发出）保持
-			// 同一 1:1 形状。
 			sig, _ := item["encrypted_content"].(string)
 			var texts []string
 			if summary, ok := item["summary"].([]any); ok {
@@ -751,15 +832,21 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool, restoreCase
 					texts = append(texts, s)
 				}
 			}
-			if len(texts) > 0 {
-				reasoningTexts = append(reasoningTexts, reasoningPart{text: strings.Join(texts, "\n"), signature: sig})
-			} else if sig != "" && wantReasoning {
-				// 无 summary 的 encrypted-only reasoning：发出带 signature
-				// 的空 thinking 槽位，保住 roundtrip（无文本可显示）。
-				reasoningEncryptedOnly = append(reasoningEncryptedOnly, sig)
+			reasoningFallback = append(reasoningFallback, texts...)
+			if !wantReasoning {
+				continue
+			}
+			for _, t := range texts {
+				content = append(content, ClaudeContent{Type: "thinking", Thinking: t})
+			}
+			if sig != "" {
+				// encrypted-only 或 summary+encrypted 共存：一律独立
+				// redacted_thinking 块，保住 roundtrip 载荷。
+				content = append(content, ClaudeContent{Type: "redacted_thinking", Data: sig})
 			}
 		case "message":
 			c, _ := item["content"].([]any)
+			var parts []string
 			for _, rc := range c {
 				cm, ok := rc.(map[string]any)
 				if !ok {
@@ -769,50 +856,30 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool, restoreCase
 				switch ct {
 				case "output_text", "input_text", "text":
 					if t, ok := cm["text"].(string); ok && t != "" {
-						textParts = append(textParts, t)
+						parts = append(parts, t)
 					} else if t, ok := cm["output_text"].(string); ok && t != "" {
-						textParts = append(textParts, t)
+						parts = append(parts, t)
 					}
 				case "refusal":
 					if t, ok := cm["refusal"].(string); ok && t != "" {
 						refusalText = t
-						if refusalText != "" {
-							textParts = append(textParts, refusalText)
-						}
+						parts = append(parts, refusalText)
 					}
 				default:
 					// annotations 等未知 content：尝试文本兜底。
 					if t, ok := cm["text"].(string); ok && t != "" {
-						textParts = append(textParts, t)
+						parts = append(parts, t)
 					}
 				}
 			}
+			if joined := strings.Join(parts, "\n"); joined != "" {
+				content = append(content, ClaudeContent{Type: "text", Text: joined})
+			}
 		case "function_call":
-			callID, _ := item["call_id"].(string)
-			if callID == "" {
-				callID, _ = item["id"].(string)
+			if tl, ok := toolUseFromFunctionCall(item); ok {
+				content = append(content, tl)
+				hasToolUse = true
 			}
-			rawName, _ := item["name"].(string)
-			// 免费层小写占位工具名仅对 Claude 系客户端还原为规范大小写。
-			name := rawName
-			if restoreCase {
-				name = restoreToolNameCase(rawName)
-			}
-			if name == "" {
-				continue
-			}
-			argsStr, _ := item["arguments"].(string)
-			var input any
-			if argsStr != "" {
-				if err := json.Unmarshal([]byte(argsStr), &input); err != nil {
-					input = map[string]any{"_raw": argsStr}
-				}
-			}
-			if input == nil {
-				input = map[string]any{}
-			}
-			tools = append(tools, toolUseItem{id: callID, name: name, input: input})
-			hasToolUse = true
 		case "apply_patch_call", "shell_call":
 			callID, _ := item["call_id"].(string)
 			if callID == "" {
@@ -844,7 +911,7 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool, restoreCase
 					input = map[string]any{"input": argsStr}
 				}
 			}
-			tools = append(tools, toolUseItem{id: callID, name: name, input: input})
+			content = append(content, ClaudeContent{Type: "tool_use", ID: sanitizeAnthropicToolUseID(callID), Name: name, Input: input})
 			hasToolUse = true
 		case "function_call_output", "apply_patch_call_output", "shell_call_output", "tool_result":
 			// 输入回显，不应出现在 assistant 输出，忽略，不报错。
@@ -857,50 +924,18 @@ func responsesOutputToClaudeBlocks(output []any, wantReasoning bool, restoreCase
 				continue
 			}
 			if t := extractTextFromContentParts(item["content"]); t != "" {
-				textParts = append(textParts, t)
+				content = append(content, ClaudeContent{Type: "text", Text: t})
 				continue
 			}
 			if b, err := json.Marshal(item); err == nil {
-				textParts = append(textParts, string(b))
+				content = append(content, ClaudeContent{Type: "text", Text: string(b)})
 			}
 		}
 	}
 
-	if wantReasoning {
-		for _, t := range reasoningTexts {
-			cc := ClaudeContent{Type: "thinking", Thinking: t.text}
-			if t.signature != "" {
-				cc.Signature = t.signature
-			}
-			content = append(content, cc)
-		}
-		for _, sig := range reasoningEncryptedOnly {
-			content = append(content, ClaudeContent{Type: "thinking", Thinking: "", Signature: sig})
-		}
-	}
-	// wantReasoning==false 时 reasoning 直接丢弃（由调用方在空回复时 promote，
-	// 与 openAIToClaudeResponse 的 keep 语义一致）；这里不提前 promote，
-	// 统一在下方空回复保护中处理。
-
-	var plainReasoning []string
-	for _, t := range reasoningTexts {
-		plainReasoning = append(plainReasoning, t.text)
-	}
-	joinedText := strings.Join(textParts, "\n")
-	if joinedText == "" && len(plainReasoning) > 0 && len(tools) == 0 {
+	if len(content) == 0 && len(reasoningFallback) > 0 && !hasToolUse {
 		// 空回复保护：Go 网关常把正文放在 reasoning 里（#37635），提升为文本。
-		joinedText = strings.Join(plainReasoning, "\n")
-	}
-	if joinedText != "" {
-		content = append(content, ClaudeContent{Type: "text", Text: joinedText})
-	}
-	for _, tl := range tools {
-		// 免费层小写占位工具名仅对 Claude 系客户端还原为规范大小写。
-		toolName := tl.name
-		if restoreCase {
-			toolName = restoreToolNameCase(tl.name)
-		}
-		content = append(content, ClaudeContent{Type: "tool_use", ID: tl.id, Name: toolName, Input: tl.input})
+		content = append(content, ClaudeContent{Type: "text", Text: strings.Join(reasoningFallback, "\n")})
 	}
 	if len(content) == 0 {
 		content = append(content, ClaudeContent{Type: "text", Text: ""})

@@ -34,13 +34,26 @@ func chatMessagesToResponsesInput(messages []Message) (string, []any) {
 				systemParts = append(systemParts, stripVolatileCountersText(s))
 			}
 		case "assistant":
+			// F4：文本在前、function_call 在后（对齐 Claude 路径的 flushPending
+			// 语义与 bifrost 原序转换；先发调用后发文本会让回放语义倒置）。
+			if s, ok := msg.Content.(string); ok && s != "" {
+				input = append(input, map[string]any{
+					"type": "message", "role": "assistant",
+					"content": []any{map[string]any{"type": "output_text", "text": s}},
+					// F2：回放的 assistant 侧 item 写 status completed
+					//（对齐 bifrost；严格校验器拒收无 status 回放，#7074）。
+					"status": "completed",
+				})
+			}
 			if len(msg.ToolCalls) > 0 {
 				for _, tc := range msg.ToolCalls {
 					item := map[string]any{
 						"type":      "function_call",
-						"call_id":   tc.ID,
+						"call_id":   sanitizeAnthropicToolUseID(tc.ID),
 						"name":      tc.Function.Name,
 						"arguments": tc.Function.Arguments,
+						// F2：同上，回放 function_call 写 status completed。
+						"status": "completed",
 					}
 					if tc.ID == "" {
 						item["call_id"] = "call_" + randomHex(12)
@@ -50,12 +63,6 @@ func chatMessagesToResponsesInput(messages []Message) (string, []any) {
 					}
 					input = append(input, item)
 				}
-			}
-			if s, ok := msg.Content.(string); ok && s != "" {
-				input = append(input, map[string]any{
-					"type": "message", "role": "assistant",
-					"content": []any{map[string]any{"type": "output_text", "text": s}},
-				})
 			}
 		case "tool":
 			output := ""

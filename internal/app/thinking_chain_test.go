@@ -624,9 +624,8 @@ func TestClaudeResponses_HistoryReasoningDualStorage(t *testing.T) {
 // ---------- 双块 reasoning 双存映射（responses→claude 非流式） ----------
 
 func TestResponsesOutput_DualReasoningMapping(t *testing.T) {
-	// 对齐 Bifrost responses.go:760-850：summary 与 encrypted_content 各落其位
-	// ——一个 reasoning item → 一个 thinking 块（summary 多段连接），密文落
-	// signature,不再只让首段带签名。
+	// 对齐 Bifrost responses.go:760-850（F1）：summary 每段独立 thinking 块，
+	// encrypted_content 独立 redacted_thinking 块（Data 字段），两者可共存。
 	output := []any{
 		map[string]any{
 			"type": "reasoning",
@@ -639,22 +638,21 @@ func TestResponsesOutput_DualReasoningMapping(t *testing.T) {
 		map[string]any{"type": "message", "content": []any{map[string]any{"type": "output_text", "text": "done"}}},
 	}
 	content, _, _ := responsesOutputToClaudeBlocks(output, true, true)
-	var thinking *ClaudeContent
-	count := 0
+	var thinkings []string
+	var redacted string
 	for i := range content {
-		if content[i].Type == "thinking" {
-			thinking = &content[i]
-			count++
+		switch content[i].Type {
+		case "thinking":
+			thinkings = append(thinkings, content[i].Thinking)
+		case "redacted_thinking":
+			redacted = content[i].Data
 		}
 	}
-	if count != 1 || thinking == nil {
-		t.Fatalf("thinking blocks = %d, want 1 per reasoning item: %#v", count, content)
+	if len(thinkings) != 2 || thinkings[0] != "step one" || thinkings[1] != "step two" {
+		t.Fatalf("thinking blocks = %#v, want [step one step two]: %#v", thinkings, content)
 	}
-	if thinking.Thinking != "step one\nstep two" {
-		t.Fatalf("thinking = %q, want joined summary", thinking.Thinking)
-	}
-	if thinking.Signature != "enc-1" {
-		t.Fatalf("signature = %q, want enc-1 (encrypted_content slot)", thinking.Signature)
+	if redacted != "enc-1" {
+		t.Fatalf("redacted_thinking data = %q, want enc-1: %#v", redacted, content)
 	}
 }
 
@@ -666,11 +664,11 @@ func TestResponsesOutput_EncryptedOnlyReasoningKeepsSignature(t *testing.T) {
 	content, _, _ := responsesOutputToClaudeBlocks(output, true, true)
 	found := false
 	for _, cc := range content {
-		if cc.Type == "thinking" && cc.Signature == "enc-2" {
+		if cc.Type == "redacted_thinking" && cc.Data == "enc-2" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("encrypted-only reasoning should keep signature slot: %#v", content)
+		t.Fatalf("encrypted-only reasoning should emit redacted_thinking: %#v", content)
 	}
 }
