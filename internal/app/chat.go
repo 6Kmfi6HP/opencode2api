@@ -1951,9 +1951,11 @@ func contentPromptCacheKey(m map[string]any) string {
 		parts = append(parts, "instr:"+stableInstructionsHead(instr))
 	}
 	if tools, ok := m["tools"].([]any); ok {
-		if b, err := json.Marshal(tools); err == nil {
-			parts = append(parts, "tools:"+string(b))
-		}
+		// 只哈希工具名集合，不哈希 schema：实测 Claude Code 异步加载 MCP/插件
+		// 工具会让 tools 全量哈希跨轮漂移（135K→142K chars），pck 随之换 key，
+		// 上游缓存分片重新一致性哈希、已攒的 instructions 前缀缓存作废。工具名
+		// 集合在会话内稳定，schema 变化只影响上游前缀匹配本身，不应让分片漂移。
+		parts = append(parts, "tools:"+toolsNamesKey(tools))
 	}
 	// 第一条 user 消息（chat.messages 或 responses.input）的前 8KB：同一会话
 	// 的首条 user 消息恒定，又是 prompts 中首个动态段——参与哈希才能区分
@@ -2069,4 +2071,24 @@ func contentPromptCacheKey(m map[string]any) string {
 		slog.Info("cache_debug_key_parts", attrs...)
 	}
 	return pck
+}
+
+// toolsNamesKey 返回工具清单的稳定键：工具名排序后 join；无 name 的工具
+// （built-in server tools）按序列化 JSON 降级参与。schema/描述变化不进键，
+// 见 contentPromptCacheKey 内 tools 分支的注释。
+func toolsNamesKey(tools []any) string {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if tm, ok := t.(map[string]any); ok {
+			if n, _ := tm["name"].(string); n != "" {
+				names = append(names, n)
+				continue
+			}
+		}
+		if b, err := json.Marshal(t); err == nil {
+			names = append(names, string(b))
+		}
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }

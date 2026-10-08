@@ -552,6 +552,13 @@ func normalizeResponsesEffort(effort string) string {
 // 失败时返回最小可用体（model + input），避免 400。
 func claudeToResponsesBody(ctx context.Context, claudeReq ClaudeRequest, modelID string) []byte {
 	instructions, input := claudeMessagesToResponsesInput(claudeReq.Messages, claudeReq.System)
+	// instructions 钉在会话首轮原文（跨轮字节稳定），尾部追加段挪到序列尾部：
+	// 前缀缓存只看公共前缀，instructions+tools 段即可跨轮全量命中（见
+	// clipInstructionsToStablePrefix）。首条 user 文本须在增量注入前提取。
+	instructions, instrDelta := clipInstructionsToStablePrefix(instructions, firstUserTextOf(input))
+	if instrDelta != "" {
+		input = appendInstructionsDeltaToLastUser(input, instrDelta)
+	}
 	body := map[string]any{
 		"model":  modelID,
 		"input":  input,
