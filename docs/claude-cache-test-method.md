@@ -5,7 +5,7 @@
 
 ## 1. 铁律（违反则结论作废）
 
-1. 模型必须用网关现存模型（如 `muse-spark-1.3-contributor-free`）。
+1. 模型必须用网关现存模型（如 `muse-spark-1.3-contributor`，以 `/v1/models` 为准）。
    网关没有的模型会触发 `[claude-code:unrecognized_model]`，流量可能旁路网关。
 2. 必须用 `--settings <gw-settings.json>` 强制指向网关。
    `~/.claude/settings.json` 自带 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN`，
@@ -26,7 +26,7 @@ OPENCODE2API_CACHE_DEBUG=1 ./bin/opencode2api -port 8080 -log-stdout
 # 1. 写强制网关的 settings（模型换成网关现存的）
 python3 -c "
 import json
-m='muse-spark-1.3-contributor-free'
+m='muse-spark-1.3-contributor'
 env={
  'ANTHROPIC_BASE_URL':'http://127.0.0.1:8080',
  'ANTHROPIC_AUTH_TOKEN':'sk-123',
