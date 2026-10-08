@@ -339,6 +339,50 @@ func TestPromptCacheKeyRecomputedAfterFingerprint(t *testing.T) {
 	}
 }
 
+func TestContentPromptCacheKey_StableHeadIgnoresAppendedTail(t *testing.T) {
+	// 实测 Claude Code 每轮在 instructions 尾部追加 role=system 消息
+	// （59→77 段，+6KB），全量哈希会导致同会话每轮换 key、prefix-cache 归零。
+	// key 只取前 stableInstrHeadSegs 段：尾部追加不换 key，头部改动仍换 key。
+	mkSegs := func(n int, prefix string) string {
+		segs := make([]string, n)
+		for i := range segs {
+			segs[i] = prefix + "_seg_" + string(rune('a'+i%26)) + "_body_padding_for_length"
+		}
+		return strings.Join(segs, "\n\n")
+	}
+	head := mkSegs(stableInstrHeadSegs, "stable")
+	body := func(instr string) map[string]any {
+		return map[string]any{
+			"model":        "muse-spark-1.3-contributor-free",
+			"instructions": instr,
+			"tools":        []any{map[string]any{"type": "function", "name": "Bash"}},
+			"input": []any{
+				map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": "input_text", "text": "hi"},
+				}},
+			},
+		}
+	}
+	base := contentPromptCacheKey(body(head))
+	appended := contentPromptCacheKey(body(head + "\n\n" + mkSegs(18, "appended_tail")))
+	if base == "" || appended == "" {
+		t.Fatalf("keys must be non-empty: base=%q appended=%q", base, appended)
+	}
+	if base != appended {
+		t.Fatalf("tail append changed key: base=%q appended=%q", base, appended)
+	}
+	// 头部改动必须换 key（避免串污染）。
+	mutated := contentPromptCacheKey(body(mkSegs(stableInstrHeadSegs, "other") + "\n\ntail"))
+	if mutated == base {
+		t.Fatalf("head mutation must change key: %q", mutated)
+	}
+	// 短 instructions（不足 N 段）不截断：行为与原来一致。
+	short := "only one segment"
+	if got := stableInstructionsHead(short); got != short {
+		t.Fatalf("short instr truncated: %q", got)
+	}
+}
+
 func TestCallOpenCodeAPIKeyedAuthDoesNotCrossModelFallback(t *testing.T) {
 	tests := []struct {
 		name   string

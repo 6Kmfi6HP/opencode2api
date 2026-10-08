@@ -1910,24 +1910,45 @@ func preferContentKey(hasToken bool) bool {
 	return !hasToken
 }
 
+// stableInstrHeadSegs 是 instructions 稳定前缀的段数："\n\n" 切段后只取前 N 段
+// 参与 prompt_cache_key 哈希。Claude 侧 instructions = system 参数 +
+// role=system 消息顺序 join，实测头 16 段跨轮逐段同哈希、尾部每轮追加约 18 段；
+// 只哈希稳定头则同会话跨轮 key 不变，上游 prefix-cache 才能命中。N=16 覆盖实测
+// 稳定区并留出余量；不同会话/不同 system 头天然不同段，不会误撞。
+const stableInstrHeadSegs = 16
+
+// stableInstructionsHead 返回参与缓存 key 的 instructions 稳定前缀：按 "\n\n"
+// 切段取前 stableInstrHeadSegs 段 join。段数不足时返回原文（短 instructions 不
+// 截断）；尾部追加段被排除在 key 之外，但仍会原样发往上游，不丢上下文。
+func stableInstructionsHead(instr string) string {
+	segs := strings.Split(instr, "\n\n")
+	if len(segs) <= stableInstrHeadSegs {
+		return instr
+	}
+	return strings.Join(segs[:stableInstrHeadSegs], "\n\n")
+}
+
 // contentPromptCacheKey 对上游请求体（已 marshal 的 chat/responses JSON）的
-// 公共前缀求 SHA-256 派生稳定 key：system 提示、工具清单、instructions 与
-// 首个 user message 决定缓存前缀；assistant/tool 后续消息会随轮次变化，
+// 公共前缀求 SHA-256 派生稳定 key：system 提示、工具清单、instructions 稳定
+// 前缀与首个 user message 决定缓存前缀；assistant/tool 后续消息会随轮次变化，
 // 不参与哈希。同一份系统提示 + 工具栈在跨 launch 之间生成同一 key，让上游
 // 一致性哈希到同一 zen 缓存分片；前缀内容一旦改动则自然换 key，避免串污染。
+// instructions 只取稳定头（见 stableInstructionsHead）：实测 Claude Code 每轮
+// 在尾部追加 role=system 消息（59→77 段，+6KB），全量哈希会导致同会话每轮换
+// key、prefix-cache 归零；头 16 段跨轮逐段同哈希，是真正的稳定前缀。
 func contentPromptCacheKey(m map[string]any) string {
 	if m == nil {
 		return ""
 	}
-	// 采样：system 块、tools 形状、instructions、首个 user 消息文本——这些
-	// 是任何 agent 会话的稳定前缀；其它动态字段忽略。
+	// 采样：system 块、tools 形状、instructions 稳定头、首个 user 消息文本——
+	// 这些是任何 agent 会话的稳定前缀；其它动态字段忽略。
 	parts := []string{}
 	if sys, ok := m["system"]; ok {
 		b, _ := json.Marshal(sys)
 		parts = append(parts, "sys:"+string(b))
 	}
 	if instr, ok := m["instructions"].(string); ok && instr != "" {
-		parts = append(parts, "instr:"+instr)
+		parts = append(parts, "instr:"+stableInstructionsHead(instr))
 	}
 	if tools, ok := m["tools"].([]any); ok {
 		if b, err := json.Marshal(tools); err == nil {
@@ -2002,8 +2023,10 @@ func contentPromptCacheKey(m map[string]any) string {
 	if len(parts) == 0 {
 		return ""
 	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
+	pck := "oc2api:csha:" + hex.EncodeToString(sum[:16])
 	if cacheDebugEnabled() {
-		attrs := []any{"parts", len(parts)}
+		attrs := []any{"parts", len(parts), "pck", pck}
 		for i, p := range parts {
 			idx := strings.Index(p, ":")
 			name, body := p, p
@@ -2012,9 +2035,38 @@ func contentPromptCacheKey(m map[string]any) string {
 			}
 			attrs = append(attrs, fmt.Sprintf("part%d", i), name+"="+hashTextPrefix(body))
 			attrs = append(attrs, fmt.Sprintf("part%d_len", i), len(body))
+			if name == "instr" {
+				// part0 已是稳定头（stableInstructionsHead 截断后），full 长度
+				// 需从原始请求体另取：m["instructions"] 即原文。
+				if full, _ := m["instructions"].(string); full != "" {
+					attrs = append(attrs, "instr_full_len", len(full))
+					attrs = append(attrs, "instr_full_segs", len(strings.Split(full, "\n\n")))
+				}
+				segs := strings.Split(body, "\n\n")
+				attrs = append(attrs, "instr_segs", len(segs))
+				// 头 16 + 尾 16:Claude 侧 instructions = system 参数 +
+				// role=system 消息 join,膨胀段常在尾部,32 上限截断后看不见。
+				// 只记哈希前缀+长度,不记原文。
+				emit := func(si int) {
+					attrs = append(attrs, fmt.Sprintf("instr_seg%d", si), hashTextPrefix(segs[si]))
+					attrs = append(attrs, fmt.Sprintf("instr_seg%d_len", si), len(segs[si]))
+				}
+				n := len(segs)
+				for si := 0; si < n && si < 16; si++ {
+					emit(si)
+				}
+				if n > 32 {
+					for si := n - 16; si < n; si++ {
+						emit(si)
+					}
+				} else {
+					for si := 16; si < n && si < 32; si++ {
+						emit(si)
+					}
+				}
+			}
 		}
 		slog.Info("cache_debug_key_parts", attrs...)
 	}
-	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
-	return "oc2api:csha:" + hex.EncodeToString(sum[:16])
+	return pck
 }
