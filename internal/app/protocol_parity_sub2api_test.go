@@ -239,9 +239,11 @@ func TestResponsesSSEToChatStream_CustomToolCall(t *testing.T) {
 
 // TestResponsesSSEToChatStream_IncompleteContentFilter incomplete +
 // content_filter 原因必须映射为 finish_reason content_filter(对齐 sub2api
-// resToChatHandleCompleted),而非一律 length。
+// resToChatHandleCompleted),而非一律 length。content_filter 是上游真实拦截
+// （非零内容 kill），即使零产出也按正常语义收尾、不发 error。
 func TestResponsesSSEToChatStream_IncompleteContentFilter(t *testing.T) {
 	sse := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_f\",\"model\":\"gpt-x\"}}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n" +
 		"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_f\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
 		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false, nil, nil)

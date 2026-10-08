@@ -77,6 +77,9 @@ func chatMessagesToResponsesInput(messages []Message) (string, []any) {
 			if callID == "" {
 				callID = "call_" + randomHex(12)
 			}
+			// F6 对齐：tool 侧与 assistant 侧同一清洗（长 id 截到 <=64、
+			// 非法字符折叠），否则上游校验 input[].call_id 长度/字符集 400。
+			callID = sanitizeAnthropicToolUseID(callID)
 			input = append(input, map[string]any{
 				"type": "function_call_output", "call_id": callID, "output": output,
 			})
@@ -936,6 +939,7 @@ type responsesToChatState struct {
 	arguments     map[int]string // chat tool_calls index → 已下发 arguments 累计文本
 	toolCount     int
 	sawTool       bool
+	producedText  bool   // 是否下发过正文/拒答文本（output_text/refusal delta，或 keepReasoning 下的 reasoning）
 	finishReason  string // 终态 finish 原因(空 = 未定,finalize 时合成)
 	fullUsage     map[string]any
 	finalized     bool // 已写 [DONE]/终态帧（幂等）
@@ -997,7 +1001,9 @@ func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		// 不再二次 peek。
 		reader = rd
 	} else {
-		peek := PeekFirstFrame(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, ResponsesProtocolHooks)
+		// 宽限窗产出感知（对齐 claude_responses）：壳帧与零内容终态不判
+		// 产出 commit，限速 kill 的空流在未写字节前可换 key 重试。
+		peek := PeekFirstFrameWithGrace(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, time.Duration(responsesShellGraceMs())*time.Millisecond, ResponsesProtocolHooks)
 		if peek.Err != nil {
 			// 空流 / 上游首帧错误 / 首字节超时:尚未向客户端写过任何字节,
 			// 让外层 DriveStreamWithRetry 换 key 重试。
@@ -1132,6 +1138,32 @@ func (st *responsesToChatState) ensureRole() {
 	st.emitChunk(map[string]any{"role": "assistant", "content": ""}, "", nil)
 }
 
+// emitError 在已 commit 的流上补发 in-band 错误帧 + [DONE]（对齐 chat.go
+// emitError 的 upstream_truncated 形状）。零内容 incomplete 等场景使用：
+// 客户端拿到带错的终止序列得以重试该回合，而不是把空消息记入历史。
+// 幂等：置 finalized 且 SawFinish/DoneSeen 保持 false，日志侧
+// truncated=true 可见。
+func (st *responsesToChatState) emitError(msg string) {
+	if st.finalized {
+		return
+	}
+	st.finalized = true
+	payload := map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    "upstream_truncated",
+		},
+		"choices": []any{map[string]any{"index": 0, "finish_reason": "error"}},
+	}
+	data, _ := json.Marshal(payload)
+	st.w.Write([]byte("data: " + string(data) + "\n\n"))
+	st.w.Write([]byte("data: [DONE]\n\n"))
+	if st.flusher != nil {
+		st.flusher.Flush()
+	}
+	st.stats.DoneSeen = false
+}
+
 // toolIdxFor 解析 item id/call_id 对应的 chat tool_calls index:未知 item
 // （上游没发 output_item.added 直接发 delta/done,Observed 场景）分配新
 // index,保证后续补发首 chunk 时 index 稳定。
@@ -1238,12 +1270,14 @@ func (st *responsesToChatState) handleLine(line string) {
 	case "response.output_text.delta":
 		st.ensureRole()
 		if t, _ := evt["delta"].(string); t != "" {
+			st.producedText = true
 			st.emitChunk(map[string]any{"content": t}, "", nil)
 		}
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		if st.keepReasoning {
 			st.ensureRole()
 			if t, _ := evt["delta"].(string); t != "" {
+				st.producedText = true
 				st.emitChunk(map[string]any{"reasoning_content": t}, "", nil)
 			}
 		}
@@ -1255,6 +1289,7 @@ func (st *responsesToChatState) handleLine(line string) {
 		// convertResponsesToChat 的 refusal 注释）。
 		st.ensureRole()
 		if t, _ := evt["delta"].(string); t != "" {
+			st.producedText = true
 			st.emitChunk(map[string]any{"content": t}, "", nil)
 		}
 	case "response.output_item.added":
@@ -1352,6 +1387,14 @@ func (st *responsesToChatState) handleLine(line string) {
 				st.serviceTier = tier
 			}
 			if status, _ := resp["status"].(string); status == "incomplete" {
+				// 零内容 incomplete（免费档限速把生成杀在不可见阶段：delta
+				// 通道为空、终态 output 亦无可交付内容）不得按正常 length
+				// 收尾——否则客户端把空消息记入历史。发 in-band error 让其
+				// 感知失败重试该回合（对齐 claude_responses 零内容检查）。
+				if !st.producedText && !st.sawTool && !responsesOutputHasContent(resp) {
+					st.emitError("upstream returned incomplete with no content (generation killed)")
+					return
+				}
 				// incomplete 原因细分(对齐 sub2api resToChatHandleCompleted):
 				// max_output_tokens → length,content_filter → content_filter。
 				reason := ""

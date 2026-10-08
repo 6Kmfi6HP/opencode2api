@@ -50,6 +50,67 @@ func responsesIsErrorEvent(payload []byte) bool {
 // 不判产出：限速杀死等场景下上游只发壳帧 + 零内容终态就断流，若壳帧即
 // commit，空流重试就永远轮不到。终态帧只在 output 携带内容时判产出
 // （空终态交给主循环/收割判定）。非 JSON 帧保守判产出，不误伤裸 JSON 流。
+// responsesOutputItemsHaveContent 报告 Responses output item 数组是否携带可
+// 交付内容：message item 含非空 text/refusal、reasoning item 含非空 summary
+// 文本，或 tool_call 系 item 具名/带参。空壳 item（空 reasoning/空 message）
+// 不算——限速杀死的零内容 incomplete 常见形态是 output 非空但无文本（usage
+// 照报 output_tokens），按 item 数判产出会误 commit。
+func responsesOutputItemsHaveContent(out []any) bool {
+	for _, it := range out {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch m["type"] {
+		case "function_call", "tool_call", "custom_tool_call":
+			if toString(m["name"]) != "" || toString(m["arguments"]) != "" ||
+				toString(m["input"]) != "" || toString(m["call_id"]) != "" {
+				return true
+			}
+		case "reasoning":
+			// summary 文本与 message 文本同为可收割内容（对齐
+			// harvestTerminalOutput 的 reasoning 分支）。
+			if summary, ok := m["summary"].([]any); ok {
+				for _, s := range summary {
+					if sm, ok := s.(map[string]any); ok {
+						if t, _ := sm["text"].(string); strings.TrimSpace(t) != "" {
+							return true
+						}
+					}
+				}
+			}
+			if s, _ := m["summary"].(string); strings.TrimSpace(s) != "" {
+				return true
+			}
+		case "message":
+			content, _ := m["content"].([]any)
+			for _, p := range content {
+				pm, ok := p.(map[string]any)
+				if !ok {
+					continue
+				}
+				if t, _ := pm["text"].(string); strings.TrimSpace(t) != "" {
+					return true
+				}
+				if t, _ := pm["refusal"].(string); strings.TrimSpace(t) != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// responsesOutputHasContent 报告终态 response.output 是否携带可交付内容
+// （见 responsesOutputItemsHaveContent）。
+func responsesOutputHasContent(resp map[string]any) bool {
+	if resp == nil {
+		return false
+	}
+	out, _ := resp["output"].([]any)
+	return responsesOutputItemsHaveContent(out)
+}
+
 func responsesIsProductiveEvent(payload []byte) bool {
 	t := strings.TrimSpace(string(payload))
 	if t == "" || t == "[DONE]" {
@@ -68,8 +129,7 @@ func responsesIsProductiveEvent(payload []byte) bool {
 		return false
 	case "response.completed", "response.incomplete":
 		if resp, ok := evt["response"].(map[string]any); ok {
-			out, _ := resp["output"].([]any)
-			return len(out) > 0
+			return responsesOutputHasContent(resp)
 		}
 		return false
 	default:

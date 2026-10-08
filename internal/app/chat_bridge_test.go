@@ -800,7 +800,10 @@ func TestResponsesToChat_OutputItemDoneAnnouncesUndeclaredCall(t *testing.T) {
 }
 
 func TestResponsesToChat_FailedThenDoneSentinel(t *testing.T) {
+	// failed 前先给一段真实 delta：宽限 peek 下纯壳帧不再 commit，直接
+	// 调 handler 必须自带产出帧才能进入 committed 分支。
 	sse := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-x\"}}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n" +
 		"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"r\",\"error\":{\"message\":\"upstream blew up\"}}}\n\n"
 	body := drainSSEFromHandler(func(w http.ResponseWriter) {
 		committed, err := responsesSSEToChatStream(context.Background(), w, strings.NewReader(sse), "gpt-x", false, false, nil, nil)
@@ -1089,5 +1092,46 @@ func TestConvertRequest_NoMaxTokensInjectionWhenMaxCompletionTokensSet(t *testin
 	}
 	if out4["max_completion_tokens"] != float64(4096) {
 		t.Fatalf("max_completion_tokens = %#v (%T), want 4096 (extra_body 透传)", out4["max_completion_tokens"], out4["max_completion_tokens"])
+	}
+}
+
+// TestChatToResponsesBody_LongToolCallIDCappedAndPaired 回归
+//（input[N].call_id must be <= 64）：chat→responses 上游路径的 tool 消息
+// call_id 之前未清洗——客户端回放合法但 >64 的 tool_call_id 原样进
+// input[].call_id 被上游 400。现在 tool 侧与 assistant 侧同用
+// sanitizeAnthropicToolUseID：两侧 <=64 且保持配对。
+func TestChatToResponsesBody_LongToolCallIDCappedAndPaired(t *testing.T) {
+	longID := strings.Repeat("a", 80)
+	req := &OpenAIRequest{
+		Model: "gpt-x",
+		Messages: []Message{
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: longID, Type: "function", Function: FunctionCall{Name: "shell", Arguments: `{"cmd":"ls"}`}}}},
+			{Role: "tool", ToolCallID: longID, Content: "ok"},
+		},
+	}
+	body := chatToResponsesBody(req, "gpt-x")
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	input, _ := got["input"].([]any)
+	var callID, outputID string
+	for _, it := range input {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch m["type"] {
+		case "function_call":
+			callID, _ = m["call_id"].(string)
+		case "function_call_output":
+			outputID, _ = m["call_id"].(string)
+		}
+	}
+	if callID == "" || len(callID) > 64 {
+		t.Fatalf("function_call call_id = %q (len %d), want 非空且 <= 64", callID, len(callID))
+	}
+	if outputID != callID {
+		t.Fatalf("pairing broken: function_call %q vs function_call_output %q", callID, outputID)
 	}
 }

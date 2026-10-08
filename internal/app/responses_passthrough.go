@@ -630,6 +630,39 @@ func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Re
 	}
 }
 
+// passthroughLineProducedContent 报告单行透传 SSE 是否携带可交付内容：
+// 非空 output_text.delta、具名 tool 系 output_item.done、含内容的终态
+// output。peek 回放与主循环共用（布尔幂等，只用于零内容 kill 判定）。
+func passthroughLineProducedContent(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+		return false
+	}
+	payload := bytes.TrimSpace(trimmed[len("data: "):])
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	var evt map[string]any
+	if json.Unmarshal(payload, &evt) != nil {
+		return false
+	}
+	switch typ, _ := evt["type"].(string); typ {
+	case "response.output_text.delta":
+		if d, _ := evt["delta"].(string); d != "" {
+			return true
+		}
+	case "response.output_item.done":
+		if item, ok := evt["item"].(map[string]any); ok {
+			return responsesOutputItemsHaveContent([]any{item})
+		}
+	case "response.completed", "response.incomplete":
+		if resp, ok := evt["response"].(map[string]any); ok {
+			return responsesOutputHasContent(resp)
+		}
+	}
+	return false
+}
+
 // relayResponsesStream 逐行透传 SSE 并在每个事件行后 Flush，保证打字机效果；
 // 同时从 response.completed / usage 事件中提取 usage 做 Token 统计，并保存
 // 完整响应对象以维持 previous_response_id 会话链条。
@@ -645,8 +678,10 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	// peek 首帧：在 WriteHeader 之前约束 commit 边界，空流 / EOF / 错误帧 /
-	// 首字节超时返回 errStreamIncompleteNoCommit,由调用方驱动重试。
-	peek := PeekFirstFrame(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, ResponsesProtocolHooks)
+	// 首字节超时返回 errStreamIncompleteNoCommit,由调用方驱动重试。宽限窗
+	// 产出感知（对齐 claude_responses）：壳帧与零内容终态不判产出 commit，
+	// 限速 kill 的空流在未写字节前可换 key 重试。
+	peek := PeekFirstFrameWithGrace(ctx, rc, time.Duration(config.StreamFirstByteTimeoutMs())*time.Millisecond, time.Duration(responsesShellGraceMs())*time.Millisecond, ResponsesProtocolHooks)
 	if peek.Err != nil {
 		return false, peek.Err
 	}
@@ -683,6 +718,13 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 	doneSeen := false
 	writeFailed := false
 	terminalSeen := false
+	// producedContent 是否见过可交付内容（跨续写轮累计）：非空
+	// output_text.delta / 具名 tool item / 含内容的终态 output。零内容
+	// incomplete 到达且全程无产出时说明生成被杀在不可见阶段，走 error
+	// 而非直写/续写（对齐 claude_responses 零内容检查）。
+	producedContent := false
+	// emptyKill 标记本轮终态为零内容 kill：跳过直写与续写，发 error + DONE。
+	emptyKill := false
 	// peek 阶段已看到完整帧，但终端事件（completed/failed/incomplete / [DONE]）
 	// 要逐行扫过目前 consumed 才知道——这里只预先回填终端标志，让末尾判定
 	// 与原有逻辑一致。
@@ -708,6 +750,9 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 			if s, _ := response["status"].(string); s == "completed" || s == "failed" || s == "incomplete" {
 				terminalSeen = true
 			}
+		}
+		if passthroughLineProducedContent([]byte(res.line)) {
+			producedContent = true
 		}
 	}
 
@@ -766,6 +811,11 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 						outLine = normalized
 					}
 				}
+				// 内容跟踪（含 peek 期 serializer 已写过的字节：主循环重放
+				// 时再次统计是幂等的布尔量，只用于零内容 kill 判定）。
+				if !producedContent && passthroughLineProducedContent(outLine) {
+					producedContent = true
+				}
 				trimmed := bytes.TrimSpace(outLine)
 				isDoneSentinel := bytes.Equal(trimmed, []byte("data: [DONE]")) || bytes.Equal(trimmed, []byte("[DONE]"))
 				if isDoneSentinel && !terminalSeen {
@@ -781,6 +831,8 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 				// 检测终结事件：判断是否为 incomplete + max_output_tokens
 				isTerminalLine := false
 				isIncompleteMaxTokens := false
+				termIsIncomplete := false
+				var termResp map[string]any
 				if bytes.HasPrefix(trimmed, []byte("data: ")) {
 					payload := trimmed[6:]
 					if len(payload) > 0 && payload[0] == '{' {
@@ -789,6 +841,8 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 							if typ, _ := evt["type"].(string); typ == "response.completed" || typ == "response.failed" || typ == "response.incomplete" {
 								isTerminalLine = true
 								if typ == "response.incomplete" {
+									termIsIncomplete = true
+									termResp, _ = evt["response"].(map[string]any)
 									if resp, ok := evt["response"].(map[string]any); ok {
 										if details, ok := resp["incomplete_details"].(map[string]any); ok {
 											if reason, _ := details["reason"].(string); reason == "max_output_tokens" {
@@ -800,6 +854,17 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 							}
 						}
 					}
+				}
+
+				// 零内容 kill：incomplete 到达时本轮无产出、终态 output 无
+				// 内容、累计 output 亦无内容——生成被杀在不可见阶段。不直写
+				// 也不续写（从空 output 续写只会烧轮次仍是空），记标记后跳
+				// 出，由外层发 error + DONE。
+				if isTerminalLine && termIsIncomplete && !producedContent &&
+					!responsesOutputHasContent(termResp) &&
+					!responsesOutputItemsHaveContent(accumulatedOutput) {
+					emptyKill = true
+					break lineLoop
 				}
 
 				// 终结事件：incomplete+max_output_tokens 时暂缓写入，其他直写
@@ -858,6 +923,29 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 			flusher.Flush()
 		}
 		_ = currentRC.Close()
+
+		// 零内容 kill：不直写空 incomplete、不续写，直接发 error + DONE，
+		// 客户端感知失败重试该回合（对齐翻译路径零内容检查）。
+		if emptyKill {
+			errPayload := map[string]any{
+				"type": "error",
+				"error": map[string]any{
+					"message": "upstream returned incomplete with no content (generation killed)",
+					"type":    "upstream_truncated",
+				},
+			}
+			if b, err := json.Marshal(errPayload); err == nil {
+				_, _ = w.Write([]byte("event: error\ndata: " + string(b) + "\n\n"))
+			}
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			doneSeen = true
+			logging.FromContext(ctx).Warn("responses passthrough zero-content incomplete, sent error",
+				"model", modelID, "round", round)
+			break
+		}
 
 		if round == 0 {
 			// 首回合：保存 output 供后续续写引用

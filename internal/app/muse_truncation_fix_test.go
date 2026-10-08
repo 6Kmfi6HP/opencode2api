@@ -346,9 +346,14 @@ func TestResponsesIsProductiveEvent_Matrix(t *testing.T) {
 		{"queued shell", `{"type":"response.queued"}`, false},
 		{"output_item.added shell", `{"type":"response.output_item.added","output_index":0,"item":{"id":"i","type":"message"}}`, false},
 		{"content_part.added shell", `{"type":"response.content_part.added","part":{"type":"output_text"}}`, false},
-		{"completed with output", `{"type":"response.completed","response":{"id":"r","output":[{"type":"message"}]}}`, true},
+		{"completed with text output", `{"type":"response.completed","response":{"id":"r","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}}`, true},
+		{"completed with bare message", `{"type":"response.completed","response":{"id":"r","output":[{"type":"message"}]}}`, false},
 		{"completed empty", `{"type":"response.completed","response":{"id":"r","output":[]}}`, false},
-		{"incomplete with output", `{"type":"response.incomplete","response":{"id":"r","output":[{"type":"reasoning"}]}}`, true},
+		// 零内容 kill 形态：空 reasoning item 不算产出（usage 照报
+		// output_tokens 但无文本；有 summary 文本的 reasoning 算产出，
+		// 对齐 harvestTerminalOutput 可收割口径）。
+		{"incomplete with bare reasoning", `{"type":"response.incomplete","response":{"id":"r","output":[{"type":"reasoning"}]}}`, false},
+		{"incomplete with reasoning summary", `{"type":"response.incomplete","response":{"id":"r","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"t"}]}]}}`, true},
 		{"incomplete empty", `{"type":"response.incomplete","response":{"id":"r","output":[]}}`, false},
 		{"text delta", `{"type":"response.output_text.delta","delta":"x"}`, true},
 		{"arguments delta", `{"type":"response.function_call_arguments.delta","delta":"x"}`, true},

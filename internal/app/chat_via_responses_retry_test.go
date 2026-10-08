@@ -147,6 +147,8 @@ func TestChatViaResponsesStream_ResponseFailed_Retries(t *testing.T) {
 // 已经收到首字节,不能再换 key 重试——必须用现有 partial 状态正常 finalize。
 // 与 PartialEOF 区别:本用例连一个 delta 都没产出,仅 role,验证 sentRole
 // 边界本身足以抑制重试。
+// 宽限 peek 下纯壳帧（created）后 EOF 不再 commit：客户端尚未收到任何
+// 字节，Drive 换 key 重试一次；重试成功后只看到干净的正常流。
 func TestChatViaResponsesStream_RoleSentThenEOF_NoRetry(t *testing.T) {
 	roleOnlyStream := "event: response.created\n" +
 		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_role\",\"model\":\"test-resp\"}}\n\n"
@@ -154,17 +156,21 @@ func TestChatViaResponsesStream_RoleSentThenEOF_NoRetry(t *testing.T) {
 
 	rec, transport := runChatViaResponsesStream(t, []fakeUpstreamResponse{
 		{status: http.StatusOK, body: roleOnlyStream},
+		{status: http.StatusOK, body: chatViaResponsesSampleStream},
 	})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if got := len(transport.requestedURLs); got != 1 {
-		t.Fatalf("upstream calls = %d, want 1 (role sent → committed, no retry)", got)
+	if got := len(transport.requestedURLs); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (shell-only → no commit → retry)", got)
 	}
 	body := rec.Body.String()
 	if !strings.Contains(body, `"role":"assistant"`) {
 		t.Fatalf("missing role chunk: %s", body)
+	}
+	if !strings.Contains(body, `"content":"hi"`) {
+		t.Fatalf("missing retried content: %s", body)
 	}
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("missing [DONE] after finalize: %s", body)
