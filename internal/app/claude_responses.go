@@ -558,6 +558,10 @@ func claudeToResponsesBody(ctx context.Context, claudeReq ClaudeRequest, modelID
 	// 注:免费层指纹重做还会按客户端原文重建 body,发送侧(opencode.go)在指纹
 	// 重做后再次剥离,此处剥离保证 claudeToResponsesBody 自身的字节稳定。
 	_ = stripVolatileTokenCountersInPlace(input)
+	// SessionStart hook 注入前缀只存在于当轮请求(客户端重放历史不带),不剥会让
+	// 上游前缀缓存从该消息逐字节分叉;须在 firstUserTextOf 提取会话注册键之前
+	// 剥,否则注册键随注入内容逐轮漂移。
+	_ = stripHookPrefixFromLastUser(input)
 	// instructions 钉在会话首轮原文（跨轮字节稳定），尾部追加段挪到序列尾部：
 	// 前缀缓存只看公共前缀，instructions+tools 段即可跨轮全量命中（见
 	// clipInstructionsToStablePrefix）。首条 user 文本须在增量注入前提取。

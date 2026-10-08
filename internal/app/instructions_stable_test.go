@@ -262,3 +262,204 @@ func TestClipChatSystemStable(t *testing.T) {
 		}
 	}
 }
+
+// SessionStart hook 注入前缀剥离:注入只存在于当轮请求(客户端 session 文件存
+// 干净版本,重放历史不带),不剥会让上游前缀缓存从该消息逐字节分叉。
+func TestStripHookPrefixFromUserText(t *testing.T) {
+	const marker = "SessionStart hook additional context: "
+	body := strings.Repeat("Do not read any new content. From the conversation history, answer in ONE line: ", 4)
+	block1 := "<context_window_protection>\n  <priority_instructions>\n    Every byte a tool returns enters your conversation memory.\n  </priority_instructions>\n</context_window_protection>"
+	block2 := "<tool_selection_hierarchy>\n  <tip>Batch independent calls in one block.</tip>\n</tool_selection_hierarchy>"
+	bare := "Concise output style is active. Be concise: lead with the result, skip preamble and narration, keep only what the user needs."
+	dataRef := "## Data References\n- The pasted text contains many 'SECTION 1 MARK-1: ff3a' lines. (215932 bytes — query mcp__plugin_context-mode_context-mode__ctx_search)"
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no injection passthrough", "plain question " + strings.Repeat("with enough body text. ", 12), "plain question " + strings.Repeat("with enough body text. ", 12)},
+		{"hook prefix + single xml block", marker + "\n" + block1 + "\n\n" + body, body},
+		// 模拟真实抓包样本:多 XML 块 + 裸文本直接跟在闭合标签后 + \n\n + 正文。
+		{"hook + multi xml + bare text", marker + "\n" + block1 + "\n" + block2 + bare + "\n\n" + body, body},
+		// 正文以 XML 开头但不带 SessionStart 前缀:不误伤。
+		{"xml-leading body without marker", block1 + "\n\n" + body, block1 + "\n\n" + body},
+		// 新 CLI 形态(实测 dump):引用块插在 XML 块序列中间,外层 session_*
+		// 闭合标签落单,引用块紧跟上一块的 \n\n 之后——贪心 XML 匹配须跳过
+		// 引用块继续匹配,剥离结果与正文逐字节相等。
+		{"new cli: ref block mid-sequence with orphan closes", marker + "\n" + block1 + "\n\n" + dataRef + "\n\n" + "</session_guide>\n" + block2 + "\n</session_knowledge>" + bare + "\n\n" + body, body},
+		{"new cli: ref block between xml blocks", marker + "\n" + block1 + "\n" + dataRef + "\n\n" + block2 + bare + "\n\n" + body, body},
+		// 引用块缺失 " — query" 检索特征:不误吞(防把用户正文里的
+		// ## Data References 段落误当引用剥掉)。
+		{"ref block without query feature kept", marker + "\n" + block1 + "\n\n" + "## Data References\n- Local notes without the query feature.\n\n" + body, "## Data References\n- Local notes without the query feature.\n\n" + body},
+	}
+	for _, tc := range cases {
+		if got := stripHookPrefixFromUserText(tc.in); got != tc.want {
+			t.Fatalf("%s: got %d bytes want %d bytes, head=%q", tc.name, len(got), len(tc.want), got[:min(len(got), 60)])
+		}
+	}
+}
+
+// 护栏:剩余正文少于 200 字节、或剥离总量超过原文 80%,视为误判返回原文。
+func TestStripHookPrefixFromUserTextGuards(t *testing.T) {
+	const marker = "SessionStart hook additional context: "
+	block := "<ctx>" + strings.Repeat("padding text ", 150) + "</ctx>"
+	// 剩余正文过短。
+	tiny := marker + "\n" + block + "\n\nhi"
+	if got := stripHookPrefixFromUserText(tiny); got != tiny {
+		t.Fatalf("tiny-body guard should keep original, got %d bytes", len(got))
+	}
+	// 剥离总量超过原文 80%(6000 字节注入 + ~360 字节正文)。
+	big := marker + "\n<ctx>" + strings.Repeat("p", 6000) + "</ctx>\n\n" + strings.Repeat("body ", 72)
+	if got := stripHookPrefixFromUserText(big); got != big {
+		t.Fatalf("over-80%% strip guard should keep original, got %d bytes", len(got))
+	}
+}
+
+// 真实长样本(注入段 2000+ 字节):构造 hookVersion = 注入段 + 干净正文,
+// 剥离结果必须与客户端 session 存的干净版本逐字节一致——上游按前缀逐字节
+// 做缓存,差一字节即全部 miss。
+func TestStripHookPrefixFromUserTextLongSample(t *testing.T) {
+	const marker = "SessionStart hook additional context: "
+	var b strings.Builder
+	b.WriteString(marker + "\n")
+	for _, tag := range []string{"context_window_protection", "tool_selection_hierarchy", "deferred_tool_bootstrap", "output_constraints"} {
+		b.WriteString("<" + tag + ">\n  <seg>\n    " + strings.Repeat("instruction line for "+tag+". ", 20) + "\n  </seg>\n</" + tag + ">\n")
+	}
+	bare := "Concise output style is active. Be concise: lead with the result, skip preamble and narration, keep only what the user needs."
+	cleanBody := strings.Repeat("修复说明正文,必须完整保留。", 40)
+	// 裸文本直接跟在末块闭合标签后(真实抓包形态)。
+	hookVersion := b.String() + bare + "\n\n" + cleanBody
+	if got := stripHookPrefixFromUserText(hookVersion); got != cleanBody {
+		t.Fatalf("long sample: stripped != cleanBody (got %d bytes, want %d)", len(got), len(cleanBody))
+	}
+	// 纯 XML 无裸文本变体:块序列以 \n\n 结尾紧跟正文。
+	pureXML := strings.TrimSuffix(b.String(), "\n") + "\n\n" + cleanBody
+	if got := stripHookPrefixFromUserText(pureXML); got != cleanBody {
+		t.Fatalf("pure-xml variant: stripped != cleanBody (got %d bytes, want %d)", len(got), len(cleanBody))
+	}
+	// 新 CLI 变体:块序列中间插入 Data References 引用块与孤儿闭合标签,
+	// 引用内容(字节数)逐轮变化。
+	newCLI := b.String() + "</session_guide>\n\n" +
+		"## Data References\n- The pasted text contains many 'SECTION 1 MARK-1: ff3a' lines. (215932 bytes — query mcp__ctx_search)\n\n" +
+		"<session_search>\nDetailed session data is indexed in context-mode FTS5.\n</session_search>\n</session_knowledge>" + bare + "\n\n" + cleanBody
+	if got := stripHookPrefixFromUserText(newCLI); got != cleanBody {
+		t.Fatalf("new-cli variant: stripped != cleanBody (got %d bytes, want %d)", len(got), len(cleanBody))
+	}
+}
+
+// 形态 2(实测 F3 dump):resume/continue hook 的引用块直接开头,SessionStart
+// 的 XML 块夹在注入序列中段,双层叠加,整个序列以最后一次 </session_knowledge>
+// + 非空裸文本 + \n\n 结尾——结尾锚点剥离,结果与正文逐字节相等。
+func TestStripHookPrefixFromUserTextForm2(t *testing.T) {
+	const marker = "SessionStart hook additional context: "
+	bare := "Concise output style is active. Be concise: lead with the result, skip preamble and narration, keep only what the user needs."
+	body := strings.Repeat("Answer from the conversation history in one line. ", 12)
+	// 双层叠加:第一层 resume hook(引用块直接开头、XML 块夹中段),第二层
+	// SessionStart hook(完整 XML 块 + 嵌套 session_knowledge source="continue")。
+	form2 := "## Data References\n- The pasted text contains many 'SECTION 1 MARK-1: ff3a' lines. (215932 bytes — query mcp__plugin_context-mode_context-mode__ctx_search(source: \"session-events\"))\n\n" +
+		"</session_guide>\n<session_search>\nDetailed session data is indexed in context-mode FTS5.\n</session_search>\n</session_knowledge>" + bare + "\n\n" +
+		marker + "\n<context_window_protection>\n  <priority_instructions>\n    " + strings.Repeat("rule line. ", 40) + "\n  </priority_instructions>\n</context_window_protection>\n" +
+		"<session_knowledge source=\"continue\">\n<session_guide>\n## Project Rules\n.claude/CLAUDE.md\n\n" +
+		"## Data References\n- Ref A. (215932 bytes — query mcp__a)\n- Ref B. (215929 bytes — query mcp__b)\n\n" +
+		"</session_guide>\n<session_search>\nIndexed session data.\n</session_search>\n</session_knowledge>" + bare + "\n\n" + body
+	if got := stripHookPrefixFromUserText(form2); got != body {
+		t.Fatalf("form-2 double-stack: stripped != body (got %d bytes, want %d)", len(got), len(body))
+	}
+	// 正文包含 </session_knowledge> 字符串但开头无注入特征:入口不进,不误伤。
+	plainWithClose := "Question about </session_knowledge> usage. " + strings.Repeat("with enough body text to pass guards. ", 8)
+	if got := stripHookPrefixFromUserText(plainWithClose); got != plainWithClose {
+		t.Fatalf("body containing session_knowledge close without injection head must stay as-is")
+	}
+	// 形态 2 + 护栏触发(正文过短):返回原文。
+	form2Short := strings.TrimSuffix(form2, body) + "hi"
+	if got := stripHookPrefixFromUserText(form2Short); got != form2Short {
+		t.Fatalf("form-2 with tiny body should keep original, got %d bytes", len(got))
+	}
+}
+
+// 包装函数只动最后一条 user 消息:历史里重放的旧 user 与 assistant 均不动;
+// content 兼容 string 与 parts;多条 text parts 只剥第一条。
+func TestStripHookPrefixFromLastUser(t *testing.T) {
+	const marker = "SessionStart hook additional context: "
+	body := strings.Repeat("Please continue the task from where it stopped. ", 6)
+	hooked := marker + "\n<ctx>\n  <seg>stable instruction content for the session hook.</seg>\n</ctx>\n\n" + body
+	mkUser := func(text string) map[string]any {
+		return map[string]any{"type": "message", "role": "user",
+			"content": []any{map[string]any{"type": "text", "text": text}}}
+	}
+	// 最后一条被剥离,前面的 user 与 assistant 均不动。
+	input := []any{
+		mkUser(hooked),
+		map[string]any{"type": "message", "role": "assistant",
+			"content": []any{map[string]any{"type": "output_text", "text": hooked}}},
+		mkUser(hooked),
+	}
+	if !stripHookPrefixFromLastUser(input) {
+		t.Fatalf("last user strip should report change")
+	}
+	if got := input[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"]; got != hooked {
+		t.Fatalf("earlier user must stay untouched")
+	}
+	if got := input[1].(map[string]any)["content"].([]any)[0].(map[string]any)["text"]; got != hooked {
+		t.Fatalf("assistant must stay untouched")
+	}
+	if got := input[2].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string); got != body {
+		t.Fatalf("last user should be stripped to clean body, got %q", got[:min(len(got), 60)])
+	}
+	// 无注入:返回 false 且内容不动。
+	plain := []any{mkUser(body)}
+	if stripHookPrefixFromLastUser(plain) {
+		t.Fatalf("no-injection input should report no change")
+	}
+	// content 为 string 的形状。
+	strInput := []any{map[string]any{"role": "user", "content": hooked}}
+	if !stripHookPrefixFromLastUser(strInput) {
+		t.Fatalf("string content strip should report change")
+	}
+	if got := strInput[0].(map[string]any)["content"]; got != body {
+		t.Fatalf("string content should be stripped, got %q", got)
+	}
+	// 多条 text parts:只剥第一条 part,其余不动。
+	multi := []any{map[string]any{"type": "message", "role": "user", "content": []any{
+		map[string]any{"type": "text", "text": hooked},
+		map[string]any{"type": "text", "text": body},
+	}}}
+	if !stripHookPrefixFromLastUser(multi) {
+		t.Fatalf("multi-part strip should report change")
+	}
+	parts := multi[0].(map[string]any)["content"].([]any)
+	if got := parts[0].(map[string]any)["text"]; got != body {
+		t.Fatalf("first text part should be stripped")
+	}
+	if got := parts[1].(map[string]any)["text"]; got != body {
+		t.Fatalf("second text part must stay untouched")
+	}
+	// 空 input。
+	if stripHookPrefixFromLastUser([]any{}) {
+		t.Fatalf("empty input should report no change")
+	}
+}
+
+// chat 形状接入:stripVolatileCountersInMap 同时覆盖 input 与 messages 数组的
+// 末条 user hook 前缀(buildUpstreamBodyFromClaude 与发送侧共用的接入点)。
+func TestStripVolatileCountersInMapHookPrefix(t *testing.T) {
+	const marker = "SessionStart hook additional context: "
+	// TrimRight:计数剥离对 string content 会 TrimSpace,正文不得以空白结尾,
+	// 否则断言差一个尾随空格(剥离逻辑本身与该行为无关)。
+	body := strings.TrimRight(strings.Repeat("Continue with the migration plan. ", 8), " ")
+	hooked := marker + "\n<ctx>\n  <seg>hook context block.</seg>\n</ctx>\n\n" + body
+	m := map[string]any{"messages": []any{
+		map[string]any{"role": "system", "content": "SYS"},
+		map[string]any{"role": "user", "content": hooked},
+	}}
+	if !stripVolatileCountersInMap(m) {
+		t.Fatalf("map strip should report change for hook prefix")
+	}
+	if got := m["messages"].([]any)[1].(map[string]any)["content"]; got != body {
+		t.Fatalf("messages last user should be stripped, got %q", got)
+	}
+	// 幂等:再跑一次无改动。
+	if stripVolatileCountersInMap(m) {
+		t.Fatalf("second map strip should be a no-op")
+	}
+}

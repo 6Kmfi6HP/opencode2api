@@ -124,7 +124,10 @@ func stripVolatileTokenCountersInPlace(input []any) bool {
 }
 
 // stripVolatileCountersInMap 对上游请求体 map(instructions / input / messages
-// 三种形状)剥离 <total_tokens> 计数块,返回是否有改动。
+// 三种形状)剥离 <total_tokens> 计数块与末条 user 的 SessionStart hook 注入
+// 前缀,返回是否有改动。buildUpstreamBodyFromClaude(chat.go)与发送侧
+// buildOCRequestWithSubpathAndState(opencode.go,指纹重做之后)都经此处,
+// 一处接入覆盖两条路径。
 func stripVolatileCountersInMap(m map[string]any) bool {
 	changed := false
 	if s, ok := m["instructions"].(string); ok && strings.Contains(s, "<total_tokens>") {
@@ -135,9 +138,17 @@ func stripVolatileCountersInMap(m map[string]any) bool {
 		if stripVolatileTokenCountersInPlace(input) {
 			changed = true
 		}
+		// hook 前缀须在计数剥离之后处理:计数块可能出现在文本头部、遮住
+		// marker,先剥计数 marker 才回到文本开头。
+		if stripHookPrefixFromLastUser(input) {
+			changed = true
+		}
 	}
 	if msgs, ok := m["messages"].([]any); ok {
 		if stripVolatileTokenCountersInPlace(msgs) {
+			changed = true
+		}
+		if stripHookPrefixFromLastUser(msgs) {
 			changed = true
 		}
 	}
@@ -159,6 +170,245 @@ func stripVolatileCountersFromBody(body []byte) []byte {
 		return body
 	}
 	return b
+}
+
+// hookCtxMarker SessionStart hook 注入块的固定开头模板(后跟空格、换行与连续
+// 行首 XML 块,总长实测 5,455-29,931 字节)。
+const hookCtxMarker = "SessionStart hook additional context:"
+
+// hookOpenTagRe 匹配行首 XML 开标签并捕获标签名。Go regexp(RE2)不支持反向
+// 引用 \1,闭合标签 </tag> 用 strings.Index 按名手工配对。
+var hookOpenTagRe = regexp.MustCompile(`^<([A-Za-z][\w-]*)>`)
+
+// hookCloseTagRe 匹配行首 session_* 闭合标签:Data References 引用块插进
+// XML 块序列中间会让外层块的闭合标签落单(实测样本引用块后紧跟
+// </session_guide>),需随注入一起剥;限定 session_ 前缀防止吃掉正文开头
+// 的普通闭合标签。
+var hookCloseTagRe = regexp.MustCompile(`^</(session_[A-Za-z][\w-]*)>`)
+
+// hookDataRefMarker 新 CLI 在 XML 块序列中间插入的 "Data References" 折叠
+// 引用块的固定开头。
+const hookDataRefMarker = "## Data References\n- "
+
+const (
+	// hookDataRefMax 引用块最大长度(引用的字节数/文本逐轮变化,超过视为正文)。
+	hookDataRefMax = 2048
+	// hookBareTextMax XML 序列后裸文本尾段(如 output style 提示)的最大长度,
+	// 超过视为正文内容不再剥离。
+	hookBareTextMax = 4096
+	// hookMinRemaining 剥离后剩余正文的最小长度,低于视为误判返回原文。
+	// 入口特征(SessionStart hook 模板/## Data References + — query)本身已
+	// 足够强,阈值只需挡住空正文;提得过高会把短指令轮(如 155 字节提问)
+	// 的正常剥离误判为误判而放回残块。
+	hookMinRemaining = 20
+)
+
+// isHookSpaceByte 判断 \s 字符(与 regexp 语义一致的 ASCII 集合)。
+func isHookSpaceByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'
+}
+
+// skipHookDataRefBlock 从注入文本当前位置跳过 "## Data References" 折叠引用
+// 块:到首个 \n\n、总长 ≤2KB、且含 " — query" 检索特征才剥,防误吞正文里的
+// 同名段落。命中返回消费长度(含结尾 \n\n),否则 -1。
+func skipHookDataRefBlock(sub string) int {
+	if !strings.HasPrefix(sub, hookDataRefMarker) {
+		return -1
+	}
+	end := strings.Index(sub, "\n\n")
+	if end < 0 {
+		return -1
+	}
+	block := sub[:end]
+	if len(block) > hookDataRefMax || !strings.Contains(block, " — query") {
+		return -1
+	}
+	return end + 2
+}
+
+// hookDataRefHead 形态 2 的开头标志:resume/continue hook 的引用块直接开头,
+// SessionStart 的 XML 块反而夹在注入序列中段。
+const hookDataRefHead = "## Data References"
+
+// hookKnowledgeClose 两种开头形态的公共结尾锚点:整个注入序列以最后一次
+// </session_knowledge> + 非空裸文本(output style 提示)+ \n\n 结尾,正文
+// 从那之后开始。
+const hookKnowledgeClose = "</session_knowledge>"
+
+// hookBareTailHasXML 判断锚点后的裸文本尾段是否含 </session_*> 之外的 XML
+// 结构:出现其他 < 开头标签说明锚点误落在正文里,拒绝该锚点。
+func hookBareTailHasXML(bare string) bool {
+	for i := 0; i < len(bare); {
+		if bare[i] != '<' {
+			i++
+			continue
+		}
+		if strings.HasPrefix(bare[i:], "</session_") {
+			j := strings.IndexByte(bare[i:], '>')
+			if j < 0 {
+				return true
+			}
+			i += j + 1
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// stripHookByTailAnchor 结尾锚点剥离(优先路径):找最后一次
+// </session_knowledge>,其后跳过非空裸文本(≤4KB,不含 </session_*> 之外的
+// XML 结构)到首个 \n\n(含),剩余为正文。anchored=false 表示锚点缺失或尾段
+// 形态不符,调用方回退单元序列贪心;护栏不通过时返回原文。
+func stripHookByTailAnchor(s string) (string, bool) {
+	idx := strings.LastIndex(s, hookKnowledgeClose)
+	if idx < 0 {
+		return s, false
+	}
+	// 锚点必须在文本前 90% 以内:更靠后说明它出现在正文里,剥到尾部会毁掉正文。
+	if idx > len(s)*9/10 {
+		return s, true
+	}
+	tail := s[idx+len(hookKnowledgeClose):]
+	bareEnd := strings.Index(tail, "\n\n")
+	if bareEnd <= 0 || bareEnd > hookBareTextMax {
+		return s, false
+	}
+	if hookBareTailHasXML(tail[:bareEnd]) {
+		return s, false
+	}
+	body := tail[bareEnd+2:]
+	// 护栏:剩余正文过短或剥离总量超过原文 80% 视为误判,返回原文
+	// (宁可漏剥不可错剥)。
+	if len(body) < hookMinRemaining || len(s)-len(body) > len(s)*4/5 {
+		return s, true
+	}
+	return body, true
+}
+
+// stripHookByUnitSequence 单元序列贪心剥离(结尾锚点缺失时的回退):依次
+// 贪心匹配注入头部之后的单元序列,直到既无 XML 块也无引用块/孤儿闭合标签:
+//  1. 行首 XML 块 <tag>...</tag>(按名配对闭合,连同块后空白);
+//  2. "## Data References" 折叠引用块(新 CLI 在块序列中间插入,内容
+//     逐轮变化,实测紧跟上一块的 \n\n 之后);
+//  3. 行首 session_* 孤儿闭合标签(引用块插进外层块中间导致,如实测
+//     样本引用块后紧跟 </session_guide>)。
+//
+// 每个单元消费后连同其后空白一起跳过;记录最后一次空白消费是否含 \n\n
+// ——含则注入与正文的分隔符已被消费,其后即正文。护栏同锚点路径。
+func stripHookByUnitSequence(s string) string {
+	rest := s
+	if strings.HasPrefix(s, hookCtxMarker) {
+		rest = strings.TrimLeft(s[len(hookCtxMarker):], " \t")
+		// 模板为 "context: " + 换行 + XML 块序列,只跳一个换行。
+		rest = strings.TrimPrefix(rest, "\r")
+		rest = strings.TrimPrefix(rest, "\n")
+	}
+	origLen := len(s)
+	pos := 0
+	sepConsumed := false
+	matched := false
+	for pos < len(rest) {
+		sub := rest[pos:]
+		if m := hookOpenTagRe.FindStringSubmatch(sub); m != nil {
+			closeTag := "</" + m[1] + ">"
+			ci := strings.Index(sub[len(m[0]):], closeTag)
+			if ci < 0 {
+				break // 闭合标签缺失,不构成注入块
+			}
+			matched = true
+			pos += len(m[0]) + ci + len(closeTag)
+		} else if n := skipHookDataRefBlock(sub); n >= 0 {
+			pos += n
+		} else if m := hookCloseTagRe.FindStringSubmatch(sub); m != nil {
+			pos += len(m[0])
+		} else {
+			break
+		}
+		ws := pos
+		for pos < len(rest) && isHookSpaceByte(rest[pos]) {
+			pos++
+		}
+		sepConsumed = strings.Contains(rest[ws:pos], "\n\n")
+	}
+	if !matched {
+		return s
+	}
+	body := rest[pos:]
+	if !sepConsumed {
+		// XML 序列后是裸文本段(如 output style 提示),以 \n\n 结尾:剥到首个
+		// \n\n 之后;裸文本超过 4KB 视为正文,不再剥。
+		if idx := strings.Index(body, "\n\n"); idx > 0 && idx <= hookBareTextMax {
+			body = body[idx+2:]
+		}
+	}
+	// 护栏:剩余正文过短或剥离总量超过原文 80% 视为误判,返回原文
+	// (宁可漏剥不可错剥)。
+	if len(body) < hookMinRemaining || origLen-len(body) > origLen*4/5 {
+		return s
+	}
+	return body
+}
+
+// stripHookPrefixFromUserText 剥离 Claude Code hook 注入到 user 消息开头的
+// 动态前缀。注入有两种开头形态:SessionStart hook 的 "SessionStart hook
+// additional context: " + XML 块序列,以及 resume/continue hook 的
+// "## Data References" 引用块直接开头;两者都以最后一次 </session_knowledge>
+// + 非空裸文本(output style 提示)+ \n\n 结尾。该注入只存在于当轮请求,
+// 客户端重放历史时不带此前缀,导致上游前缀缓存在此分叉。剥离后两轮逐字节
+// 一致。返回剥离后的文本;无注入特征时原样返回。
+func stripHookPrefixFromUserText(s string) string {
+	if !strings.HasPrefix(s, hookCtxMarker) && !strings.HasPrefix(s, hookDataRefHead) {
+		return s
+	}
+	if body, anchored := stripHookByTailAnchor(s); anchored {
+		return body
+	}
+	return stripHookByUnitSequence(s)
+}
+
+// stripHookPrefixFromLastUser 对 input(Responses 形状)的最后一条 user 消息
+// 剥离 SessionStart hook 注入前缀。返回是否有修改。
+// 只动最后一条:注入只 prepend 到当轮 user 消息,历史里重放的旧 user 是干净
+// 版本,不动可把误伤面降到最小。content 兼容 string 与 parts 两种形状;parts
+// 里只剥第一个带 text 的 part(注入只会 prepend 到最前面,部分路径的 part
+// type 是 input_text,故按 text 字段识别而非 type)。
+func stripHookPrefixFromLastUser(input []any) bool {
+	for i := len(input) - 1; i >= 0; i-- {
+		item, ok := input[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := item["role"].(string); role != "user" {
+			continue
+		}
+		changed := false
+		switch content := item["content"].(type) {
+		case string:
+			if rest := stripHookPrefixFromUserText(content); rest != content {
+				item["content"] = rest
+				changed = true
+			}
+		case []any:
+			for _, p := range content {
+				pm, ok := p.(map[string]any)
+				if !ok {
+					continue
+				}
+				t, ok := pm["text"].(string)
+				if !ok || t == "" {
+					continue
+				}
+				if rest := stripHookPrefixFromUserText(t); rest != t {
+					pm["text"] = rest
+					changed = true
+				}
+				break // 注入只 prepend 到最前,只剥第一条 text part
+			}
+		}
+		return changed
+	}
+	return false
 }
 
 // instructionsClipMaxEntries 限制稳定 instructions 注册表条数，防止长期运行

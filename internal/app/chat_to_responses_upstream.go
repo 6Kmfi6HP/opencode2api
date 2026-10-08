@@ -132,6 +132,9 @@ func chatToResponsesBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[
 	// CLI 每轮改写 user 消息里的 <total_tokens> 上下文计数,值逐请求变化,会让
 	// 上游前缀缓存从首个含计数的消息断;剥离(对齐 claudeToResponsesBody)。
 	_ = stripVolatileTokenCountersInPlace(input)
+	// SessionStart hook 注入前缀只存在于当轮请求,客户端重放历史不带;不剥会让
+	// 上游前缀缓存从该消息逐字节分叉(对齐 claudeToResponsesBody)。
+	_ = stripHookPrefixFromLastUser(input)
 	body := map[string]any{
 		"model":  modelID,
 		"input":  input,
