@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.14.28
+
+- Align conversion layer with Bifrost reference (`fix(protocol)`, PR #41): 转换层对齐 maximhq/bifrost (Apache-2.0) 语义，修复 stop reason / thinking / tool 映射多处偏差：
+  - stop reason：`responsesOutcome` 折叠 `finish_reason=length` 与 Anthropic `model_context_window_exceeded` 为 `incomplete/max_output_tokens`，`content_filter` → `incomplete/content_filter`，`pause_turn`/`compaction` 不再误报 completed；`normalizeFinishReason` 映射 `model_context_window_exceeded` → `length`，`pause_turn`/`compaction` 返回空让 chat choices 不再谎报完成；流式/非流式 Claude 路径 `model_context_window_exceeded` → `max_tokens`、`content_filter` → Anthropic `refusal`；stop_sequence 往返（请求 stop_sequences 命中响应尾部即恢复 `stop_sequence` + 回显序列）。
+  - thinking：adaptive thinking 仅对 adaptive-only 模型（Opus 4.7+/Sonnet 5+/Fable）保留、不再强制 normalize 为 enabled+budget（该类模型直接拒绝）；`reasoning.encrypted_content` 独立 `redacted_thinking` 块（不再塞 `thinking.signature`），summary 每段独立 thinking 块；`ReasoningDetails` 结构化携带 thinking 签名与 redacted 载荷并在 chat-to-anthropic 出站回放。
+  - tool：新增 `sanitizeToolUseID`（Anthropic `^[a-zA-Z0-9_-]+$` 字符集，64 截断，FNV-1a 确定性映射保 `tool_calls[].id`/`tool_call_id` 配对）；空 ID tool_use 跳过、孤儿 tool_result 降级 user 文本（不再必 400）；`tool_choice` 收窄 `allowed_tools`、`parallel_tool_calls` → `disable_parallel_tool_use`、参数经 `parseToolCallArguments` 压实。
+  - 内容杂项：对话中段 system/developer 内联为 system-reminder user 轮（tool_result 块保持首位）；file part → Anthropic document 块；非允许 scheme 图片 URL（如 file://）丢弃；part 级 `cache_control` 透传；usage 合并 cache_creation 5m/1h 明细与 `server_tool_use.web_search_requests`，`mergeUsage` 按 max 合并嵌套计数（事件序无关）。
+  - 合并解决：与 main 上 `9ca44b4`（F1-F6）/`829eacd`（responses 透传恢复）冲突时采用已落定的 F1 语义，PR 自带 thinking 断言同步更新。
+  - 验证：`go test ./...`、`go vet`、`gofmt` 全过；三协议真实测试全过（muse-spark chat/responses/messages + thinking 推理链路）；Claude Code 长上下文稳态 99.8%、pi 三协议稳态 98-99.9%。
+
 ## v0.14.26
 
 - Map downstream sessions to dedicated upstream sessions (`feat(session)`): 网关此前全部流量共用一个进程全局 `x-opencode-session`，在上游侧形成"超级会话"——所有下游 agent 钉在同一个 provider 粘性上、计费归因混合、一次 429 触发的本地解绑影响全体。已查证上游 zen handler（anomalyco/opencode v2）只读 `x-opencode-session` 且该值直接决定 provider 粘性与计费归因（`stickyId = sessionId ?: workspaceID ?: ip`），真实 opencode 客户端每个 agent 会话独立发 affinity 值（`parentID ?? fork.sessionID ?? session.id`）。新增有界映射表（下游会话身份 → 专属 `ses_`，`internal/app/opencode.go`）：
