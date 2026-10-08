@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.14.25
+
+- Strip volatile client injections and pin stable prefixes across both upstream body shapes (`fix(cache)`): Claude Code 逐请求注入易变内容（`<total_tokens>` 上下文计数、system-reminder 上下文、hand-back 通知），让上游请求前缀逐请求漂移、前缀缓存反复从漂移点截断。按两种上游 body 形状分别修复（`internal/app/instructions_stable.go`，接入点统一在 `buildOCRequestWithSubpathAndState` 的免费层指纹重做之后、`prompt_cache_key` 重算之前——指纹重做按客户端原文重建 body，此前的前置剥离都会被覆盖）：
+  - 计数剥离扩展三种形状与三个 role：`stripVolatileCountersInMap` 剥离 instructions / input / messages 形状里 user、system、developer 消息的 `<total_tokens>` 计数块（regex 连同周围空白一起吃，防逐轮累积空行漂移；assistant 输出稳定不动；非文本 part 原样保留）。Responses 形状（muse-spark 系）计数走 instructions + user；chat 形状（ling 系）计数以 role=system join 进 messages[0] 尾部逐轮累积（实测 ling-3.1-flash-free 上累积 3 处、命中率 11.7%）。
+  - chat 形状 system 钉首轮（`clipChatSystemStable` + `appendChatDeltaToLastUser`）：chat 协议把 system 提示 join 进 messages[0]，CLI 每轮往尾部追加 hand-back 通知（剥计数后仍逐轮增长 ~3K），上游前缀缓存从 system 增长点截断、tools 与会话历史全 miss（命中率封顶 ~17%）。首条 role=system 消息按会话注册首轮原文钉住、增量 TrimSpace 后并入末条 user 消息，注册表与回退行为同 Responses 形状的 `clipInstructionsToStablePrefix`（未命中/前缀不匹配时原样返回，不丢上下文）。
+  - thinking 回放跳过（`claudeToResponsesBody`）：CLI 按 Anthropic 惯例只回放最后一轮 thinking，reasoning item 的有无/位置逐请求漂移，前缀缓存从首个 reasoning item 断；GLM 系上游推理自含，回放无增益。
+  - pck 稳定段挑选：`prompt_cache_key` 的 tools 分支只哈希工具名集合（排序 join，异步 MCP/插件加载的 schema 漂移不再换缓存分片）；first_user 改取非 system-reminder 的稳定 part 并剥离计数（逐请求重写的 SR 注入块不再做会话标识）。
+  - 调试设施：新增 `OPENCODE2API_DUMP_UPSTREAM=<dir>`——把发往上游的请求体逐个落盘（纳秒时间戳命名），用于缓存前缀字节级 diff 定位漂移段；默认关闭，仅限本地调试。
+  - 验证（真实 4 轮 Claude Code agents 任务、同会话 resume、全程相同 `--allowedTools`）：muse-spark-1.3-contributor 总命中率 92.9%、主对话稳态 96-100%、计数残留 0、截断 0；ling-3.1-flash-free 主对话 7/8 请求 87-100%（唯一 low 是冷启动 probe）、计数残留 0/208 dumps、截断 0（28/28 `truncated=false`）。剩余低命中全为固有冷启动（每个新子代理 pck 按 first_user 隔离防串污染）与 CLI 2.1.293.45a 的 hand-back 中段插入（单次断点、断后即恢复——通知含子代理最终报告不可删，挪尾部实测更差，留原位为固有代价）。回归测试 `TestStripVolatileTokenCounters`、`TestStripVolatileTokenCountersSystemRole`、`TestClipChatSystemStable`、`TestStableUserTextFromParts`、`TestContentPromptCacheKey_ToolsNamesIgnoreSchemaDrift` 等；`docs/claude-cache-test-method.md` §6/§7 补两轮根因、验证结果与测试环境陷阱（8080 日常网关占用、CLI 429 后 fallback 桌面 3P OAuth 直连官方致流量绕网关、CLI 自动更新改变通知注入位置）。
+
 ## v0.14.22
 
 - Fix muse-spark free-tier intermittent empty turns / truncation (`fix(responses)`, `fix(keypool)`, `fix(chat)`, `fix(httpclient)`): 免费档共享 Output-token 限速承压时，上游以 HTTP 200 + `response.created→response.incomplete`（零内容、usage 报 reasoning tokens）杀死请求；`PeekFirstFrame` 壳帧即 commit（`IsProductiveEvent` 是零调用死代码）+ `response.incomplete` 分支无零内容检查 → 客户端拿 200 空消息 `stop_reason=max_tokens`、零重试零报错，Claude Code 把空轮记入历史、agent 任务停摆（表现为「任务永远无法完成」）。六层修复（18-agent 排查对抗验证 0 驳回；mock 上游确定性复现闭环：empty_incomplete 从「200 空轮零重试」变为「pre-commit 换 key 重试 → 仍空 → 502 诚实失败」；真实网关 keypool 接管生效，`upstream_attempt` 出现 key_id 轮动）：
