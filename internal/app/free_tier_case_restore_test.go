@@ -231,7 +231,7 @@ func TestClaudeResponsesStream_CaseRestoreToolUseStart(t *testing.T) {
 	h2 := http.Header{}
 	h2.Set("User-Agent", "claude-cli/2.0.0")
 	ctxClaude2 := context.WithValue(context.Background(), opencodeUpstreamHeadersContextKey{}, h2)
-	_, err := claudeResponsesStreamHandler(ctxClaude2, rec, strings.NewReader(sse), "m", false, nil)
+	_, err := claudeResponsesStreamHandler(ctxClaude2, rec, strings.NewReader(sse), "m", false, nil, nil)
 	if err != nil {
 		t.Fatalf("claudeResponsesStreamHandler: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestConvertResponsesToClaude_CaseRestoreNonStream(t *testing.T) {
 		"usage": map[string]any{"input_tokens": 5, "output_tokens": 6, "total_tokens": 11},
 	}
 	raw, _ := json.Marshal(resp)
-	out := convertResponsesToClaude(raw, "m", false, true)
+	out := convertResponsesToClaude(raw, "m", false, true, nil)
 	var claudeResp struct {
 		Content []struct {
 			Type string `json:"type"`
@@ -287,7 +287,7 @@ func TestConvertResponsesToClaude_CaseRestoreNonStream(t *testing.T) {
 		}
 	}
 	// 门控关闭:保持小写透传。
-	outOff := convertResponsesToClaude(raw, "m", false, false)
+	outOff := convertResponsesToClaude(raw, "m", false, false, nil)
 	var offResp struct {
 		Content []struct {
 			Type string `json:"type"`

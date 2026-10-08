@@ -95,9 +95,9 @@ func TestClaudeToResponsesBody_BasicMapping(t *testing.T) {
 	if len(input) == 0 {
 		t.Fatal("input is empty")
 	}
-	// thinking 回放已跳过(CLI 只保留最后一轮 thinking,旧轮丢弃会让 reasoning
-	// item 位置逐请求漂移、前缀缓存从首个 reasoning item 断),不再期待
-	// reasoning item;至少包含 message / function_call / function_call_output
+	// thinking 回放为 reasoning item（对齐 Bifrost responses.go:760-850 的
+	// summary 与 encrypted_content 双存）：assistant 轮的 thinking 落
+	// summary，多轮推理上下文不再丢失。
 	types := map[string]int{}
 	for _, it := range input {
 		if m, ok := it.(map[string]any); ok {
@@ -109,8 +109,15 @@ func TestClaudeToResponsesBody_BasicMapping(t *testing.T) {
 			t.Fatalf("input types = %#v, want %q", types, want)
 		}
 	}
-	if types["reasoning"] != 0 {
-		t.Fatalf("thinking replay should be skipped, got %d reasoning items", types["reasoning"])
+	if types["reasoning"] != 1 {
+		t.Fatalf("thinking should replay as one reasoning item, got %d", types["reasoning"])
+	}
+	for _, it := range input {
+		if m, ok := it.(map[string]any); !ok || m["type"] != "reasoning" {
+			continue
+		} else if sm, ok := m["summary"].([]any); !ok || len(sm) == 0 {
+			t.Fatalf("replayed reasoning item missing summary: %#v", m)
+		}
 	}
 	// tools 映射
 	tools, _ := req["tools"].([]any)
@@ -193,7 +200,7 @@ func TestResponsesToClaude_BasicMapping(t *testing.T) {
 		],
 		"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}
 	}`
-	out := convertResponsesToClaude([]byte(respBody), "primary-model", true, true)
+	out := convertResponsesToClaude([]byte(respBody), "primary-model", true, true, nil)
 	var claude ClaudeResponse
 	if err := json.Unmarshal(out, &claude); err != nil {
 		t.Fatalf("claude response is not JSON: %v, body=%s", err, string(out))
@@ -239,7 +246,7 @@ func TestResponsesToClaude_UnknownItemDowngradesToText(t *testing.T) {
 		],
 		"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
 	}`
-	out := convertResponsesToClaude([]byte(respBody), "m", true, true)
+	out := convertResponsesToClaude([]byte(respBody), "m", true, true, nil)
 	var claude ClaudeResponse
 	json.Unmarshal(out, &claude)
 	foundText := false

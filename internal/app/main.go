@@ -8,6 +8,7 @@ import (
 // surface stable while the implementation is split into packages.
 type OpenAIRequest = domain.OpenAIRequest
 type Message = domain.Message
+type ReasoningDetail = domain.ReasoningDetail
 type ToolCall = domain.ToolCall
 type FunctionCall = domain.FunctionCall
 type Tool = domain.Tool
@@ -31,6 +32,7 @@ type ClaudeMessage = domain.ClaudeMessage
 type ClaudeContent = domain.ClaudeContent
 type ClaudeTool = domain.ClaudeTool
 type ClaudeResponse = domain.ClaudeResponse
+type ClaudeStopReason = domain.ClaudeStopReason
 type ClaudeUsage = domain.ClaudeUsage
 type ResponsesAPIRequest = domain.ResponsesAPIRequest
 type ResponsesTool = domain.ResponsesTool

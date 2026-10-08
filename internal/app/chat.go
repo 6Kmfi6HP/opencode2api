@@ -43,6 +43,7 @@ func buildOpenAIResponse(anthropicMsg map[string]any, contentBlocks []map[string
 	var textBuilder strings.Builder
 	var reasoningContent string
 	var toolCalls []map[string]any
+	var reasoningDetails []ReasoningDetail
 	hasNonText := false
 
 	for _, blk := range contentBlocks {
@@ -60,8 +61,41 @@ func buildOpenAIResponse(anthropicMsg map[string]any, contentBlocks []map[string
 				}
 				reasoningContent += t
 			}
+			// typed 槽位（对齐 Bifrost chat.go:1319-1331
+			// ReasoningDetails{index,type,text,signature}）：签名随文本一起落
+			// 槽，客户端回传历史时 chat→anthropic 出站据此重放 thinking 块。
+			// 文本与签名都空的块不落槽（Bifrost pruneEmptyReasoningDetails 同
+			// 语义），避免合成空 detail。
+			detail := ReasoningDetail{
+				Index: len(reasoningDetails),
+				Type:  "reasoning.text",
+			}
+			if t, ok := blk["thinking"].(string); ok {
+				detail.Text = t
+			}
+			if sig, ok := blk["signature"].(string); ok {
+				detail.Signature = sig
+			}
+			if detail.Text != "" || detail.Signature != "" {
+				reasoningDetails = append(reasoningDetails, detail)
+			}
 		case "redacted_thinking":
 			hasNonText = true
+			// redacted_thinking 是不透明密文负载（对齐 Bifrost chat.go:1319-1331
+			// 的 reasoning.encrypted detail）：落 typed 槽位保留 data，客户端
+			// 下一轮回传后 chat→anthropic 出站原样重放——Anthropic 要求
+			// thinking/redacted_thinking 块在 tool-use 回合原样回传，丢弃即
+			// 上游 400。仅置 hasNonText 会把密文从 typed 通道丢掉。
+			detail := ReasoningDetail{
+				Index: len(reasoningDetails),
+				Type:  "reasoning.encrypted",
+			}
+			if d, ok := blk["data"].(string); ok {
+				detail.Data = d
+			}
+			if detail.Data != "" {
+				reasoningDetails = append(reasoningDetails, detail)
+			}
 		case "tool_use":
 			hasNonText = true
 			input := blk["input"]
@@ -114,6 +148,13 @@ func buildOpenAIResponse(anthropicMsg map[string]any, contentBlocks []map[string
 		msg["reasoning_content"] = reasoningContent
 	}
 
+	if len(reasoningDetails) > 0 {
+		// typed 推理槽位（OpenRouter 形状,对齐 Bifrost reasoning_details）：
+		// thinking 文本/签名与 redacted 密文都从这里回放。normalizeReasoning
+		// Content 侧已兼容该字段（reasoning_content 优先,不互相覆盖）。
+		msg["reasoning_details"] = reasoningDetails
+	}
+
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
 	}
@@ -131,9 +172,13 @@ func buildOpenAIResponse(anthropicMsg map[string]any, contentBlocks []map[string
 	}
 
 	choice := map[string]any{
-		"index":         0,
-		"message":       msg,
-		"finish_reason": finishReason,
+		"index":   0,
+		"message": msg,
+	}
+	// finish_reason 置空时不发:pause_turn/compaction 等 Anthropic 未完结
+	// stop_reason 无 chat 等价物,不报完成态(对齐 Bifrost unmapped → unset)。
+	if finishReason != "" {
+		choice["finish_reason"] = finishReason
 	}
 
 	resp := map[string]any{
@@ -394,6 +439,9 @@ func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
 	}
 	if !keepReasoning {
 		delete(delta, "reasoning_content")
+		// typed 推理槽位与 reasoning_content 同一抑制契约：客户端未请求推理
+		// 时不外泄（含上游直发的 reasoning_details）。
+		delete(delta, "reasoning_details")
 	} else {
 		if v, ok := delta["reasoning_content"]; ok && v == nil {
 			delete(delta, "reasoning_content")
@@ -574,6 +622,9 @@ func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 					promoteMisplacedReasoning(msg, keepReasoning)
 					if !keepReasoning {
 						delete(msg, "reasoning_content")
+						// typed 推理槽位与 reasoning_content 同一抑制契约：客户端
+						// 未请求推理时不外泄（buildOpenAIResponse 会写入）。
+						delete(msg, "reasoning_details")
 					}
 					// Strip private Anthropic roundtrip field so it never
 					// leaks to Chat Completions consumers.
@@ -1207,10 +1258,29 @@ func isThinkingDisabled(value any) bool {
 }
 
 // buildUpstreamThinking preserves budget_tokens / effort fields when present.
+// adaptive 语义按原样保留：adaptive-only 机型（Opus 4.7+/Sonnet 5+/Fable 系）
+// 拒绝 budget_tokens thinking，恒归一成 enabled 会把上游必拒的形状发出去
+// （对齐 Bifrost chat.go:780-782 的 adaptive 透传）；adaptive 模式不携带
+// budget_tokens（该组合上游拒绝），effort 字段保留。
 func buildUpstreamThinking(value any) map[string]any {
-	out := map[string]any{"type": "enabled"}
+	typ := "enabled"
 	m, ok := value.(map[string]any)
+	if ok {
+		if t, _ := m["type"].(string); t == "adaptive" {
+			typ = "adaptive"
+		}
+	}
+	out := map[string]any{"type": typ}
 	if !ok {
+		return out
+	}
+	if typ == "adaptive" {
+		if effort, exists := m["effort"]; exists && effort != nil {
+			out["effort"] = effort
+		}
+		if d := thinkingDisplay(m); d != "" {
+			out["display"] = d
+		}
 		return out
 	}
 	for _, key := range []string{"budget_tokens", "effort"} {

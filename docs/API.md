@@ -85,6 +85,10 @@
 
 - 上游 Anthropic 响应会转换 stop reason、usage、reasoning、refusal 和工具调用。
 - 不同上游模型对 `thinking` / `reasoning_effort` 的支持可能不同。
+- 走原生 Anthropic 上游时：`tool_choice.allowed_tools` 按声明收窄 `tools` 列表（空交集 → `tool_choice` `none`，绝不静默放行全量）；`parallel_tool_calls:false` 携带为 `tool_choice.disable_parallel_tool_use:true`（`none` 跳过；无 `tool_choice` 且已声明工具时补 `auto` 载体）；`tool_choice` 的 `any` 透传、`custom` 映射 `auto`。
+- 走原生 Anthropic 上游时：历史 `tool_calls[].id` / `tool_call_id` 中 Anthropic 字符集（`^[A-Za-z0-9_-]+$`）外的 ID（如 Kimi/Gemini 风格 `functions.x:0`）会确定性清洗（语义保留 + hash 前缀，超 64 截断）；同一 ID 在两侧清洗到相同值保持配对，合法 ID 直通不变。孤儿 `tool_result`（空 `tool_use_id`）降级为普通 user 文本，不再照发必 400；空 ID 的 `tool_calls` 条目跳过。
+- 走原生 Anthropic 上游时：对话中间出现的 system/developer 原地转 `<system-reminder>` 包裹的 user 轮（缓存锚点留在 messages 里）；其与相邻 user 轮合并时 `tool_result` 块保持消息首位（Anthropic 要求紧跟 `tool_use` 的 user 消息以 `tool_result` 开头，400 文本 "Did not find N `tool_result` block(s) at the beginning of this message"）。
+- 走原生 Anthropic 上游时：`tool_result.content` 内嵌 block 上的 part 级 `cache_control` 提升到 `tool_result` 块本身（Anthropic 拒绝嵌在 `tool_result.content` 里的块级断点；首个命中提升、其余折叠）。
 
 ### 不支持
 
@@ -102,8 +106,8 @@
 - `max_output_tokens`、`stop`、`user`、`parallel_tool_calls`、`stream_options`、`store`
 - 函数工具、项目已有的内置工具、`tool_choice`、`reasoning`、`metadata`
 - Chat 经 `protocol_rules` 走原生 Responses 上游时：`parallel_tool_calls` / `service_tier` 透传上游；`response_format`（`json_schema` 展平 / `json_object` 透传 `type`）映射为 `text.format`；`custom_tool_call`（custom/freeform 工具）的 `input` 增量与 `done` 按同一 `tool_calls` index 累积；`incomplete` 按 `reason` 细分 `finish_reason`（`max_output_tokens`→`length`，`content_filter`→`content_filter`）；上游 `service_tier` 回写 chat 顶层；`response.done`（Realtime/WS 别名）与 `completed` 同等终结流
-- Chat 经 `protocol_rules` 走原生 Anthropic 上游时：thinking 生效即剥离 `temperature`/`top_p`（与 Claude 入站同口径，避免上游 400）
-- Anthropic-style `tool_result`（`call_id`，缺省时用 `tool_use_id`；`content` 支持 string、字符串数组、`{type:"text"|"input_text"|"output_text",text}` blocks；`is_error:true` 加 `Error: ` 前缀）
+- Chat 经 `protocol_rules` 走原生 Anthropic 上游时：thinking 生效即剥离 `temperature`/`top_p`；adaptive-only 机型（Opus 4.7+ / Sonnet 5+ / Fable 系）无条件剥离（这些机型拒绝 sampling 参数，400 与 thinking 决策无关）；其余机型 `temperature`/`top_p` 同时携带时收成单参（优先 `temperature`，对齐 Bifrost）
+- Anthropic-style `tool_result`（`call_id`，缺省时用 `tool_use_id`；`content` 支持 string、字符串数组、`{type:"text"|"input_text"|"output_text",text}` blocks；`is_error:true` 由网关内部标记携带——内容文本不再加 `Error: ` 前缀，走 Anthropic 上游时转回 `tool_result.is_error:true`）
 - 正常终态 `response.completed`；长度截断终态 `response.incomplete`，reason 为 `max_output_tokens`
 
 ### Best-effort
@@ -147,9 +151,11 @@ curl http://127.0.0.1:8000/v1/responses \
 - `max_tokens`：Chat/Responses 直通与翻译同样收敛 `[128, cap]`（cap 来自 `max_tokens_cap` / `max_tokens_cap_per_model`）；count_tokens 命中 anthropic 规则时只降不补
 - `metadata.user_id`：若为 JSON 串则只转发 `session_id`（避免 `device_id` 外泄）；否则原样转发
 - 文本、base64/URL image、`tool_use`、`tool_result`（包括 `is_error`）；合法的 tool result 在普通用户内容之前的顺序会被保留
+- `is_error:true` 的 `tool_result` 转 Chat 上游时内容文本不加 `Error: ` 前缀（不变形），错误标记由网关内部携带；转 Anthropic 上游时保留原生 `is_error:true`
+- `tool_use.id` / `tool_result.tool_use_id` 中 Anthropic 字符集（`^[A-Za-z0-9_-]+$`）外的 ID 确定性清洗（同侧配对保持）；空 `tool_use_id` 的 `tool_result` 降级为普通 user 文本（转 Chat tool 消息必缺 `tool_call_id`），空 ID 的 `tool_use` 跳过
 - `tool_result` 中的 image 转为紧随其后的 `role=user` + `image_url`，tool 文本保留字符串并标注 `[image attached]`；`tool_result` 中的 document 同样转为紧随其后的 user file part 并标注 `[document attached]`；orphan `tool_use`（无 matching tool_result）在翻译路径由 Worker A/B 的配对归一化处理
 - `tool_choice` 的 `auto`、`any`、`tool`、`none`；`disable_parallel_tool_use:true` 映射为上游 `parallel_tool_calls=false`
-- `output_config.effort` → 上游 `reasoning_effort`；`thinking.type=adaptive` 视为 enabled
+- `output_config.effort` → 上游 `reasoning_effort`；thinking 翻译按机型收口（对齐 Bifrost）：adaptive-only 机型（Opus 4.7+ / Sonnet 5+ / Fable 系）上 `thinking.type=enabled`(+budget) 重写为 `adaptive` + effort（budget 折算 effort，budget_tokens 不随 adaptive 发送），其余机型保持 `enabled` 归一；走原生 Anthropic 上游时按机型发 `adaptive`(+`display`)/`between_tools`/`enabled`+budget，不再恒发 `enabled`+budget
 - JSON Schema 约束字段（包括 `additionalParameters`、`format`）
 - stop reason、usage 以及流式 content block 配对
 - `/v1/messages/count_tokens`：`protocol_rules` 命中 anthropic 上游时直连 `/zen/v1/messages/count_tokens` 透传取精确计数；未命中、仅命中 chat/responses 或上游失败时回落本地启发式（chat 上游对 thinking 的采样参数互斥剥参同样生效）
@@ -165,9 +171,9 @@ curl http://127.0.0.1:8000/v1/responses \
 ### Best-effort / 显式丢弃（可观测）
 
 - `document`（`source.type=base64`，默认 `application/pdf`；`source.type=url`）映射为 Chat content part `{type:"file",file:{...}}`，可保留 block/title 作为 `filename`。模型不支持 file 模态时上游可能拒绝；document 缺少可用 payload 时返回 HTTP 400。
-- thinking 会在没有 signature 时继续输出，以提高客户端兼容性。代理不会伪造 signature 或发送假的 `signature_delta`。
-- 请求历史中的 thinking `signature` 没有 Chat Completions 等价物，会被丢弃；代理仅统计历史中非空 signature block 数量到 `request_plan`（`history_signature_count`），不记录签名内容。
-- `redacted_thinking.data` 是不可解释的加密数据，无法无损转成请求侧 reasoning；请求历史中的 redacted data 会被丢弃。native Anthropic 响应中明确存在的 signature / redacted data 由第二批私有 roundtrip 字段（`_opencode2api_anthropic_content`）保留，仅用于 Claude Messages 往返，Chat/Responses 公共 payload 不会泄漏这些私有字段。
+- thinking 会在没有 signature 时继续输出，以提高客户端兼容性。代理不会伪造 signature。
+- thinking 响应中的 signature / redacted `data` 落 typed 推理槽位 `reasoning_details[]`（对齐 Bifrost `ReasoningDetails{index,type,text,signature,data}`：thinking → `reasoning.text`，redacted → `reasoning.encrypted`），流式路径同样经 `reasoning_details` delta 流出（`keep_reasoning=false` 时与 `reasoning_content` 同一抑制契约）。Chat 请求历史中携带 `reasoning_details` 的 assistant 消息走原生 Anthropic 上游时，在 assistant 消息头部重放 thinking+signature / redacted_thinking 块（thinking-head 要求）；历史请求中的 thinking 块数仍计入 `request_plan`（`history_signature_count`），不记录签名内容。
+- `redacted_thinking.data` 是不可解释的加密数据：经 `/v1/messages` 历史不再 JSON-stringify 进文本（密文泄漏），走 typed 槽位 / 原样重放；claude→Responses 路径的请求历史中 thinking/redacted 回放为 reasoning item（文本落 `summary`、signature/密文落 `encrypted_content`，对齐 Bifrost 的 summary 与 encrypted_content 双存），文本与密文都缺时才丢弃。native Anthropic 响应中明确存在的 signature / redacted data 同时由私有 roundtrip 字段（`_opencode2api_anthropic_content`）保留，仅用于 Claude Messages 往返，Chat/Responses 公共 payload 不会泄漏这些私有字段。
 - 无 Chat Completions 等价物的字段不进上游 body，但会绑定并记入 `request_plan` / body summary：`context_management`、`cache_control`、`anthropic-beta`、带 `type` 且无 `input_schema` 的 server tools（如 `web_search_*`）。
 - `cache_control` breakpoints 现在被保留：Claude 侧的 `system[].cache_control`、`messages[].content[].cache_control`、`tools[].cache_control` 会在转换到 Chat 上游时按文本/工具名重放到对应消息/工具上（`config.cache_control_breakpoints` 默认开启，`rejectsCacheControl` 列表内的 GLM/Zhipu 仍跳过），同时自动附加顶层 `cache_control` breakpoint；`cached_tokens` usage 由上游返回时映射到 `prompt_tokens_details.cached_tokens` 并累计到本地 stats。请求中的 `cache_control` 也仍然计入 `cache_control_blocks` 供诊断。
 

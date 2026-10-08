@@ -109,7 +109,7 @@ func TestAnthropicStreamKeepsParallelToolArgumentDeltasOnTheirOwnBlocks(t *testi
 		`data: [DONE]`, "",
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 
 	var starts, deltas []sseEvent
 	for _, event := range parseSSEEvents(t, rr.Body.String()) {
@@ -172,8 +172,14 @@ func TestAnthropicContentPreservesTextImageOrderAndToolErrors(t *testing.T) {
 		map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": "https://example.test/a.png"}},
 		map[string]any{"type": "text", "text": "after"},
 	}}}, nil)
-	if got := msgs[0].Content; got != "Error: boom" {
-		t.Fatalf("tool error = %#v", got)
+	// is_error 不再把 "Error: " 前缀烤进文本（内容不变形）；错误语义由内部
+	// IsError 标记携带（json:"-"，不进 OpenAI wire；Anthropic 上游转回
+	// tool_result.is_error:true）。
+	if got := msgs[0].Content; got != "boom" {
+		t.Fatalf("tool error = %#v, want 'boom' (no prefix)", got)
+	}
+	if msgs[0].IsError == nil || !*msgs[0].IsError {
+		t.Fatalf("IsError flag = %#v, want true", msgs[0].IsError)
 	}
 	parts, ok := msgs[1].Content.([]any)
 	if !ok || len(parts) != 3 {
@@ -181,6 +187,74 @@ func TestAnthropicContentPreservesTextImageOrderAndToolErrors(t *testing.T) {
 	}
 	if parts[0].(map[string]any)["text"] != "before" || parts[1].(map[string]any)["type"] != "image_url" || parts[2].(map[string]any)["text"] != "after" {
 		t.Fatalf("order not preserved: %#v", parts)
+	}
+}
+
+// TestClaudeToOpenAIMessages_ToolIDsSanitizeAndPair 钉死 Anthropic 入站
+// tool_use.id / tool_result.tool_use_id 的确定性清洗：同一原始 ID 在两侧清洗
+// 到相同值才能配对（Anthropic 字符集外的 id 照发上游必 400）。
+func TestClaudeToOpenAIMessages_ToolIDsSanitizeAndPair(t *testing.T) {
+	badID := "functions.x:0"
+	msgs := claudeToOpenAIMessages([]ClaudeMessage{
+		{Role: "assistant", Content: []any{
+			map[string]any{"type": "tool_use", "id": badID, "name": "shell", "input": map[string]any{"cmd": "ls"}},
+		}},
+		{Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "tool_use_id": badID, "content": "ok"},
+		}},
+	}, nil)
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %#v, want 2 (assistant + tool)", msgs)
+	}
+	if len(msgs[0].ToolCalls) != 1 {
+		t.Fatalf("tool_calls = %#v, want 1", msgs[0].ToolCalls)
+	}
+	callID := msgs[0].ToolCalls[0].ID
+	if callID == "" || callID == badID {
+		t.Fatalf("tool call id not sanitized: %q", callID)
+	}
+	if msgs[1].Role != "tool" || msgs[1].ToolCallID != callID {
+		t.Fatalf("pairing broken: role=%q tool_call_id=%q, want tool/%q", msgs[1].Role, msgs[1].ToolCallID, callID)
+	}
+	for _, r := range callID {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			t.Fatalf("sanitized id %q has illegal rune %q", callID, r)
+		}
+	}
+}
+
+// TestClaudeToOpenAIMessages_EmptyIDToolUseSkipped 钉死空 id 的 tool_use 被
+// 跳过（无法配对，照发上游必 400）——不产生任何 tool_calls 条目。
+func TestClaudeToOpenAIMessages_EmptyIDToolUseSkipped(t *testing.T) {
+	msgs := claudeToOpenAIMessages([]ClaudeMessage{
+		{Role: "assistant", Content: []any{
+			map[string]any{"type": "tool_use", "id": "", "name": "f", "input": map[string]any{}},
+		}},
+	}, nil)
+	for _, m := range msgs {
+		if len(m.ToolCalls) > 0 {
+			t.Fatalf("empty-id tool_use must be dropped: %#v", m.ToolCalls)
+		}
+	}
+}
+
+// TestClaudeToOpenAIMessages_OrphanToolResultDegradesToUser 钉死空
+// tool_use_id 的 tool_result 降级为普通 user 消息（转 tool 消息必缺
+// tool_call_id，上游 400）。
+func TestClaudeToOpenAIMessages_OrphanToolResultDegradesToUser(t *testing.T) {
+	msgs := claudeToOpenAIMessages([]ClaudeMessage{
+		{Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "", "content": "orphan output"},
+		}},
+	}, nil)
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %#v, want 1", msgs)
+	}
+	if msgs[0].Role != "user" {
+		t.Fatalf("role = %q, want user (degraded)", msgs[0].Role)
+	}
+	if got := msgs[0].Content; got != "orphan output" {
+		t.Fatalf("content = %#v, want 'orphan output'", got)
 	}
 }
 
@@ -270,7 +344,7 @@ func TestClaudeStreamPromotesReasoningToTextWhenThinkingDisabled(t *testing.T) {
 		`data: [DONE]`, "",
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", false, nil)
 	out := rr.Body.String()
 	if !strings.Contains(out, `"type":"text_delta"`) {
 		t.Fatalf("missing text_delta:\n%s", out)
@@ -290,7 +364,7 @@ func TestClaudeStreamFallbackEmitsTextWhenOnlyReasoningWithThinkingEnabled(t *te
 		`data: [DONE]`, "",
 	}, "\n")
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", true)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(upstream)), "m", true, nil)
 	out := rr.Body.String()
 	if !strings.Contains(out, `"type":"thinking_delta"`) {
 		t.Fatalf("expected thinking while keepReasoning=true:\n%s", out)
@@ -301,7 +375,7 @@ func TestClaudeStreamFallbackEmitsTextWhenOnlyReasoningWithThinkingEnabled(t *te
 }
 
 func TestClaudeNonStreamPromotesEmptyContentFromReasoning(t *testing.T) {
-	body := openAIToClaudeResponse([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"2"},"finish_reason":"stop"}]}`), "m", false, true)
+	body := openAIToClaudeResponse([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"2"},"finish_reason":"stop"}]}`), "m", false, true, nil)
 	var got ClaudeResponse
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
@@ -312,7 +386,7 @@ func TestClaudeNonStreamPromotesEmptyContentFromReasoning(t *testing.T) {
 }
 
 func TestClaudeNonStreamKeepsThinkingAndTextFallbackWhenReasoningEnabled(t *testing.T) {
-	body := openAIToClaudeResponse([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"step by step"},"finish_reason":"stop"}]}`), "m", true, true)
+	body := openAIToClaudeResponse([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"step by step"},"finish_reason":"stop"}]}`), "m", true, true, nil)
 	var got ClaudeResponse
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
@@ -969,7 +1043,7 @@ func TestChatStreamSiblingToolCallsHoistedIntoDelta(t *testing.T) {
 
 	// 3. claude 翻译路径:claudeStreamHandler 必须看到 delta 内的 tool call。
 	rr := httptest.NewRecorder()
-	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(sse)), "m", false)
+	claudeStreamHandler(context.Background(), rr, io.NopCloser(strings.NewReader(sse)), "m", false, nil)
 	claudeOut := rr.Body.String()
 	if !strings.Contains(claudeOut, `"name":"Read"`) || !strings.Contains(claudeOut, `call_1`) {
 		t.Fatalf("claude path dropped sibling tool call:\n%s", claudeOut)

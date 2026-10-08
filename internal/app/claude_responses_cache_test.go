@@ -207,7 +207,7 @@ func TestForwardClaudeViaResponses_NonStreamAggregatesForcedSSE(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	body := extractResponsesJsonFromSse([]byte(sse))
-	claudeBody := convertResponsesToClaude(body, "muse-spark-1.3-contributor-free", false, false)
+	claudeBody := convertResponsesToClaude(body, "muse-spark-1.3-contributor-free", false, false, nil)
 	var out map[string]any
 	if err := json.Unmarshal(claudeBody, &out); err != nil {
 		t.Fatalf("aggregated SSE not convertible: %v", err)

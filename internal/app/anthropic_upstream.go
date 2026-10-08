@@ -348,9 +348,36 @@ func relayAnthropicBuffered(ctx context.Context, w http.ResponseWriter, rc io.Re
 }
 
 // mergeUsage 把增量 usage 合并进累计表（新值覆盖旧值，保留未知键）。
+// server_tool_use / cache_creation 两个嵌套计数 map 按 max 合并（对齐 Bifrost
+// passthrough_usage 的 AnthropicPassthroughStreamUsage.ObserveEvent——Anthropic
+// 把 usage 拆到 message_start 与 message_delta 两处,服务端工具/缓存写计数
+// 单调增长,按 max 合并与事件顺序无关）。
 func mergeUsage(full map[string]any, delta map[string]any) {
 	for k, v := range delta {
+		if k == "server_tool_use" || k == "cache_creation" {
+			if existing, ok := full[k].(map[string]any); ok {
+				if src, ok := v.(map[string]any); ok {
+					mergeUsageCountersByMax(existing, src)
+					continue
+				}
+			}
+		}
 		full[k] = v
+	}
+}
+
+// mergeUsageCountersByMax 按 max 合并两个 usage 计数 map：数值键取较大值,
+// 非数值键覆盖。dst 原地更新。
+func mergeUsageCountersByMax(dst, src map[string]any) {
+	for k, v := range src {
+		if n, ok := numberAsFloat(v); ok {
+			if old, ok2 := numberAsFloat(dst[k]); ok2 && old >= n {
+				continue
+			}
+			dst[k] = v
+			continue
+		}
+		dst[k] = v
 	}
 }
 

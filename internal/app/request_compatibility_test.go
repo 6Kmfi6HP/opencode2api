@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/domain"
 )
 
 // =====================================================================
@@ -77,9 +79,12 @@ func TestResponsesToolResult_AnthropicStyleContentBlocks(t *testing.T) {
 	}
 }
 
-// TestResponsesToolResult_IsErrorPrefix verifies is_error:true adds the stable
-// "Error: " prefix without duplication.
-func TestResponsesToolResult_IsErrorPrefix(t *testing.T) {
+// TestResponsesToolResult_IsErrorContentUnDeformed verifies is_error:true
+// keeps the tool output text un-deformed: no "Error: " prefix is baked into
+// the content, and the OpenAI wire (which has no tool-error field) never
+// carries an is_error key. The error flag rides internally on the message and
+// is mapped onto the Anthropic-bound tool_result instead.
+func TestResponsesToolResult_IsErrorContentUnDeformed(t *testing.T) {
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{{
 		status: http.StatusOK,
 		body:   `{"id":"r","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
@@ -98,8 +103,11 @@ func TestResponsesToolResult_IsErrorPrefix(t *testing.T) {
 	}
 	messages, _ := transport.requestPayloads[0]["messages"].([]any)
 	tool, _ := messages[1].(map[string]any)
-	if got := tool["content"]; got != "Error: boom" {
-		t.Fatalf("is_error content = %#v, want 'Error: boom'", got)
+	if got := tool["content"]; got != "boom" {
+		t.Fatalf("is_error content = %#v, want 'boom' (un-deformed)", got)
+	}
+	if _, has := tool["is_error"]; has {
+		t.Fatalf("OpenAI wire must not carry is_error: %#v", tool)
 	}
 }
 
@@ -884,10 +892,65 @@ func TestCountClaudeThinkingSignatures(t *testing.T) {
 // Fix 1: is_error order-independence and missing payload
 // =====================================================================
 
-// TestResponsesToolResult_IsErrorOutputBeforeCall verifies that is_error
-// prefix is applied regardless of whether the output item appears before or
-// after the call item in the array. Also asserts the exact message sequence
-// is assistant(call) then exactly one tool result (no leading duplicate).
+// TestResponsesToolResult_IsErrorToAnthropicToolResult verifies the end-to-end
+// Responses inbound → Anthropic upstream path: an Anthropic-style tool_result
+// carrying is_error:true maps onto the Anthropic tool_result's native
+// is_error:true, with the content text un-deformed (no "Error: " prefix).
+func TestResponsesToolResult_IsErrorToAnthropicToolResult(t *testing.T) {
+	setProtocolRulesForTest(t, []domain.ProtocolRule{{Pattern: "claude-err-*", Protocol: "anthropic"}})
+	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{{
+		status: http.StatusOK,
+		body:   `{"id":"msg_1","type":"message","role":"assistant","model":"claude-err-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
+	}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"claude-err-test",
+		"input":[
+			{"type":"function_call","call_id":"call_err","name":"f","arguments":"{}"},
+			{"type":"tool_result","call_id":"call_err","is_error":true,"content":"boom"}
+		]
+	}`))
+	rec := httptest.NewRecorder()
+	responsesHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if len(transport.requestPayloads) == 0 {
+		t.Fatal("no upstream request captured")
+	}
+	// Anthropic 上游 body 的 messages[1] 是 user 的 tool_result。
+	messages, _ := transport.requestPayloads[0]["messages"].([]any)
+	if len(messages) < 2 {
+		t.Fatalf("anthropic messages = %#v", messages)
+	}
+	userMsg, _ := messages[1].(map[string]any)
+	blocks, _ := userMsg["content"].([]any)
+	var result map[string]any
+	for _, b := range blocks {
+		if bm, ok := b.(map[string]any); ok && bm["type"] == "tool_result" {
+			result = bm
+		}
+	}
+	if result == nil {
+		t.Fatalf("tool_result block missing: %#v", userMsg)
+	}
+	if result["is_error"] != true {
+		t.Fatalf("is_error = %#v, want true on the Anthropic tool_result", result["is_error"])
+	}
+	content, _ := result["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("content = %#v", content)
+	}
+	text, _ := content[0].(map[string]any)["text"].(string)
+	if text != "boom" {
+		t.Fatalf("content text = %q, want 'boom' (no Error: prefix)", text)
+	}
+}
+
+// TestResponsesToolResult_IsErrorOutputBeforeCall verifies that the error
+// flag is carried regardless of whether the output item appears before or
+// after the call item in the array, and that the text stays un-deformed.
+// Also asserts the exact message sequence is assistant(call) then exactly one
+// tool result (no leading duplicate).
 func TestResponsesToolResult_IsErrorOutputBeforeCall(t *testing.T) {
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{{
 		status: http.StatusOK,
@@ -922,14 +985,15 @@ func TestResponsesToolResult_IsErrorOutputBeforeCall(t *testing.T) {
 	if m1["tool_call_id"] != "call_err" {
 		t.Fatalf("tool_call_id = %#v, want call_err", m1["tool_call_id"])
 	}
-	if got := m1["content"]; got != "Error: boom" {
-		t.Fatalf("tool content = %#v, want 'Error: boom'", got)
+	if got := m1["content"]; got != "boom" {
+		t.Fatalf("tool content = %#v, want 'boom' (no prefix)", got)
 	}
 }
 
-// TestResponsesToolResult_IsErrorOutputAfterCall verifies is_error when
-// output appears after the call item (the original order). Also asserts the
-// exact message sequence is assistant(call) then exactly one tool result.
+// TestResponsesToolResult_IsErrorOutputAfterCall verifies the error flag when
+// output appears after the call item (the original order), with the text
+// un-deformed. Also asserts the exact message sequence is assistant(call)
+// then exactly one tool result.
 func TestResponsesToolResult_IsErrorOutputAfterCall(t *testing.T) {
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{{
 		status: http.StatusOK,
@@ -963,8 +1027,8 @@ func TestResponsesToolResult_IsErrorOutputAfterCall(t *testing.T) {
 	if m1["tool_call_id"] != "call_err" {
 		t.Fatalf("tool_call_id = %#v, want call_err", m1["tool_call_id"])
 	}
-	if got := m1["content"]; got != "Error: boom" {
-		t.Fatalf("tool content = %#v, want 'Error: boom'", got)
+	if got := m1["content"]; got != "boom" {
+		t.Fatalf("tool content = %#v, want 'boom' (no prefix)", got)
 	}
 }
 
@@ -1001,9 +1065,12 @@ func TestResponsesToolResult_NoPayloadGivesMissing(t *testing.T) {
 	t.Fatal("no tool message found")
 }
 
-// TestNormalizeToolResultOutput_IsErrorApplied verifies the helper itself
-// applies the is_error prefix.
-func TestNormalizeToolResultOutput_IsErrorApplied(t *testing.T) {
+// TestNormalizeToolResultOutput_IsErrorNotBakedIntoText verifies the helper
+// keeps the text un-deformed: is_error semantics are no longer represented as
+// an "Error: " prefix inside the text — callers read elem["is_error"]
+// separately (see collectFunctionOutputs) and map it onto the error-capable
+// outbound shape.
+func TestNormalizeToolResultOutput_IsErrorNotBakedIntoText(t *testing.T) {
 	text, present := normalizeToolResultOutput(map[string]any{
 		"content":  "failure",
 		"is_error": true,
@@ -1011,13 +1078,13 @@ func TestNormalizeToolResultOutput_IsErrorApplied(t *testing.T) {
 	if !present {
 		t.Fatal("want present")
 	}
-	if text != "Error: failure" {
-		t.Fatalf("got %q, want 'Error: failure'", text)
+	if text != "failure" {
+		t.Fatalf("got %q, want 'failure' (no prefix)", text)
 	}
 }
 
-// TestNormalizeToolResultOutput_IsErrorNotAppliedWhenFalse verifies no prefix
-// when is_error is absent or false.
+// TestNormalizeToolResultOutput_IsErrorNotAppliedWhenFalse verifies the text
+// is unchanged when is_error is absent or false.
 func TestNormalizeToolResultOutput_IsErrorNotAppliedWhenFalse(t *testing.T) {
 	text, _ := normalizeToolResultOutput(map[string]any{"content": "ok"})
 	if text != "ok" {
@@ -1032,11 +1099,11 @@ func TestNormalizeToolResultOutput_IsErrorNotAppliedWhenFalse(t *testing.T) {
 	}
 }
 
-// TestCollectFunctionOutputs_IsErrorBakedIntoMap verifies that
-// collectFunctionOutputs already includes the is_error prefix in the map,
-// making it order-independent.
-func TestCollectFunctionOutputs_IsErrorBakedIntoMap(t *testing.T) {
-	outputs := collectFunctionOutputs([]any{
+// TestCollectFunctionOutputs_IsErrorCarriedSeparately verifies that
+// collectFunctionOutputs returns the error flag as a separate set (not baked
+// into the text), making it order-independent.
+func TestCollectFunctionOutputs_IsErrorCarriedSeparately(t *testing.T) {
+	outputs, errored := collectFunctionOutputs([]any{
 		map[string]any{
 			"type":     "tool_result",
 			"call_id":  "call_x",
@@ -1044,15 +1111,26 @@ func TestCollectFunctionOutputs_IsErrorBakedIntoMap(t *testing.T) {
 			"is_error": true,
 		},
 	})
-	if got, ok := outputs["call_x"]; !ok || got != "Error: boom" {
-		t.Fatalf("outputs[call_x] = %q (ok=%v), want 'Error: boom'", got, ok)
+	if got, ok := outputs["call_x"]; !ok || got != "boom" {
+		t.Fatalf("outputs[call_x] = %q (ok=%v), want 'boom' (no prefix)", got, ok)
+	}
+	if !errored["call_x"] {
+		t.Fatalf("errored[call_x] = %v, want true", errored["call_x"])
+	}
+
+	// is_error:false → 不进 errored 集合。
+	outputs2, errored2 := collectFunctionOutputs([]any{
+		map[string]any{"type": "tool_result", "call_id": "call_y", "content": "ok", "is_error": false},
+	})
+	if outputs2["call_y"] != "ok" || errored2["call_y"] {
+		t.Fatalf("outputs/errored = %q/%v, want ok/false", outputs2["call_y"], errored2["call_y"])
 	}
 }
 
 // TestCollectFunctionOutputs_NoPayloadAbsent verifies that a tool_result with
 // no payload leaves the key absent (not set to empty string).
 func TestCollectFunctionOutputs_NoPayloadAbsent(t *testing.T) {
-	outputs := collectFunctionOutputs([]any{
+	outputs, errored := collectFunctionOutputs([]any{
 		map[string]any{
 			"type":    "tool_result",
 			"call_id": "call_missing",
@@ -1061,12 +1139,15 @@ func TestCollectFunctionOutputs_NoPayloadAbsent(t *testing.T) {
 	if _, ok := outputs["call_missing"]; ok {
 		t.Fatal("key should be absent for missing payload")
 	}
+	if errored["call_missing"] {
+		t.Fatal("errored should be false for missing payload")
+	}
 }
 
 // TestCollectFunctionOutputs_EmptyContentPresent verifies that an explicit
 // empty content string IS present in the map.
 func TestCollectFunctionOutputs_EmptyContentPresent(t *testing.T) {
-	outputs := collectFunctionOutputs([]any{
+	outputs, _ := collectFunctionOutputs([]any{
 		map[string]any{
 			"type":    "tool_result",
 			"call_id": "call_empty",
