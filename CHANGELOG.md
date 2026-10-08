@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.14.26
+
+- Map downstream sessions to dedicated upstream sessions (`feat(session)`): 网关此前全部流量共用一个进程全局 `x-opencode-session`，在上游侧形成"超级会话"——所有下游 agent 钉在同一个 provider 粘性上、计费归因混合、一次 429 触发的本地解绑影响全体。已查证上游 zen handler（anomalyco/opencode v2）只读 `x-opencode-session` 且该值直接决定 provider 粘性与计费归因（`stickyId = sessionId ?: workspaceID ?: ip`），真实 opencode 客户端每个 agent 会话独立发 affinity 值（`parentID ?? fork.sessionID ?? session.id`）。新增有界映射表（下游会话身份 → 专属 `ses_`，`internal/app/opencode.go`）：
+  - `ocSessionMap`：256 上限 + 滑动 2h TTL + LRU 淘汰（对齐 `stickyMaxEntries`，TTL 远大于 sticky 出口 15min 防止出口未换 session 先转），锁内创建防并发重复，`newOCSessionID()` 生成（满足上游免费层 `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$` 校验），`refreshOCSession`（admin reload）一并清空。
+  - `downstreamSessionKey`：客户端会话头（`X-Claude-Code-Session-Id`/`Thread-Id`/`Session-Id` 大小写不敏感，复用 `sessionHeaderValue`）> body `user`（chat `req.User` / Claude `metadata.user`）> token 哈希作用域前缀防跨账号同名串扰；全程 sha256 8 字节 hex，原文不入日志。下游显式 `x-opencode-session` 不进映射、原样透传（客户端自有语义最高优先级）。
+  - 解析顺序（`callOpenCodeEndpoint`）：显式透传 > 映射命中/新建 > 全局 sessionID > 临时随机（不回写）。`normalizedTransportScope` 输入自然变专属值，sticky 出口 `oc:` 后缀、keypool 路由零改动自动按下游会话隔离，429 解绑只影响出事会话。
+  - 开关 `OPENCODE2API_OC_SESSION_MAP=off/0/false/no` 回退单一全局 session 行为；`/api/config` 暴露 `oc_session_map_size` 可观测；`buildOCRequest`/`systemone` 路径 `ocScope` 统一 `normalizedTransportScope` 哈希（与主路径一致）。
+  - `projectID`/`clientVersion`/三头同值双发/prompt_cache_key 内容派生全部不变——上游 project 头零路由语义（纯来源标注），缓存身份与 session 头正交。
+  - 验证：gofmt/vet/`go test ./...` 全过含 `-race`；ultracode 工作流三视角对抗评审 0 findings；mock 上游 E2E 12 项检查全过（同会话稳定、异会话隔离、显式透传、off 回退全局、reload 清空、`oc_session_map_size` 计数）。真实 7 轮 Claude Code agents 缓存复测两遍达标：总命中 78.7%/83.5%（基线 81.1-84.2%，遍 1 低 2.4pp 归因子代理冷启动 4 个 vs 基线 2-3 个），稳态 96-100%，`prompt_cached_tokens` 突破 40960 封顶随 prompt 增长（max 57344/59264），截断 0；pck 全程稳定且跨会话共享同一上游分片（两遍主对话 pck 同值，遍 2 冷启动仅 1 个）。回归测试 `oc_session_map_test.go`（稳定/隔离/透传/兜底/开关/淘汰/TTL/并发）。
+
 ## v0.14.25
 
 - Strip volatile client injections and pin stable prefixes across both upstream body shapes (`fix(cache)`): Claude Code 逐请求注入易变内容（`<total_tokens>` 上下文计数、system-reminder 上下文、hand-back 通知），让上游请求前缀逐请求漂移、前缀缓存反复从漂移点截断。按两种上游 body 形状分别修复（`internal/app/instructions_stable.go`，接入点统一在 `buildOCRequestWithSubpathAndState` 的免费层指纹重做之后、`prompt_cache_key` 重算之前——指纹重做按客户端原文重建 body，此前的前置剥离都会被覆盖）：
