@@ -357,9 +357,13 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 						continue
 					}
 					input = append(input, map[string]any{
-						// 清洗 id（与 tool_use 侧同一确定性函数，保证配对）。
+						// 清洗 id：与 tool_use 侧同一组合
+						// sanitizeAnthropicToolUseID(sanitizeToolUseID(id))，
+						// 保证配对；sanitizeToolUseID 对合法字符集 id 不截断，
+						// 外层 sanitizeAnthropicToolUseID 把 >64 的合法 id 截到
+						// <=64，否则原样进 input[].call_id 被上游拒收。
 						"type":    "function_call_output",
-						"call_id": sanitizeToolUseID(toolUseID),
+						"call_id": sanitizeAnthropicToolUseID(sanitizeToolUseID(toolUseID)),
 						"output":  text,
 					})
 					// tool_result 内的 image/document part 提取为独立 user

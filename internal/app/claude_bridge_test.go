@@ -700,3 +700,53 @@ func TestClaudeBridge_ClientStreamUsageWanted(t *testing.T) {
 		t.Fatal("missing stream_options should default to false")
 	}
 }
+
+// TestClaudeBridge_ToResponsesBody_LongToolUseIDCappedAndPaired 回归
+//（input[N].call_id must be <= 64）：tool_result 侧之前只走
+// sanitizeToolUseID——该函数对合法字符集 id 不做长度截断，>64 的合法
+// tool_use_id 原样进 input[].call_id 被上游 400。现在与 tool_use 侧同用
+// sanitizeAnthropicToolUseID：两侧 <=64 且保持配对。
+func TestClaudeBridge_ToResponsesBody_LongToolUseIDCappedAndPaired(t *testing.T) {
+	longID := strings.Repeat("a", 80)
+	var claudeReq ClaudeRequest
+	raw := `{
+		"model":"m",
+		"max_tokens":128,
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"` + longID + `","name":"shell","input":{"cmd":"ls"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"` + longID + `","content":"ok"}
+			]}
+		]
+	}`
+	if err := json.Unmarshal([]byte(raw), &claudeReq); err != nil {
+		t.Fatal(err)
+	}
+	body := claudeToResponsesBody(context.Background(), claudeReq, "m")
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatal(err)
+	}
+	input, _ := req["input"].([]any)
+	var callID, outputID string
+	for _, it := range input {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch m["type"] {
+		case "function_call":
+			callID, _ = m["call_id"].(string)
+		case "function_call_output":
+			outputID, _ = m["call_id"].(string)
+		}
+	}
+	if callID == "" || len(callID) > 64 {
+		t.Fatalf("function_call call_id = %q (len %d), want 非空且 <= 64", callID, len(callID))
+	}
+	if outputID != callID {
+		t.Fatalf("pairing broken: function_call %q vs function_call_output %q", callID, outputID)
+	}
+}
