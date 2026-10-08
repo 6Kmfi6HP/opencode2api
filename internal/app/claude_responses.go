@@ -76,7 +76,7 @@ func extractClaudeSystemTextFiltered(system any) string {
 func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, []any) {
 	var instructionParts []string
 	if sysText := extractClaudeSystemTextFiltered(system); sysText != "" {
-		instructionParts = append(instructionParts, sysText)
+		instructionParts = append(instructionParts, stripVolatileCountersText(sysText))
 	}
 	input := []any{} // 非 nil 空数组，避免上游对 null 的严格校验
 
@@ -116,7 +116,9 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 		// x-anthropic-billing-header 块），不产生 input item。
 		if msg.Role == "system" {
 			if text := extractClaudeContentText(msg.Content); text != "" && !isAnthropicBillingHeader(text) {
-				instructionParts = append(instructionParts, text)
+				// CLI 每轮以 role=system 消息注入 <total_tokens> 计数,值逐请求
+				// 变化会让 instructions 漂移、前缀缓存从 instructions 断;剥离。
+				instructionParts = append(instructionParts, stripVolatileCountersText(text))
 			}
 			continue
 		}
@@ -196,15 +198,13 @@ func claudeMessagesToResponsesInput(msgs []ClaudeMessage, system any) (string, [
 						pending = append(pending, responsesTextPart(role, "[document attached]"))
 					}
 				case "thinking":
+					// 跳过 thinking 回放:CLI 按 Anthropic 惯例只保留最后一轮
+					// thinking,旧轮丢弃,导致 reasoning item 的位置/有无逐请求
+					// 漂移,上游前缀缓存从首个 reasoning item 就断(实测命中率
+					// 封顶 ~50%)。上游(GLM 系)推理在请求内自含,回放历史
+					// thinking 无增益,丢弃后历史 item 序列跨轮稳定。
 					flushPending()
-					thinking, _ := block["thinking"].(string)
-					if thinking == "" {
-						continue
-					}
-					input = append(input, map[string]any{
-						"type":    "reasoning",
-						"summary": []any{map[string]any{"type": "summary_text", "text": thinking}},
-					})
+					continue
 				case "redacted_thinking":
 					// 无文本等价物，丢弃，不报错。
 					continue
@@ -552,6 +552,12 @@ func normalizeResponsesEffort(effort string) string {
 // 失败时返回最小可用体（model + input），避免 400。
 func claudeToResponsesBody(ctx context.Context, claudeReq ClaudeRequest, modelID string) []byte {
 	instructions, input := claudeMessagesToResponsesInput(claudeReq.Messages, claudeReq.System)
+	// CLI 每轮改写 user 消息里的 <total_tokens> 上下文计数,值逐请求变化,会让
+	// 上游前缀缓存从首个含计数的消息断(实测 cached 恒 ≈ instructions+tools,
+	// 命中率封顶 ~50%);剥离后第 N 轮请求体成为第 N+1 轮的真前缀,再做钉头。
+	// 注:免费层指纹重做还会按客户端原文重建 body,发送侧(opencode.go)在指纹
+	// 重做后再次剥离,此处剥离保证 claudeToResponsesBody 自身的字节稳定。
+	_ = stripVolatileTokenCountersInPlace(input)
 	// instructions 钉在会话首轮原文（跨轮字节稳定），尾部追加段挪到序列尾部：
 	// 前缀缓存只看公共前缀，instructions+tools 段即可跨轮全量命中（见
 	// clipInstructionsToStablePrefix）。首条 user 文本须在增量注入前提取。

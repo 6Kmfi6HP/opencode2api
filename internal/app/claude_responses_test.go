@@ -95,17 +95,22 @@ func TestClaudeToResponsesBody_BasicMapping(t *testing.T) {
 	if len(input) == 0 {
 		t.Fatal("input is empty")
 	}
-	// 至少包含 message / reasoning / function_call / function_call_output
+	// thinking 回放已跳过(CLI 只保留最后一轮 thinking,旧轮丢弃会让 reasoning
+	// item 位置逐请求漂移、前缀缓存从首个 reasoning item 断),不再期待
+	// reasoning item;至少包含 message / function_call / function_call_output
 	types := map[string]int{}
 	for _, it := range input {
 		if m, ok := it.(map[string]any); ok {
 			types[m["type"].(string)]++
 		}
 	}
-	for _, want := range []string{"message", "reasoning", "function_call", "function_call_output"} {
+	for _, want := range []string{"message", "function_call", "function_call_output"} {
 		if types[want] == 0 {
 			t.Fatalf("input types = %#v, want %q", types, want)
 		}
+	}
+	if types["reasoning"] != 0 {
+		t.Fatalf("thinking replay should be skipped, got %d reasoning items", types["reasoning"])
 	}
 	// tools 映射
 	tools, _ := req["tools"].([]any)

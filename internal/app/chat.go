@@ -1580,6 +1580,11 @@ func buildUpstreamBody(req *OpenAIRequest) []byte {
 // 换结果上(GLM/Zhipu 等拒绝该字段的模型除外;幂等)。
 func buildUpstreamBodyFromClaude(chatReq *OpenAIRequest, claudeReq ClaudeRequest) []byte {
 	body := buildUpstreamBody(chatReq)
+	// CLI 每轮把 <total_tokens> 上下文计数写入 user 消息/role=system 消息且值
+	// 逐请求变化,留在 body 里会让上游前缀缓存从含计数的消息断掉(实测 cached
+	// 恒 ≈ instructions+tools,命中率封顶 ~50%);剥离后第 N 轮请求体成为
+	// 第 N+1 轮的真前缀。
+	body = stripVolatileCountersFromBody(body)
 	return applyClaudeCacheBreakpointsToChatBody(body, claudeReq)
 }
 
@@ -1967,16 +1972,10 @@ func contentPromptCacheKey(m map[string]any) string {
 				var text string
 				switch c := content.(type) {
 				case string:
-					text = c
+					text = strings.TrimSpace(volatileTokenCountRe.ReplaceAllString(c, ""))
 				case []any:
-					for _, p := range c {
-						if pm, ok := p.(map[string]any); ok {
-							if t, _ := pm["text"].(string); t != "" {
-								text = t
-								break
-							}
-						}
-					}
+					// 跳过整段 system-reminder 注入块与计数块,取稳定请求文本。
+					text = stableUserTextFromParts(c)
 				}
 				if len(text) > 8192 {
 					text = text[:8192]
@@ -1997,20 +1996,10 @@ func contentPromptCacheKey(m map[string]any) string {
 				}
 				var text string
 				if c, ok := mm["content"].([]any); ok {
-					for _, p := range c {
-						if pm, ok := p.(map[string]any); ok {
-							if t, _ := pm["text"].(string); t != "" {
-								text = t
-								break
-							}
-							if t, _ := pm["input_text"].(string); t != "" {
-								text = t
-								break
-							}
-						}
-					}
+					// 跳过整段 system-reminder 注入块与计数块,取稳定请求文本。
+					text = stableUserTextFromParts(c)
 				} else if s, ok := mm["content"].(string); ok {
-					text = s
+					text = strings.TrimSpace(volatileTokenCountRe.ReplaceAllString(s, ""))
 				}
 				if len(text) > 8192 {
 					text = text[:8192]

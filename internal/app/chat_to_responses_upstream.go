@@ -30,7 +30,8 @@ func chatMessagesToResponsesInput(messages []Message) (string, []any) {
 		switch msg.Role {
 		case "system", "developer":
 			if s, ok := msg.Content.(string); ok && s != "" {
-				systemParts = append(systemParts, s)
+				// 剥离逐请求变化的 <total_tokens> 计数(见 instructions_stable.go)。
+				systemParts = append(systemParts, stripVolatileCountersText(s))
 			}
 		case "assistant":
 			if len(msg.ToolCalls) > 0 {
@@ -128,6 +129,9 @@ func chatToResponsesBody(req *OpenAIRequest, modelID string) []byte {
 
 func chatToResponsesBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[string]any) []byte {
 	instructions, input := chatMessagesToResponsesInput(req.Messages)
+	// CLI 每轮改写 user 消息里的 <total_tokens> 上下文计数,值逐请求变化,会让
+	// 上游前缀缓存从首个含计数的消息断;剥离(对齐 claudeToResponsesBody)。
+	_ = stripVolatileTokenCountersInPlace(input)
 	body := map[string]any{
 		"model":  modelID,
 		"input":  input,

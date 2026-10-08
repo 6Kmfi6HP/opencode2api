@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -487,6 +488,15 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	// chat/completions。客户端语义上的非流式由 callOpenCodeAPI 的本地聚合
 	// 还原(见 aggregateOpenAIStream)。
 	applyFreeTierFingerprint(bodyMap, subpath, modelID)
+	// CLI 每轮把 <total_tokens> 上下文计数写入 user/role=system 消息且值逐请求
+	// 变化,免费层指纹重做还会按客户端原文重建 body——剥离必须在指纹重做之后、
+	// 求 pck 之前,否则计数留在序列前部会让上游前缀缓存从该消息断掉(实测
+	// cached 恒 ≈ instructions+tools,命中率封顶 ~50%)。
+	stripVolatileCountersInMap(bodyMap)
+	// chat 形状把 system 提示 join 进 messages[0],CLI 每轮往尾部追加
+	// hand-back 通知等增量——钉住首轮原文、增量挪末条 user,否则上游前缀
+	// 缓存从 system 增长点截断(tools 与历史全 miss,实测命中率封顶 ~17%)。
+	clipChatSystemStable(bodyMap)
 	// key 与终态对齐: handler 层按指纹/sanitize 之前的 tools 算出 content
 	// key (oc2api:csha:),而免费层指纹在此处追加 stub,使"哈希用的
 	// tools"≠"实际发送的 tools"。免费层且无 token 时按终态 bodyMap 重算
@@ -502,6 +512,13 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	tryBody, err := json.Marshal(bodyMap)
 	if err != nil {
 		return nil, err
+	}
+	// OPENCODE2API_DUMP_UPSTREAM=<dir>: 调试用,把发往上游的请求体逐个落盘
+	// (纳秒时间戳命名),用于缓存前缀字节级 diff。默认关闭;会记录完整请求体,
+	// 仅限本地调试环境使用。
+	if dir := os.Getenv("OPENCODE2API_DUMP_UPSTREAM"); dir != "" {
+		_ = os.MkdirAll(dir, 0o755)
+		_ = os.WriteFile(fmt.Sprintf("%s/%019d.json", dir, time.Now().UnixNano()), tryBody, 0o644)
 	}
 	var upstreamURL string
 	if useGoEndpoint {
