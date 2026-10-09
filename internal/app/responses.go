@@ -992,25 +992,22 @@ func storeResponseState(response map[string]any, req ResponsesAPIRequest) {
 		return
 	}
 	output, _ := response["output"].([]any)
-	storedResponsesMu.Lock()
-	storedResponses[responseID] = StoredResponseState{
+	// 先克隆再计量：克隆后的 JSON 字节数就是这条状态在堆上的近似占用，交给
+	// 有界 store 做字节预算（见 response_store.go）。
+	tools, toolsSize := cloneJSONValueSized(req.Tools)
+	toolChoice, choiceSize := cloneJSONValueSized(req.ToolChoice)
+	clonedOutput, outputSize := cloneJSONValueSized(output)
+	responseStateStore.store(responseID, StoredResponseState{
 		Model:        req.Model,
 		Instructions: req.Instructions,
-		Tools:        cloneJSONValue(req.Tools),
-		ToolChoice:   cloneJSONValue(req.ToolChoice),
-		Output:       cloneJSONValue(output),
-	}
-	storedResponsesMu.Unlock()
+		Tools:        tools,
+		ToolChoice:   toolChoice,
+		Output:       clonedOutput,
+	}, len(req.Instructions)+len(req.Model)+toolsSize+choiceSize+outputSize)
 }
 
 func loadResponseState(responseID string) (StoredResponseState, bool) {
-	storedResponsesMu.RLock()
-	defer storedResponsesMu.RUnlock()
-	state, ok := storedResponses[responseID]
-	if !ok {
-		return StoredResponseState{}, false
-	}
-	return cloneJSONValue(state), true
+	return responseStateStore.load(responseID)
 }
 
 func extractTextFromContentParts(content any) string {

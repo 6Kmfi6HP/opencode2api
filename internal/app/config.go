@@ -21,14 +21,15 @@ type compiledKeywordRule struct {
 }
 
 var (
-	port              string
-	configPath        = "config.json"
-	modelAliasRules   = []domain.ModelKeywordRule{}
-	compiledRules     = []compiledKeywordRule{}
-	debugMode         bool
-	configMu          sync.RWMutex
-	storedResponses   = map[string]StoredResponseState{}
-	storedResponsesMu sync.RWMutex
+	port            string
+	configPath      = "config.json"
+	modelAliasRules = []domain.ModelKeywordRule{}
+	compiledRules   = []compiledKeywordRule{}
+	debugMode       bool
+	configMu        sync.RWMutex
+	// /v1/responses 的 previous_response_id 状态改由 responseStateStore 持有
+	// （TTL + 条数 + 字节预算的有界 LRU，见 response_store.go）。历史上的
+	// storedResponses 全局 map 无 TTL、无上限，是线上内存持续增长的根因，已删除。
 )
 
 // ======================== 配置管理 ========================

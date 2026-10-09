@@ -208,6 +208,8 @@ func initProxyCoreWithSave(save bool) {
 	}
 
 	startModelRefresh()
+	// 有界 response 状态存储的过期清理；顺带在启动日志里打出存储配置。
+	startResponseStoreJanitor()
 }
 
 // startServer binds the HTTP server to addr and starts serving. Returns the
