@@ -124,6 +124,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			// 下游→上游 session 映射表条目数(锁内读): 可观测下游会话分拆
 			// 规模,接近 256 上限说明淘汰开始生效。
 			"oc_session_map_size": ocSessionMapSize(),
+			"response_store":      responseStoreStatsView(),
 			"log_level":           logging.LevelString(),
 			"log_bodies":          logging.BodiesEnabled(),
 		})
