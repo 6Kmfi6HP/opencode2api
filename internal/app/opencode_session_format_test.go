@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,29 @@ func TestOpenCode_SessionIDMatchesClientFormat(t *testing.T) {
 		id := newOCSessionID()
 		if !re.MatchString(id) {
 			t.Fatalf("session id %q does not match client format", id)
+		}
+	}
+}
+
+// 上游除 UA 外还校验 session 前 12 位可解码为降序时间戳（2026-10-13 实测：
+// 随机前缀 403 FreeTierError，时间戳前缀 200）。正则断言覆盖不到这一层——
+// 随机实现同样满足 ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$，故反解前缀比对时间窗。
+// 前缀只有 48 位，容不下完整毫秒时间戳，故只比对低 36 位。
+func TestOpenCode_SessionIDCarriesDescendingTimestamp(t *testing.T) {
+	const (
+		bodyMask = uint64(0xffffffffffff)
+		tsMask   = uint64(0xfffffffff)
+	)
+	before := uint64(time.Now().UnixMilli()) & tsMask
+	for i := 0; i < 1000; i++ {
+		id := newOCSessionID()
+		v, err := strconv.ParseUint(id[4:16], 16, 64)
+		if err != nil {
+			t.Fatalf("session id %q has non-hex prefix", id)
+		}
+		got := ((bodyMask - v) >> 12) & tsMask
+		if got != before && got != uint64(time.Now().UnixMilli())&tsMask {
+			t.Fatalf("session id %q prefix decodes to %d, want current ms low 36 bits %d", id, got, before)
 		}
 	}
 }

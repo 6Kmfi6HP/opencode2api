@@ -44,28 +44,51 @@ const (
 	headerOCSessionAffnity = "x-session-affinity"
 )
 
-// newOCSessionShapeID 生成上游免费层校验格式的 26 字符 ID 主体:
-// 12 位小写 hex + 14 位 base62（lite 版 opencode2api-lite.go L498-514）。
-// 上游对免费层校验 session 必须匹配 ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$,否则拒绝:
-// "OpenCode's free tier can only be used from within OpenCode"。
-// 取舍: 先前实现把时间戳反转编码进 hex 前缀(TypeID-descending),以贴近真实
-// 客户端的排序行为;lite 实测该字段仅做格式正则校验、不含时间语义,纯随机即可。
-// 这里按 lite 简化为全随机,不再保留 descending 版本作双头之一——真正的
-// 兼容手段是新旧 session 头(x-session-id / x-opencode-session)同时发送。
-func newOCSessionShapeID() string {
+// 同毫秒内多个 ID 的递增序号。
+var (
+	opencodeIDMu      sync.Mutex
+	opencodeIDCounter uint64
+	opencodeIDLastMS  int64
+)
+
+// opencodeTimestampID 生成 26 字符 ID 主体：前 12 位为 (timestamp<<12|counter)
+// 的时间戳 hex，后 14 位为 base62 随机。descending 对值取反，对齐官方客户端
+// packages/schema/src/identifier.ts。
+// 上游免费层校验 session 前 12 位可解码为降序时间戳：纯随机前缀 403
+// FreeTierError，时间戳前缀 200（2026-10-13 实测）。
+func opencodeTimestampID(descending bool) string {
 	const hexChars = "0123456789abcdef"
 	const alnumChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 	var b [26]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand 不可用时退化为时间戳混合,仍保持格式合规(长度/字符集正确)
+
+	opencodeIDMu.Lock()
+	now := time.Now().UnixMilli()
+	if now != opencodeIDLastMS {
+		opencodeIDLastMS = now
+		opencodeIDCounter = 0
+	}
+	opencodeIDCounter++
+	counter := opencodeIDCounter
+	opencodeIDMu.Unlock()
+
+	current := uint64(now)<<12 | counter
+	value := current
+	if descending {
+		value = ^value
+	}
+	for i := 0; i < 6; i++ {
+		shift := uint(40 - 8*i)
+		bv := byte((value >> shift) & 0xff)
+		b[2*i] = hexChars[bv>>4]
+		b[2*i+1] = hexChars[bv&0x0f]
+	}
+	if _, err := rand.Read(b[12:]); err != nil {
+		// crypto/rand 不可用时退化为时间戳混合。
 		var seed [8]byte
 		binary.BigEndian.PutUint64(seed[:], uint64(time.Now().UnixNano()))
-		for i := range b {
+		for i := 12; i < 26; i++ {
 			b[i] = seed[i%8] ^ byte(i*37)
 		}
-	}
-	for i := 0; i < 12; i++ {
-		b[i] = hexChars[b[i]%16]
 	}
 	for i := 12; i < 26; i++ {
 		b[i] = alnumChars[b[i]%byte(len(alnumChars))]
@@ -73,12 +96,17 @@ func newOCSessionShapeID() string {
 	return string(b[:])
 }
 
+// session 主体取降序时间戳，请求主体取升序。
+func newOCSessionShapeID() string {
+	return opencodeTimestampID(true)
+}
+
 func newOCSessionID() string {
 	return "ses_" + newOCSessionShapeID()
 }
 
 func newOCRequestID() string {
-	return "msg_" + newOCSessionShapeID()
+	return "msg_" + opencodeTimestampID(false)
 }
 
 type opencodeSessionContextKey struct{}
