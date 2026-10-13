@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.14.29
 
 - Restore descending-timestamp session IDs and un-break free-tier gate (`fix(fingerprint)`): 上游 2026-10-11(83f2b6f67a zen 路由改薄代理)把免费层门禁下沉到私有 inference 服务后,新门禁校验 session ID 前 12 位 hex 为反转时间戳 `~(ts_ms*0x1000+counter)` 低 48 位——纯随机或升序均 403 FreeTierError("OpenCode's free tier can only be used from within OpenCode",全部免费模型三协议)。2026-09-18 移除 descending 编码的前提(当时仅格式正则校验)已失效:
   - `newOCShapeID`(internal/app/opencode.go):恢复反转时间戳编码,对齐上游 `packages/schema/src/identifier.ts` 每毫秒计数器语义(ses_ 降序反转、msg_ 升序;后 14 位 base62 随机不变);`ocIDTimestamp` 锁内每毫秒重置 counter。
