@@ -977,7 +977,7 @@ func convertResponsesToClaude(respBody []byte, model string, wantReasoning bool,
 	if resp.Status == "incomplete" {
 		if resp.IncompleteDetails != nil && resp.IncompleteDetails.Reason == "content_filter" {
 			stopReason = "refusal"
-		} else {
+		} else if stopReason != "tool_use" {
 			stopReason = "max_tokens"
 		}
 	}
@@ -1984,6 +1984,19 @@ loop:
 						logging.FromContext(ctx).Warn("claude-responses stream interrupted mid-stream",
 							"model", model, "text_chars", stats.TextChars, "reasoning_chars", stats.ReasoningChars,
 							"tool_calls", len(toolOrder), "err", res.err)
+						// 中断时关闭所有仍 open 的工具块，避免客户端收到不完整的
+						// tool_use 块（缺少 content_block_stop 会导致协议错误）。
+						for _, idx := range toolOrder {
+							if b, ok := blocks[idx]; ok && b.open {
+								emitEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": b.claudeIndex})
+								b.open = false
+							}
+						}
+						// 传输中断不应向客户端汇报 end_turn；改为 max_tokens 表示
+						// 截断（对齐 chat.go/responses.go 的中断语义）。
+						if stopReason == "end_turn" {
+							stopReason = "max_tokens"
+						}
 						emitError("upstream stream interrupted before completion")
 						finished = true
 						doFinalize()
