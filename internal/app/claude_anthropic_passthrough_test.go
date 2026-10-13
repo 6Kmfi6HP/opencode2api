@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/domain"
 	statsx "github.com/6Kmfi6HP/opencode2api/internal/stats"
@@ -65,9 +66,19 @@ func TestClaudeAnthropicPassthrough_Buffered(t *testing.T) {
 
 	// usage 记账（上游重试 3 次成功，统计为 3 倍）。断言用内存态 Snapshot
 	// 而非 ReadTokenStatsSnapshot（后者读文件，写入原子替换存在落盘延迟）。
-	ms := statsx.Snapshot().Models[model]
-	if ms == nil || ms.PromptTokens < 5 || ms.CompletionTokens < 7 {
-		t.Fatalf("usage = %#v, want prompt >=5 completion >=7", ms)
+	// 2026-10-13 CI 出现过一次 usage 不可见 flake（重跑即过、本地 -race 10 次
+	// 全过、记账为同步写）：断言改为 2s 有界轮询，容忍延迟可见性，真缺失仍失败。
+	deadline := time.Now().Add(2 * time.Second)
+	var ms *statsx.ModelStats
+	for {
+		ms = statsx.Snapshot().Models[model]
+		if ms != nil && ms.PromptTokens >= 5 && ms.CompletionTokens >= 7 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("usage = %#v, want prompt >=5 completion >=7", ms)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if ms.CacheReadTokens < 2 || ms.CacheCreatedTokens < 3 {
 		t.Fatalf("cache usage = %#v, want cache_read >=2 cache_created >=3", ms)
