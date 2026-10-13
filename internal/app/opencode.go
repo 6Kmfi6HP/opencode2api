@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,41 +43,77 @@ const (
 	headerOCSessionAffnity = "x-session-affinity"
 )
 
-// newOCSessionShapeID 生成上游免费层校验格式的 26 字符 ID 主体:
-// 12 位小写 hex + 14 位 base62（lite 版 opencode2api-lite.go L498-514）。
-// 上游对免费层校验 session 必须匹配 ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$,否则拒绝:
-// "OpenCode's free tier can only be used from within OpenCode"。
-// 取舍: 先前实现把时间戳反转编码进 hex 前缀(TypeID-descending),以贴近真实
-// 客户端的排序行为;lite 实测该字段仅做格式正则校验、不含时间语义,纯随机即可。
-// 这里按 lite 简化为全随机,不再保留 descending 版本作双头之一——真正的
-// 兼容手段是新旧 session 头(x-session-id / x-opencode-session)同时发送。
-func newOCSessionShapeID() string {
+// ocIDMu/ocIDLastMilli/ocIDCounter 复刻上游 packages/schema/src/identifier.ts
+// 的每毫秒计数器语义: 同毫秒内多次生成时 counter 递增(首 ID counter=1),
+// current = ts_ms*0x1000 + counter。
+var (
+	ocIDMu        sync.Mutex
+	ocIDLastMilli uint64
+	ocIDCounter   uint64
+)
+
+func ocIDTimestamp() (uint64, uint64) {
+	ocIDMu.Lock()
+	defer ocIDMu.Unlock()
+	now := uint64(time.Now().UnixMilli())
+	if now != ocIDLastMilli {
+		ocIDLastMilli = now
+		ocIDCounter = 0
+	}
+	ocIDCounter++
+	return now, ocIDCounter
+}
+
+// newOCShapeID 生成上游免费层校验格式的 26 字符 ID 主体(对齐上游
+// packages/schema/src/identifier.ts): 前 12 位小写 hex 是 value 的低 48 位,
+// value = ts_ms*0x1000 + counter,descending 时按位取反——真实客户端 session
+// 用 descending、message 用 ascending;后 14 位 base62 随机。
+// 背景(2026-10-13 实测,docs/labs/2026-10-13-free-tier-fingerprint-refresh.md):
+// 上游 2026-10-11 起(83f2b6f67a zen 路由改薄代理,免费层门禁下沉到私有
+// inference 服务)校验 session ID 的反转时间戳语义——前 12 位 hex 必须是
+// ~(ts_ms*0x1000+counter) 低 48 位;纯随机或升序均 403 FreeTierError
+// ("OpenCode's free tier can only be used from within OpenCode",全部免费模型)。
+// 取舍: 2026-09-18 曾按 lite 实测(当时该字段仅格式正则校验)改为纯随机并移除
+// descending 编码;2026-10-13 复测上游已收紧,恢复 descending。UA 形状/版本、
+// x-opencode-project、x-opencode-request、x-opencode-session-id 头实测均不参与
+// 门禁(新旧 UA、40hex/global project 均 200),保持现状不改。
+func newOCShapeID(descending bool) string {
 	const hexChars = "0123456789abcdef"
 	const alnumChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	ts, counter := ocIDTimestamp()
+	current := ts*0x1000 + counter
+	value := current
+	if descending {
+		value = ^current
+	}
 	var b [26]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand 不可用时退化为时间戳混合,仍保持格式合规(长度/字符集正确)
-		var seed [8]byte
-		binary.BigEndian.PutUint64(seed[:], uint64(time.Now().UnixNano()))
-		for i := range b {
-			b[i] = seed[i%8] ^ byte(i*37)
+	for i := range 6 {
+		byteVal := byte(value >> (40 - 8*i))
+		b[i*2] = hexChars[byteVal>>4]
+		b[i*2+1] = hexChars[byteVal&0xf]
+	}
+	var rnd [14]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		// crypto/rand 不可用时退化为 counter 派生序列,仍保持字符集/长度合规
+		for i := range rnd {
+			rnd[i] = alnumChars[(counter+uint64(i)*31)%uint64(len(alnumChars))]
+		}
+	} else {
+		for i := range rnd {
+			rnd[i] = alnumChars[rnd[i]%byte(len(alnumChars))]
 		}
 	}
-	for i := 0; i < 12; i++ {
-		b[i] = hexChars[b[i]%16]
-	}
-	for i := 12; i < 26; i++ {
-		b[i] = alnumChars[b[i]%byte(len(alnumChars))]
-	}
+	copy(b[12:], rnd[:])
 	return string(b[:])
 }
 
 func newOCSessionID() string {
-	return "ses_" + newOCSessionShapeID()
+	return "ses_" + newOCShapeID(true)
 }
 
 func newOCRequestID() string {
-	return "msg_" + newOCSessionShapeID()
+	// 真实客户端 msg_ 用升序(非反转)时间戳,与 ses_ 的降序相对。
+	return "msg_" + newOCShapeID(false)
 }
 
 type opencodeSessionContextKey struct{}
@@ -177,6 +212,17 @@ func normalizeOCVersion(version string) string {
 		return ocMinFreeTierVersion
 	}
 	return version
+}
+
+// ocUserAgent 构造上游 User-Agent。ai-sdk/runtime 后缀贴近真实 opencode
+// 客户端(lite L1931);版本号经 normalizeOCVersion 兜底下限。2026-10-13 实测
+// 上游门禁不校验 UA 形状/版本(新旧格式均 200),仅保真。
+func ocUserAgent(state *opencodeSessionState) string {
+	uaVersion := state.clientVersion
+	if strings.TrimSpace(uaVersion) == "" {
+		uaVersion = ocDefaultFreeTierVersion
+	}
+	return fmt.Sprintf("opencode/%s ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", normalizeOCVersion(uaVersion))
 }
 
 // compareOCVersion 逐段比较点分十进制版本号;a<b 返回 -1,相等 0,a>b 返回 1。
@@ -416,6 +462,13 @@ func fetchModels() ([]ModelInfo, error) {
 	if session == "" {
 		session = newOCSessionID()
 	}
+	// 2026-10-13 实测(docs/labs/2026-10-13-free-tier-fingerprint-refresh.md):
+	// /zen/v1/models 也过免费层门禁,仅 Bearer public + session 头 403,
+	// 需补 UA/x-opencode-client/x-opencode-project/x-opencode-request(全量头 200)。
+	req.Header.Set("User-Agent", ocUserAgent(sessionState))
+	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("x-opencode-project", sessionState.projectID)
+	req.Header.Set("x-opencode-request", newOCRequestID())
 	// 新门禁头 x-session-id 与旧 x-opencode-session 同值双发,理由见
 	// buildOCRequestWithSubpath 中的取舍注释。
 	req.Header.Set("x-opencode-session", session)
@@ -451,6 +504,11 @@ func fetchGoModels() ([]ModelInfo, error) {
 	if session == "" {
 		session = newOCSessionID()
 	}
+	// 同 fetchModels: /zen/go/v1/models 也过免费层门禁,需全量指纹头。
+	req.Header.Set("User-Agent", ocUserAgent(sessionState))
+	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("x-opencode-project", sessionState.projectID)
+	req.Header.Set("x-opencode-request", newOCRequestID())
 	// 新门禁头 x-session-id 与旧 x-opencode-session 同值双发,理由见
 	// buildOCRequestWithSubpath 中的取舍注释。
 	req.Header.Set("x-opencode-session", session)
@@ -676,12 +734,7 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 		req.Header.Set("x-api-key", auth.apiKey())
 	}
 	// UA 对齐 lite L1931: ai-sdk/runtime 后缀贴近真实 opencode 客户端。
-	uaVersion := state.clientVersion
-	if strings.TrimSpace(uaVersion) == "" {
-		uaVersion = ocDefaultFreeTierVersion
-	}
-	uaVersion = normalizeOCVersion(uaVersion)
-	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", uaVersion))
+	req.Header.Set("User-Agent", ocUserAgent(state))
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-project", state.projectID)
 	if subpath == "messages" {

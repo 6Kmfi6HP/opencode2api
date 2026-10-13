@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -35,8 +36,41 @@ func TestOpenCode_RequestIDMatchesClientFormat(t *testing.T) {
 	}
 }
 
-// 全随机 26 字符主体由 crypto/rand 填充;1000 次生成不得重复。
-// 原 opencodeDescendingID 的时间戳回环/排序语义随上游格式正则化被移除。
+// 2026-10-13 起(上游 83f2b6f67a zen 路由改薄代理、免费层门禁下沉私有
+// inference)门禁校验 session ID 前 12 位 hex 为反转时间戳
+// (~(ts_ms*0x1000+counter) 低 48 位,对齐上游 packages/schema/src/identifier.ts);
+// 纯随机或升序均 403 FreeTierError(docs/labs/2026-10-13-free-tier-fingerprint-refresh.md)。
+// 回归: ses_ 必须携带降序反转时间戳且贴近当前毫秒,msg_ 携带升序时间戳。
+func TestOpenCode_SessionIDDescendingTimestamp(t *testing.T) {
+	now := time.Now().UnixMilli()
+	decodeTS36 := func(t *testing.T, body string, descending bool) int64 {
+		t.Helper()
+		var stored uint64
+		for i := range 6 {
+			n, err := strconv.ParseUint(body[2*i:2*i+2], 16, 8)
+			if err != nil {
+				t.Fatalf("hex prefix %q not lowercase hex: %v", body[:12], err)
+			}
+			stored = stored<<8 | n
+		}
+		if descending {
+			stored = ^stored & 0xFFFFFFFFFFFF
+		}
+		return int64(stored >> 12)
+	}
+	want36 := now % (1 << 36)
+	if got := decodeTS36(t, strings.TrimPrefix(newOCSessionID(), "ses_"), true); got < want36-5000 || got > want36+5000 {
+		t.Fatalf("ses_ decodes to ts36 %d, want within 5s of now %d (upstream gate requires descending timestamp)", got, want36)
+	}
+	if got := decodeTS36(t, strings.TrimPrefix(newOCRequestID(), "msg_"), false); got < want36-5000 || got > want36+5000 {
+		t.Fatalf("msg_ decodes to ts36 %d, want within 5s of now %d (ascending timestamp)", got, want36)
+	}
+}
+
+// 26 字符主体: 前 12 位 hex 为反转时间戳、后 14 位 base62 由 crypto/rand 填充;
+// 1000 次生成不得重复。
+// 原 opencodeDescendingID 的时间戳编码曾随 2026-09-18 lite 实测(仅格式校验)
+// 被移除;2026-10-13 上游门禁收紧后恢复(见 newOCShapeID)。
 func TestSession_IDUniqueAcrossGenerations(t *testing.T) {
 	seen := make(map[string]bool, 2000)
 	for i := 0; i < 1000; i++ {

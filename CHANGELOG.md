@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Restore descending-timestamp session IDs and un-break free-tier gate (`fix(fingerprint)`): 上游 2026-10-11(83f2b6f67a zen 路由改薄代理)把免费层门禁下沉到私有 inference 服务后,新门禁校验 session ID 前 12 位 hex 为反转时间戳 `~(ts_ms*0x1000+counter)` 低 48 位——纯随机或升序均 403 FreeTierError("OpenCode's free tier can only be used from within OpenCode",全部免费模型三协议)。2026-09-18 移除 descending 编码的前提(当时仅格式正则校验)已失效:
+  - `newOCShapeID`(internal/app/opencode.go):恢复反转时间戳编码,对齐上游 `packages/schema/src/identifier.ts` 每毫秒计数器语义(ses_ 降序反转、msg_ 升序;后 14 位 base62 随机不变);`ocIDTimestamp` 锁内每毫秒重置 counter。
+  - `fetchModels`/`fetchGoModels`:补全量指纹头(UA/x-opencode-client/x-opencode-project/x-opencode-request)——上游 `/zen/v1/models` 与 `/zen/go/v1/models` 现已过免费层门禁,裸 `Bearer public` + session 头 403,模型目录刷新整体失败(修复后 84 模型/38 go 目录)。
+  - 实测消融(docs/labs/2026-10-13-free-tier-fingerprint-refresh.md):UA 形状/版本(新旧两式)、x-opencode-project(40hex/global)、x-opencode-request、x-opencode-session-id 头均不参与新门禁,保持现状;降序 session 时效容忍 ≥7 天,升序 403。
+  - 验证:修复后直连上游全部免费模型 chat/responses/messages 均 200;真实网关 `/v1/models` 11 免费模型、tool_calls 回合 18× 200 零错误、三协议全过;`make test`/`go vet`/`gofmt` 全过。
+
 ## v0.14.28
 
 - Align conversion layer with Bifrost reference (`fix(protocol)`, PR #41): 转换层对齐 maximhq/bifrost (Apache-2.0) 语义，修复 stop reason / thinking / tool 映射多处偏差：
