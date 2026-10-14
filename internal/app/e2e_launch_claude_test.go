@@ -144,6 +144,12 @@ func TestE2ELaunchClaude(t *testing.T) {
 	}
 
 	if exitErr != nil {
+		// Claude CLI is present but not authenticated (e.g. in CI without credentials).
+		// Skip rather than fail so the suite stays green without a logged-in session.
+		if strings.Contains(string(stdout), "Not logged in") ||
+			strings.Contains(string(stderr), "Not logged in") {
+			t.Skipf("claude CLI is not authenticated; skipping end-to-end launch test (exit: %v)", exitErr)
+		}
 		dump()
 		t.Fatalf("launch claude exited with error: %v", exitErr)
 	}
