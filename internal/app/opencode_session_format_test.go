@@ -117,8 +117,13 @@ func TestOpenCode_RequestHeadersMirrorClient(t *testing.T) {
 	if !regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`).MatchString(req.Header.Get("x-opencode-session")) {
 		t.Fatalf("x-opencode-session = %q has wrong format", req.Header.Get("x-opencode-session"))
 	}
-	if !regexp.MustCompile(`^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`).MatchString(req.Header.Get("x-opencode-request")) {
-		t.Fatalf("x-opencode-request = %q has wrong format", req.Header.Get("x-opencode-request"))
+	// V2 gate: the inference path requires x-opencode-project "global" and
+	// rejects any x-opencode-request header (live probe 2026-10-14).
+	if got := req.Header.Get("x-opencode-project"); got != "global" {
+		t.Fatalf("x-opencode-project = %q, want global", got)
+	}
+	if got := req.Header.Get("x-opencode-request"); got != "" {
+		t.Fatalf("x-opencode-request = %q, want absent on the zen surface", got)
 	}
 }
 

@@ -34,8 +34,8 @@ func TestSystemoneHandler_ForwardsFreeModel(t *testing.T) {
 		t.Fatalf("answers missing: %v", resp)
 	}
 
-	if len(transport.requestedURLs) != 1 || !strings.HasSuffix(transport.requestedURLs[0], "/zen/v1/systemone") {
-		t.Fatalf("URLs = %#v, want single /zen/v1/systemone call", transport.requestedURLs)
+	if len(transport.requestedURLs) != 1 || !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/systemone") {
+		t.Fatalf("URLs = %#v, want single /inference/v1/systemone call", transport.requestedURLs)
 	}
 	payload := transport.requestPayloads[0]
 	if payload["model"] != "jev-1.13-free" {

@@ -453,20 +453,20 @@ var (
 )
 
 func fetchModels() ([]ModelInfo, error) {
-	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/v1/models", nil)
+	// Upstream moved the free-tier surface to /inference/v1 (V2); the /zen/v1
+	// path is a gated thin proxy that answers 403 FreeTierError (probe 2026-10-14).
+	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/inference/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
 	sessionState := initOCSession()
 	session := strings.TrimSpace(sessionFromRequestContext(context.TODO(), sessionState.sessionID))
 	if session == "" {
 		session = newOCSessionID()
 	}
-	// 2026-10-13 实测(docs/labs/2026-10-13-free-tier-fingerprint-refresh.md):
-	// /zen/v1/models 也过免费层门禁,仅 Bearer public + session 头 403,
-	// 需补 UA/x-opencode-client/x-opencode-project/x-opencode-request(全量头 200)。
+	// V2 gate on the inference path: x-opencode-project must be "global" (a 40-hex
+	// project id 403s) and x-opencode-request must not be sent (403s when present).
 	req.Header.Set("User-Agent", ocUserAgent(sessionState))
 	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-project", sessionState.projectID)
-	req.Header.Set("x-opencode-request", newOCRequestID())
+	req.Header.Set("x-opencode-project", "global")
 	// 2026-10-14 抓包 CLI v2.0.29: 同时发旧 x-opencode-session、新 x-session-id、
 	// x-session-affinity、以及新增的 x-opencode-session-id 四头。
 	req.Header.Set("x-opencode-session", session)
@@ -720,7 +720,9 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	if useGoEndpoint {
 		upstreamURL = "https://opencode.ai/zen/go/v1/" + subpath
 	} else {
-		upstreamURL = baseURL + "/zen/v1/" + subpath
+		// Upstream moved the free-tier surface to /inference/v1 (V2); the /zen/v1
+		// path is a gated thin proxy that answers 403 FreeTierError (probe 2026-10-14).
+		upstreamURL = baseURL + "/inference/v1/" + subpath
 	}
 	// 上游偶发对无 Accept-Encoding 的 Go 默认 gzip 响应不吐 identity,
 	// 客户端拿到的会是乱码 gzip 二进制;显式 identity 避免歧义。
@@ -736,7 +738,12 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	// UA 对齐 lite L1931: ai-sdk/runtime 后缀贴近真实 opencode 客户端。
 	req.Header.Set("User-Agent", ocUserAgent(state))
 	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-project", state.projectID)
+	if useGoEndpoint {
+		req.Header.Set("x-opencode-project", state.projectID)
+	} else {
+		// V2 gate on the inference path: "global" is required; a 40-hex project id 403s.
+		req.Header.Set("x-opencode-project", "global")
+	}
 	if subpath == "messages" {
 		// Anthropic Messages 上游需要版本头；流式时 Accept 切为 SSE。
 		req.Header.Set("anthropic-version", "2023-06-01")
@@ -766,7 +773,10 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	req.Header.Set(headerOCSessionID, session)
 	req.Header.Set(headerOCSessionAffnity, session)
 	req.Header.Set(headerOCSessionIDNew, session)
-	req.Header.Set("x-opencode-request", newOCRequestID())
+	// V2 gate: x-opencode-request 403s on the inference path; keep it for the Go surface only.
+	if useGoEndpoint {
+		req.Header.Set("x-opencode-request", newOCRequestID())
+	}
 	if subpath != "messages" {
 		req.Header.Set("Accept", "application/json")
 	}
