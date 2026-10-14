@@ -38,9 +38,12 @@ func randomHex(n int) string {
 // ======================== OpenCode 会话 ========================
 
 const (
-	headerOpencodeSession  = "x-opencode-session"
-	headerOCSessionID      = "x-session-id"
-	headerOCSessionAffnity = "x-session-affinity"
+	headerOpencodeSession   = "x-opencode-session"
+	headerOCSessionID       = "x-session-id"
+	headerOCSessionAffnity  = "x-session-affinity"
+	// headerOCSessionIDNew 是 2026-10-14 抓包发现 CLI v2.0.29 新增的头,
+	// 与 x-session-id 同值双发。
+	headerOCSessionIDNew    = "x-opencode-session-id"
 )
 
 // ocIDMu/ocIDLastMilli/ocIDCounter 复刻上游 packages/schema/src/identifier.ts
@@ -189,16 +192,12 @@ var (
 
 const (
 	// ocMinFreeTierVersion 是上游免费层声明的最低客户端版本;低于它时上游
-	// 返回 426 UpgradeRequired("OpenCode 1.18.0 or newer is required").
-	// 取舍(2026-09-18 实测校准): lite opencode2api-lite.go L486-489 记为
-	// minOCVersion = "1.17.0",但 issue #19 的实测消融
-	// (docs/labs/2026-09-18-fingerprint-ablation.md E17/E18/U1-U5)表明
-	// 上游阈值实际已上移到 1.18.0 —— 1.17.0/1.17.9 均 426,1.18.0+ 才 200。
-	// 故下限采实测值 1.18.0 而非 lite 的 1.17.0。
-	ocMinFreeTierVersion = "1.18.0"
+	// 返回 426 UpgradeRequired。上游 2026-10 发布 v2.0.x 大版本,下限随之
+	// 更新为 2.0.0(实测 1.x UA 被 403 FreeTierError 拒绝)。
+	ocMinFreeTierVersion = "2.0.0"
 	// ocDefaultFreeTierVersion 是 npm 拉取失败时的回退版本,高于下限
-	// 且贴近实测当前上游最新版(2026-09-18 npm latest = 1.18.31),留一份冗余。
-	ocDefaultFreeTierVersion = "1.18.31"
+	// 且贴近实测当前上游最新版(2026-10-14 @opencode/cli latest = 2.0.29)。
+	ocDefaultFreeTierVersion = "2.0.29"
 )
 
 // normalizeOCVersion 保证 UA 版本号不低于 ocMinFreeTierVersion,
@@ -214,15 +213,14 @@ func normalizeOCVersion(version string) string {
 	return version
 }
 
-// ocUserAgent 构造上游 User-Agent。ai-sdk/runtime 后缀贴近真实 opencode
-// 客户端(lite L1931);版本号经 normalizeOCVersion 兜底下限。2026-10-13 实测
-// 上游门禁不校验 UA 形状/版本(新旧格式均 200),仅保真。
+// ocUserAgent 构造上游 User-Agent。2026-10-14 抓包 opencode CLI v2.0.29 实测:
+// 真实格式为 "opencode/latest/<version>/cli",不再使用旧的 ai-sdk/bun 后缀。
 func ocUserAgent(state *opencodeSessionState) string {
 	uaVersion := state.clientVersion
 	if strings.TrimSpace(uaVersion) == "" {
 		uaVersion = ocDefaultFreeTierVersion
 	}
-	return fmt.Sprintf("opencode/%s ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", normalizeOCVersion(uaVersion))
+	return fmt.Sprintf("opencode/latest/%s/cli", normalizeOCVersion(uaVersion))
 }
 
 // compareOCVersion 逐段比较点分十进制版本号;a<b 返回 -1,相等 0,a>b 返回 1。
@@ -266,7 +264,7 @@ func ocVersionNumbers(v string) []int {
 }
 
 func fetchOCVersion() string {
-	req, _ := http.NewRequest("GET", "https://registry.npmjs.org/opencode-ai/latest", nil)
+	req, _ := http.NewRequest("GET", "https://registry.npmjs.org/@opencode/cli/latest", nil)
 	req.Header.Set("Accept", "application/json")
 	resp, err := getHTTPClient().Do(req)
 	if err != nil {
@@ -469,11 +467,12 @@ func fetchModels() ([]ModelInfo, error) {
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-project", sessionState.projectID)
 	req.Header.Set("x-opencode-request", newOCRequestID())
-	// 新门禁头 x-session-id 与旧 x-opencode-session 同值双发,理由见
-	// buildOCRequestWithSubpath 中的取舍注释。
+	// 2026-10-14 抓包 CLI v2.0.29: 同时发旧 x-opencode-session、新 x-session-id、
+	// x-session-affinity、以及新增的 x-opencode-session-id 四头。
 	req.Header.Set("x-opencode-session", session)
 	req.Header.Set(headerOCSessionID, session)
 	req.Header.Set(headerOCSessionAffnity, session)
+	req.Header.Set(headerOCSessionIDNew, session)
 	resp, err := getHTTPClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -509,11 +508,12 @@ func fetchGoModels() ([]ModelInfo, error) {
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-project", sessionState.projectID)
 	req.Header.Set("x-opencode-request", newOCRequestID())
-	// 新门禁头 x-session-id 与旧 x-opencode-session 同值双发,理由见
-	// buildOCRequestWithSubpath 中的取舍注释。
+	// 2026-10-14 抓包 CLI v2.0.29: 同时发旧 x-opencode-session、新 x-session-id、
+	// x-session-affinity、以及新增的 x-opencode-session-id 四头。
 	req.Header.Set("x-opencode-session", session)
 	req.Header.Set(headerOCSessionID, session)
 	req.Header.Set(headerOCSessionAffnity, session)
+	req.Header.Set(headerOCSessionIDNew, session)
 	resp, err := getHTTPClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -765,6 +765,7 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	req.Header.Set("x-opencode-session", session)
 	req.Header.Set(headerOCSessionID, session)
 	req.Header.Set(headerOCSessionAffnity, session)
+	req.Header.Set(headerOCSessionIDNew, session)
 	req.Header.Set("x-opencode-request", newOCRequestID())
 	if subpath != "messages" {
 		req.Header.Set("Accept", "application/json")

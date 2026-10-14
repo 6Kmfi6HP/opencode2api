@@ -100,9 +100,10 @@ func TestOpenCode_RequestHeadersMirrorClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantUA := "opencode/" + ocMinFreeTierVersion + " ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
-	if got := req.Header.Get("User-Agent"); got != wantUA {
-		t.Fatalf("User-Agent = %q, want %q", got, wantUA)
+	wantUAPrefix := "opencode/latest/"
+	wantUASuffix := "/cli"
+	if got := req.Header.Get("User-Agent"); !strings.HasPrefix(got, wantUAPrefix) || !strings.HasSuffix(got, wantUASuffix) {
+		t.Fatalf("User-Agent = %q, want %s<ver>%s format", got, wantUAPrefix, wantUASuffix)
 	}
 	if got := req.Header.Get("x-session-id"); got != state.sessionID {
 		t.Fatalf("x-session-id = %q, want %q", got, state.sessionID)

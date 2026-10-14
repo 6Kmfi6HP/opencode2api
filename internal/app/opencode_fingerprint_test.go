@@ -50,8 +50,8 @@ func TestOCRequest_FreeTierInjectsSessionHeadersAndStream(t *testing.T) {
 	if got := req.Header.Get("x-opencode-session"); got != req.Header.Get("x-session-id") {
 		t.Fatalf("x-opencode-session = %q differs from x-session-id = %q", got, req.Header.Get("x-session-id"))
 	}
-	if got := req.Header.Get("User-Agent"); !strings.HasPrefix(got, "opencode/1.18.31 ai-sdk/") {
-		t.Fatalf("User-Agent = %q, want opencode/<ver> ai-sdk/... suffix", got)
+	if got := req.Header.Get("User-Agent"); !strings.HasPrefix(got, "opencode/latest/") || !strings.HasSuffix(got, "/cli") {
+		t.Fatalf("User-Agent = %q, want opencode/latest/<ver>/cli format", got)
 	}
 
 	body, err := io.ReadAll(req.Body)
@@ -287,9 +287,9 @@ func TestAggregate_ToolCallsAssembledByIndex(t *testing.T) {
 	}
 }
 
-// normalizeOCVersion 的 426 防护: 低于 ocMinFreeTierVersion(lite 记 1.17.0,
-// issue #19 消融实测已上移到 1.18.0)一律提到下限;空值/空白退到 default;
-// 高于下限原样放行。
+// normalizeOCVersion 的 426 防护: 低于 ocMinFreeTierVersion 一律提到下限;
+// 空值/空白退到 default; 高于下限原样放行。
+// 2026-10-14 更新: npm @opencode/cli latest 已升至 v2.0.29,下限随之更新为 2.0.0。
 func TestOCVersion_NormalizeAgainstFreeTierFloor(t *testing.T) {
 	cases := []struct {
 		name, in, want string
@@ -297,11 +297,13 @@ func TestOCVersion_NormalizeAgainstFreeTierFloor(t *testing.T) {
 		{"empty to default", "", ocDefaultFreeTierVersion},
 		{"whitespace to default", "  ", ocDefaultFreeTierVersion},
 		{"older minor floats to floor", "1.15.9", ocMinFreeTierVersion},
-		// 实测(issue #19 消融): 1.17.0 已越过上游下限被 426,下限=1.18.0.
+		// 1.17.0 和 1.18.x 均低于新下限 2.0.0,提升到 2.0.0。
 		{"1.17.0 floats past lite floor", "1.17.0", ocMinFreeTierVersion},
-		{"equal passes", "1.18.0", "1.18.0"},
-		{"newer passes", "1.18.31", "1.18.31"},
-		{"major bump passes", "2.0.0", "2.0.0"},
+		{"1.18.0 floats to v2 floor", "1.18.0", ocMinFreeTierVersion},
+		{"1.18.31 floats to v2 floor", "1.18.31", ocMinFreeTierVersion},
+		{"equal passes", "2.0.0", "2.0.0"},
+		{"newer passes", "2.0.29", "2.0.29"},
+		{"major bump passes", "3.0.0", "3.0.0"},
 		{"prerelease segment keeps head digits", "1.17.9-beta", ocMinFreeTierVersion},
 	}
 	for _, tc := range cases {
