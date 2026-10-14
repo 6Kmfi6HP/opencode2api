@@ -546,7 +546,11 @@ func sanitizeImageURLForUpstream(rawURL string) (string, bool) {
 		return "", false
 	}
 	if strings.HasPrefix(trimmed, "data:") {
-		meta, payload, ok := strings.Cut(strings.TrimPrefix(trimmed, "data:"), ",")
+		rest, ok := strings.CutPrefix(trimmed, "data:")
+		if !ok {
+			return "", false
+		}
+		meta, payload, ok := strings.Cut(rest, ",")
 		if !ok || payload == "" || strings.TrimSpace(strings.Split(meta, ";")[0]) == "" {
 			return "", false
 		}
@@ -1543,10 +1547,7 @@ func (st *anthropicToChatState) chatUsage() map[string]any {
 			details = map[string]any{}
 		}
 		if v, ok := numberAsFloat(details["reasoning_tokens"]); !ok || v <= 0 {
-			est := st.reasoningTokens / 4
-			if est < 1 {
-				est = 1
-			}
+			est := max(st.reasoningTokens/4, 1)
 			details["reasoning_tokens"] = est
 		}
 		if len(details) > 0 {

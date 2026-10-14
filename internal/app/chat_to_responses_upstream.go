@@ -248,7 +248,7 @@ func chatToResponsesBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[
 	mergeResponsesIncludeKey(body, "reasoning.encrypted_content")
 	b, err := json.Marshal(body)
 	if err != nil {
-		return []byte(fmt.Sprintf(`{"model":%q,"input":[],"stream":%t}`, modelID, req.Stream))
+		return fmt.Appendf(nil, `{"model":%q,"input":[],"stream":%t}`, modelID, req.Stream)
 	}
 	return b
 }
@@ -454,8 +454,7 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 // convertResponsesToChat 的 JSON 解析），因此幂等。
 func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning bool, restoreCase bool) []byte {
 	var id, outModel, serviceTier string
-	var contentBuilder, reasoningBuilder strings.Builder
-	var refusal string
+	var contentBuilder, reasoningBuilder, refusalBuilder strings.Builder
 	type toolAcc struct {
 		callID, name, args string
 	}
@@ -537,7 +536,7 @@ func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning boo
 			}
 		case "response.refusal.delta":
 			if t, _ := evt["delta"].(string); t != "" {
-				refusal += t
+				refusalBuilder.WriteString(t)
 			}
 		case "response.output_item.added", "response.output_item.done":
 			item, _ := evt["item"].(map[string]any)
@@ -633,8 +632,8 @@ func aggregateResponsesStreamToChat(body []byte, model string, wantReasoning boo
 	if reasoning := reasoningBuilder.String(); reasoning != "" {
 		msg["reasoning_content"] = reasoning
 	}
-	if refusal != "" {
-		msg["refusal"] = refusal
+	if r := refusalBuilder.String(); r != "" {
+		msg["refusal"] = r
 	}
 	if len(toolOrder) > 0 {
 		var toolCalls []map[string]any
@@ -734,7 +733,7 @@ func convertResponsesToChat(respBody []byte, model string, wantReasoning bool) [
 	}
 	var textParts []string
 	var reasoningParts []string
-	var refusal string
+	var refusalBuilder strings.Builder
 	var toolCalls []map[string]any
 	finishReason := "stop"
 	if status, _ := raw["status"].(string); status == "incomplete" {
@@ -771,7 +770,7 @@ func convertResponsesToChat(respBody []byte, model string, wantReasoning bool) [
 					}
 				case "refusal":
 					if t, _ := cm["refusal"].(string); t != "" {
-						refusal += t
+						refusalBuilder.WriteString(t)
 					}
 				}
 			}
@@ -820,8 +819,8 @@ func convertResponsesToChat(respBody []byte, model string, wantReasoning bool) [
 	if reasoning := strings.Join(reasoningParts, "\n"); reasoning != "" {
 		msg["reasoning_content"] = reasoning
 	}
-	if refusal != "" {
-		msg["refusal"] = refusal
+	if r := refusalBuilder.String(); r != "" {
+		msg["refusal"] = r
 	}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls

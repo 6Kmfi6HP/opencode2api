@@ -834,10 +834,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 	var lastStatus int
 	var lastHeader http.Header
 	var lastBaseURL string
-	maxAttempts := maxUpstreamRetries
-	if max401Retries > maxAttempts {
-		maxAttempts = max401Retries
-	}
+	maxAttempts := max(maxUpstreamRetries, max401Retries)
 	if poolEnabled() && keypoolMaxAttempts() > maxAttempts {
 		maxAttempts = keypoolMaxAttempts()
 	}
