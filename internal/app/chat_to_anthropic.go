@@ -1105,7 +1105,7 @@ func chatToAnthropicBodyWithRaw(req *OpenAIRequest, modelID string, rawBody map[
 	}
 	b, err := json.Marshal(body)
 	if err != nil {
-		return []byte(fmt.Sprintf(`{"model":%q,"messages":[],"max_tokens":%d,"stream":%t}`, modelID, maxTokens, req.Stream))
+		return fmt.Appendf(nil, `{"model":%q,"messages":[],"max_tokens":%d,"stream":%t}`, modelID, maxTokens, req.Stream)
 	}
 	return b
 }

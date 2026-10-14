@@ -962,7 +962,7 @@ func TestDispatch_ChatToResponsesMemory(t *testing.T) {
 	if out["object"] != "chat.completion" {
 		t.Fatalf("object = %#v, want chat.completion", out["object"])
 	}
-	if !strings.Contains(string(rec.Body.Bytes()), "via memory") {
+	if !strings.Contains(rec.Body.String(), "via memory") {
 		t.Fatalf("body missing upstream text: %s", rec.Body.String())
 	}
 }

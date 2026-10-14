@@ -21,6 +21,6 @@ func signalLaunchChild(proc *os.Process, sig os.Signal) {
 
 // selectModelInteractive is the platform selection entry point. Unix-likes
 // keep the existing terminal raw-mode selector.
-func selectModelInteractive(in io.Reader, out io.Writer, errOut io.Writer, modelIDs []string, catalog modelsdev.Catalog) (string, error) {
+func selectModelInteractive(_ io.Reader, _ io.Writer, _ io.Writer, modelIDs []string, catalog modelsdev.Catalog) (string, error) {
 	return selectModelTTY(modelIDs, catalog)
 }

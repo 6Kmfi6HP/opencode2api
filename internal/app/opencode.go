@@ -458,7 +458,7 @@ func fetchModels() ([]ModelInfo, error) {
 	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
 	sessionState := initOCSession()
-	session := strings.TrimSpace(sessionFromRequestContext(nil, sessionState.sessionID))
+	session := strings.TrimSpace(sessionFromRequestContext(context.TODO(), sessionState.sessionID))
 	if session == "" {
 		session = newOCSessionID()
 	}
@@ -500,7 +500,7 @@ func fetchGoModels() ([]ModelInfo, error) {
 	req, _ := http.NewRequest("GET", roundRobinBaseURL()+"/zen/go/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer public")
 	sessionState := initOCSession()
-	session := strings.TrimSpace(sessionFromRequestContext(nil, sessionState.sessionID))
+	session := strings.TrimSpace(sessionFromRequestContext(context.TODO(), sessionState.sessionID))
 	if session == "" {
 		session = newOCSessionID()
 	}
@@ -748,7 +748,7 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	session := sessionFromRequestContext(nil, ocSession)
+	session := sessionFromRequestContext(context.TODO(), ocSession)
 	if strings.TrimSpace(session) == "" {
 		session = state.sessionID
 	}

@@ -478,10 +478,7 @@ func e2eClaudeChildEnv(tmpDir, modelsDevCache string) []string {
 	}
 	env := []string{}
 	for _, kv := range os.Environ() {
-		key := kv
-		if i := strings.IndexByte(kv, '='); i >= 0 {
-			key = kv[:i]
-		}
+		key, _, _ := strings.Cut(kv, "=")
 		if skipSet[key] {
 			continue
 		}

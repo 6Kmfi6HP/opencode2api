@@ -323,7 +323,7 @@ func TestStripHookPrefixFromUserTextLongSample(t *testing.T) {
 	var b strings.Builder
 	b.WriteString(marker + "\n")
 	for _, tag := range []string{"context_window_protection", "tool_selection_hierarchy", "deferred_tool_bootstrap", "output_constraints"} {
-		b.WriteString("<" + tag + ">\n  <seg>\n    " + strings.Repeat("instruction line for "+tag+". ", 20) + "\n  </seg>\n</" + tag + ">\n")
+		fmt.Fprintf(&b, "<%s>\n  <seg>\n    %s\n  </seg>\n</%s>\n", tag, strings.Repeat("instruction line for "+tag+". ", 20), tag)
 	}
 	bare := "Concise output style is active. Be concise: lead with the result, skip preamble and narration, keep only what the user needs."
 	cleanBody := strings.Repeat("修复说明正文,必须完整保留。", 40)
