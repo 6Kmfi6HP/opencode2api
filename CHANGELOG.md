@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.14.30
+
+- Migrate free tier from `/zen/v1` to `/inference/v1` (V2 gate): 上游 2026-10-11 起免费层迁移至 `/inference/v1`，`/zen/v1` 对所有匿名请求返回 `403 FreeTierError`。
+  - `fetchModels`：URL 改为 `/inference/v1/models`，`x-opencode-project` 固定为 `"global"`（40-hex project id 触发 403），移除 `x-opencode-request`（其存在本身触发 403）。
+  - `buildOCRequestWithSubpathAndState` zen 分支：`/zen/v1/` → `/inference/v1/`；inference 路径 `x-opencode-project` 固定 `"global"`，go/v1 路径沿用 `state.projectID`；`x-opencode-request` 仅在 `useGoEndpoint=true` 时发送。
+  - 11 个测试文件中 URL 断言同步更新（`/zen/v1/` → `/inference/v1/`）；`TestOpenCode_RequestHeadersMirrorClient` 改为断言 inference/v1 路径 `x-opencode-request` 为空。
+  - 验证：`go test ./...`、`go vet`、`gofmt` 全过；本地真实测试 public 与 keypool 两条路径均 200。
+
 ## v0.14.29
 
 - Restore descending-timestamp session IDs and un-break free-tier gate (`fix(fingerprint)`): 上游 2026-10-11(83f2b6f67a zen 路由改薄代理)把免费层门禁下沉到私有 inference 服务后,新门禁校验 session ID 前 12 位 hex 为反转时间戳 `~(ts_ms*0x1000+counter)` 低 48 位——纯随机或升序均 403 FreeTierError("OpenCode's free tier can only be used from within OpenCode",全部免费模型三协议)。2026-09-18 移除 descending 编码的前提(当时仅格式正则校验)已失效:
