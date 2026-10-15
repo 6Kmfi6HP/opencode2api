@@ -306,12 +306,12 @@ func TestClaudeResponsesPassthrough_FallbackAndMemory(t *testing.T) {
 		t.Fatalf("requested URLs after first = %#v, want 3 chat + 1 responses", transport.requestedURLs)
 	}
 	for _, u := range transport.requestedURLs[:3] {
-		if !strings.HasSuffix(u, "/zen/v1/chat/completions") {
+		if !strings.HasSuffix(u, "/inference/v1/chat/completions") {
 			t.Fatalf("unexpected translated URL = %s", u)
 		}
 	}
-	if !strings.HasSuffix(transport.requestedURLs[3], "/zen/v1/responses") {
-		t.Fatalf("probe URL = %s, want /zen/v1/responses", transport.requestedURLs[3])
+	if !strings.HasSuffix(transport.requestedURLs[3], "/inference/v1/responses") {
+		t.Fatalf("probe URL = %s, want /inference/v1/responses", transport.requestedURLs[3])
 	}
 	// 探测发往 responses 的应是转换后的体（含 instructions/input），而非 Claude 原体。
 	probePayload := transport.requestPayloads[3]
@@ -332,7 +332,7 @@ func TestClaudeResponsesPassthrough_FallbackAndMemory(t *testing.T) {
 	if len(transport.requestedURLs) != 5 {
 		t.Fatalf("URLs after second = %#v, want exactly one more passthrough", transport.requestedURLs)
 	}
-	if !strings.HasSuffix(transport.requestedURLs[4], "/zen/v1/responses") {
+	if !strings.HasSuffix(transport.requestedURLs[4], "/inference/v1/responses") {
 		t.Fatalf("second URL = %s, want responses", transport.requestedURLs[4])
 	}
 }
@@ -364,7 +364,7 @@ func TestClaudeResponsesPassthrough_RememberedModelForwards(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "remembered ok") {
 		t.Fatalf("body = %s, want remembered ok", rec.Body.String())
 	}
-	if len(transport.requestedURLs) != 1 || !strings.HasSuffix(transport.requestedURLs[0], "/zen/v1/responses") {
+	if len(transport.requestedURLs) != 1 || !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/responses") {
 		t.Fatalf("URLs = %#v, want single responses call", transport.requestedURLs)
 	}
 }

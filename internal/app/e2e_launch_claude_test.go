@@ -23,7 +23,7 @@ import (
 //
 //  1. claude in print mode (-p) emits a streaming /v1/messages request; the
 //     proxy's protocol_rules ("anthropic/*" → anthropic) forward it natively to
-//     the fake /zen/v1/messages endpoint, preserving the anthropics shape
+//     the fake /inference/v1/messages endpoint, preserving the anthropics shape
 //     (max_tokens present, stream=true, last message role=user with content
 //     blocks, anthropic-version + Accept: text/event-stream headers).
 //  2. Turn 1: fake upstream streams a tool_use block (read_file
@@ -136,7 +136,7 @@ func TestE2ELaunchClaude(t *testing.T) {
 	}
 
 	reqs := fake.Requests()
-	t.Logf("fake upstream saw %d main /zen/v1/messages request(s), %d probe request(s)",
+	t.Logf("fake upstream saw %d main /inference/v1/messages request(s), %d probe request(s)",
 		len(reqs), fake.probes.Load())
 	for i, rq := range reqs {
 		t.Logf("turn %d: model=%q stream=%v max_tokens=%v roles=%v stop=%q",
@@ -156,15 +156,15 @@ func TestE2ELaunchClaude(t *testing.T) {
 
 	if len(reqs) < 2 {
 		dump()
-		t.Fatalf("fake upstream saw %d main /zen/v1/messages request(s), want >= 2 "+
+		t.Fatalf("fake upstream saw %d main /inference/v1/messages request(s), want >= 2 "+
 			"(second turn with tool_result proves claude consumed the streamed tool_use)",
 			len(reqs))
 	}
 
 	// ---------- Turn 1: canonical Anthropic streaming request + tool_use SSE ----------
 	first := reqs[0]
-	if first.Path != "/zen/v1/messages" {
-		t.Errorf("turn 1: path = %q, want /zen/v1/messages", first.Path)
+	if first.Path != "/inference/v1/messages" {
+		t.Errorf("turn 1: path = %q, want /inference/v1/messages", first.Path)
 	}
 	if first.Model != "anthropic/claude-opus-4-6" {
 		t.Errorf("turn 1: model = %q, want anthropic/claude-opus-4-6 (protocol_rules anthropic/* hit)",
@@ -283,13 +283,13 @@ func (f *fakeAnthropicUpstream) handle(w http.ResponseWriter, r *http.Request) {
 	// 旁路探测路径：模型目录 / count_tokens / 遥测 —— 一律 200 + 最小合法体，
 	// 否则 claude 启动预热会反复重试、拖慢主对话。
 	switch r.URL.Path {
-	case "/zen/v1/models", "/zen/go/v1/models":
+	case "/inference/v1/models", "/zen/go/v1/models":
 		w.Header().Set("Content-Type", "application/json")
 		// 返回包含目标模型的清单，让 mapPublicToFreeModel / modelExistsInCaches
 		// 保持 model 原样（否则 public key 会被降级成 ...-free）。
 		io.WriteString(w, `{"data":[{"id":"anthropic/claude-opus-4-6"},{"id":"claude-haiku-4-5"}]}`)
 		return
-	case "/zen/v1/messages/count_tokens":
+	case "/inference/v1/messages/count_tokens":
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"input_tokens":42}`)
 		return
@@ -301,7 +301,7 @@ func (f *fakeAnthropicUpstream) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if r.URL.Path != "/zen/v1/messages" {
+	if r.URL.Path != "/inference/v1/messages" {
 		f.t.Errorf("unexpected upstream path: %s %s", r.Method, r.URL.Path)
 		http.Error(w, `{"type":"error","error":{"type":"not_found_error","message":"unknown path"}}`,
 			http.StatusNotFound)

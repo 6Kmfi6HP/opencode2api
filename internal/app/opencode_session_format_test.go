@@ -117,8 +117,9 @@ func TestOpenCode_RequestHeadersMirrorClient(t *testing.T) {
 	if !regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`).MatchString(req.Header.Get("x-opencode-session")) {
 		t.Fatalf("x-opencode-session = %q has wrong format", req.Header.Get("x-opencode-session"))
 	}
-	if !regexp.MustCompile(`^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`).MatchString(req.Header.Get("x-opencode-request")) {
-		t.Fatalf("x-opencode-request = %q has wrong format", req.Header.Get("x-opencode-request"))
+	// inference/v1 路径不发 x-opencode-request（其存在本身触发 403）；仅 go/v1 路径发送。
+	if got := req.Header.Get("x-opencode-request"); got != "" {
+		t.Fatalf("x-opencode-request = %q, want empty on inference/v1 path", got)
 	}
 }
 

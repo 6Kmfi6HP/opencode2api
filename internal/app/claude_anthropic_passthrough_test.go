@@ -40,12 +40,12 @@ func TestClaudeAnthropicPassthrough_Buffered(t *testing.T) {
 		t.Fatalf("body = %s, want passthrough text", rec.Body.String())
 	}
 
-	// 请求应打到 /zen/v1/messages。
+	// 请求应打到 /inference/v1/messages。
 	if len(transport.requestedURLs) != 1 {
 		t.Fatalf("URLs = %#v, want single messages call", transport.requestedURLs)
 	}
-	if !strings.HasSuffix(transport.requestedURLs[0], "/zen/v1/messages") {
-		t.Fatalf("URL = %s, want /zen/v1/messages", transport.requestedURLs[0])
+	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/messages") {
+		t.Fatalf("URL = %s, want /inference/v1/messages", transport.requestedURLs[0])
 	}
 	if got := transport.requestHeaders[0].Get("anthropic-version"); got != "2023-06-01" {
 		t.Fatalf("anthropic-version = %q, want 2023-06-01", got)
@@ -111,7 +111,7 @@ func TestClaudeAnthropicPassthrough_Stream(t *testing.T) {
 			t.Fatalf("stream body missing %q; body=%s", want, body)
 		}
 	}
-	if !strings.HasSuffix(transport.requestedURLs[0], "/zen/v1/messages") {
+	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/messages") {
 		t.Fatalf("URL = %s", transport.requestedURLs[0])
 	}
 	// 上游流式请求 Accept 应为 text/event-stream。
@@ -172,7 +172,7 @@ func TestBuildOCRequestWithSubpath_Messages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req.URL.String() != "https://upstream.test/zen/v1/messages" {
+	if req.URL.String() != "https://upstream.test/inference/v1/messages" {
 		t.Fatalf("URL = %s", req.URL)
 	}
 	if req.Header.Get("anthropic-version") != "2023-06-01" {
