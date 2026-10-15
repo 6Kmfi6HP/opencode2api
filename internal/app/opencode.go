@@ -38,12 +38,12 @@ func randomHex(n int) string {
 // ======================== OpenCode 会话 ========================
 
 const (
-	headerOpencodeSession   = "x-opencode-session"
-	headerOCSessionID       = "x-session-id"
-	headerOCSessionAffnity  = "x-session-affinity"
+	headerOpencodeSession  = "x-opencode-session"
+	headerOCSessionID      = "x-session-id"
+	headerOCSessionAffnity = "x-session-affinity"
 	// headerOCSessionIDNew 是 2026-10-14 抓包发现 CLI v2.0.29 新增的头,
 	// 与 x-session-id 同值双发。
-	headerOCSessionIDNew    = "x-opencode-session-id"
+	headerOCSessionIDNew = "x-opencode-session-id"
 )
 
 // ocIDMu/ocIDLastMilli/ocIDCounter 复刻上游 packages/schema/src/identifier.ts
