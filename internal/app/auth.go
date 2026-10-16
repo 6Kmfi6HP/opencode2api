@@ -51,8 +51,8 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		sessionsMu.Lock()
 		entry, ok := sessions[cookie.Value]
 		if ok {
-			// 检查是否过期
-			if time.Since(entry.createdAt) > sessionTTL {
+			// 检查是否过期（以最后使用时间为基准，与 cleanupExpiredSessions 保持一致）
+			if time.Since(entry.lastUsed) > sessionTTL {
 				delete(sessions, cookie.Value)
 				ok = false
 			} else {
@@ -95,6 +95,16 @@ func generateCSRFToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
+// isHTTPS 判断请求是否通过 HTTPS（含反向代理场景）。
+// 浏览器对 localhost 豁免 Secure cookie 要求，所以 HTTP localhost 也能正常工作；
+// 但我们的 Secure 标志只影响是否发送，不影响功能本身，因此简单判断即可。
+func isHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if adminPassword == "" {
 		http.Redirect(w, r, "/", http.StatusFound)
@@ -129,7 +139,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			Value:    token,
 			Path:     "/",
 			HttpOnly: true,
-			Secure:   true,
+			Secure:   isHTTPS(r),
 			SameSite: http.SameSiteStrictMode,
 			MaxAge:   sessionMaxAgeSecs,
 		})
@@ -144,7 +154,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			Value:    csrfToken,
 			Path:     "/",
 			HttpOnly: false, // JavaScript 需要读取
-			Secure:   true,
+			Secure:   isHTTPS(r),
 			SameSite: http.SameSiteStrictMode,
 			MaxAge:   sessionMaxAgeSecs,
 		})
@@ -170,7 +180,7 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   isHTTPS(r),
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
 	})
@@ -179,7 +189,7 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: false,
-		Secure:   true,
+		Secure:   isHTTPS(r),
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
 	})
@@ -203,7 +213,8 @@ func cleanupExpiredSessions() {
 	defer sessionsMu.Unlock()
 
 	for token, entry := range sessions {
-		if now.Sub(entry.createdAt) > sessionTTL {
+		// 以最后使用时间为基准（滑动窗口）：活跃会话不因创建早而过期
+		if now.Sub(entry.lastUsed) > sessionTTL {
 			delete(sessions, token)
 		}
 	}
@@ -265,13 +276,13 @@ func securityHeaders(next http.HandlerFunc) http.HandlerFunc {
 		// XSS 保护（旧版浏览器）
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
 
-		// 内容安全策略
+		// 内容安全策略：允许 Google Fonts（admin.html/login.html 使用）
 		w.Header().Set("Content-Security-Policy",
 			"default-src 'self'; "+
-				"script-src 'self' 'unsafe-inline'; "+ // admin.html 内联脚本
-				"style-src 'self' 'unsafe-inline'; "+
+				"script-src 'self' 'unsafe-inline'; "+
+				"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "+
+				"font-src 'self' https://fonts.gstatic.com; "+
 				"img-src 'self' data:; "+
-				"font-src 'self'; "+
 				"connect-src 'self'; "+
 				"frame-ancestors 'none'")
 

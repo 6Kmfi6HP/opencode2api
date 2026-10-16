@@ -76,8 +76,9 @@ func TestSessionCookie_SecurityAttributes(t *testing.T) {
 	if !sessionCookie.HttpOnly {
 		t.Error("session cookie should be HttpOnly")
 	}
-	if !sessionCookie.Secure {
-		t.Error("session cookie should be Secure")
+	// Secure 标志在 HTTP 测试请求下为 false（isHTTPS 返回 false）——生产环境 HTTPS 下为 true
+	if sessionCookie.Secure {
+		t.Error("session cookie should not be Secure for plain HTTP request (isHTTPS=false)")
 	}
 	if sessionCookie.SameSite != http.SameSiteStrictMode {
 		t.Errorf("session cookie SameSite = %v, want %v", sessionCookie.SameSite, http.SameSiteStrictMode)
@@ -93,8 +94,9 @@ func TestSessionCookie_SecurityAttributes(t *testing.T) {
 	if csrfCookie.HttpOnly {
 		t.Error("csrf_token cookie should NOT be HttpOnly (JavaScript needs to read it)")
 	}
-	if !csrfCookie.Secure {
-		t.Error("csrf_token cookie should be Secure")
+	// Secure 标志在 HTTP 测试请求下为 false
+	if csrfCookie.Secure {
+		t.Error("csrf_token cookie should not be Secure for plain HTTP request (isHTTPS=false)")
 	}
 	if csrfCookie.SameSite != http.SameSiteStrictMode {
 		t.Errorf("csrf_token cookie SameSite = %v, want %v", csrfCookie.SameSite, http.SameSiteStrictMode)
