@@ -136,21 +136,21 @@ func buildMux() *http.ServeMux {
 	// → 不注册这些端点，避免本地代理被无意暴露。
 	if adminAPIEnabled() {
 		// i18n 字典不带鉴权：登录页在认证前就要加载它。
-		mux.HandleFunc("/i18n.js", logging.Middleware(adminI18nJSHandler))
-		mux.HandleFunc("/login", logging.Middleware(loginHandler))
-		mux.HandleFunc("/logout", logging.Middleware(logoutHandler))
-		mux.HandleFunc("/api/config", logging.Middleware(requireAuth(adminConfigHandler)))
-		mux.HandleFunc("/api/stats", logging.Middleware(requireAuth(adminStatsHandler)))
-		mux.HandleFunc("/api/key_parse", logging.Middleware(requireAuth(keyPoolParseHandler)))
-		mux.HandleFunc("/api/key_status", logging.Middleware(requireAuth(keyPoolStatusHandler)))
-		mux.HandleFunc("/api/reload", logging.Middleware(requireAuth(reloadHandler)))
-		mux.HandleFunc("/", logging.Middleware(func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/i18n.js", securityHeaders(logging.Middleware(adminI18nJSHandler)))
+		mux.HandleFunc("/login", securityHeaders(logging.Middleware(loginHandler)))
+		mux.HandleFunc("/logout", securityHeaders(logging.Middleware(requireAuth(requireCSRF(logoutHandler)))))
+		mux.HandleFunc("/api/config", securityHeaders(logging.Middleware(requireAuth(requireCSRF(adminConfigHandler)))))
+		mux.HandleFunc("/api/stats", securityHeaders(logging.Middleware(requireAuth(requireCSRF(adminStatsHandler)))))
+		mux.HandleFunc("/api/key_parse", securityHeaders(logging.Middleware(requireAuth(requireCSRF(keyPoolParseHandler)))))
+		mux.HandleFunc("/api/key_status", securityHeaders(logging.Middleware(requireAuth(keyPoolStatusHandler))))
+		mux.HandleFunc("/api/reload", securityHeaders(logging.Middleware(requireAuth(requireCSRF(reloadHandler)))))
+		mux.HandleFunc("/", securityHeaders(logging.Middleware(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/" {
 				requireAuth(adminPageHandler)(w, r)
 				return
 			}
 			http.NotFound(w, r)
-		}))
+		})))
 	}
 	return mux
 }
@@ -208,6 +208,9 @@ func initProxyCoreWithSave(save bool) {
 	}
 
 	startModelRefresh()
+	if adminAPIEnabled() {
+		startSessionCleanup()
+	}
 }
 
 // startServer binds the HTTP server to addr and starts serving. Returns the

@@ -1607,12 +1607,21 @@ function toggleTheme() {
   applyTheme(next);
 }
 
+// Extract CSRF token from cookie
+function getCSRFToken() {
+  const match = document.cookie.match(/csrf_token=([^;]+)/);
+  return match ? match[1] : '';
+}
+
 // Reload Session & Models
 async function reloadConfig() {
   const icon = document.getElementById('reloadIcon');
   if (icon) icon.style.animation = 'spin 0.8s linear infinite';
   try {
-    const r = await fetch('/api/reload', { method: 'POST' });
+    const r = await fetch('/api/reload', {
+      method: 'POST',
+      headers: { 'X-CSRF-Token': getCSRFToken() }
+    });
     const d = await r.json();
     showToast(t('toast.reload.ok', { free: d.free || 0, go: d.go || 0 }), 'success');
   } catch (e) {
@@ -2181,7 +2190,10 @@ async function addKeypoolBatch() {
   try {
     const r = await fetch('/api/key_parse', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': getCSRFToken()
+      },
       body: JSON.stringify({ text: text })
     });
     if (!r.ok) throw new Error(await r.text());
@@ -2307,7 +2319,10 @@ async function saveConfig() {
   try {
     const r = await fetch('/api/config', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': getCSRFToken()
+      },
       body: JSON.stringify(cfg)
     });
     if (!r.ok) throw new Error(await r.text());
@@ -2412,7 +2427,10 @@ function closeResetModal() {
 async function confirmResetStats() {
   closeResetModal();
   try {
-    const r = await fetch('/api/stats', { method: 'DELETE' });
+    const r = await fetch('/api/stats', {
+      method: 'DELETE',
+      headers: { 'X-CSRF-Token': getCSRFToken() }
+    });
     if (!r.ok) throw new Error(await r.text());
     showToast(t('toast.stats.cleared'), 'success');
     loadStats();

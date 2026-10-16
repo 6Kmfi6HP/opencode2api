@@ -7,15 +7,26 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
 )
 
 // ======================== 管理面板认证 ========================
 
+const (
+	sessionTTL        = 24 * time.Hour // 会话 24 小时后过期
+	sessionMaxAgeSecs = 86400          // 24 小时（cookie MaxAge）
+)
+
+type sessionEntry struct {
+	createdAt time.Time
+	lastUsed  time.Time
+}
+
 var (
 	adminPassword string
-	sessions      = map[string]struct{}{}
+	sessions      = map[string]sessionEntry{}
 	sessionsMu    sync.Mutex
 )
 
@@ -38,7 +49,18 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		sessionsMu.Lock()
-		_, ok := sessions[cookie.Value]
+		entry, ok := sessions[cookie.Value]
+		if ok {
+			// 检查是否过期
+			if time.Since(entry.createdAt) > sessionTTL {
+				delete(sessions, cookie.Value)
+				ok = false
+			} else {
+				// 更新最后使用时间（滑动窗口）
+				entry.lastUsed = time.Now()
+				sessions[cookie.Value] = entry
+			}
+		}
 		sessionsMu.Unlock()
 		if !ok {
 			http.Redirect(w, r, dest, http.StatusFound)
@@ -64,6 +86,15 @@ func generateToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
+// generateCSRFToken 创建加密安全的 CSRF token
+func generateCSRFToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if adminPassword == "" {
 		http.Redirect(w, r, "/", http.StatusFound)
@@ -76,7 +107,8 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			renderLoginPage(w, "login.err.parse")
 			return
 		}
-		if r.FormValue("password") != adminPassword {
+		passwordInput := r.FormValue("password")
+		if subtle.ConstantTimeCompare([]byte(passwordInput), []byte(adminPassword)) != 1 {
 			renderLoginPage(w, "login.err.password")
 			return
 		}
@@ -85,10 +117,37 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			renderLoginPage(w, "login.err.session")
 			return
 		}
+		now := time.Now()
 		sessionsMu.Lock()
-		sessions[token] = struct{}{}
+		sessions[token] = sessionEntry{
+			createdAt: now,
+			lastUsed:  now,
+		}
 		sessionsMu.Unlock()
-		http.SetCookie(w, &http.Cookie{Name: "session", Value: token, Path: "/", HttpOnly: true})
+		http.SetCookie(w, &http.Cookie{
+			Name:     "session",
+			Value:    token,
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+			MaxAge:   sessionMaxAgeSecs,
+		})
+		// 设置 CSRF token cookie（与 session 分离）
+		csrfToken, err := generateCSRFToken()
+		if err != nil {
+			renderLoginPage(w, "login.err.session")
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "csrf_token",
+			Value:    csrfToken,
+			Path:     "/",
+			HttpOnly: false, // JavaScript 需要读取
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+			MaxAge:   sessionMaxAgeSecs,
+		})
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
@@ -106,8 +165,127 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 		delete(sessions, cookie.Value)
 		sessionsMu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "session", Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "csrf_token",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: false,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1,
+	})
 	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+// startSessionCleanup 启动后台 goroutine，定期清理过期 session
+func startSessionCleanup() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			cleanupExpiredSessions()
+		}
+	}()
+}
+
+func cleanupExpiredSessions() {
+	now := time.Now()
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+
+	for token, entry := range sessions {
+		if now.Sub(entry.createdAt) > sessionTTL {
+			delete(sessions, token)
+		}
+	}
+}
+
+// requireCSRF 验证 CSRF token（双重提交 cookie 模式）
+func requireCSRF(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if adminPassword == "" {
+			next(w, r)
+			return
+		}
+
+		// GET 请求不需要 CSRF 保护
+		if r.Method == http.MethodGet {
+			next(w, r)
+			return
+		}
+
+		// /logout 豁免 CSRF（即使被 CSRF 也只是登出用户，无害）
+		if r.URL.Path == "/logout" {
+			next(w, r)
+			return
+		}
+
+		// 提取 cookie 中的 CSRF token
+		cookie, err := r.Cookie("csrf_token")
+		if err != nil || cookie.Value == "" {
+			http.Error(w, "CSRF token missing", http.StatusForbidden)
+			return
+		}
+
+		// 提取 header 中的 CSRF token
+		headerToken := r.Header.Get("X-CSRF-Token")
+		if headerToken == "" {
+			http.Error(w, "CSRF token missing in header", http.StatusForbidden)
+			return
+		}
+
+		// 常量时间比对 token
+		if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(headerToken)) != 1 {
+			http.Error(w, "CSRF token mismatch", http.StatusForbidden)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+// securityHeaders 为所有管理路由添加安全响应头
+func securityHeaders(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 防止点击劫持
+		w.Header().Set("X-Frame-Options", "DENY")
+
+		// 防止 MIME 嗅探
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		// XSS 保护（旧版浏览器）
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+
+		// 内容安全策略
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; "+
+				"script-src 'self' 'unsafe-inline'; "+ // admin.html 内联脚本
+				"style-src 'self' 'unsafe-inline'; "+
+				"img-src 'self' data:; "+
+				"font-src 'self'; "+
+				"connect-src 'self'; "+
+				"frame-ancestors 'none'")
+
+		// HSTS（仅 HTTPS）
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security",
+				"max-age=31536000; includeSubDomains")
+		}
+
+		// Referrer 策略
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		next(w, r)
+	}
 }
 
 // ======================== 认证层级 ========================
