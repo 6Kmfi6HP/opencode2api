@@ -929,6 +929,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 				args = append(args, "key_id", keyID)
 			}
 			log.Info("upstream_attempt", args...)
+			logging.UpstreamErrorDebug(ctx, up, savedReqBody, nil, nil, err.Error())
 			if canRetry {
 				client.CloseIdleConnections()
 				// 解析后的 ocSession 与本次 attempt 绑定 sticky 用的是同一个
