@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.14.31
+
+- Harden admin panel security (`fix(admin)`):
+  - 登录密码校验采用 `subtle.ConstantTimeCompare` 防范基于响应耗时的时序侧信道攻击。
+  - 管理员 Session 增加 24 小时 TTL 与滑动窗口机制（依据 `lastUsed` 更新），配合后台定期清理协程自动淘汰过期会话。
+  - Cookie 安全加固：设置 `HttpOnly`、`SameSite=Strict`、`MaxAge`，并依据请求协议（`r.TLS` / `X-Forwarded-Proto`）动态适配 `Secure` 属性以兼容纯 HTTP 本地调试与 HTTPS 生产部署。
+  - 实现双重提交 Cookie 模式（Double-Submit Cookie）的 CSRF 防护，管理后台所有状态修改请求（POST/PUT/DELETE）均强制校验 CSRF token。
+  - 增强安全响应头：注入 `X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、`X-XSS-Protection`、`Referrer-Policy` 以及针对后台页面的 `Content-Security-Policy`（允许 Google Fonts）。
+  - 新增完备的后台安全回归测试用例（`auth_security_test.go`）。
+
 ## v0.14.30
 
 - Migrate free tier from `/zen/v1` to `/inference/v1` (V2 gate): 上游 2026-10-11 起免费层迁移至 `/inference/v1`，`/zen/v1` 对所有匿名请求返回 `403 FreeTierError`。
