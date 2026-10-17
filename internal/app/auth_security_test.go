@@ -171,14 +171,14 @@ func TestCSRFProtection(t *testing.T) {
 	csrfToken := "test-csrf-token"
 
 	tests := []struct {
-		name         string
-		method       string
-		path         string
-		cookieToken  string
-		headerToken  string
-		wantCode     int
-		wantAuth     bool
-		description  string
+		name        string
+		method      string
+		path        string
+		cookieToken string
+		headerToken string
+		wantCode    int
+		wantAuth    bool
+		description string
 	}{
 		{
 			"GET request bypasses CSRF",
@@ -273,10 +273,10 @@ func TestSecurityHeaders(t *testing.T) {
 	testHandler(w, req)
 
 	expectedHeaders := map[string]string{
-		"X-Frame-Options":           "DENY",
-		"X-Content-Type-Options":    "nosniff",
-		"X-XSS-Protection":          "1; mode=block",
-		"Referrer-Policy":           "strict-origin-when-cross-origin",
+		"X-Frame-Options":        "DENY",
+		"X-Content-Type-Options": "nosniff",
+		"X-XSS-Protection":       "1; mode=block",
+		"Referrer-Policy":        "strict-origin-when-cross-origin",
 	}
 
 	for header, expected := range expectedHeaders {
