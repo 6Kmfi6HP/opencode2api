@@ -117,6 +117,13 @@ func configureLaunchGlobals(f launchFlags) {
 	if f.debug {
 		logLevel = "debug"
 	}
+	// 环境变量 OPENCODE2API_LOG_LEVEL 作为 launch 模式的日志级别默认值。
+	// -debug 标志仍可覆盖。
+	if !f.debug {
+		if envLevel := os.Getenv("OPENCODE2API_LOG_LEVEL"); envLevel != "" {
+			logLevel = envLevel
+		}
+	}
 	activeLogFile, _ = resolveLogFilePath(f.logFile, f.logExplicit, configPath, f.configExplicit)
 	logging.Stdout = false // launch mode: logs go to file only, never stdout (would corrupt the child TUI)
 	logging.MaxSize = 100

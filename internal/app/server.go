@@ -66,6 +66,13 @@ func Run() {
 
 	configExplicit := flagSet("config")
 
+	// 环境变量 OPENCODE2API_LOG_LEVEL 作为 -log-level 的默认值。
+	// 命令行显式传入时优先级更高；-debug 标志仍可覆盖。
+	if !flagSet("log-level") {
+		if envLevel := os.Getenv("OPENCODE2API_LOG_LEVEL"); envLevel != "" {
+			logLevel = envLevel
+		}
+	}
 	if debugMode && strings.EqualFold(logLevel, "info") {
 		logLevel = "debug"
 	}
