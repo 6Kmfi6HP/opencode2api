@@ -894,6 +894,12 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 			return nil, 500, nil, err
 		}
 		up = up.WithContext(ctx)
+		// debug 模式下备份请求体，以便上游出错时完整记录，生产模式下跳过。
+		var savedReqBody []byte
+		if logging.IsDebug() {
+			savedReqBody, _ = io.ReadAll(up.Body)
+			up.Body = io.NopCloser(bytes.NewReader(savedReqBody))
+		}
 		attemptStart := time.Now()
 		resp, err := client.Do(up)
 		durationMs := time.Since(attemptStart).Milliseconds()
@@ -962,6 +968,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		resp.Body.Close()
 		logging.UpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL)
+		logging.UpstreamErrorDebug(ctx, up, savedReqBody, resp.Header, errBody, "")
 		if pooled {
 			reportKeyResult(keyID, resp.StatusCode, nil, errBody)
 			statsx.RecordKeyUsage(keyID, resp.StatusCode, string(truncateKeyErrBytes(errBody)))

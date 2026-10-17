@@ -97,6 +97,11 @@ func SetLevelString(s string) {
 	levelVar.Set(parseLogLevel(s))
 }
 
+// IsDebug reports whether the current log level is debug.
+func IsDebug() bool {
+	return levelVar.Level() <= slog.LevelDebug
+}
+
 // LevelString returns the current log level as a canonical string.
 func LevelString() string {
 	switch levelVar.Level() {
@@ -133,8 +138,8 @@ func isSensitiveLogKey(key string) bool {
 
 func looksLikeSecretValue(s string) bool {
 	trimmed := strings.TrimSpace(s)
-	if strings.HasPrefix(trimmed, "Bearer ") {
-		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "Bearer "))
+	if after, ok := strings.CutPrefix(trimmed, "Bearer "); ok {
+		trimmed = strings.TrimSpace(after)
 	}
 	return strings.HasPrefix(trimmed, "sk-") && len(trimmed) > 8
 }
@@ -613,6 +618,45 @@ func MaybeBodySummary(ctx context.Context, label string, raw []byte) {
 		return
 	}
 	FromContext(ctx).Debug(label, "summary", summarizeJSONBody(raw, 4096))
+}
+
+// UpstreamErrorDebug logs a debug-level record with the full upstream request
+// details (URL, headers, request body, response headers, response body) when
+// the upstream returns a non-2xx status or the transport fails. No redaction
+// is applied — values are logged verbatim so callers can diagnose auth /
+// routing failures exactly as sent. errMsg is recorded when non-empty
+// (transport errors); for HTTP error responses pass "".
+//
+// Gated on debug log level; at info/warn/error level it is a no-op so
+// production deployments pay zero overhead. The log file is rotated and
+// aged out by the shared lumberjack rotator (MaxSize/MaxBackups/MaxAge),
+// so debug traces never grow unbounded.
+func UpstreamErrorDebug(ctx context.Context, req *http.Request, reqBody []byte, respHeaders http.Header, respBody []byte, errMsg string) {
+	if levelVar.Level() > slog.LevelDebug {
+		return
+	}
+	hdrs := make(map[string]string, len(req.Header))
+	for k, vals := range req.Header {
+		hdrs[k] = strings.Join(vals, ", ")
+	}
+	attrs := []any{
+		"url", req.URL.String(),
+		"method", req.Method,
+		"req_headers", hdrs,
+		"req_body", string(reqBody),
+		"resp_body", string(respBody),
+	}
+	if len(respHeaders) > 0 {
+		rh := make(map[string]string, len(respHeaders))
+		for k, vals := range respHeaders {
+			rh[k] = strings.Join(vals, ", ")
+		}
+		attrs = append(attrs, "resp_headers", rh)
+	}
+	if errMsg != "" {
+		attrs = append(attrs, "error", errMsg)
+	}
+	FromContext(ctx).Debug("upstream_request_debug", attrs...)
 }
 
 // UpstreamError logs an upstream error with per-model/status/base-URL
