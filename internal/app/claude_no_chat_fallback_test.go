@@ -52,11 +52,11 @@ func TestClaudeResponsesPassthrough_NoChatFallbackOnFailure(t *testing.T) {
 		t.Fatalf("expected at least one upstream call, got none")
 	}
 	for _, u := range transport.requestedURLs {
-		if strings.HasSuffix(u, "/inference/v1/chat/completions") {
+		if strings.HasSuffix(u, "/inference/openai/v1/chat/completions") {
 			t.Fatalf("found chat fallback to %s; native-responses model must not fall back", u)
 		}
-		if !strings.HasSuffix(u, "/inference/v1/responses") {
-			t.Fatalf("URL = %s, want /inference/v1/responses", u)
+		if !strings.HasSuffix(u, "/inference/openai/v1/responses") {
+			t.Fatalf("URL = %s, want /inference/openai/v1/responses", u)
 		}
 	}
 	if !strings.Contains(rec.Body.String(), "native-responses model cannot fall back to chat") {
@@ -107,8 +107,8 @@ func TestClaudeResponsesForward_NonStreamReadErrRetrySameProtocol(t *testing.T) 
 		t.Fatalf("requested URLs = %#v, want exactly two responses calls (retry on same protocol)", transport.requestedURLs)
 	}
 	for i, u := range transport.requestedURLs {
-		if !strings.HasSuffix(u, "/inference/v1/responses") {
-			t.Fatalf("URL[%d] = %s, want /inference/v1/responses (same-protocol retry)", i, u)
+		if !strings.HasSuffix(u, "/inference/openai/v1/responses") {
+			t.Fatalf("URL[%d] = %s, want /inference/openai/v1/responses (same-protocol retry)", i, u)
 		}
 	}
 }

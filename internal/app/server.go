@@ -128,6 +128,12 @@ func buildMux() *http.ServeMux {
 	mux.HandleFunc("/v1/messages/count_tokens", sessionContextMiddleware(logging.Middleware(claudeCountTokensHandler)))
 	mux.HandleFunc("/v1/systemone", sessionContextMiddleware(logging.Middleware(systemoneHandler)))
 	mux.HandleFunc("/v1/models", sessionContextMiddleware(logging.Middleware(listModelsHandler)))
+	// OpenCode Console Inference API 路径（向后兼容 + Console 官方路径）
+	mux.HandleFunc("/inference/openai/v1/chat/completions", sessionContextMiddleware(logging.Middleware(chatCompletionsHandler)))
+	mux.HandleFunc("/inference/openai/v1/responses", sessionContextMiddleware(logging.Middleware(responsesHandler)))
+	mux.HandleFunc("/inference/anthropic/v1/messages", sessionContextMiddleware(logging.Middleware(claudeMessagesHandler)))
+	mux.HandleFunc("/inference/anthropic/v1/messages/count_tokens", sessionContextMiddleware(logging.Middleware(claudeCountTokensHandler)))
+	mux.HandleFunc("/inference/v1/models", sessionContextMiddleware(logging.Middleware(listModelsHandler)))
 	mux.HandleFunc("/health", logging.Middleware(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))

@@ -26,10 +26,22 @@
 | `/v1/messages` | `POST` | Anthropic Messages 兼容入口 |
 | `/v1/messages/count_tokens` | `POST` | Anthropic token 计数入口：命中 anthropic 规则时直连上游 `/zen/v1/messages/count_tokens`，否则本地启发式估算 |
 | `/v1/systemone` | `POST` | TypeSafe System One 协议入口（`state` + typed `questions` → structured `answers`），直通上游 `/zen/v1/systemone`；仅 jev 系列模型可用——该模型不做文本生成，无法用 Chat / Responses / Messages 任何一条协议驱动。body 除 `model` 外原样透传，不走协议路由/协议转换，也不套用免费层指纹重做（该门禁只作用于 chat/completions/messages/responses 三个上游子路径） |
+| `/inference/openai/v1/chat/completions` | `POST` | OpenAI Chat Completions 入口（OpenCode Console 官方路径），行为等同 `/v1/chat/completions` |
+| `/inference/openai/v1/responses` | `POST` | OpenAI Responses 入口（OpenCode Console 官方路径），行为等同 `/v1/responses` |
+| `/inference/anthropic/v1/messages` | `POST` | Anthropic Messages 入口（OpenCode Console 官方路径），行为等同 `/v1/messages` |
+| `/inference/anthropic/v1/messages/count_tokens` | `POST` | Anthropic token 计数入口（OpenCode Console 官方路径），行为等同 `/v1/messages/count_tokens` |
+| `/inference/v1/models` | `GET` | 模型列表入口（OpenCode Console 官方路径），行为等同 `/v1/models` |
 | `/health` | `GET` | 健康检查 |
 | `/api/config` | `GET`/`POST` | 管理面板配置接口 |
 | `/api/stats` | `GET`/`DELETE` | token 统计接口 |
 | `/api/reload` | `POST` | 刷新 OpenCode 会话和模型列表；并发请求共享一次刷新 |
+
+### OpenCode Console 官方路径支持
+
+从 v0.14.32 开始，网关同时支持传统 `/v1/*` 路径和 OpenCode Console 官方 `/inference/*` 路径（[文档](https://opencode.ai/v2/docs/console/api/inference/)），两者功能完全等效。客户端可根据场景选择：
+
+- **传统路径** `/v1/*`：与 OpenAI / Anthropic 官方 API 路径一致，适合从标准客户端迁移。
+- **官方路径** `/inference/*`：OpenCode Console 文档标准路径，适合新接入或明确对标 OpenCode 的场景。
 
 `GET /v1/models` 的返回会随鉴权模式变化：
 

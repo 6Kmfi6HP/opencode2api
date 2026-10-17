@@ -719,7 +719,16 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	if useGoEndpoint {
 		upstreamURL = "https://opencode.ai/zen/go/v1/" + subpath
 	} else {
-		upstreamURL = baseURL + "/inference/v1/" + subpath
+		// 2026-10-17: Console Inference API 要求协议前缀
+		// https://opencode.ai/v2/docs/console/api/inference/
+		var protocolPrefix string
+		if strings.HasPrefix(subpath, "messages") {
+			protocolPrefix = "anthropic/"
+		} else if subpath == "responses" || subpath == "chat/completions" {
+			protocolPrefix = "openai/"
+		}
+		// systemone 等其他路径不带协议前缀
+		upstreamURL = baseURL + "/inference/" + protocolPrefix + "v1/" + subpath
 	}
 	// 上游偶发对无 Accept-Encoding 的 Go 默认 gzip 响应不吐 identity,
 	// 客户端拿到的会是乱码 gzip 二进制;显式 identity 避免歧义。

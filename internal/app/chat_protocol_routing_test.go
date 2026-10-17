@@ -787,13 +787,13 @@ func TestDispatch_NoRules_DefaultBehaviorUnchanged(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/chat/completions") {
+	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/openai/v1/chat/completions") {
 		t.Fatalf("URL = %s, want chat/completions", transport.requestedURLs[0])
 	}
 }
 
 // TestDispatch_ChatToAnthropicRule 规则命中 anthropic 时 chat 入站打到
-// /inference/v1/messages。
+// /inference/anthropic/v1/messages。
 func TestDispatch_ChatToAnthropicRule(t *testing.T) {
 	setProtocolRulesForTest(t, []domain.ProtocolRule{{Pattern: "go-anthropic-*", Protocol: "anthropic"}})
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
@@ -809,13 +809,13 @@ func TestDispatch_ChatToAnthropicRule(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "via anthropic") {
 		t.Fatalf("body = %s", rec.Body.String())
 	}
-	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/messages") {
-		t.Fatalf("URL = %s, want /inference/v1/messages", transport.requestedURLs[0])
+	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/anthropic/v1/messages") {
+		t.Fatalf("URL = %s, want /inference/anthropic/v1/messages", transport.requestedURLs[0])
 	}
 }
 
 // TestDispatch_ChatToResponsesRule 规则命中 responses 时 chat 入站打到
-// /inference/v1/responses。
+// /inference/anthropic/v1/responses。
 func TestDispatch_ChatToResponsesRule(t *testing.T) {
 	setProtocolRulesForTest(t, []domain.ProtocolRule{{Pattern: "go-responses-*", Protocol: "responses"}})
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
@@ -831,8 +831,8 @@ func TestDispatch_ChatToResponsesRule(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "via responses") {
 		t.Fatalf("body = %s", rec.Body.String())
 	}
-	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/responses") {
-		t.Fatalf("URL = %s, want /inference/v1/responses", transport.requestedURLs[0])
+	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/openai/v1/responses") {
+		t.Fatalf("URL = %s, want /inference/openai/v1/responses", transport.requestedURLs[0])
 	}
 }
 
@@ -849,13 +849,13 @@ func TestDispatch_ClaudeToAnthropicRule(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/messages") {
-		t.Fatalf("URL = %s, want /inference/v1/messages", transport.requestedURLs[0])
+	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/anthropic/v1/messages") {
+		t.Fatalf("URL = %s, want /inference/anthropic/v1/messages", transport.requestedURLs[0])
 	}
 }
 
 // TestDispatch_ResponsesToAnthropicRule 规则命中 anthropic 时 responses 入站
-// 走 /inference/v1/messages（请求为转换后的 Anthropic 形状）。
+// 走 /inference/anthropic/v1/messages（请求为转换后的 Anthropic 形状）。
 func TestDispatch_ResponsesToAnthropicRule(t *testing.T) {
 	setProtocolRulesForTest(t, []domain.ProtocolRule{{Pattern: "go-anthropic-*", Protocol: "anthropic"}})
 	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
@@ -871,8 +871,8 @@ func TestDispatch_ResponsesToAnthropicRule(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "resp via anthropic") {
 		t.Fatalf("body = %s", rec.Body.String())
 	}
-	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/messages") {
-		t.Fatalf("URL = %s, want /inference/v1/messages", transport.requestedURLs[0])
+	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/anthropic/v1/messages") {
+		t.Fatalf("URL = %s, want /inference/anthropic/v1/messages", transport.requestedURLs[0])
 	}
 	// 请求体应为 Anthropic 形状（max_tokens 必填兜底）。
 	payload := transport.requestPayloads[0]
@@ -929,7 +929,7 @@ func TestAggregateResponsesStreamToChat_NonStream(t *testing.T) {
 }
 
 // TestDispatch_ChatToResponsesMemory 记忆层命中（native-responses registry）
-// 时 chat 入站直接打 /inference/v1/responses，不再走 chat/completions + probe 回退。
+// 时 chat 入站直接打 /inference/openai/v1/responses，不再走 chat/completions + probe 回退。
 // 这是 muse-spark-*-contributor[-free] 的修复关键：chat 通道 500 整档拒，
 // 只能靠 memory 层预路由绕开。
 func TestDispatch_ChatToResponsesMemory(t *testing.T) {
@@ -951,8 +951,8 @@ func TestDispatch_ChatToResponsesMemory(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/responses") {
-		t.Fatalf("URL = %s, want /inference/v1/responses (memory-routed), got %#v", transport.requestedURLs[0], transport.requestedURLs)
+	if !strings.HasSuffix(transport.requestedURLs[0], "/inference/openai/v1/responses") {
+		t.Fatalf("URL = %s, want /inference/openai/v1/responses (memory-routed), got %#v", transport.requestedURLs[0], transport.requestedURLs)
 	}
 	// 非流式客户端应收到聚合后的 chat.completion JSON（非 SSE）
 	var out map[string]any

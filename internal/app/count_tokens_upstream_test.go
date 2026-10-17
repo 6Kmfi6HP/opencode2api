@@ -14,7 +14,7 @@ import (
 )
 
 // 命中 protocol_rules 的 anthropic 规则时，count_tokens 应直连
-// /inference/v1/messages/count_tokens，且 2xx 响应透传 input_tokens。
+// /inference/anthropic/v1/messages/count_tokens,且 2xx 响应透传 input_tokens。
 func TestCountTokensHandler_RouteHitAnthropicForwardsUpstream(t *testing.T) {
 	const model = "claude-x-ct-hit"
 	setProtocolRulesForTest(t, []domain.ProtocolRule{{Pattern: "claude-x-*", Protocol: "anthropic"}})
@@ -40,8 +40,8 @@ func TestCountTokensHandler_RouteHitAnthropicForwardsUpstream(t *testing.T) {
 	if resp["input_tokens"] != float64(321) {
 		t.Fatalf("input_tokens = %#v, want 321 (upstream passthrough)", resp["input_tokens"])
 	}
-	if len(transport.requestedURLs) != 1 || !strings.HasSuffix(transport.requestedURLs[0], "/inference/v1/messages/count_tokens") {
-		t.Fatalf("URL = %#v, want single /inference/v1/messages/count_tokens call", transport.requestedURLs)
+	if len(transport.requestedURLs) != 1 || !strings.HasSuffix(transport.requestedURLs[0], "/inference/anthropic/v1/messages/count_tokens") {
+		t.Fatalf("URL = %#v, want single /inference/anthropic/v1/messages/count_tokens call", transport.requestedURLs)
 	}
 	// upstream body 应只改写 model 且 max_tokens 按要求收敛到 [128, cap]。
 	payload := transport.requestPayloads[0]

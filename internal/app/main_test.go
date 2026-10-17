@@ -438,7 +438,7 @@ func TestCallOpenCodeAPIKeyedAuthDoesNotCrossModelFallback(t *testing.T) {
 			if !reflect.DeepEqual(transport.requestedModels, wantModels) {
 				t.Fatalf("requested models = %#v, want %#v (no cross-model fallback, no credits retry)", transport.requestedModels, wantModels)
 			}
-			wantURL := "https://opencode.ai/inference/v1/chat/completions"
+			wantURL := "https://opencode.ai/inference/openai/v1/chat/completions"
 			if !reflect.DeepEqual(transport.requestedURLs, []string{wantURL}) {
 				t.Fatalf("requested URLs = %#v, want single %q", transport.requestedURLs, wantURL)
 			}
@@ -635,13 +635,13 @@ func TestBuildOCRequestRoutesSharedAndGoOnlyModelsByAuthMode(t *testing.T) {
 			name:    "public stays on zen free surface",
 			auth:    UpstreamAuth{Mode: AuthRoutePublic},
 			modelID: "deepseek-v4-flash-free",
-			wantURL: "https://opencode.ai/inference/v1/chat/completions",
+			wantURL: "https://opencode.ai/inference/openai/v1/chat/completions",
 		},
 		{
 			name:    "bare key keeps shared model on zen",
 			auth:    UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-auto"},
 			modelID: "glm-5.2",
-			wantURL: "https://opencode.ai/inference/v1/chat/completions",
+			wantURL: "https://opencode.ai/inference/openai/v1/chat/completions",
 		},
 		{
 			name:    "go prefix sends shared model to go surface",
@@ -659,7 +659,7 @@ func TestBuildOCRequestRoutesSharedAndGoOnlyModelsByAuthMode(t *testing.T) {
 			name:    "zen prefix forces zen surface",
 			auth:    UpstreamAuth{Mode: AuthRouteZen, Token: "sk-zen"},
 			modelID: "glm-5.2",
-			wantURL: "https://opencode.ai/inference/v1/chat/completions",
+			wantURL: "https://opencode.ai/inference/openai/v1/chat/completions",
 		},
 	}
 

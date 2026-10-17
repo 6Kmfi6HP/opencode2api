@@ -23,7 +23,7 @@ import (
 // 所以 fake 上游说的是 chat/completions。It asserts the full round trip:
 //
 //  1. codex emits a streaming /responses request (stream=true, instructions
-//     set); the proxy translates it into a /inference/v1/chat/completions request
+//     set); the proxy translates it into a /inference/openai/v1/chat/completions request
 //     (default chat translation path).
 //  2. The proxy converts the chat SSE back into Responses events
 //     (response.created → output_item.added → function_call_arguments.delta/
@@ -132,7 +132,7 @@ func TestE2ELaunchCodex(t *testing.T) {
 	}
 
 	turns := fake.Turns()
-	t.Logf("fake upstream saw %d /inference/v1/chat/completions request(s)", len(turns))
+	t.Logf("fake upstream saw %d /inference/openai/v1/chat/completions request(s)", len(turns))
 	for i, turn := range turns {
 		t.Logf("turn %d: stream=%v model=%q tool_names=%v msg_roles=%v",
 			i, turn.Stream, turn.Model, turn.ToolNames, messageRoles(turn.Messages))
@@ -145,7 +145,7 @@ func TestE2ELaunchCodex(t *testing.T) {
 
 	if len(turns) < 2 {
 		dump()
-		t.Fatalf("fake upstream saw %d /inference/v1/chat/completions request(s), want >= 2 (second turn proves codex consumed the streamed tool_call and sent the tool result back)", len(turns))
+		t.Fatalf("fake upstream saw %d /inference/openai/v1/chat/completions request(s), want >= 2 (second turn proves codex consumed the streamed tool_call and sent the tool result back)", len(turns))
 	}
 
 	// Turn 1: the proxy must translate codex's Responses request into a chat
@@ -247,7 +247,7 @@ func (f *fakeChatUpstream) handle(w http.ResponseWriter, r *http.Request) {
 		// Two IDs: buildCodexModelCatalogSpecs needs at least the launched
 		// model in the startup catalog or codex receives no catalog at all.
 		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5-codex","object":"model"},{"id":"big-pickle","object":"model"}]}`))
-	case r.Method == http.MethodPost && r.URL.Path == "/inference/v1/chat/completions":
+	case r.Method == http.MethodPost && r.URL.Path == "/inference/openai/v1/chat/completions":
 		f.handleChatCompletions(w, r)
 	default:
 		http.Error(w, "unexpected path: "+r.Method+" "+r.URL.Path, http.StatusNotFound)
