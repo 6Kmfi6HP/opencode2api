@@ -14,6 +14,7 @@ type Snapshot struct {
 	MaxTokensCapPerModel map[string]int
 	ReasoningEffortMap   map[string]string
 	ForceDisableThinking bool
+	ForceFree            bool
 	PromptCacheRetention string
 	CacheBreakpoints     bool
 	TextOnlyModels       []string
@@ -107,6 +108,11 @@ func CacheBreakpoints() bool {
 // ForceDisableThinking reports whether reasoning is disabled globally.
 func ForceDisableThinking() bool {
 	return Get().ForceDisableThinking
+}
+
+// ForceFree reports whether all requests must use free-tier model variants.
+func ForceFree() bool {
+	return Get().ForceFree
 }
 
 // StreamEmptyRetryMax reports how many times the claude→responses stream may

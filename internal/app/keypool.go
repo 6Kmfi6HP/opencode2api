@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
 )
 
 const (
@@ -187,6 +189,17 @@ const keyPoolRetrySuffix = "|pool-retry"
 func publicPoolEnabled() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("OPENCODE2API_POOL_PUBLIC")))
 	return v != "0" && v != "false" && v != "no" && v != "off"
+}
+
+// forceFreeEnabled 报告是否强制所有鉴权模式（包括 keypool）只使用免费额度模型。
+// 优先级：OPENCODE2API_FORCE_FREE 环境变量（部署期硬覆盖）> config.ForceFree
+// （管理面板可在线修改并持久化）。两者任一为真即生效。
+func forceFreeEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("OPENCODE2API_FORCE_FREE")))
+	if v == "1" || v == "true" || v == "yes" || v == "on" {
+		return true
+	}
+	return config.ForceFree()
 }
 
 // selectPoolKey picks a pooled key for this request. scope carries the

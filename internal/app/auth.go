@@ -436,7 +436,7 @@ func publicFacingModelID(modelID string) string {
 // resolved free ID (e.g. "deepseek-v4-flash[1m]" → "deepseek-v4-flash-free[1m]").
 func mapPublicToFreeModel(auth UpstreamAuth, modelID string) string {
 	base, suffix := stripContextSuffix(modelID)
-	if auth.Mode != AuthRoutePublic || isFreeModel(base) {
+	if (auth.Mode != AuthRoutePublic && !forceFreeEnabled()) || isFreeModel(base) {
 		return modelID
 	}
 	if freeID := base + "-free"; modelExistsInCaches(freeID) {

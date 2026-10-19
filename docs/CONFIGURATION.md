@@ -312,6 +312,7 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 | `OPENCODE2API_SHELL_GRACE_MS` | `5000` | Responses 壳帧宽限窗毫秒数:壳帧后等待产出帧的时长,到期仍只有壳帧按健康慢流放行;`0` 恢复「任意帧即 commit」的旧行为 |
 | `OPENCODE2API_UPSTREAM_TIMEOUT_SECS` | `900` | 上游 http.Client 墙钟超时秒数(Go `Timeout` 覆盖整个响应体流式读取);`<=0` 关闭整体墙钟,交由流中断分支 + 客户端断开兜底 |
 | `OPENCODE2API_POOL_PUBLIC` | on | public auth 下免费模型是否交由 `key_pool` 接管(round_robin 分摊每账号输出限额);`off` 回退 public 直连。池整体黑名单级失败时自动回落直连,绝不弄坏原本可用路径 |
+| `OPENCODE2API_FORCE_FREE` | off | 强制所有鉴权模式（包括 keypool）只使用免费额度模型：`/v1/models` 只展示 `-free` 变体（去掉后缀）、上游请求模型名自动加 `-free`，行为等同 public 模式的过滤与改写，但 key 鉴权路径不变。`1`/`true`/`yes`/`on` 启用 |
 
 > 免费档限速说明:opencode.ai 免费层的 Output-token 限速是身份/出口级共享桶,承压窗口内外生波动。网关对 429 退避重试(Retry-After 优先,缺省 1s/2s/3s 递增,cap 5s),并在壳帧宽限窗内对「限速杀死型空流」换 key 重试——把空轮/截断收敛为延迟或明确报错,agent 任务不再无限停摆。
 
