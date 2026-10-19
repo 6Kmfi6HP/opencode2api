@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
@@ -116,7 +117,7 @@ func TestFreeTierFingerprint_SKKeyFreeModelNoTools(t *testing.T) {
 }
 
 // A2: Bearer public + big-pickle + 客户端自带 weather ⇒ 保留 weather 在前,
-// 追加标准四件（缓存优化：移除四件变体后统一追加）。
+// 仅追加缺失的 bash/glob/grep/read(顺序 bash,glob,grep,read)。
 func TestFreeTierFingerprint_PublicPartialClientTools(t *testing.T) {
 	modelsdev.SetFreeModelsForTest("big-pickle")
 	t.Cleanup(func() { modelsdev.SetFreeModelsForTest() })
@@ -138,14 +139,14 @@ func TestFreeTierFingerprint_PublicPartialClientTools(t *testing.T) {
 	}
 	names := assertFreeTierToolsPresent(t, sent)
 	if len(names) != 5 {
-		t.Fatalf("tools = %v, want exactly weather + 4 standard", names)
+		t.Fatalf("tools = %v, want exactly weather + 4 required", names)
 	}
 	if names[0] != "weather" {
 		t.Fatalf("client tool must stay first, got order %v", names)
 	}
 	for i, want := range []string{"bash", "glob", "grep", "read"} {
 		if names[1+i] != want {
-			t.Fatalf("standard tools order = %v, want bash,glob,grep,read appended after weather", names)
+			t.Fatalf("appended tools order = %v, want bash,glob,grep,read appended after weather", names)
 		}
 	}
 }
@@ -214,8 +215,8 @@ func TestFreeTierFingerprint_SKKeyContributorFreeModel(t *testing.T) {
 }
 
 // A4: anthropic 原生 subpath "messages" + 付费 key + -free 模型 ⇒ 同样重做指纹。
-// 客户端带 bash(Anthropic 形状)时移除后统一追加标准四件（缓存优化）;
-// 只强制 stream,不往 Anthropic schema 里塞 OpenAI 专属的 stream_options。
+// 客户端已带 bash(Anthropic 形状)时保留且不重复,仅追加余下三件;只强制 stream,
+// 不往 Anthropic schema 里塞 OpenAI 专属的 stream_options。
 func TestFreeTierFingerprint_SubpathMessages(t *testing.T) {
 	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRouteAuto, Token: "sk-realkey0123456789abcdef"}
@@ -242,14 +243,10 @@ func TestFreeTierFingerprint_SubpathMessages(t *testing.T) {
 	}
 	names := assertFreeTierToolsPresent(t, sent)
 	if len(names) != 4 {
-		t.Fatalf("tools = %v, want standard 4 (bash removed then re-added)", names)
+		t.Fatalf("tools = %v, want client bash + glob/grep/read (no duplicate bash)", names)
 	}
-	// 标准四件按固定顺序: bash, glob, grep, read
-	want := []string{"bash", "glob", "grep", "read"}
-	for i, wantName := range want {
-		if names[i] != wantName {
-			t.Fatalf("tools[%d] = %q, want %q (standard order)", i, names[i], wantName)
-		}
+	if names[0] != "bash" {
+		t.Fatalf("client-provided bash must stay first, got %v", names)
 	}
 	// Anthropic 形状: 补齐的工具也应挂在 name 字段下,而不是 OpenAI 的 function 包装。
 	rawTools, _ := sent["tools"].([]any)
@@ -336,11 +333,11 @@ func TestFreeTierFingerprint_PaidModelAndCountTokensSkipped(t *testing.T) {
 	}
 }
 
-// NormalizeFourTools: 客户端带 PascalCase 四件(Bash/Glob/Grep/Read)时,
-// ensureFreeTierTools 移除所有四件工具变体,统一追加标准小写四件。
-// 缓存优化策略(2026-10-19):移除 + 统一追加,确保所有"只用四件"的客户端
-// 发给上游的 tools 数组完全一致,最大化缓存命中率。
-func TestEnsureFreeTierTools_NormalizePascalCase(t *testing.T) {
+// LowercaseStub: 客户端已带 PascalCase 四件(Bash/Glob/Grep/Read)时,
+// ensureFreeTierTools 必须追加小写 stub(上游免费层门禁按小写名精确匹配,
+// 大小写敏感;2026-10-07 public 实测:只带 PascalCase 四件被 403 整档拒)。
+// 终态 tools = 4 原工具(PascalCase,位置保留) + 4 小写 stub。
+func TestEnsureFreeTierTools_CaseInsensitiveNoDup(t *testing.T) {
 	mkFn := func(name string) map[string]any {
 		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
 	}
@@ -360,23 +357,33 @@ func TestEnsureFreeTierTools_NormalizePascalCase(t *testing.T) {
 			bodyMap := map[string]any{"tools": tc.tools}
 			ensureFreeTierTools(bodyMap, tc.subpath)
 			rawTools, _ := bodyMap["tools"].([]any)
-			names := toolNames(t, bodyMap)
-			if len(rawTools) != 4 {
-				t.Fatalf("subpath %q: tools = %v, want 4 (normalized to standard lowercase)", tc.subpath, names)
+			if len(rawTools) != 8 {
+				names := toolNames(t, bodyMap)
+				t.Fatalf("subpath %q: tools = %v, want 8 (4 PascalCase + 4 lowercase stub)", tc.subpath, names)
 			}
-			// 全部为标准小写且顺序固定: bash, glob, grep, read
-			want := []string{"bash", "glob", "grep", "read"}
-			for i, wantName := range want {
-				if names[i] != wantName {
-					t.Fatalf("subpath %q: tools[%d] = %q, want %q (standard order)", tc.subpath, i, names[i], wantName)
+			// 前 4 个保持原 PascalCase,后 4 个为小写 stub 且顺序固定。
+			lower := map[string]bool{}
+			for i, tl := range rawTools {
+				name := freeTierToolNameOf(tl.(map[string]any))
+				if i < 4 {
+					continue
+				}
+				if name != strings.ToLower(name) {
+					t.Fatalf("subpath %q: stub %d = %q, want lowercase", tc.subpath, i, name)
+				}
+				lower[name] = true
+			}
+			for _, want := range []string{"bash", "glob", "grep", "read"} {
+				if !lower[want] {
+					t.Fatalf("subpath %q: missing lowercase stub %q", tc.subpath, want)
 				}
 			}
 		})
 	}
 }
 
-// LowercaseIdempotent: 客户端已带小写四件时幂等(移除后重新追加,结果相同)。
-func TestEnsureFreeTierTools_LowercaseIdempotent(t *testing.T) {
+// LowercaseHit: 客户端已带小写四件时不追加(幂等),三个 subpath 各一测。
+func TestEnsureFreeTierTools_LowercaseNoDup(t *testing.T) {
 	mkFn := func(name string) map[string]any {
 		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
 	}
@@ -396,67 +403,10 @@ func TestEnsureFreeTierTools_LowercaseIdempotent(t *testing.T) {
 			bodyMap := map[string]any{"tools": tc.tools}
 			ensureFreeTierTools(bodyMap, tc.subpath)
 			rawTools, _ := bodyMap["tools"].([]any)
-			names := toolNames(t, bodyMap)
 			if len(rawTools) != 4 {
-				t.Fatalf("subpath %q: tools = %v, want 4 (idempotent)", tc.subpath, names)
-			}
-			want := []string{"bash", "glob", "grep", "read"}
-			for i, wantName := range want {
-				if names[i] != wantName {
-					t.Fatalf("subpath %q: tools[%d] = %q, want %q", tc.subpath, i, names[i], wantName)
-				}
+				names := toolNames(t, bodyMap)
+				t.Fatalf("subpath %q: tools = %v, want 4 (no dup injection)", tc.subpath, names)
 			}
 		})
 	}
-}
-
-// CustomToolsPreserved: 客户端带自定义工具 + 部分四件时,移除四件变体、保留
-// 自定义工具、追加标准四件。确保缓存优化不丢失客户端业务工具。
-func TestEnsureFreeTierTools_CustomToolsPreserved(t *testing.T) {
-	mkFn := func(name string) map[string]any {
-		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
-	}
-	mkBare := func(name string) map[string]any {
-		return map[string]any{"name": name}
-	}
-
-	t.Run("chat/completions", func(t *testing.T) {
-		bodyMap := map[string]any{"tools": []any{
-			mkFn("weather"),
-			mkFn("Bash"),
-			mkFn("custom_tool"),
-		}}
-		ensureFreeTierTools(bodyMap, "chat/completions")
-		names := toolNames(t, bodyMap)
-		// 预期: [weather, custom_tool, bash, glob, grep, read]
-		if len(names) != 6 {
-			t.Fatalf("want 6 tools (2 custom + 4 standard), got %d: %v", len(names), names)
-		}
-		if names[0] != "weather" || names[1] != "custom_tool" {
-			t.Fatalf("custom tools order changed: got %v", names[:2])
-		}
-		want := []string{"bash", "glob", "grep", "read"}
-		for i, wantName := range want {
-			if names[2+i] != wantName {
-				t.Fatalf("standard tools[%d] = %q, want %q", i, names[2+i], wantName)
-			}
-		}
-	})
-
-	t.Run("messages", func(t *testing.T) {
-		bodyMap := map[string]any{"tools": []any{
-			mkBare("search"),
-			mkBare("Grep"),
-			mkBare("Read"),
-		}}
-		ensureFreeTierTools(bodyMap, "messages")
-		names := toolNames(t, bodyMap)
-		// 预期: [search, bash, glob, grep, read]
-		if len(names) != 5 {
-			t.Fatalf("want 5 tools (1 custom + 4 standard), got %d: %v", len(names), names)
-		}
-		if names[0] != "search" {
-			t.Fatalf("custom tool must stay first, got %v", names)
-		}
-	})
 }

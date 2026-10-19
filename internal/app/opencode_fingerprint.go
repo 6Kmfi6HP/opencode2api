@@ -167,59 +167,80 @@ func freeTierToolNameOf(t map[string]any) string {
 	return name
 }
 
-// normalizeFourToolsForCache 从 tools 数组中移除四件占位工具的所有大小写变体
-// (bash/Bash/BASH, glob/Glob, grep/Grep, read/Read),保留客户端自定义工具,
-// 然后统一在尾部追加标准小写四件。最大化缓存命中率:所有"只用四件工具"的
-// 客户端共享同一缓存键,所有"四件 + 同一组自定义工具"的客户端共享同一缓存键。
-func normalizeFourToolsForCache(tools []any, subpath string) []any {
-	fourToolNames := map[string]bool{
-		"bash": true, "glob": true, "grep": true, "read": true,
-		"Bash": true, "Glob": true, "Grep": true, "Read": true,
-	}
-
-	// 第一步：移除四件工具的所有变体，保留自定义工具
-	filtered := make([]any, 0, len(tools))
-	for _, t := range tools {
-		tm, ok := t.(map[string]any)
-		if !ok {
-			continue
-		}
-		name := freeTierToolNameOf(tm)
-		if !fourToolNames[name] {
-			filtered = append(filtered, t)
-		}
-	}
-
-	// 第二步：统一追加标准小写四件
-	var standardFour []map[string]any
-	switch subpath {
-	case "messages":
-		standardFour = freeTierRequiredToolsAnthropic
-	case "responses":
-		standardFour = freeTierRequiredToolsResponses
-	default: // chat/completions
-		for _, tool := range freeTierRequiredTools {
-			standardFour = append(standardFour, tool)
-		}
-	}
-
-	for _, tool := range standardFour {
-		filtered = append(filtered, tool)
-	}
-
-	return filtered
-}
-
-// ensureFreeTierTools 标准化免费层请求的 tools 数组:移除四件工具的所有大小写
-// 变体,保留客户端自定义工具,统一追加标准小写 bash/glob/grep/read。
-// 旧版"逐项补齐"策略导致缓存分叉(不同客户端的 tools 数组各异),新版统一化
-// 策略确保所有使用相同自定义工具集的客户端共享同一缓存键。
+// ensureFreeTierTools 检查上游请求体里的 tools,把 bash/glob/grep/read 四件中
+// 缺失的**逐项**补上(只补缺失项、保留客户端已有工具的原始位置与形状,
+// 四件按 bash,glob,grep,read 顺序追加在后),而不是"客户端带了任一工具就整包
+// 跳过"——上游按"有无四件"整体判定,部分带齐与完全不带一样会被 403。
+// 上游门禁按小写名精确匹配(大小写敏感),因此追加的 stub 一律小写:Claude
+// Code 的 PascalCase(Bash/Glob/Grep/Read)在建 existing 键时统一小写做命中
+// 检查,但命中不代表门禁通过——仍需追加小写 stub(2026-10-07 public 实测:
+// 只带 PascalCase 四件被 403 FreeTierError 整档拒)。
+// subpath == "messages" 用 Anthropic 的裸 name+input_schema 形状；
+// subpath == "responses" 用 OpenAI Responses 的 type:function+parameters 形状；
+// chat/completions 沿用 OpenAI 嵌套 function 形状。tools 已补齐时不动。
+// bare name 命中检查由 freeTierToolNameOf 兼容三种形状。
 func ensureFreeTierTools(bodyMap map[string]any, subpath string) {
 	if bodyMap == nil {
 		return
 	}
 	rawTools, _ := bodyMap["tools"].([]any)
-	bodyMap["tools"] = normalizeFourToolsForCache(rawTools, subpath)
+	// existing 只记录精确小写名:上游门禁按小写名精确匹配(大小写敏感),
+	// PascalCase(Bash 等)命中不代表门禁通过,仍需追加小写 stub。
+	existing := make(map[string]bool, len(rawTools)+len(freeTierRequiredTools))
+	for _, t := range rawTools {
+		tm, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name := freeTierToolNameOf(tm); name != "" && name == strings.ToLower(name) {
+			existing[name] = true
+		}
+	}
+	missing := make([]any, 0, len(freeTierRequiredTools))
+	switch subpath {
+	case "messages":
+		for _, tool := range freeTierRequiredToolsAnthropic {
+			if !existing[strings.ToLower(tool["name"].(string))] {
+				fixed := map[string]any{
+					"name":         strings.ToLower(tool["name"].(string)),
+					"description":  tool["description"],
+					"input_schema": tool["input_schema"],
+				}
+				missing = append(missing, fixed)
+			}
+		}
+	case "responses":
+		for _, tool := range freeTierRequiredToolsResponses {
+			if !existing[strings.ToLower(tool["name"].(string))] {
+				fixed := map[string]any{
+					"type":        tool["type"],
+					"name":        strings.ToLower(tool["name"].(string)),
+					"description": tool["description"],
+					"parameters":  tool["parameters"],
+				}
+				missing = append(missing, fixed)
+			}
+		}
+	default: // chat/completions
+		for _, tool := range freeTierRequiredTools {
+			fn := tool["function"].(map[string]any)
+			if !existing[strings.ToLower(fn["name"].(string))] {
+				fixed := map[string]any{
+					"type": "function",
+					"function": map[string]any{
+						"name":        strings.ToLower(fn["name"].(string)),
+						"description": fn["description"],
+						"parameters":  fn["parameters"],
+					},
+				}
+				missing = append(missing, fixed)
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	bodyMap["tools"] = append(rawTools, missing...)
 }
 
 // applyFreeTierFingerprint 对"解析后的上游模型本身是免费"的请求执行免费层
