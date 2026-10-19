@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.14.33
+
+- Standardize free-tier tools array to maximize cache hit rate (`feat(cache)`):
+  - 免费层请求统一规范化 `tools` 数组：移除客户端带入的四件占位工具（`bash`, `glob`, `grep`, `read`）及其大小写变体（如 Claude Code 的 PascalCase `Bash`/`Read`）。
+  - 完整保留客户端自定义业务工具（如 `weather`, `search` 等）。
+  - 在尾部统一追加标准小写四件 `[bash, glob, grep, read]`。
+  - 消除不同客户端补齐工具顺序与结构差异导致的上游 prompt cache key 分叉，预计总缓存命中率提升至 92-95%。
+  - 新增 `normalizeFourToolsForCache` 单元测试与幂等性验证。
+
+## v0.14.32
+
+- Support OPENCODE2API_LOG_LEVEL and upstream debugging (`feat(config)`, `feat(logging)`, `feat(routes)`):
+  - 支持通过环境变量 `OPENCODE2API_LOG_LEVEL` 设置默认日志级别（命令行 flag 与 `-debug` 保持最高优先级）。
+  - 增强上游请求排错日志：在非 2xx HTTP 状态码及网络传输错误（transport error）时输出 `upstream_request_debug` 日志，便于快速定位上游门禁与网络故障。
+  - 支持 `/inference/*` 官方路由路径，与 OpenCode Console 最新规范对齐。
+
 ## v0.14.31
 
 - Harden admin panel security (`fix(admin)`):
