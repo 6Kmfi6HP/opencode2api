@@ -163,12 +163,12 @@ type AppConfig struct {
 	// append -free to the model name. Behaviour is identical to public auth
 	// but the key authentication path is unchanged.
 	// Can also be enabled at runtime via OPENCODE2API_FORCE_FREE=1.
-	ForceFree            bool              `json:"force_free,omitempty"`
-	MaxTokensCap         int               `json:"max_tokens_cap,omitempty"`
-	MaxTokensCapPerModel map[string]int    `json:"max_tokens_cap_per_model,omitempty"`
-	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
-	ActiveSocks5         string            `json:"active_socks5,omitempty"`
-	Socks5PaidDirect     bool              `json:"socks5_paid_direct,omitempty"`
+	ForceFree            bool           `json:"force_free,omitempty"`
+	MaxTokensCap         int            `json:"max_tokens_cap,omitempty"`
+	MaxTokensCapPerModel map[string]int `json:"max_tokens_cap_per_model,omitempty"`
+	Socks5Proxies        []Socks5Proxy  `json:"socks5_proxies,omitempty"`
+	ActiveSocks5         string         `json:"active_socks5,omitempty"`
+	Socks5PaidDirect     bool           `json:"socks5_paid_direct,omitempty"`
 	// UpstreamBaseURLs lists the opencode zen upstream base URLs (e.g.
 	// reversed domains). When unset or empty the runtime falls back to
 	// ["https://opencode.ai"]. Sessions are sticky to one (base URL, proxy)
