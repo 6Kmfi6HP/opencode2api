@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.14.34
+
+- Add `force_free` mode to route all traffic to free-tier models (`feat(config)`):
+  - 新增 `force_free` 配置字段：开启后，所有鉴权路径（包括 keypool）只使用 `-free` 变体模型，`/v1/models` 只展示免费模型（剥 `-free` 后缀），上游请求模型名自动加 `-free`，行为与 public auth 完全一致，但 key 鉴权路径不变。
+  - 支持管理面板在线热切换（「推理力度映射」区域新增「强制使用免费额度」开关），保存后立即生效并持久化到 `config.json`，无需重启。
+  - 支持部署期硬覆盖：`OPENCODE2API_FORCE_FREE=1`（或 `true`/`yes`/`on`）优先于 config 字段，适合需要强制锁定的场景。
+
 ## v0.14.33
 
 - Standardize free-tier tools array to maximize cache hit rate (`feat(cache)`):
