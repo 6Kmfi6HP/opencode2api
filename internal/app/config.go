@@ -171,6 +171,7 @@ func applyConfig(cfg AppConfig) {
 			s.ReasoningEffortMap = m
 		}
 		s.ForceDisableThinking = cfg.ForceDisableThinking
+		s.ForceFree = cfg.ForceFree
 		s.MaxTokensCap = cfg.MaxTokensCap
 		if cfg.MaxTokensCapPerModel != nil {
 			m := make(map[string]int, len(cfg.MaxTokensCapPerModel))

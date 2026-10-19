@@ -1167,6 +1167,16 @@ textarea.form-control {
             <span class="switch-track"></span>
           </label>
         </div>
+        <div class="switch-wrapper">
+          <div class="switch-label-group">
+            <span class="switch-title" data-i18n="section.effortMapping.forceFreeTitle"></span>
+            <span class="switch-desc" data-i18n="section.effortMapping.forceFreeDesc"></span>
+          </div>
+          <label class="custom-switch">
+            <input type="checkbox" id="force_free">
+            <span class="switch-track"></span>
+          </label>
+        </div>
         <div class="card-actions">
           <button class="btn btn-secondary" onclick="addEffortRow()">
             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
@@ -1639,6 +1649,7 @@ async function loadConfig() {
     const r = await fetch('/api/config');
     const cfg = await r.json();
     document.getElementById('force_disable_thinking').checked = !!cfg.force_disable_thinking;
+    document.getElementById('force_free').checked = !!cfg.force_free;
     document.getElementById('socks5_paid_direct').checked = !!cfg.socks5_paid_direct;
     effortData = cfg.reasoning_effort_map || {};
     socks5Data = cfg.socks5_proxies || [];
@@ -2301,6 +2312,7 @@ async function saveConfig() {
     protocol_rules: protocolRulesData.filter(r => r.pattern && r.protocol),
     reasoning_effort_map: effortData,
     force_disable_thinking: document.getElementById('force_disable_thinking').checked,
+    force_free: document.getElementById('force_free').checked,
     max_tokens_cap: parseInt(document.getElementById('maxTokensCap').value) || 0,
     max_tokens_cap_per_model: capData,
     socks5_proxies: socks5Data,

@@ -85,6 +85,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		configMu.RUnlock()
 		cfg.ReasoningEffortMap = snap.ReasoningEffortMap
 		cfg.ForceDisableThinking = snap.ForceDisableThinking
+		cfg.ForceFree = snap.ForceFree
 		cfg.MaxTokensCap = snap.MaxTokensCap
 		cfg.MaxTokensCapPerModel = snap.MaxTokensCapPerModel
 		promptCacheRetentionRT := snap.PromptCacheRetention
@@ -108,6 +109,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			"model_alias":               cfg.ModelAlias,
 			"reasoning_effort_map":      cfg.ReasoningEffortMap,
 			"force_disable_thinking":    cfg.ForceDisableThinking,
+			"force_free":                cfg.ForceFree,
 			"max_tokens_cap":            cfg.MaxTokensCap,
 			"max_tokens_cap_per_model":  cfg.MaxTokensCapPerModel,
 			"socks5_proxies":            cfg.Socks5Proxies,
@@ -172,6 +174,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 				"aliases", len(payload.ModelAlias),
 				"effort_map", len(payload.ReasoningEffortMap),
 				"force_disable", payload.ForceDisableThinking,
+				"force_free", payload.ForceFree,
 				"max_tokens_cap", payload.MaxTokensCap,
 				"max_tokens_cap_per_model", len(payload.MaxTokensCapPerModel),
 				"log_level", logging.LevelString(),

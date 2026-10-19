@@ -1149,7 +1149,7 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		modelMu.RUnlock()
-	case auth.Mode == AuthRoutePublic:
+	case auth.Mode == AuthRoutePublic || forceFreeEnabled():
 		combinedModels = models
 		filtered := make([]ModelInfo, 0, len(combinedModels))
 		for _, m := range combinedModels {
@@ -1166,7 +1166,7 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 	// 只有 public（无 key）路由把免费模型剥皮成裸名展示，与 resolveModel 的
 	// 裸名→xxx-free 反向映射配套。API key 用户看到的是上游真实 ID，不要隐藏
 	// -free 后缀，否则用户无法在目录里看到并直接选用免费变体。
-	stripFreeSuffix := auth.Mode == AuthRoutePublic
+	stripFreeSuffix := auth.Mode == AuthRoutePublic || forceFreeEnabled()
 	allModels := replaceModelIDsWithAliases(combinedModels, aliases, stripFreeSuffix)
 
 	w.Header().Set("Content-Type", "application/json")
