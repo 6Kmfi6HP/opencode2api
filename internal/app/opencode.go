@@ -382,19 +382,6 @@ func downstreamSessionKey(auth UpstreamAuth, bodyMap map[string]any, headers htt
 	return key
 }
 
-// rotateOCSessionForKey 强制为下游会话分配新的上游 session，用于 429
-// 重试耗尽后的 session 轮换。key 为空时生成临时 session（不写入映射表）。
-func rotateOCSessionForKey(key string) string {
-	if key == "" {
-		return newOCSessionID()
-	}
-	ocSessionMapMu.Lock()
-	defer ocSessionMapMu.Unlock()
-	id := newOCSessionID()
-	ocSessionMap[key] = &ocSessionMapping{sessionID: id, lastUsed: time.Now()}
-	return id
-}
-
 // lookupOrCreateOCSession 查找或创建下游身份专属的上游 session。锁内创建
 // 防并发重复: 纯内存随机 ID,锁内完成的代价低于 per-key singleflight 的
 // bookkeeping。淘汰对齐 httpclient.go lookupOrCreateSticky 的清理模式:
@@ -881,13 +868,11 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 	//  4) 裸进程内回退值才现造临时会话不回写(现状)。
 	upstreamHeaders := upstreamHeadersFromContext(ctx)
 	ocSessionClientSpecified := false
-	downstreamKey := ""
 	ocSession := sessionFromRequestContext(ctx, "")
 	if ocSession != "" {
 		ocSessionClientSpecified = true
 	} else if ocSessionMapEnabled() {
 		if key := downstreamSessionKey(auth, bodyMap, upstreamHeaders); key != "" {
-			downstreamKey = key
 			ocSession = lookupOrCreateOCSession(key)
 		}
 	}
@@ -1043,14 +1028,19 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 				case <-time.After(backoff):
 				}
 			}
-			// 429 重试耗尽且未换过 session 时，为当前下游会话轮换一个新的
-			// upstream session 并额外多试一次。不改 maxAttempts，通过
-			// sessionRotated 标志保证每次请求至多轮换一次，避免无限重建。
+			// 429 重试耗尽且未换过 session 时，执行与控制面板等价的全局
+			// session 换代（新 sessionID + 新 projectID + 清空下游映射表）。
+			// 光换 sessionID 不够：上游限流按 sessionID+projectID 组合归因，
+			// projectID 不变则限流窗口仍在旧身份上。sessionRotated 标志保证
+			// 每次请求至多换代一次，避免无限重建。
 			if !canRetry && !sessionRotated && !ocSessionClientSpecified {
-				newSess := rotateOCSessionForKey(downstreamKey)
-				log.Info("upstream 429 session rotate",
-					"old_session", ocSession, "new_session", newSess)
-				ocSession = newSess
+				newState := refreshOCSession()
+				log.Info("upstream 429 global session refresh",
+					"old_session", ocSession,
+					"new_session", newState.sessionID,
+					"new_project_id", newState.projectID)
+				sessionState = newState
+				ocSession = newState.sessionID
 				sessionRotated = true
 				invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, ocSession)
 				client.CloseIdleConnections()
