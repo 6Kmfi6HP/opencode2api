@@ -384,3 +384,82 @@ func TestOCSessionMap_BuildOCRequestHashScope(t *testing.T) {
 		t.Fatalf("buildOCRequest ocScope must be hashed, got sticky key %q", keys[0])
 	}
 }
+
+// TestOCSession_429ExhaustionRefreshesSessionAndRetries 验证 429 常规重试耗尽后
+// 能够触发全局 session 换代并额外发起第 4 次重试成功。
+func TestOCSession_429ExhaustionRefreshesSessionAndRetries(t *testing.T) {
+	withOCSessionMapEnv(t, true)
+	setDefaultOCSessionStateForTest()
+	clearStickyEntriesForTest()
+
+	oldBackoff := upstream429Backoff
+	upstream429Backoff = func(attempt int, retryAfter string) time.Duration { return 0 }
+	t.Cleanup(func() { upstream429Backoff = oldBackoff })
+
+	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
+		{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
+		{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
+		{status: http.StatusOK, body: `{"id":"chatcmpl_success","choices":[]}`},
+	})
+
+	ctx := context.Background()
+	bodyJSON := `{"model":"fallback-model-free","messages":[],"user":"down-retry-user"}`
+	rc, status, _, err := callOpenCodeEndpoint(ctx, "chat/completions", []byte(bodyJSON), "fallback-model-free", UpstreamAuth{Mode: AuthRoutePublic})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("expected status 200 after session refresh retry, got %d", status)
+	}
+	_ = rc.Close()
+
+	if len(transport.requestHeaders) != 4 {
+		t.Fatalf("want 4 upstream attempts (3 regular + 1 refreshed), got %d", len(transport.requestHeaders))
+	}
+
+	initialSession := transport.requestHeaders[0].Get(headerOpencodeSession)
+	refreshedSession := transport.requestHeaders[3].Get(headerOpencodeSession)
+	if initialSession == "" || refreshedSession == "" {
+		t.Fatalf("sessions must not be empty, got initial=%q, refreshed=%q", initialSession, refreshedSession)
+	}
+	if initialSession == refreshedSession {
+		t.Fatalf("4th attempt must use refreshed session, got same session %q", initialSession)
+	}
+}
+
+// TestOCSession_429ExhaustionStill429Terminates 验证若换代后仍然 429，则不会无限循环，
+// 恰好尝试 4 次后终止并返回 429。
+func TestOCSession_429ExhaustionStill429Terminates(t *testing.T) {
+	withOCSessionMapEnv(t, true)
+	setDefaultOCSessionStateForTest()
+	clearStickyEntriesForTest()
+
+	oldBackoff := upstream429Backoff
+	upstream429Backoff = func(attempt int, retryAfter string) time.Duration { return 0 }
+	t.Cleanup(func() { upstream429Backoff = oldBackoff })
+
+	transport := installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
+		{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
+		{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
+		{status: http.StatusTooManyRequests, body: `{"error":"rate_limited"}`},
+	})
+
+	ctx := context.Background()
+	bodyJSON := `{"model":"fallback-model-free","messages":[],"user":"down-retry-fail"}`
+	rc, status, _, err := callOpenCodeEndpoint(ctx, "chat/completions", []byte(bodyJSON), "fallback-model-free", UpstreamAuth{Mode: AuthRoutePublic})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("expected status 429 when retry also fails, got %d", status)
+	}
+	if rc != nil {
+		_ = rc.Close()
+	}
+
+	if len(transport.requestHeaders) != 4 {
+		t.Fatalf("want exactly 4 upstream attempts, got %d", len(transport.requestHeaders))
+	}
+}

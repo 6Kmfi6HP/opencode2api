@@ -995,6 +995,19 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 			retryReason = "pool_failover"
 			canRetry = true
 		}
+		// 429 重试耗尽且未换过 session 时，执行与控制面板等价的全局
+		// session 换代（新 sessionID + 新 projectID + 清空下游映射表）。
+		// 光换 sessionID 不够：上游限流按 sessionID+projectID 组合归因，
+		// projectID 不变则限流窗口仍在旧身份上。sessionRotated 标志保证
+		// 每次请求至多换代一次，避免无限重建。
+		rotateSessionOn429 := resp.StatusCode == http.StatusTooManyRequests &&
+			!canRetry &&
+			!sessionRotated &&
+			!ocSessionClientSpecified
+		if rotateSessionOn429 {
+			retryReason = "session_refresh_429"
+			canRetry = true
+		}
 		args := []any{
 			"try_model", modelID,
 			"base_url", baseURL,
@@ -1028,23 +1041,27 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 				case <-time.After(backoff):
 				}
 			}
-			// 429 重试耗尽且未换过 session 时，执行与控制面板等价的全局
-			// session 换代（新 sessionID + 新 projectID + 清空下游映射表）。
-			// 光换 sessionID 不够：上游限流按 sessionID+projectID 组合归因，
-			// projectID 不变则限流窗口仍在旧身份上。sessionRotated 标志保证
-			// 每次请求至多换代一次，避免无限重建。
-			if !canRetry && !sessionRotated && !ocSessionClientSpecified {
+			if rotateSessionOn429 {
 				newState := refreshOCSession()
 				log.Info("upstream 429 global session refresh",
 					"old_session", ocSession,
 					"new_session", newState.sessionID,
 					"new_project_id", newState.projectID)
 				sessionState = newState
-				ocSession = newState.sessionID
-				sessionRotated = true
 				invalidateUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, ocSession)
+				if ocSessionMapEnabled() {
+					if key := downstreamSessionKey(auth, bodyMap, upstreamHeaders); key != "" {
+						ocSession = lookupOrCreateOCSession(key)
+					} else {
+						ocSession = newState.sessionID
+					}
+				} else {
+					ocSession = newState.sessionID
+				}
+				sessionRotated = true
 				client.CloseIdleConnections()
 				retryCount++
+				maxAttempts++
 				continue
 			}
 		}

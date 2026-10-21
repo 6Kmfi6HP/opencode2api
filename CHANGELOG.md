@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.14.38
+
+- Fix dead-code branch in 429 session refresh and allow in-flight retry (`fix(session)`):
+  - 修复 429 会话刷新逻辑因位于 `if !canRetry { break }` 之后成为不可达死代码的问题。
+  - 在重试判定前置提取 `rotateSessionOn429`，当常规重试耗尽且遇 429 时放行 `canRetry` 并标记 `retryReason="session_refresh_429"`。
+  - 触发换代时自增 `maxAttempts` 确保给予新 session 原地重试机会，并重新绑定下游专属 session 映射。
+  - 增加 429 耗尽换代重试与终止防死循环的完整回归测试。
+
 ## v0.14.34
 
 - Add `force_free` mode to route all traffic to free-tier models (`feat(config)`):
