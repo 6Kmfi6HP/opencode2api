@@ -2,14 +2,14 @@ package app
 
 import (
 	"context"
+	"github.com/6Kmfi6HP/opencode2api/internal/config"
+	"github.com/6Kmfi6HP/opencode2api/internal/domain"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/6Kmfi6HP/opencode2api/internal/config"
-	"github.com/6Kmfi6HP/opencode2api/internal/domain"
+	"time"
 )
 
 // forwardClaudeViaAnthropic：上游 2xx + stream 请求保持 SSE 管道透传
@@ -49,7 +49,11 @@ func TestForwardClaudeViaAnthropic_Stream2xxPipesRawEvents(t *testing.T) {
 func TestForwardClaudeViaAnthropic_StreamErrorRelaysJSONNotSSE(t *testing.T) {
 	const model = "claude-x-passthrough-stream-err"
 	setProtocolRulesForTest(t, []domain.ProtocolRule{{Pattern: "claude-x-*", Protocol: "anthropic"}})
+	oldBackoff := upstream429Backoff
+	upstream429Backoff = func(attempt int, retryAfter string) time.Duration { return 0 }
+	t.Cleanup(func() { upstream429Backoff = oldBackoff })
 	installFakeOpenCodeClient(t, []fakeUpstreamResponse{
+		{status: http.StatusTooManyRequests, body: `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`},
 		{status: http.StatusTooManyRequests, body: `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`},
 		{status: http.StatusTooManyRequests, body: `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`},
 		{status: http.StatusTooManyRequests, body: `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`},
