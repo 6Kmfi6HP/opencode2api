@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.14.39
+
+- Fix thread explosion causing fatal `newosproc` crashes and 502 SSE stream drops (`fix(stats)`):
+  - 根因：`RecordTokenUsage` / `RecordCacheUsage` 每次调用派生一个 goroutine，对 stats.json 做 `flock(LOCK_EX)` + 全量读 + `MarshalIndent` + truncate + write + `fsync`；`flock` 是阻塞系统调用，每个等待者独占一个 OS 线程且 park 后不被 Go 运行时回收，在 429 风暴期并发 200+ 条记录入队时线程涨到容器 `pids.max=1036`，进程以 `fatal error: newosproc` 崩溃，在途 SSE 流全断（下游记 502）。
+  - 改为同步内存累加（不派生 goroutine），单写者后台 goroutine 每 5s / 128 条批量落盘，`fsync` 最多每 30s 一次。
+  - `json.MarshalIndent` → `json.Marshal`，落盘体积约减 30%。
+  - `keys` 表加 LRU 上限（默认 2000，`OPENCODE2API_STATS_KEY_LIMIT` 可覆盖），阻止文件无限增长（线上实例已增至 500KB / 1811 条）。
+  - 新增 `FlushTokenStats()` 供优雅关闭调用（`server.go` / `launch.go` 退出路径均已接入）。
+
+- Add opt-in pprof debug endpoint (`feat(debug)`):
+  - `OPENCODE2API_DEBUG_ADDR=127.0.0.1:6060` 启用 `/debug/threads`（JSON 概览）与标准 `/debug/pprof/*`；手动注册，不挂 `DefaultServeMux`，默认关闭，不对外暴露。
+
+- Fix `pids_limit` in deploy compose templates (`fix(deploy)`):
+  - `deploy/compose/*.yml` 补 `pids_limit: -1`；因 compose v5 将 `-1` 视为未设置，`scripts/update-remote.sh` 在 `up -d` 后补一次 `docker update --pids-limit -1` 确保生效。
+
 ## v0.14.38
 
 - Fix dead-code branch in 429 session refresh and allow in-flight retry (`fix(session)`):
