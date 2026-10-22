@@ -3,6 +3,9 @@ services:
     image: ${OPENCODE2API_IMAGE:-ghcr.io/6kmfi6hp/opencode2api:latest}
     container_name: opencode2api
     restart: unless-stopped
+    # 同 compose.yml：避免撞上 systemd DefaultTasksMax（约 1036）导致
+    # fatal error: newosproc 崩溃并斩断在途流。
+    pids_limit: -1
     depends_on:
       - warp
     ports:

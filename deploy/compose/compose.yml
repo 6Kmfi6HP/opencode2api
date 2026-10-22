@@ -3,6 +3,14 @@ services:
     image: ${OPENCODE2API_IMAGE:-ghcr.io/6kmfi6hp/opencode2api:latest}
     container_name: opencode2api
     restart: unless-stopped
+    # 放开 pids/线程上限：systemd 的 DefaultTasksMax 默认是 kernel.threads-max
+    # 的 15%，在 2 核小机上约为 1036。网关在高并发下 OS 线程数会爬到上千，
+    # 触顶时 Go 抛 fatal error: newosproc 直接退出，把在途 SSE 流全斩断
+    # （下游表现为 unexpected EOF / 502）。
+    # 注意：compose v5 会把 -1 当作"未设置"（HostConfig.PidsLimit=<nil>），
+    # 重建后上限仍回落 1036，所以 scripts/update-remote.sh 在 up -d 之后会
+    # 再补一次 docker update --pids-limit -1。
+    pids_limit: -1
     ports:
       - "${OPENCODE2API_HTTP_PORT:-8000}:8000"
     environment:
