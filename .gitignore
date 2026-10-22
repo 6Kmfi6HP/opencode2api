@@ -19,5 +19,13 @@ bin/
 .env
 agent-browser.json
 
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Claude Code
+.claude/*
+!.claude/skills/
+
 # Local deployment helpers (not for upstream)
 /scripts/update-remote.sh
