@@ -9,11 +9,9 @@ import (
 )
 
 // lockStatsFileExclusive acquires an exclusive cross-process advisory lock on
-// the open file description behind f. Use it to serialize writers of the
-// shared token-stats file across independently launched binary instances
-// (long-running server plus short-lived `opencode2api launch claude|codex`
-// proxies) so a stale per-process snapshot can never overwrite another
-// process's accumulated usage.
+// the shared stats file. Each process has one dedicated writer that holds the
+// lock across read-modify-write, so server and launch deltas cannot overwrite
+// each other; only those writer goroutines can wait on flock.
 func lockStatsFileExclusive(f *os.File) error { return unix.Flock(int(f.Fd()), unix.LOCK_EX) }
 
 // unlockStatsFile releases a previously held advisory lock.

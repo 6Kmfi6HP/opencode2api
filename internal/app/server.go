@@ -118,6 +118,9 @@ func Run() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("graceful shutdown failed", "error", err)
 	}
+	if err := stats.FlushTokenStats(); err != nil {
+		slog.Error("failed to flush token stats", "error", err)
+	}
 }
 
 func sessionContextMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -221,6 +224,7 @@ func initProxyCoreWithSave(save bool) {
 	}
 
 	startModelRefresh()
+	startDebugServer()
 	if adminAPIEnabled() {
 		startSessionCleanup()
 	}

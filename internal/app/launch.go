@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/6Kmfi6HP/opencode2api/internal/logging"
 	"github.com/6Kmfi6HP/opencode2api/internal/modelsdev"
+	"github.com/6Kmfi6HP/opencode2api/internal/stats"
 	"log/slog"
 	"net"
 	"net/http"
@@ -283,6 +284,9 @@ func runLaunchChild(tool, path string, args, extraEnv []string, server *http.Ser
 			cleanup()
 		}
 		_ = server.Shutdown(context.Background())
+		if err := stats.FlushTokenStats(); err != nil {
+			slog.Error("failed to flush token stats", "error", err)
+		}
 		os.Exit(1)
 	}
 
@@ -307,6 +311,9 @@ func runLaunchChild(tool, path string, args, extraEnv []string, server *http.Ser
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Warn("proxy graceful shutdown failed", "error", err)
+	}
+	if err := stats.FlushTokenStats(); err != nil {
+		slog.Error("failed to flush token stats", "error", err)
 	}
 	os.Exit(exitCode)
 }

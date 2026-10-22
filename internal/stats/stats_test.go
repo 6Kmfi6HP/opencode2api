@@ -11,15 +11,27 @@ import (
 // them when the test completes.
 func resetStatsForTest(t *testing.T) {
 	t.Helper()
+	if err := FlushTokenStats(); err != nil {
+		t.Fatalf("flush prior stats: %v", err)
+	}
 	tokenStatsMu.Lock()
 	orig := tokenStats
 	origPath := tokenStatsPath
+	origLimit := statsKeyLimit
+	origLimitFromEnv := keyLimitFromEnv
+	origLimitConfigured := keyLimitConfigured
 	tokenStatsMu.Unlock()
 	t.Cleanup(func() {
+		_ = FlushTokenStats()
+		SetPath(origPath)
 		tokenStatsMu.Lock()
 		tokenStats = orig
+		statsKeyLimit = origLimit
+		keyLimitFromEnv = origLimitFromEnv
+		keyLimitConfigured = origLimitConfigured
+		pendingStats = &TokenStatsData{Models: map[string]*ModelStats{}}
+		pendingEvents = 0
 		tokenStatsMu.Unlock()
-		SetPath(origPath)
 	})
 }
 

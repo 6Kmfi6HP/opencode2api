@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -128,6 +130,9 @@ func TestRecordTokenUsagePersistDeltas(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	if err := FlushTokenStats(); err != nil {
+		t.Fatal(err)
+	}
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -184,6 +189,9 @@ func TestRecordCacheUsageMergesAcrossWriters(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	if err := FlushTokenStats(); err != nil {
+		t.Fatal(err)
+	}
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -219,6 +227,42 @@ func TestRecordCacheUsageMergesAcrossWriters(t *testing.T) {
 	body := string(raw)
 	if !containsAll(body, `"cache_read_tokens"`, `"cache_created_tokens"`) {
 		t.Fatalf("unexpected json: %s", body)
+	}
+}
+
+func TestRecordTokenUsageDoesNotSpawnPerCallGoroutines(t *testing.T) {
+	resetStatsForTest(t)
+	SetPath(filepath.Join(t.TempDir(), "stats.json"))
+	before := runtime.NumGoroutine()
+	const calls = 1000
+	for i := 0; i < calls; i++ {
+		RecordTokenUsage("goroutine-model", 1, 2, 3)
+	}
+	if got := runtime.NumGoroutine(); got > before+2 {
+		t.Fatalf("goroutines after %d calls = %d, baseline %d", calls, got, before)
+	}
+	if err := FlushTokenStats(); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.NumGoroutine(); got > before+2 {
+		t.Fatalf("goroutines after flush = %d, baseline %d", got, before)
+	}
+}
+
+func TestStatsFlushesQueuedDeltasOnShutdown(t *testing.T) {
+	resetStatsForTest(t)
+	path := filepath.Join(t.TempDir(), "shutdown-stats.json")
+	SetPath(path)
+	RecordTokenUsage("shutdown-model", 2, 3, 5)
+	request := statsSignalRequest{signal: syscall.SIGTERM, reply: make(chan struct{})}
+	statsSignalRequests <- request
+	<-request.reply
+	st, err := readTokenStatsFromDisk(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.TotalRequests != 1 || st.Models["shutdown-model"] == nil || st.Models["shutdown-model"].TotalTokens != 5 {
+		t.Fatalf("shutdown stats = %+v, want one flushed request", st)
 	}
 }
 
