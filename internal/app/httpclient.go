@@ -44,8 +44,19 @@ func envIntOr(key string, def int) int {
 var httpClient = &http.Client{
 	Timeout: upstreamTimeout(),
 	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
+		// TCP 连接建立超时
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,  // TCP 三次握手超时
+			KeepAlive: 30 * time.Second, // TCP keep-alive 探测间隔
+		}).DialContext,
+		// TLS 握手超时
+		TLSHandshakeTimeout: 5 * time.Second,
+		// 等待响应头超时（避免上游卡住）
+		ResponseHeaderTimeout: 10 * time.Second,
+		// 连接池优化：高并发下单 host 需要更多空闲连接
+		MaxIdleConns:        500,  // 全局空闲连接池（原 100）
+		MaxIdleConnsPerHost: 100,  // 单 host 空闲连接（原 20）
+		MaxConnsPerHost:     200,  // 单 host 最大连接数（新增）
 		IdleConnTimeout:     90 * time.Second,
 	},
 }
@@ -358,9 +369,15 @@ func buildProxyClient(proxy Socks5Proxy) *http.Client {
 	return &http.Client{
 		Timeout: 300 * time.Second,
 		Transport: &http.Transport{
-			DialContext:         socks5Dial(proxy),
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
+			DialContext: socks5Dial(proxy),
+			// TLS 握手超时
+			TLSHandshakeTimeout: 5 * time.Second,
+			// 等待响应头超时
+			ResponseHeaderTimeout: 10 * time.Second,
+			// 连接池优化：高并发下单 host 需要更多空闲连接
+			MaxIdleConns:        500,
+			MaxIdleConnsPerHost: 100,
+			MaxConnsPerHost:     200,
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}

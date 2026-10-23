@@ -1,0 +1,13 @@
+{
+  "port": "8080",
+  "log_file": "logs/opencode2api.log",
+  "log_level": "info",
+  "stats_file": "stats.json",
+  "upstream_base_urls": ["https://api.opencode.com"],
+  "models": [
+    {
+      "id": "gpt-4o-mini",
+      "upstream_id": "gpt-4o-mini"
+    }
+  ]
+}

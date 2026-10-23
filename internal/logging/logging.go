@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -34,6 +35,9 @@ var (
 	bodiesMu      sync.RWMutex
 	bodiesEnabled bool
 	rotator       *lumberjack.Logger
+	bufferedLog   *bufio.Writer
+	flushTicker   *time.Ticker
+	flushDone     chan struct{}
 
 	upstreamErrDedupMu sync.Mutex
 	upstreamErrDedup   = map[string]upstreamErrDedupEntry{}
@@ -162,6 +166,18 @@ func redactLogAttr(_ []string, a slog.Attr) slog.Attr {
 
 // CloseRotator closes and clears the active log rotator, if any.
 func CloseRotator() {
+	if flushDone != nil {
+		close(flushDone)
+		flushDone = nil
+	}
+	if flushTicker != nil {
+		flushTicker.Stop()
+		flushTicker = nil
+	}
+	if bufferedLog != nil {
+		_ = bufferedLog.Flush()
+		bufferedLog = nil
+	}
 	if rotator != nil {
 		_ = rotator.Close()
 		rotator = nil
@@ -201,8 +217,29 @@ func Init(path, level string, bodies bool) *slog.Logger {
 				Compress:   Compress,
 				LocalTime:  true,
 			}
-			writers = append(writers, rotator)
+			// 使用 64KB buffer 包装 rotator，批量写入减少磁盘 I/O
+			bufferedLog = bufio.NewWriterSize(rotator, 64*1024)
+			writers = append(writers, bufferedLog)
 			resolvedPath = absPath
+
+			// 启动定时 flush goroutine，每 100ms 批量写入一次。
+			// 全部用局部变量捕获，避免 CloseRotator 将全局置 nil 后 goroutine
+			// 仍解引用全局指针导致 panic。
+			flushTicker = time.NewTicker(100 * time.Millisecond)
+			flushDone = make(chan struct{})
+			bw := bufferedLog
+			tick := flushTicker.C
+			done := flushDone
+			go func() {
+				for {
+					select {
+					case <-tick:
+						bw.Flush()
+					case <-done:
+						return
+					}
+				}
+			}()
 		}
 	}
 
@@ -233,6 +270,12 @@ func Init(path, level string, bodies bool) *slog.Logger {
 		attrs = append([]any{"path", "stdout"}, attrs...)
 	}
 	slog.Info("logging configured", attrs...)
+	// Flush immediately so lumberjack creates the file on disk; without this,
+	// the bufio.Writer holds the first write in memory and the file does not
+	// exist until the next ticker tick.
+	if bufferedLog != nil {
+		_ = bufferedLog.Flush()
+	}
 	return logger
 }
 
