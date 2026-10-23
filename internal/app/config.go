@@ -198,10 +198,11 @@ func applyConfig(cfg AppConfig) {
 	})
 
 	socks5Mu.Lock()
-	if cfg.Socks5Proxies != nil {
+	proxyListChanged := cfg.Socks5Proxies != nil
+	if proxyListChanged {
 		socks5Proxies = cfg.Socks5Proxies
 	}
-	if activeSocks5 != cfg.ActiveSocks5 {
+	if activeSocks5 != cfg.ActiveSocks5 || proxyListChanged {
 		activeSocks5 = cfg.ActiveSocks5
 		socks5Client = nil
 		socks5ClientAddr = ""
@@ -210,6 +211,8 @@ func applyConfig(cfg AppConfig) {
 		stickyMu.Lock()
 		stickyEntries = map[string]*stickyProxyEntry{}
 		stickyMu.Unlock()
+		// 清空代理 Client 单例池并关闭旧连接。
+		resetProxyClientPool()
 	}
 	socks5PaidDirect = cfg.Socks5PaidDirect
 	socks5Sticky = true

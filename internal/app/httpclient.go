@@ -260,11 +260,11 @@ type stickyProxyEntry struct {
 	baseIdx  int // 上游域名下标（-1 表示未启用多域名 sticky）
 	proxyIdx int // 代理下标（-1 表示直连）
 	client   *http.Client
-	lastUsed time.Time
+	lastUsed atomic.Int64 // unix nano；读路径可无锁更新
 }
 
 var (
-	stickyMu      sync.Mutex
+	stickyMu      sync.RWMutex
 	stickyEntries = map[string]*stickyProxyEntry{}
 )
 
@@ -364,6 +364,53 @@ func stickyByBodyEnabled() bool {
 	return v != "0" && v != "false" && v != "no" && v != "off"
 }
 
+// ======================== 代理 Client 单例池 ========================
+//
+// 之前每次请求（轮询模式）或每个会话（sticky 模式）都 buildProxyClient 新建
+// http.Client + http.Transport，连接池配置形同虚设，且并发请求各自重建
+// TCP+SOCKS5+TLS 握手。改为按 proxy.Addr 缓存单例 Client，全局复用同一连接池。
+// 配置变更时由 resetProxyClientPool 清空并 CloseIdleConnections 旧实例。
+
+var (
+	proxyClientMu      sync.RWMutex
+	proxyClientPool    = map[string]*http.Client{} // key: proxy.Addr
+	proxyClientBuilder = buildProxyClient
+)
+
+// getOrBuildProxyClient 返回 proxy.Addr 对应的单例 HTTP 客户端，不存在则构建。
+func getOrBuildProxyClient(proxy Socks5Proxy) *http.Client {
+	proxyClientMu.RLock()
+	if c, ok := proxyClientPool[proxy.Addr]; ok {
+		proxyClientMu.RUnlock()
+		return c
+	}
+	proxyClientMu.RUnlock()
+
+	proxyClientMu.Lock()
+	defer proxyClientMu.Unlock()
+	// 双重检查
+	if c, ok := proxyClientPool[proxy.Addr]; ok {
+		return c
+	}
+	c := proxyClientBuilder(proxy)
+	proxyClientPool[proxy.Addr] = c
+	return c
+}
+
+// resetProxyClientPool 清空代理 Client 单例池并关闭旧实例的空闲连接。
+// 在代理配置（socks5Proxies / activeSocks5）变更时调用，避免残留指向已删除
+// 代理的连接池。sticky 条目由调用方另行清空。
+func resetProxyClientPool() {
+	proxyClientMu.Lock()
+	defer proxyClientMu.Unlock()
+	for addr, c := range proxyClientPool {
+		if t, ok := c.Transport.(*http.Transport); ok {
+			t.CloseIdleConnections()
+		}
+		delete(proxyClientPool, addr)
+	}
+}
+
 // buildProxyClient 为指定代理构建带 SOCKS5 dial 的 HTTP 客户端。
 func buildProxyClient(proxy Socks5Proxy) *http.Client {
 	return &http.Client{
@@ -434,40 +481,54 @@ func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any, upstreamHea
 // 绑定因 stickyRebindSeq 递增而轮换，使失效后的重绑真正换到不同目标。
 // proxySticky=false 时只缓存域名维（baseIdx），client 字段不使用。
 func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nProxy int, proxies []Socks5Proxy) *stickyProxyEntry {
-	stickyMu.Lock()
-	defer stickyMu.Unlock()
-	now := time.Now()
-	// 懒清理：先清过期条目，超出上限时再清最旧的。
-	if len(stickyEntries) > stickyMaxEntries || len(stickyEntries) > 0 {
-		for k, e := range stickyEntries {
-			if now.Sub(e.lastUsed) > stickyEntryTTL {
-				delete(stickyEntries, k)
-			}
-		}
-	}
-	if len(stickyEntries) > stickyMaxEntries {
-		var oldestKey string
-		var oldest time.Time
-		for k, e := range stickyEntries {
-			if oldestKey == "" || e.lastUsed.Before(oldest) {
-				oldestKey, oldest = k, e.lastUsed
-			}
-		}
-		delete(stickyEntries, oldestKey)
-	}
+	nowNano := time.Now().UnixNano()
+	ttlNano := stickyEntryTTL.Nanoseconds()
+
+	// 快路径：持读锁检查已有条目，命中时仅原子更新 lastUsed。
+	stickyMu.RLock()
 	if e, ok := stickyEntries[key]; ok {
-		if (domainSticky && e.baseIdx < 0) || (proxySticky && e.proxyIdx < 0) {
-			// 维度配置变化导致旧条目不满足当前需求，重建。
-			delete(stickyEntries, key)
-		} else {
-			e.lastUsed = now
+		needRebuild := (domainSticky && e.baseIdx < 0) || (proxySticky && e.proxyIdx < 0)
+		if !needRebuild {
+			e.lastUsed.Store(nowNano)
+			stickyMu.RUnlock()
 			slog.Debug("sticky target reuse", "key", key, "baseIdx", e.baseIdx, "proxyIdx", e.proxyIdx)
 			return e
 		}
 	}
+	stickyMu.RUnlock()
+
+	// 慢路径：写锁 — 创建或重建条目，并做懒清理。
+	stickyMu.Lock()
+	defer stickyMu.Unlock()
+
+	// 双重检查：其他 goroutine 可能已在我们拿到写锁前完成了创建。
+	if e, ok := stickyEntries[key]; ok {
+		needRebuild := (domainSticky && e.baseIdx < 0) || (proxySticky && e.proxyIdx < 0)
+		if !needRebuild {
+			e.lastUsed.Store(nowNano)
+			return e
+		}
+		delete(stickyEntries, key)
+	}
+
+	// 懒清理：清过期条目，超出上限时清最旧的。
+	for k, e := range stickyEntries {
+		if nowNano-e.lastUsed.Load() > ttlNano {
+			delete(stickyEntries, k)
+		}
+	}
+	if len(stickyEntries) > stickyMaxEntries {
+		var oldestKey string
+		var oldestNano int64 = 1<<63 - 1
+		for k, e := range stickyEntries {
+			if n := e.lastUsed.Load(); oldestKey == "" || n < oldestNano {
+				oldestKey, oldestNano = k, n
+			}
+		}
+		delete(stickyEntries, oldestKey)
+	}
 
 	// 哈希 + 递增序号：同一 key 的连续绑定会落在不同目标。
-	// base 与 proxy 使用不同哈希位独立分布，避免组合取模导致的偏斜。
 	seq := atomic.AddUint32(&stickyRebindSeq, 1)
 	h := fnv32a(key) + seq
 
@@ -484,9 +545,10 @@ func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nPr
 		proxyIdx = int(h % uint32(nProxy))
 	}
 
-	entry := &stickyProxyEntry{baseIdx: baseIdx, proxyIdx: proxyIdx, lastUsed: now}
+	entry := &stickyProxyEntry{baseIdx: baseIdx, proxyIdx: proxyIdx}
+	entry.lastUsed.Store(nowNano)
 	if proxySticky {
-		entry.client = buildProxyClient(proxies[proxyIdx])
+		entry.client = getOrBuildProxyClient(proxies[proxyIdx])
 	} else {
 		entry.client = httpClient
 	}
@@ -527,41 +589,28 @@ func getHTTPClient() *http.Client {
 		return httpClient
 	}
 
-	var proxy Socks5Proxy
-	var useRR bool
-
 	if activeSocks5 == socks5RR {
 		if len(socks5Proxies) == 0 {
 			return httpClient
 		}
 		idx := atomic.AddUint32(&socks5RRIndex, 1) % uint32(len(socks5Proxies))
-		proxy = socks5Proxies[idx]
-		useRR = true
-	} else {
-		if socks5Client != nil && socks5ClientAddr == activeSocks5 {
-			return socks5Client
-		}
-
-		var found bool
-		for i := range socks5Proxies {
-			if socks5Proxies[i].Addr == activeSocks5 {
-				proxy = socks5Proxies[i]
-				found = true
-				break
-			}
-		}
-		if !found {
-			return httpClient
-		}
+		// 复用单例池：轮询只选代理，不重新建连接池。
+		return getOrBuildProxyClient(socks5Proxies[idx])
 	}
 
-	client := buildProxyClient(proxy)
-
-	if !useRR {
-		socks5Client = client
-		socks5ClientAddr = activeSocks5
+	// 单固定代理：优先查单例池；池中无则按 Addr 查找并缓存。
+	if socks5Client != nil && socks5ClientAddr == activeSocks5 {
+		return socks5Client
 	}
-	return client
+	for i := range socks5Proxies {
+		if socks5Proxies[i].Addr == activeSocks5 {
+			c := getOrBuildProxyClient(socks5Proxies[i])
+			socks5Client = c
+			socks5ClientAddr = activeSocks5
+			return c
+		}
+	}
+	return httpClient
 }
 
 // getHTTPClientForTier 按认证层级选择 HTTP 客户端。
