@@ -54,9 +54,9 @@ var httpClient = &http.Client{
 		// 等待响应头超时（避免上游卡住）
 		ResponseHeaderTimeout: 10 * time.Second,
 		// 连接池优化：高并发下单 host 需要更多空闲连接
-		MaxIdleConns:        500,  // 全局空闲连接池（原 100）
-		MaxIdleConnsPerHost: 100,  // 单 host 空闲连接（原 20）
-		MaxConnsPerHost:     200,  // 单 host 最大连接数（新增）
+		MaxIdleConns:        500, // 全局空闲连接池（原 100）
+		MaxIdleConnsPerHost: 100, // 单 host 空闲连接（原 20）
+		MaxConnsPerHost:     200, // 单 host 最大连接数（新增）
 		IdleConnTimeout:     90 * time.Second,
 	},
 }
