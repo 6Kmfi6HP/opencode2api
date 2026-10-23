@@ -198,7 +198,9 @@ func applyConfig(cfg AppConfig) {
 	})
 
 	socks5Mu.Lock()
-	proxyListChanged := cfg.Socks5Proxies != nil
+	// 深度比较代理列表：仅在内容真正变化时才重置状态，避免管理界面每次
+	// 保存配置都清空 sticky 绑定、轮询序号和连接池。
+	proxyListChanged := cfg.Socks5Proxies != nil && !proxiesEqual(socks5Proxies, cfg.Socks5Proxies)
 	if proxyListChanged {
 		socks5Proxies = cfg.Socks5Proxies
 	}

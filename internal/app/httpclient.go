@@ -208,6 +208,20 @@ var (
 	socks5Mu         sync.RWMutex
 )
 
+// proxiesEqual 深度比较两个代理列表（含凭证），用于判断配置热重载时代理配置
+// 是否真正发生变化，避免无关字段保存时误触发 sticky/连接池重置。
+func proxiesEqual(a, b []Socks5Proxy) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Addr != b[i].Addr || a[i].Username != b[i].Username || a[i].Password != b[i].Password {
+			return false
+		}
+	}
+	return true
+}
+
 const socks5RR = "__round_robin__"
 
 var socks5RRIndex uint32
@@ -373,14 +387,21 @@ func stickyByBodyEnabled() bool {
 
 var (
 	proxyClientMu      sync.RWMutex
-	proxyClientPool    = map[string]*http.Client{} // key: proxy.Addr
+	proxyClientPool    = map[string]*http.Client{} // key: proxyClientKey(proxy)
 	proxyClientBuilder = buildProxyClient
 )
 
-// getOrBuildProxyClient 返回 proxy.Addr 对应的单例 HTTP 客户端，不存在则构建。
+// proxyClientKey 生成代理单例池的键，包含 Addr 与凭证，避免同地址不同账号
+// 的代理共用同一 Client 导致认证串号。
+func proxyClientKey(proxy Socks5Proxy) string {
+	return proxy.Addr + "\x00" + proxy.Username + "\x00" + proxy.Password
+}
+
+// getOrBuildProxyClient 返回 proxy 对应的单例 HTTP 客户端，不存在则构建。
 func getOrBuildProxyClient(proxy Socks5Proxy) *http.Client {
+	k := proxyClientKey(proxy)
 	proxyClientMu.RLock()
-	if c, ok := proxyClientPool[proxy.Addr]; ok {
+	if c, ok := proxyClientPool[k]; ok {
 		proxyClientMu.RUnlock()
 		return c
 	}
@@ -389,11 +410,11 @@ func getOrBuildProxyClient(proxy Socks5Proxy) *http.Client {
 	proxyClientMu.Lock()
 	defer proxyClientMu.Unlock()
 	// 双重检查
-	if c, ok := proxyClientPool[proxy.Addr]; ok {
+	if c, ok := proxyClientPool[k]; ok {
 		return c
 	}
 	c := proxyClientBuilder(proxy)
-	proxyClientPool[proxy.Addr] = c
+	proxyClientPool[k] = c
 	return c
 }
 
@@ -485,10 +506,12 @@ func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nPr
 	ttlNano := stickyEntryTTL.Nanoseconds()
 
 	// 快路径：持读锁检查已有条目，命中时仅原子更新 lastUsed。
+	// 若条目已过期则直接落入慢路径重建，不刷新 lastUsed。
 	stickyMu.RLock()
 	if e, ok := stickyEntries[key]; ok {
 		needRebuild := (domainSticky && e.baseIdx < 0) || (proxySticky && e.proxyIdx < 0)
-		if !needRebuild {
+		expired := nowNano-e.lastUsed.Load() > ttlNano
+		if !needRebuild && !expired {
 			e.lastUsed.Store(nowNano)
 			stickyMu.RUnlock()
 			slog.Debug("sticky target reuse", "key", key, "baseIdx", e.baseIdx, "proxyIdx", e.proxyIdx)
