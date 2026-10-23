@@ -29,10 +29,23 @@ oc2api-admin — opencode2api 实例管理脚本
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# /api/config 里由服务端运行时状态派生的只读字段，回写时必须剔除：
+# 它们不属于 AppConfig，带上会被忽略，留着只会污染请求体。
+READ_ONLY_CONFIG_KEYS = frozenset({"key_pool_status", "oc_session_map_size"})
+
+# AppConfig 里存在、但 GET /api/config 不下发的字段。合并回写无法保住它们的
+# 原有取值（客户端读不到），只能靠直接改配置文件。这里仅用于提示用户。
+UNEXPOSED_CONFIG_KEYS = frozenset({
+    "native_responses_models",
+    "stream_empty_retry_max",
+    "stream_first_byte_timeout_ms",
+})
 
 
 class AdminClient:
@@ -149,7 +162,33 @@ class AdminClient:
         return self._request("GET", "/api/config")
 
     def config_set(self, updates: dict) -> dict:
-        return self._request("POST", "/api/config", updates)
+        """增量修改配置：先取完整运行时配置，合并更新后整份回写。
+
+        服务端 POST /api/config 会用提交内容**整体覆盖**配置文件并全量应用，
+        只提交变更字段会把其余字段清成零值——其中 active_socks5 变空字符串
+        等于改为直连，key_pool / protocol_rules 等则直接从磁盘消失，重启即丢。
+        所以这里必须先 GET 拿全量快照再合并，不能只 POST 增量。
+        """
+        if not updates:
+            raise RuntimeError("没有需要修改的配置项")
+
+        snapshot = self.config_get()
+        # 兼容将来可能出现的 {"config": {...}} 包装。
+        if isinstance(snapshot.get("config"), dict):
+            snapshot = snapshot["config"]
+        if not isinstance(snapshot, dict) or not snapshot:
+            raise RuntimeError("读取现有配置失败，已中止写入（避免覆盖掉其余配置）")
+
+        base = {k: v for k, v in snapshot.items() if k not in READ_ONLY_CONFIG_KEYS}
+        lost = sorted(UNEXPOSED_CONFIG_KEYS - set(snapshot))
+        if lost and os.environ.get("OC2API_QUIET") != "1":
+            print(
+                f"提示: 服务端未下发 {', '.join(lost)}，回写会将其恢复为默认值；"
+                f"如需保留请直接编辑宿主机配置文件。",
+                file=sys.stderr,
+            )
+
+        return self._request("POST", "/api/config", {**base, **updates})
 
     def reload(self) -> dict:
         return self._request("POST", "/api/reload")
