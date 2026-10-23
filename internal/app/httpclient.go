@@ -397,7 +397,27 @@ func proxyClientKey(proxy Socks5Proxy) string {
 	return proxy.Addr + "\x00" + proxy.Username + "\x00" + proxy.Password
 }
 
+// isTemplateProxy 报告代理凭证中是否含有模板变量（目前仅 {{session-id}}）。
+// 含模板的代理不进单例池，每次请求展开后独立构建 Client。
+func isTemplateProxy(proxy Socks5Proxy) bool {
+	return strings.Contains(proxy.Username, "{{session-id}}") ||
+		strings.Contains(proxy.Password, "{{session-id}}")
+}
+
+// expandProxyCredentials 将代理凭证中的模板变量替换为实际值。
+// ocScope 是 normalizedTransportScope(ocSessionID) 的哈希形式（16 hex chars），
+// 用于唯一标识会话出口，长度固定且已脱敏，适合直接嵌入用户名。
+func expandProxyCredentials(proxy Socks5Proxy, ocScope string) Socks5Proxy {
+	if ocScope == "" || !isTemplateProxy(proxy) {
+		return proxy
+	}
+	proxy.Username = strings.ReplaceAll(proxy.Username, "{{session-id}}", ocScope)
+	proxy.Password = strings.ReplaceAll(proxy.Password, "{{session-id}}", ocScope)
+	return proxy
+}
+
 // getOrBuildProxyClient 返回 proxy 对应的单例 HTTP 客户端，不存在则构建。
+// 模板代理（含 {{session-id}}）不进单例池，由调用方负责传入已展开凭证的 proxy。
 func getOrBuildProxyClient(proxy Socks5Proxy) *http.Client {
 	k := proxyClientKey(proxy)
 	proxyClientMu.RLock()
@@ -483,7 +503,7 @@ func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any, upstreamHea
 		return baseURLs[0], getHTTPClient()
 	}
 
-	entry := lookupOrCreateSticky(key, domainSticky, proxySticky, len(baseURLs), len(proxies), proxies)
+	entry := lookupOrCreateSticky(key, domainSticky, proxySticky, len(baseURLs), len(proxies), proxies, ocScope)
 	base := baseURLs[0]
 	if entry.baseIdx >= 0 {
 		base = baseURLs[entry.baseIdx]
@@ -495,13 +515,20 @@ func selectUpstreamTarget(auth UpstreamAuth, bodyMap map[string]any, upstreamHea
 		}
 		return base, getHTTPClient()
 	}
+	// 模板代理：client 字段为 nil，每次请求按 ocScope 展开凭证后新建（不池化）。
+	if entry.client == nil && entry.proxyIdx >= 0 && entry.proxyIdx < len(proxies) {
+		expanded := expandProxyCredentials(proxies[entry.proxyIdx], ocScope)
+		return base, buildProxyClient(expanded)
+	}
 	return base, entry.client
 }
 
 // lookupOrCreateSticky 查找或创建会话的 (域名, 代理) 绑定。同一 key 的连续
 // 绑定因 stickyRebindSeq 递增而轮换，使失效后的重绑真正换到不同目标。
 // proxySticky=false 时只缓存域名维（baseIdx），client 字段不使用。
-func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nProxy int, proxies []Socks5Proxy) *stickyProxyEntry {
+// 模板代理（含 {{session-id}}）不在 entry 中缓存 client，由调用方按 ocScope
+// 展开凭证后直接构建，避免每会话独立 Transport 无限增长。
+func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nProxy int, proxies []Socks5Proxy, _ string) *stickyProxyEntry {
 	nowNano := time.Now().UnixNano()
 	ttlNano := stickyEntryTTL.Nanoseconds()
 
@@ -571,12 +598,20 @@ func lookupOrCreateSticky(key string, domainSticky, proxySticky bool, nBase, nPr
 	entry := &stickyProxyEntry{baseIdx: baseIdx, proxyIdx: proxyIdx}
 	entry.lastUsed.Store(nowNano)
 	if proxySticky {
-		entry.client = getOrBuildProxyClient(proxies[proxyIdx])
+		p := proxies[proxyIdx]
+		if isTemplateProxy(p) {
+			// 模板代理：凭证含 {{session-id}}，每次请求须按 ocScope 展开，
+			// 不同会话凭证不同，不能共用同一 Transport。entry.client 留 nil，
+			// 由 selectUpstreamTarget 调用方负责按 ocScope 展开后直接构建。
+			entry.client = nil
+		} else {
+			entry.client = getOrBuildProxyClient(p)
+		}
 	} else {
 		entry.client = httpClient
 	}
 	stickyEntries[key] = entry
-	slog.Debug("sticky target bind", "key", key, "baseIdx", baseIdx, "proxyIdx", proxyIdx)
+	slog.Debug("sticky target bind", "key", key, "baseIdx", baseIdx, "proxyIdx", proxyIdx, "template", proxyIdx >= 0 && isTemplateProxy(proxies[proxyIdx]))
 	return entry
 }
 
