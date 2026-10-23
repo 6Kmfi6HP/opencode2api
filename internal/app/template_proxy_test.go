@@ -1,17 +1,17 @@
 package app
 
 import (
-	"testing"
 	"github.com/6Kmfi6HP/opencode2api/internal/domain"
+	"testing"
 )
 
 func TestExpandProxyCredentials(t *testing.T) {
 	cases := []struct {
-		name    string
-		proxy   domain.Socks5Proxy
-		scope   string
-		wantU   string
-		wantP   string
+		name  string
+		proxy domain.Socks5Proxy
+		scope string
+		wantU string
+		wantP string
 	}{
 		{
 			name:  "no template passes through",
