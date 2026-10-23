@@ -53,9 +53,20 @@ python3 .claude/skills/oc2api-admin/oc2api-admin.py -u <base_url> -p <admin_pass
 
 > **字段定义参考**：完整可用字段、类型及默认值以项目根目录 [`config.example.json`](config.example.json) 为单一真实来源。
 
+> ⚠️ **服务端 POST /api/config 是整体覆盖**：它会用提交内容覆盖整个配置文件并全量应用，
+> 未提交的字段一律取零值——`active_socks5` 变空字符串等于改为直连，`key_pool` /
+> `protocol_rules` 等会直接从磁盘消失，重启即丢。
+> 客户端已内置保护：`config set` 会先 `GET` 全量运行时快照、合并本次变更后再整份 `POST`。
+> 直接 `curl` 打这个端点时必须自己完成同样的合并，不要只发增量字段。
+>
+> 三个字段服务端不下发（`native_responses_models`、`stream_empty_retry_max`、
+> `stream_first_byte_timeout_ms`），合并回写保不住它们的原值；需要修改请直接编辑宿主机
+> 配置文件。客户端在检测到时会在 stderr 打印提示（`OC2API_QUIET=1` 可关闭）。
+
 **完成标准**：
 - `get`：已向用户展示当前生效配置及关注字段。
-- `set`：确认命令输出 `✓ 配置已更新`，并向用户核对生效的键值对。
+- `set`：确认命令输出 `✓ 配置已更新`，并向用户核对生效的键值对；涉及代理配置时
+  另需回读 `active_socks5`（应为 `__round_robin__`）与宿主机 config.json 大小/键数是否完整。
 
 ---
 
