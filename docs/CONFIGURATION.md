@@ -255,6 +255,27 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 
 域名列表变化（增删改）时自动清空全部 sticky 绑定，避免指向已不存在的目标。
 
+### `tls_fingerprint`
+
+上游 TLS ClientHello 与 HTTP/1.1 请求字节的指纹档位。默认 `chrome`（历史行为），可显式切换或关闭，用于必要时回滚。
+
+```json
+{
+  "tls_fingerprint": "bun"
+}
+```
+
+| 取值 | 行为 |
+| --- | --- |
+| `bun` / `boringssl` / `node` | **CLI 档**：uTLS `HelloCustom` 逐字节复刻 opencode CLI v2.1.4（Bun/BoringSSL）抓到的 ClientHello —— 17 cipher BoringSSL 顺序、13 扩展固定顺序（含 MLKEM 混合密钥共享 `0x11ec`、`status_request`、SCT）、32 字节 legacy session id、无 GREASE/ALPS、ALPN **只有 `http/1.1`**、BoringSSL 512 字节 padding 规则。与真实抓包归一化后**逐字节相等**（1502B，JA3 md5 `1523504b…`）。HTTP 层是项目自写的 HTTP/1.1 客户端（真实 CLI 全程 h1，不协商 h2）：请求行 + 用户头按大小写敏感字典序 + 固定尾块（`Connection: keep-alive`、`Accept: */*`、`Host`、`Accept-Encoding: gzip, deflate, br, zstd`、`Content-Length`），并自动补 `b3`/`traceparent`；响应支持 gzip/deflate/br/zstd 解压。 |
+| `chrome` / `auto`（缺省） | uTLS `HelloChrome_Auto`（= Chrome 133）+ `x/net/http2`。TLS 层是 Chrome，HTTP/2 层仍是 Go 指纹。 |
+| `off` / `none` / `false` / `0` / `golang` | 完全关闭：标准 `crypto/tls` + `net/http`，不模拟。 |
+
+- 环境变量 `OPENCODE2API_TLS_FINGERPRINT` 提供同样的取值；`config.json` 中显式配置优先于环境变量。
+- 切换后连接池自动重建（`setTLSFingerprintProfile` → `resetProxyClientPool`），无需重启。
+- 抓包对照、实现细节与已知差异见 `docs/labs/2026-10-24-bun-fingerprint-alignment.md`。
+- 注意：CLI 档的上游请求**不复用** `net/http` 发头，所以不会出现 Go 默认的 `accept-encoding: gzip`、随机化的头序与 `Content-Length` 位置差异；需要自己维护连接池（keep-alive、空闲 90s、按 host 复用）。
+
 ### `prompt_cache_key` / `prompt_cache_retention` / `cache_control_breakpoints`
 
 缓存命中率与三个开关相关，默认对接受的模型都会启用（详见 `internal/app/cache_debug.go` 的 `OPENCODE2API_CACHE_DEBUG=1` 运行时日志可以在各入口看到生效后的上游 body 摘要）：

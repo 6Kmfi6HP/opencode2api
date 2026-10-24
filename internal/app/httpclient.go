@@ -86,10 +86,24 @@ func isTLSFingerprintEnabled() bool {
 func getTargetClientHelloID() utls.ClientHelloID {
 	p := strings.ToLower(getTLSFingerprintProfile())
 	switch p {
-	case "chrome", "auto", "bun", "boringssl":
+	case "chrome", "auto":
 		return utls.HelloChrome_Auto
 	default:
 		return utls.HelloChrome_Auto
+	}
+}
+
+// isBunFingerprintProfile 报告当前档位是否为 Bun/BoringSSL 档。该档位使用
+// 逐字节复刻自 opencode CLI（Bun 1.3.14）的 ClientHello（HelloCustom，ALPN 只有
+// http/1.1）+ 自研 HTTP/1.1 客户端，而不是 Chrome 档的 HelloChrome_Auto +
+// x/net/http2；真实 CLI 全程 HTTP/1.1，不协商 h2。
+// 档位取值见 docs/CONFIGURATION.md。
+func isBunFingerprintProfile() bool {
+	switch strings.ToLower(getTLSFingerprintProfile()) {
+	case "bun", "boringssl", "node":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -141,6 +155,12 @@ func newUTLSTransport(dialContext func(ctx context.Context, network, addr string
 			MaxConnsPerHost:       200,
 			IdleConnTimeout:       90 * time.Second,
 		}
+	}
+
+	// Bun/BoringSSL 档：ClientHello 与 HTTP/1.1 请求字节都由项目自己产出，
+	// 见 fp_bun_hello.go / fp_h1.go。
+	if isBunFingerprintProfile() {
+		return newBunFingerprintTransport(dialContext)
 	}
 
 	helloID := getTargetClientHelloID()
