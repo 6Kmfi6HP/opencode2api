@@ -257,7 +257,7 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 
 ### `tls_fingerprint`
 
-上游 TLS ClientHello 与 HTTP/1.1 请求字节的指纹档位。默认 `chrome`（历史行为），可显式切换或关闭，用于必要时回滚。
+上游 TLS ClientHello 与 HTTP/1.1 请求字节的指纹档位。默认 `bun`（对齐真实 opencode CLI），可显式切换或关闭。
 
 ```json
 {
@@ -267,8 +267,8 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 
 | 取值 | 行为 |
 | --- | --- |
-| `bun` / `boringssl` / `node` | **CLI 档**：uTLS `HelloCustom` 逐字节复刻 opencode CLI v2.1.4（Bun/BoringSSL）抓到的 ClientHello —— 17 cipher BoringSSL 顺序、13 扩展固定顺序（含 MLKEM 混合密钥共享 `0x11ec`、`status_request`、SCT）、32 字节 legacy session id、无 GREASE/ALPS、ALPN **只有 `http/1.1`**、BoringSSL 512 字节 padding 规则。与真实抓包归一化后**逐字节相等**（1502B，JA3 md5 `1523504b…`）。HTTP 层是项目自写的 HTTP/1.1 客户端（真实 CLI 全程 h1，不协商 h2）：请求行 + 用户头按大小写敏感字典序 + 固定尾块（`Connection: keep-alive`、`Accept: */*`、`Host`、`Accept-Encoding: gzip, deflate, br, zstd`、`Content-Length`），并自动补 `b3`/`traceparent`；响应支持 gzip/deflate/br/zstd 解压。 |
-| `chrome` / `auto`（缺省） | uTLS `HelloChrome_Auto`（= Chrome 133）+ `x/net/http2`。TLS 层是 Chrome，HTTP/2 层仍是 Go 指纹。 |
+| `bun` / `boringssl` / `node`（缺省） | **CLI 档**：uTLS `HelloCustom` 逐字节复刻 opencode CLI v2.1.4（Bun/BoringSSL）抓到的 ClientHello —— 17 cipher BoringSSL 顺序、13 扩展固定顺序（含 MLKEM 混合密钥共享 `0x11ec`、`status_request`、SCT）、32 字节 legacy session id、无 GREASE/ALPS、ALPN **只有 `http/1.1`**、BoringSSL 512 字节 padding 规则。与真实抓包归一化后**逐字节相等**（1502B，JA3 md5 `1523504b…`）。HTTP 层是项目自写的 HTTP/1.1 客户端（真实 CLI 全程 h1，不协商 h2）：请求行 + 用户头按大小写敏感字典序 + 固定尾块（`Connection: keep-alive`、`Accept: */*`、`Host`、`Accept-Encoding: gzip, deflate, br, zstd`、`Content-Length`），并自动补 `b3`/`traceparent`；响应支持 gzip/deflate/br/zstd 解压。 |
+| `chrome` / `auto` | 历史档位（需显式配置）：uTLS `HelloChrome_Auto`（= Chrome 133）+ `x/net/http2`。TLS 层是 Chrome，HTTP/2 层仍是 Go 指纹。 |
 | `off` / `none` / `false` / `0` / `golang` | 完全关闭：标准 `crypto/tls` + `net/http`，不模拟。 |
 
 - 环境变量 `OPENCODE2API_TLS_FINGERPRINT` 提供同样的取值；`config.json` 中显式配置优先于环境变量。

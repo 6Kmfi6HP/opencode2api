@@ -27,8 +27,8 @@
   **逐行相等**（头名大小写、头序、固定尾块、trace 头格式）；
 - 原 `fp_h2.go` / `fp_h2_test.go` 已删除：真实客户端不发 h2，留着只会制造不一致特征。
 
-默认档位仍是 `chrome`（历史行为），`bun` 为显式开关，`tls_fingerprint=off` 完全关闭 →
-回滚只改一个配置项。
+默认档位已切到 `bun`（`defaultTLSFingerprintProfile`，未配置时即生效）；想退回历史行为
+显式写 `chrome`，`tls_fingerprint=off` 完全关闭 → 回滚只改一个配置项。
 
 ## 抓包方法
 

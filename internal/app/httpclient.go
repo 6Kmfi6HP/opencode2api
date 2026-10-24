@@ -46,7 +46,12 @@ func envIntOr(key string, def int) int {
 	return n
 }
 
-// ======================== uTLS 与 HTTP/2 指纹模拟 ========================
+// ======================== uTLS 与 HTTP 指纹模拟 ========================
+
+// defaultTLSFingerprintProfile 是未配置 tls_fingerprint 时的缺省档位：
+// 对齐真实 opencode CLI 的 bun 档（HelloCustom + 自写 HTTP/1.1）。
+// 历史 Chrome 档（HelloChrome_Auto + x/net/http2）需显式配置 "chrome"。
+const defaultTLSFingerprintProfile = "bun"
 
 var (
 	tlsFingerprintMu      sync.RWMutex
@@ -75,7 +80,7 @@ func getTLSFingerprintProfile() string {
 	if env := strings.TrimSpace(os.Getenv("OPENCODE2API_TLS_FINGERPRINT")); env != "" {
 		return env
 	}
-	return "chrome"
+	return defaultTLSFingerprintProfile
 }
 
 func isTLSFingerprintEnabled() bool {

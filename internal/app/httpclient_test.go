@@ -325,3 +325,26 @@ func TestUTLSTransport_ToggleOffFallback(t *testing.T) {
 		t.Fatalf("expected *uTLSTransport when enabled, got %T", trChrome)
 	}
 }
+
+// TestUTLSTransport_DefaultIsCLIProfile 未配置 tls_fingerprint 时缺省走对齐
+// opencode CLI 的 bun 档（HelloCustom + 自写 HTTP/1.1），而不是历史 Chrome 档。
+func TestUTLSTransport_DefaultIsCLIProfile(t *testing.T) {
+	oldProfile := getTLSFingerprintProfile()
+	t.Cleanup(func() {
+		setTLSFingerprintProfile(oldProfile)
+	})
+	t.Setenv("OPENCODE2API_TLS_FINGERPRINT", "")
+
+	setTLSFingerprintProfile("")
+	if got := strings.ToLower(getTLSFingerprintProfile()); got != defaultTLSFingerprintProfile {
+		t.Fatalf("default profile = %q, want %q", got, defaultTLSFingerprintProfile)
+	}
+	if !isBunFingerprintProfile() {
+		t.Fatalf("expected default profile to route to the CLI (bun) implementation")
+	}
+
+	tr := newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext)
+	if _, ok := tr.(*fp1Transport); !ok {
+		t.Fatalf("expected *fp1Transport by default, got %T", tr)
+	}
+}
