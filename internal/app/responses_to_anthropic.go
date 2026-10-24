@@ -38,9 +38,8 @@ func forwardResponsesViaAnthropic(w http.ResponseWriter, r *http.Request, auth U
 		// key 重试;UpstreamErrorCapture 暂存非 2xx 响应,重试全失败后透传
 		// 上游真实 status+body。
 		upstreamCap := &UpstreamErrorCapture{}
-		callOnce := upstreamCap.WrapCallOnce(func(callCtx context.Context) (io.ReadCloser, int, error) {
-			nrc, nstatus, _, nerr := callOpenCodeAnthropicEndpoint(callCtx, upstreamBody, chatReq.Model, auth)
-			return nrc, nstatus, nerr
+		callOnce := upstreamCap.WrapCallOnceWithHeader(func(callCtx context.Context) (io.ReadCloser, int, http.Header, error) {
+			return callOpenCodeAnthropicEndpoint(callCtx, upstreamBody, chatReq.Model, auth)
 		})
 		runOnce := func(runCtx context.Context, rw http.ResponseWriter, nrc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
 			return anthropicSSEToResponsesStream(runCtx, rw, nrc, chatReq.Model, wantReasoning, peeked, rd)

@@ -231,6 +231,7 @@ var errStreamIncompleteNoCommit = errors.New("stream incomplete before first cli
 type UpstreamErrorCapture struct {
 	RC     io.ReadCloser
 	Status int
+	Header http.Header
 }
 
 // WrapCallOnce 包装一个原始 callOnce:首轮/重试都过Wrap。
@@ -262,6 +263,31 @@ func (cap *UpstreamErrorCapture) WrapCallOnce(
 	}
 }
 
+// WrapCallOnceWithHeader 包装带 Header 返回的 callOnce 函数。
+func (cap *UpstreamErrorCapture) WrapCallOnceWithHeader(
+	callOnce func(ctx context.Context) (io.ReadCloser, int, http.Header, error),
+) func(ctx context.Context) (io.ReadCloser, int, error) {
+	return func(ctx context.Context) (io.ReadCloser, int, error) {
+		rc, status, header, err := callOnce(ctx)
+		if err != nil {
+			if rc != nil {
+				rc.Close()
+			}
+			return nil, status, err
+		}
+		if status < 200 || status >= 300 {
+			if cap.RC != nil {
+				cap.RC.Close()
+			}
+			cap.RC = rc
+			cap.Status = status
+			cap.Header = header
+			return nil, status, nil
+		}
+		return rc, status, nil
+	}
+}
+
 // WriteUpstreamErrorTo 把捕获到的非 2xx 上游响应原样回写给客户端。返回
 // 是否成功表达了一段上游错误(若 cap 里没有捕获,返回 false)。调用方在
 // false 时应回退到自己的通用错误。
@@ -276,16 +302,27 @@ func (cap *UpstreamErrorCapture) WriteUpstreamErrorTo(w http.ResponseWriter) boo
 		status = http.StatusBadGateway
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if cap.Header != nil {
+		if ra := cap.Header.Get("Retry-After"); ra != "" {
+			w.Header().Set("Retry-After", ra)
+		}
+	}
 	w.WriteHeader(status)
 	if len(errBody) > 0 {
-		_, _ = w.Write(errBody)
+		finalBody := injectRateLimitResetWithHeader(errBody, cap.Header)
+		_, _ = w.Write(finalBody)
 	} else {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"message": fmt.Sprintf("upstream status %d", status),
-				"type":    "upstream_error",
-			},
-		})
+		finalBody := injectRateLimitResetWithHeader(nil, cap.Header)
+		if len(finalBody) > 0 {
+			_, _ = w.Write(finalBody)
+		} else {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": fmt.Sprintf("upstream status %d", status),
+					"type":    "upstream_error",
+				},
+			})
+		}
 	}
 	return true
 }

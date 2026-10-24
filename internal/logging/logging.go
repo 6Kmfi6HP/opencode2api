@@ -704,7 +704,7 @@ func UpstreamErrorDebug(ctx context.Context, req *http.Request, reqBody []byte, 
 
 // UpstreamError logs an upstream error with per-model/status/base-URL
 // deduplication to keep noisy upstream failures from flooding the log.
-func UpstreamError(ctx context.Context, model string, status int, body []byte, baseURL string) {
+func UpstreamError(ctx context.Context, model string, status int, body []byte, baseURL string, extraAttrs ...any) {
 	key := fmt.Sprintf("%s:%d:%s", model, status, baseURL)
 	now := time.Now()
 	upstreamErrDedupMu.Lock()
@@ -714,23 +714,27 @@ func UpstreamError(ctx context.Context, model string, status int, body []byte, b
 		upstreamErrDedup[key] = entry
 		suppressed := entry.suppressed
 		upstreamErrDedupMu.Unlock()
-		FromContext(ctx).Error("upstream error",
+		args := []any{
 			"model", model,
 			"base_url", baseURL,
 			"status", status,
 			"body", truncateForLog(string(body), 512),
 			"suppressed", suppressed,
-		)
+		}
+		args = append(args, extraAttrs...)
+		FromContext(ctx).Error("upstream error", args...)
 		return
 	}
 	upstreamErrDedup[key] = upstreamErrDedupEntry{last: now}
 	upstreamErrDedupMu.Unlock()
-	FromContext(ctx).Error("upstream error",
+	args := []any{
 		"model", model,
 		"base_url", baseURL,
 		"status", status,
 		"body", truncateForLog(string(body), 512),
-	)
+	}
+	args = append(args, extraAttrs...)
+	FromContext(ctx).Error("upstream error", args...)
 }
 
 func truncateForLog(s string, max int) string {

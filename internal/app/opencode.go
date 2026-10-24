@@ -974,7 +974,15 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		}
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		resp.Body.Close()
-		logging.UpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL)
+		var resetInfo string
+		if resp.StatusCode == http.StatusTooManyRequests {
+			resetInfo = extractRateLimitReset(resp.Header, errBody)
+		}
+		if resetInfo != "" {
+			logging.UpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL, "rate_limit_reset", resetInfo)
+		} else {
+			logging.UpstreamError(ctx, modelID, resp.StatusCode, errBody, baseURL)
+		}
 		logging.UpstreamErrorDebug(ctx, up, savedReqBody, resp.Header, errBody, "")
 		if pooled {
 			reportKeyResult(keyID, resp.StatusCode, nil, errBody)
@@ -1019,6 +1027,9 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 			"attempt_index", attempt,
 			"retry_reason", retryReason,
 		}
+		if resetInfo != "" {
+			args = append(args, "rate_limit_reset", resetInfo)
+		}
 		if pooled {
 			args = append(args, "key_id", keyID)
 		}
@@ -1035,8 +1046,13 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		// （cap 5s），缺省 (attempt+1)s 递增；尊重 ctx 取消。
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if backoff := upstream429Backoff(attempt, resp.Header.Get("Retry-After")); backoff > 0 {
-				log.Info("upstream 429 backoff before retry",
-					"attempt", attempt, "backoff_ms", backoff.Milliseconds())
+				backoffArgs := []any{
+					"attempt", attempt, "backoff_ms", backoff.Milliseconds(),
+				}
+				if resetInfo != "" {
+					backoffArgs = append(backoffArgs, "rate_limit_reset", resetInfo)
+				}
+				log.Info("upstream 429 backoff before retry", backoffArgs...)
 				select {
 				case <-ctx.Done():
 					return nil, 0, nil, ctx.Err()
@@ -1141,7 +1157,7 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		}
 		// 包装上游错误体，让下游 writeUpstreamError 能透出原始 message 而非
 		// 笼统 "upstream error"。
-		err = &upstreamBodyError{msg: err.Error(), body: errBody}
+		err = &upstreamBodyError{msg: err.Error(), body: errBody, header: header}
 		return errBody, status, header, err
 	}
 	defer rc.Close()
@@ -1189,8 +1205,9 @@ func (e *anthropicProtocolError) Error() string {
 // 无类型化错误（非 anthropicProtocolError）时也能透出原始 body 中的错误信息
 // （message / type），而不是笼统的 "upstream error"。
 type upstreamBodyError struct {
-	msg  string
-	body []byte
+	msg    string
+	body   []byte
+	header http.Header
 }
 
 func (e *upstreamBodyError) Error() string { return e.msg }
@@ -1226,31 +1243,59 @@ func writeUpstreamError(w http.ResponseWriter, status int, err error, protocol s
 		}
 	}
 
+	var resetInfo string
+	if ube != nil {
+		resetInfo = extractRateLimitReset(ube.header, ube.body)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
+	if ube != nil && ube.header != nil {
+		if ra := ube.header.Get("Retry-After"); ra != "" {
+			w.Header().Set("Retry-After", ra)
+		}
+	}
 	w.WriteHeader(status)
 	switch protocol {
 	case "claude":
-		json.NewEncoder(w).Encode(map[string]any{
-			"type": "error",
-			"error": map[string]string{
-				"type":    errType,
-				"message": message,
-			},
-		})
+		errMap := map[string]any{
+			"type":    errType,
+			"message": message,
+		}
+		respMap := map[string]any{
+			"type":  "error",
+			"error": errMap,
+		}
+		if resetInfo != "" {
+			errMap["rate_limit_reset"] = resetInfo
+			respMap["rate_limit_reset"] = resetInfo
+		}
+		json.NewEncoder(w).Encode(respMap)
 	case "responses":
-		json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"type":    errType,
-				"message": message,
-			},
-		})
+		errMap := map[string]any{
+			"type":    errType,
+			"message": message,
+		}
+		respMap := map[string]any{
+			"error": errMap,
+		}
+		if resetInfo != "" {
+			errMap["rate_limit_reset"] = resetInfo
+			respMap["rate_limit_reset"] = resetInfo
+		}
+		json.NewEncoder(w).Encode(respMap)
 	default: // "chat"
-		json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"type":    errType,
-				"message": message,
-			},
-		})
+		errMap := map[string]any{
+			"type":    errType,
+			"message": message,
+		}
+		respMap := map[string]any{
+			"error": errMap,
+		}
+		if resetInfo != "" {
+			errMap["rate_limit_reset"] = resetInfo
+			respMap["rate_limit_reset"] = resetInfo
+		}
+		json.NewEncoder(w).Encode(respMap)
 	}
 }
 

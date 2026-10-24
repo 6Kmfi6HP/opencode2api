@@ -362,14 +362,13 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 
 		pending := rc
 		upstreamCap := &UpstreamErrorCapture{}
-		callOnce := upstreamCap.WrapCallOnce(func(ctx context.Context) (io.ReadCloser, int, error) {
+		callOnce := upstreamCap.WrapCallOnceWithHeader(func(ctx context.Context) (io.ReadCloser, int, http.Header, error) {
 			if pending != nil {
 				first := pending
 				pending = nil
-				return first, http.StatusOK, nil
+				return first, http.StatusOK, nil, nil
 			}
-			rc2, status2, _, err2 := callOpenCodeEndpoint(ctx, "responses", upstreamBody, req.Model, auth)
-			return rc2, status2, err2
+			return callOpenCodeEndpoint(ctx, "responses", upstreamBody, req.Model, auth)
 		})
 		runOnce := func(ctx context.Context, w http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
 			return responsesSSEToChatStream(ctx, w, rc, req.Model, keepReasoning, true, peeked, rd)

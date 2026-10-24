@@ -1680,14 +1680,13 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		pending := upResp
 		upstreamCap := &UpstreamErrorCapture{}
-		callOnce := upstreamCap.WrapCallOnce(func(c context.Context) (io.ReadCloser, int, error) {
+		callOnce := upstreamCap.WrapCallOnceWithHeader(func(c context.Context) (io.ReadCloser, int, http.Header, error) {
 			if pending != nil {
 				rc := pending
 				pending = nil
-				return rc, http.StatusOK, nil
+				return rc, http.StatusOK, nil, nil
 			}
-			nrc, nstatus, _, nerr := callOpenCodeAPIStream(c, upstreamBody, chatReq.Model, auth)
-			return nrc, nstatus, nerr
+			return callOpenCodeAPIStream(c, upstreamBody, chatReq.Model, auth)
 		})
 		runOnce := func(c context.Context, w http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
 			return responsesStreamHandler(w, r, rc, chatReq.Model, chatReq.Model, wantReasoning, respReq.Tools, respReq.ToolChoice, respReq, peeked, rd)
@@ -1709,7 +1708,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
+	respBody, status, header, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
 		// 上游明确把顶层 cache_control 判为未知参数：剥离后重发一次
 		// （prompt_cache_key/retention 保留），并记住该模型不再注入。
@@ -1742,7 +1741,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
 			if len(respBody) > 0 {
-				w.Write(respBody)
+				w.Write(injectRateLimitResetWithHeader(respBody, header))
 			} else {
 				json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error"}})
 			}

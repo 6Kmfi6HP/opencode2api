@@ -1259,7 +1259,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
+	respBody, status, header, err := callOpenCodeAPI(r.Context(), upstreamBody, chatReq.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
 		// 翻译路径失败：探测上游原生 responses，成功则转换并记住该模型。
 		// 本地转换失败（上游 200 但包体无法解析，err 非 "upstream error"）
@@ -1274,7 +1274,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
 			if len(respBody) > 0 {
-				w.Write(respBody)
+				w.Write(injectRateLimitResetWithHeader(respBody, header))
 			} else {
 				json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "api_error", "message": "upstream error"}})
 			}

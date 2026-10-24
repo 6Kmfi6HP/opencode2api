@@ -747,9 +747,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		// 端,而不是吞掉换成通用 502。
 		upstreamCap := &UpstreamErrorCapture{}
 		committed, driveErr := DriveStreamWithRetry(ctx, w, ChatProtocolHooks,
-			upstreamCap.WrapCallOnce(func(c context.Context) (io.ReadCloser, int, error) {
-				rc, status, _, err := callOpenCodeAPIStream(c, upstreamBody, req.Model, auth)
-				return rc, status, err
+			upstreamCap.WrapCallOnceWithHeader(func(c context.Context) (io.ReadCloser, int, http.Header, error) {
+				return callOpenCodeAPIStream(c, upstreamBody, req.Model, auth)
 			}),
 			func(c context.Context, w http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
 				return chatStreamRunOnce(c, w, rc, peeked, rd, &req, keepReasoning, clientWantsUsage)
@@ -782,7 +781,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(r.Context(), upstreamBody, req.Model, auth)
+	respBody, status, header, err := callOpenCodeAPI(r.Context(), upstreamBody, req.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
 		if err != nil {
 			writeUpstreamError(w, status, err, "chat")
@@ -790,7 +789,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
 			if len(respBody) > 0 {
-				w.Write(respBody)
+				w.Write(injectRateLimitResetWithHeader(respBody, header))
 			} else {
 				json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error", "type": "upstream_error"}})
 			}

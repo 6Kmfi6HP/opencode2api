@@ -343,7 +343,11 @@ func relayAnthropicBuffered(ctx context.Context, w http.ResponseWriter, rc io.Re
 			logging.LogResult(ctx, result)
 		}
 	} else {
-		logging.UpstreamError(ctx, modelID, status, body, roundRobinBaseURL())
+		if resetInfo := extractRateLimitReset(nil, body); resetInfo != "" {
+			logging.UpstreamError(ctx, modelID, status, body, roundRobinBaseURL(), "rate_limit_reset", resetInfo)
+		} else {
+			logging.UpstreamError(ctx, modelID, status, body, roundRobinBaseURL())
+		}
 	}
 }
 

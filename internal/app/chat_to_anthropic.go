@@ -1174,9 +1174,8 @@ func forwardChatViaAnthropic(w http.ResponseWriter, r *http.Request, auth Upstre
 		// 用 UpstreamErrorCapture 暂存非 2xx 响应,这样 retry 全失败后能
 		// 把上游真实 status+body 透回去给客户端,而不是吞掉换成通用 502。
 		upstreamCap := &UpstreamErrorCapture{}
-		callOnce := upstreamCap.WrapCallOnce(func(callCtx context.Context) (io.ReadCloser, int, error) {
-			rc, status, _, err := callOpenCodeAnthropicEndpoint(callCtx, upstreamBody, req.Model, auth)
-			return rc, status, err
+		callOnce := upstreamCap.WrapCallOnceWithHeader(func(callCtx context.Context) (io.ReadCloser, int, http.Header, error) {
+			return callOpenCodeAnthropicEndpoint(callCtx, upstreamBody, req.Model, auth)
 		})
 		runOnce := func(runCtx context.Context, rw http.ResponseWriter, rc io.Reader, peeked []streamReadResult, rd *streamReader) (bool, error) {
 			return anthropicSSEToChatStream(runCtx, rw, rc, req.Model, keepReasoning, true, peeked, rd)
