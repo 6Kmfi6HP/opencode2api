@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.14.40
+
+- Fix free-tier upstream fake 429 errors by injecting required `<env>` system prompt block (`feat(fingerprint)`):
+  - 根因：服务端对免费层（Free Tier）设有第 6 层隐蔽门禁，要求 system prompt 中必须包含 `<env>`、`Working directory:`、`</env>` 且顺序闭合；若缺失，服务端刻意返回与配额耗尽相同的 429 `FreeUsageLimitError` 伪装错误。
+  - 网关在 `applyFreeTierFingerprint` 中增加 `ensureFreeTierSystemEnv`，为 `chat/completions`、`messages`、`responses` 三协议自动补齐或前置注入合规 `<env>` 块。
+  - 注入采用头部前置策略，与 `clipChatSystemStable` 及上游 prompt cache 保持 100% 前缀对齐，不产生缓存抖动。
+
+- Optimize GitHub Actions workflows and image builds (`ci(workflow)`):
+  - 限制 Docker 镜像构建仅在发布版本 tag（`v*`）时触发推送到 GHCR，避免日常提交浪费多架构 QEMU 分钟数。
+  - 镜像构建同时打对应版本号和 `latest` 标签。
+  - 移除多架构二进制编译工作流 `release.yml`，减少 Actions 额度消耗。
+  - 工作流与 Dockerfile 编译基础镜像全面对齐 `go.mod` 声明的 Go 1.26。
+
 ## v0.14.39
 
 - Fix thread explosion causing fatal `newosproc` crashes and 502 SSE stream drops (`fix(stats)`):
