@@ -460,12 +460,13 @@ func fetchModels() ([]ModelInfo, error) {
 	if session == "" {
 		session = newOCSessionID()
 	}
-	// 2026-10-14: /zen/v1 迁移至 /inference/v1（V2 免费层）。
-	// inference 路径上 x-opencode-project 必须为 "global"（40-hex project id 触发 403），
-	// x-opencode-request 不可发（其存在本身触发 403）。
+	// 2026-10-24: the real CLI (v2.1.3) sends its own 40-hex project id on the
+	// free inference path and is served; a shared "global" project bucket is what
+	// the free-tier rate limiter meters (and it is perpetually exhausted). Use the
+	// session's rotating project id instead, exactly like the client does.
 	req.Header.Set("User-Agent", ocUserAgent(sessionState))
 	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-project", "global")
+	req.Header.Set("x-opencode-project", sessionState.projectID)
 	// 2026-10-14 抓包 CLI v2.0.29: 同时发旧 x-opencode-session、新 x-session-id、
 	// x-session-affinity、以及新增的 x-opencode-session-id 四头。
 	req.Header.Set("x-opencode-session", session)
@@ -744,13 +745,9 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	// UA 对齐 lite L1931: ai-sdk/runtime 后缀贴近真实 opencode 客户端。
 	req.Header.Set("User-Agent", ocUserAgent(state))
 	req.Header.Set("x-opencode-client", "cli")
-	// inference/v1 路径：project 必须为 "global"（40-hex id 触发 403）。
-	// go/v1 路径沿用 state.projectID 以兼容旧门禁。
-	if useGoEndpoint {
-		req.Header.Set("x-opencode-project", state.projectID)
-	} else {
-		req.Header.Set("x-opencode-project", "global")
-	}
+	// 2026-10-24: send the session's rotating 40-hex project id on both surfaces —
+	// the real CLI does, and the shared "global" bucket is what stays rate-limited.
+	req.Header.Set("x-opencode-project", state.projectID)
 	if subpath == "messages" {
 		// Anthropic Messages 上游需要版本头；流式时 Accept 切为 SSE。
 		req.Header.Set("anthropic-version", "2023-06-01")
