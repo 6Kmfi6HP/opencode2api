@@ -51,6 +51,13 @@ macOS arm64，两个本地代理：
 CLI 侧的坑：它会把内部请求发到自己起的本地 HTTP 服务，走代理会得到 `405` ——
 必须 `NO_PROXY=127.0.0.1,localhost` 且用 `--standalone`，只有真正出网的请求才落进抓包。
 
+**收尾必做**：CLI 会派生常驻守护进程 `~/.opencode/bin/opencode serve --service`，它
+**继承并长期保留**这次运行的环境变量。带着 `HTTP_PROXY`/`HTTPS_PROXY` 跑过一次后，
+之后每次 `opencode run` 都复用那个守护进程的去代理连接，抓包代理一停就变成
+`ECONNRESET: The socket connection was closed unexpectedly`（看起来像被上游封禁，
+其实是本机残留进程）。抓包结束请 `pgrep -f "opencode serve --service"` 并 kill，
+`ps eww -p <pid>` 可确认它是否还带着 proxy env。
+
 ## TLS ClientHello 对比（同机实测）
 
 | 客户端 | 长度 | cipher | 扩展 | ALPN | JA3 md5 |
