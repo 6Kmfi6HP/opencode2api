@@ -2,8 +2,6 @@ name: Docker Image
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -60,10 +58,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
             type=ref,event=tag
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
           labels: |
             org.opencontainers.image.title=opencode2api
             org.opencontainers.image.description=OpenCode to OpenAI/Anthropic compatible API proxy
