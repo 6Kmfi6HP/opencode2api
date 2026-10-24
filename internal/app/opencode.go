@@ -1028,6 +1028,17 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		if !canRetry {
 			break
 		}
+		// A long Retry-After means the upstream identity/egress is parked for a
+		// window we cannot outwait inside one request. Retrying (and letting the
+		// 5s-capped backoff re-hit the same window) is what keeps the penalty
+		// alive for hours; stop here and surface the 429 instead.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if d := parseRetryAfter(resp.Header.Get("Retry-After")); d > 60*time.Second {
+				log.Info("upstream 429 long retry-after; not retrying",
+					"attempt", attempt, "retry_after_s", int(d.Seconds()))
+				break
+			}
+		}
 		// 429 重试退避：上游错误信息明确要求 "Please retry after a brief
 		// wait"，立即重发只会在同一限速窗口内反复撞限。Retry-After 优先
 		// （cap 5s），缺省 (attempt+1)s 递增；尊重 ctx 取消。
