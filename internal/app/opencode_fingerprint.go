@@ -243,10 +243,146 @@ func ensureFreeTierTools(bodyMap map[string]any, subpath string) {
 	bodyMap["tools"] = append(rawTools, missing...)
 }
 
+// ======================== 免费层指纹: system prompt <env> 门禁 ========================
+//
+// 上游免费层第 6 层门禁（实测见 rea-opencode）：
+// 服务端要求 system prompt 必须包含合规的 <env> 块：同时出现 "<env>"、
+// "Working directory:"、"</env>"，区分大小写，且必须顺序闭合。
+// 缺失时服务端刻意返回与配额耗尽相同的 429 FreeUsageLimitError 响应体和
+// retry-after 头。网关在指纹阶段前置注入，对齐 CLI 行为且保持跨轮前缀缓存稳定。
+
+const freeTierDefaultEnvBlock = "<env>\n  Working directory: /workspace\n</env>"
+
+// hasFreeTierEnvBlock 校验字符串是否已包含合规的免费层 <env> 块。
+func hasFreeTierEnvBlock(s string) bool {
+	envStart := strings.Index(s, "<env>")
+	if envStart == -1 {
+		return false
+	}
+	workDirRel := strings.Index(s[envStart:], "Working directory:")
+	if workDirRel == -1 {
+		return false
+	}
+	envEndRel := strings.Index(s[envStart+workDirRel:], "</env>")
+	return envEndRel != -1
+}
+
+func ensureFreeTierSystemEnvChat(bodyMap map[string]any) {
+	rawMsgs, ok := bodyMap["messages"].([]any)
+	if !ok || len(rawMsgs) == 0 {
+		bodyMap["messages"] = []any{
+			map[string]any{
+				"role":    "system",
+				"content": freeTierDefaultEnvBlock,
+			},
+		}
+		return
+	}
+	for _, m := range rawMsgs {
+		msg, ok := m.(map[string]any)
+		if !ok || msg["role"] != "system" {
+			continue
+		}
+		switch c := msg["content"].(type) {
+		case string:
+			if !hasFreeTierEnvBlock(c) {
+				if strings.TrimSpace(c) == "" {
+					msg["content"] = freeTierDefaultEnvBlock
+				} else {
+					msg["content"] = freeTierDefaultEnvBlock + "\n\n" + c
+				}
+			}
+			return
+		case []any:
+			for _, part := range c {
+				if pm, ok := part.(map[string]any); ok {
+					if text, _ := pm["text"].(string); hasFreeTierEnvBlock(text) {
+						return
+					}
+				}
+			}
+			envPart := map[string]any{"type": "text", "text": freeTierDefaultEnvBlock}
+			msg["content"] = append([]any{envPart}, c...)
+			return
+		}
+	}
+	sysMsg := map[string]any{
+		"role":    "system",
+		"content": freeTierDefaultEnvBlock,
+	}
+	bodyMap["messages"] = append([]any{sysMsg}, rawMsgs...)
+}
+
+func ensureFreeTierSystemEnvMessages(bodyMap map[string]any) {
+	sysVal, ok := bodyMap["system"]
+	if !ok || sysVal == nil {
+		bodyMap["system"] = freeTierDefaultEnvBlock
+		return
+	}
+	switch s := sysVal.(type) {
+	case string:
+		if !hasFreeTierEnvBlock(s) {
+			if strings.TrimSpace(s) == "" {
+				bodyMap["system"] = freeTierDefaultEnvBlock
+			} else {
+				bodyMap["system"] = freeTierDefaultEnvBlock + "\n\n" + s
+			}
+		}
+	case []any:
+		for _, part := range s {
+			if pm, ok := part.(map[string]any); ok {
+				if text, _ := pm["text"].(string); hasFreeTierEnvBlock(text) {
+					return
+				}
+			}
+		}
+		envPart := map[string]any{"type": "text", "text": freeTierDefaultEnvBlock}
+		bodyMap["system"] = append([]any{envPart}, s...)
+	default:
+		bodyMap["system"] = freeTierDefaultEnvBlock
+	}
+}
+
+func ensureFreeTierSystemEnvResponses(bodyMap map[string]any) {
+	instrVal, ok := bodyMap["instructions"]
+	if !ok || instrVal == nil {
+		bodyMap["instructions"] = freeTierDefaultEnvBlock
+		return
+	}
+	switch s := instrVal.(type) {
+	case string:
+		if !hasFreeTierEnvBlock(s) {
+			if strings.TrimSpace(s) == "" {
+				bodyMap["instructions"] = freeTierDefaultEnvBlock
+			} else {
+				bodyMap["instructions"] = freeTierDefaultEnvBlock + "\n\n" + s
+			}
+		}
+	default:
+		bodyMap["instructions"] = freeTierDefaultEnvBlock
+	}
+}
+
+// ensureFreeTierSystemEnv 检查并补齐免费层上游所需的 system prompt <env> 自证块。
+func ensureFreeTierSystemEnv(bodyMap map[string]any, subpath string) {
+	if bodyMap == nil {
+		return
+	}
+	switch subpath {
+	case "messages":
+		ensureFreeTierSystemEnvMessages(bodyMap)
+	case "responses":
+		ensureFreeTierSystemEnvResponses(bodyMap)
+	default: // chat/completions
+		ensureFreeTierSystemEnvChat(bodyMap)
+	}
+}
+
 // applyFreeTierFingerprint 对"解析后的上游模型本身是免费"的请求执行免费层
 // 指纹重做(issue #19,2026-09-18 实测门禁口径:按解析后的上游模型判定,
 // 不按客户端 Authorization tier):
 //   - tools: 缺 bash/glob/grep/read 任何一件时按上游协议形状补齐缺失项;
+//   - system prompt: 补齐上游第 6 层门禁要求的 <env> 自证块(缺则报假 429);
 //   - stream: 一律强制 true(上游仅接受流式);
 //   - stream_options: chat/completions 与 responses 子路径保留客户端自定义键、
 //     仅补 include_usage=true;messages 子路径不写 stream_options(不属于
@@ -266,6 +402,7 @@ func applyFreeTierFingerprint(bodyMap map[string]any, subpath, modelID string) {
 		return
 	}
 	ensureFreeTierTools(bodyMap, subpath)
+	ensureFreeTierSystemEnv(bodyMap, subpath)
 	bodyMap["stream"] = true
 	if subpath == "messages" {
 		return

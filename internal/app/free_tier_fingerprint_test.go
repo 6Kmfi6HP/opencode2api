@@ -151,6 +151,145 @@ func TestFreeTierFingerprint_PublicPartialClientTools(t *testing.T) {
 	}
 }
 
+func TestHasFreeTierEnvBlock(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"standard multi-line", "<env>\nWorking directory: /tmp/lab\n</env>", true},
+		{"inline single line", "<env>Working directory: /workspace</env>", true},
+		{"empty working directory", "<env>Working directory:</env>", true},
+		{"embedded in text", "some preamble <env>\n  Working directory: /foo\n</env> trailing instructions", true},
+		{"missing closing env", "<env>\nWorking directory: /tmp/lab", false},
+		{"missing opening env", "Working directory: /tmp/lab\n</env>", false},
+		{"missing working directory", "<env>\nPlatform: darwin\n</env>", false},
+		{"case mismatch uppercase", "<ENV>Working directory: /workspace</ENV>", false},
+		{"wrong order", "</env>Working directory: /workspace<env>", false},
+		{"empty string", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasFreeTierEnvBlock(tt.text); got != tt.want {
+				t.Errorf("hasFreeTierEnvBlock(%q) = %v, want %v", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnsureFreeTierSystemEnv_ChatCompletions(t *testing.T) {
+	t.Run("empty messages adds system message", func(t *testing.T) {
+		body := map[string]any{"messages": []any{}}
+		ensureFreeTierSystemEnv(body, "chat/completions")
+		msgs := body["messages"].([]any)
+		if len(msgs) != 1 {
+			t.Fatalf("len(messages) = %d, want 1", len(msgs))
+		}
+		m := msgs[0].(map[string]any)
+		if m["role"] != "system" || !hasFreeTierEnvBlock(m["content"].(string)) {
+			t.Fatalf("first message = %v, want system with env block", m)
+		}
+	})
+
+	t.Run("user message only prepends system message", func(t *testing.T) {
+		body := map[string]any{"messages": []any{
+			map[string]any{"role": "user", "content": "hello"},
+		}}
+		ensureFreeTierSystemEnv(body, "chat/completions")
+		msgs := body["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("len(messages) = %d, want 2", len(msgs))
+		}
+		sys := msgs[0].(map[string]any)
+		if sys["role"] != "system" || !hasFreeTierEnvBlock(sys["content"].(string)) {
+			t.Fatalf("first message = %v, want system with env block", sys)
+		}
+		user := msgs[1].(map[string]any)
+		if user["role"] != "user" || user["content"] != "hello" {
+			t.Fatalf("second message = %v, want user hello", user)
+		}
+	})
+
+	t.Run("existing system string without env prepends env block", func(t *testing.T) {
+		body := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": "You are a helpful assistant."},
+			map[string]any{"role": "user", "content": "hi"},
+		}}
+		ensureFreeTierSystemEnv(body, "chat/completions")
+		msgs := body["messages"].([]any)
+		sys := msgs[0].(map[string]any)
+		content := sys["content"].(string)
+		if !hasFreeTierEnvBlock(content) {
+			t.Fatalf("content = %q, want env block present", content)
+		}
+		if !strings.HasSuffix(content, "You are a helpful assistant.") {
+			t.Fatalf("content = %q, want original prompt preserved at suffix", content)
+		}
+	})
+
+	t.Run("existing system string with env left untouched", func(t *testing.T) {
+		orig := "<env>\n  Working directory: /my/custom/path\n</env>\n\nCustom prompt"
+		body := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": orig},
+		}}
+		ensureFreeTierSystemEnv(body, "chat/completions")
+		msgs := body["messages"].([]any)
+		sys := msgs[0].(map[string]any)
+		if sys["content"] != orig {
+			t.Fatalf("content = %q, want untouched %q", sys["content"], orig)
+		}
+	})
+}
+
+func TestEnsureFreeTierSystemEnv_MessagesSubpath(t *testing.T) {
+	t.Run("nil system sets default env block", func(t *testing.T) {
+		body := map[string]any{"messages": []any{}}
+		ensureFreeTierSystemEnv(body, "messages")
+		sys, ok := body["system"].(string)
+		if !ok || !hasFreeTierEnvBlock(sys) {
+			t.Fatalf("body[system] = %v, want string with env block", body["system"])
+		}
+	})
+
+	t.Run("string system without env prepends env block", func(t *testing.T) {
+		body := map[string]any{"system": "System instructions here"}
+		ensureFreeTierSystemEnv(body, "messages")
+		sys, ok := body["system"].(string)
+		if !ok || !hasFreeTierEnvBlock(sys) || !strings.HasSuffix(sys, "System instructions here") {
+			t.Fatalf("body[system] = %v, want env block + instructions", body["system"])
+		}
+	})
+
+	t.Run("string system with env untouched", func(t *testing.T) {
+		orig := "<env>\nWorking directory: /tmp\n</env>"
+		body := map[string]any{"system": orig}
+		ensureFreeTierSystemEnv(body, "messages")
+		if body["system"] != orig {
+			t.Fatalf("body[system] = %v, want untouched %q", body["system"], orig)
+		}
+	})
+}
+
+func TestEnsureFreeTierSystemEnv_ResponsesSubpath(t *testing.T) {
+	t.Run("nil instructions sets default env block", func(t *testing.T) {
+		body := map[string]any{}
+		ensureFreeTierSystemEnv(body, "responses")
+		instr, ok := body["instructions"].(string)
+		if !ok || !hasFreeTierEnvBlock(instr) {
+			t.Fatalf("body[instructions] = %v, want env block", body["instructions"])
+		}
+	})
+
+	t.Run("string instructions without env prepends env block", func(t *testing.T) {
+		body := map[string]any{"instructions": "Base instructions"}
+		ensureFreeTierSystemEnv(body, "responses")
+		instr, ok := body["instructions"].(string)
+		if !ok || !hasFreeTierEnvBlock(instr) || !strings.HasSuffix(instr, "Base instructions") {
+			t.Fatalf("body[instructions] = %v, want env block + Base instructions", body["instructions"])
+		}
+	})
+}
+
 // 免费层指纹补齐：走到上游 responses 子路径时，缺失的四件工具必须按
 // OpenAI Responses 形状（{"type":"function","name","parameters"}）注入；
 // Anthropic 的 ("name"+input_schema) 形状会被上游按 `did not match any
