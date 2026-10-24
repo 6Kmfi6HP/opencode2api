@@ -465,7 +465,11 @@ func fetchModels() ([]ModelInfo, error) {
 	// x-opencode-request 不可发（其存在本身触发 403）。
 	req.Header.Set("User-Agent", ocUserAgent(sessionState))
 	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-project", "global")
+	projID := sessionState.projectID
+	if strings.TrimSpace(projID) == "" {
+		projID = randomHex(40)
+	}
+	req.Header.Set("x-opencode-project", projID)
 	// 2026-10-14 抓包 CLI v2.0.29: 同时发旧 x-opencode-session、新 x-session-id、
 	// x-session-affinity、以及新增的 x-opencode-session-id 四头。
 	req.Header.Set("x-opencode-session", session)
@@ -744,13 +748,11 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	// UA 对齐 lite L1931: ai-sdk/runtime 后缀贴近真实 opencode 客户端。
 	req.Header.Set("User-Agent", ocUserAgent(state))
 	req.Header.Set("x-opencode-client", "cli")
-	// inference/v1 路径：project 必须为 "global"（40-hex id 触发 403）。
-	// go/v1 路径沿用 state.projectID 以兼容旧门禁。
-	if useGoEndpoint {
-		req.Header.Set("x-opencode-project", state.projectID)
-	} else {
-		req.Header.Set("x-opencode-project", "global")
+	projectID := state.projectID
+	if strings.TrimSpace(projectID) == "" {
+		projectID = randomHex(40)
 	}
+	req.Header.Set("x-opencode-project", projectID)
 	if subpath == "messages" {
 		// Anthropic Messages 上游需要版本头；流式时 Accept 切为 SSE。
 		req.Header.Set("anthropic-version", "2023-06-01")

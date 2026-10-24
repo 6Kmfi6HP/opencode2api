@@ -2,9 +2,13 @@ package app
 
 import (
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 保存并替换全局代理状态,结束后恢复。
@@ -270,5 +274,54 @@ func TestNormalizeBaseURLs(t *testing.T) {
 	}
 	if got := normalizeBaseURLs(nil); strings.Join(got, ",") != strings.Join(defaultBaseURLs, ",") {
 		t.Fatalf("empty normalize = %#v, want default", got)
+	}
+}
+
+func TestUTLSTransport_PlainHTTPRouting(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("plain_http_ok"))
+	}))
+	defer ts.Close()
+
+	client := &http.Client{
+		Transport: newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext),
+	}
+
+	resp, err := client.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("expected plain http to succeed, got: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "plain_http_ok" {
+		t.Fatalf("expected plain_http_ok, got: %q", string(body))
+	}
+}
+
+func TestUTLSTransport_ToggleOffFallback(t *testing.T) {
+	oldProfile := getTLSFingerprintProfile()
+	t.Cleanup(func() {
+		setTLSFingerprintProfile(oldProfile)
+	})
+
+	setTLSFingerprintProfile("off")
+	if isTLSFingerprintEnabled() {
+		t.Fatalf("expected isTLSFingerprintEnabled() to be false when off")
+	}
+
+	tr := newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext)
+	if _, ok := tr.(*http.Transport); !ok {
+		t.Fatalf("expected fallback to *http.Transport when disabled, got %T", tr)
+	}
+
+	setTLSFingerprintProfile("chrome")
+	if !isTLSFingerprintEnabled() {
+		t.Fatalf("expected isTLSFingerprintEnabled() to be true for chrome")
+	}
+
+	trChrome := newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext)
+	if _, ok := trChrome.(*uTLSTransport); !ok {
+		t.Fatalf("expected *uTLSTransport when enabled, got %T", trChrome)
 	}
 }

@@ -223,6 +223,10 @@ func applyConfig(cfg AppConfig) {
 	}
 	socks5Mu.Unlock()
 
+	if cfg.TLSFingerprint != "" {
+		setTLSFingerprintProfile(cfg.TLSFingerprint)
+	}
+
 	setUpstreamBaseURLs(cfg.UpstreamBaseURLs)
 
 	if cfg.NativeResponsesModels != nil {

@@ -164,6 +164,7 @@ type AppConfig struct {
 	// but the key authentication path is unchanged.
 	// Can also be enabled at runtime via OPENCODE2API_FORCE_FREE=1.
 	ForceFree            bool           `json:"force_free,omitempty"`
+	TLSFingerprint       string         `json:"tls_fingerprint,omitempty"`
 	MaxTokensCap         int            `json:"max_tokens_cap,omitempty"`
 	MaxTokensCapPerModel map[string]int `json:"max_tokens_cap_per_model,omitempty"`
 	Socks5Proxies        []Socks5Proxy  `json:"socks5_proxies,omitempty"`

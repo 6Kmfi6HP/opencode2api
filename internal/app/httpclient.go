@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +16,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 // upstreamTimeout 返回上游 http.Client 的墙钟超时。Go http.Client.Timeout
@@ -41,24 +46,180 @@ func envIntOr(key string, def int) int {
 	return n
 }
 
+// ======================== uTLS 与 HTTP/2 指纹模拟 ========================
+
+var (
+	tlsFingerprintMu      sync.RWMutex
+	tlsFingerprintProfile string
+	errNotHTTP2           = errors.New("utls: negotiated protocol is not h2")
+)
+
+func setTLSFingerprintProfile(profile string) {
+	tlsFingerprintMu.Lock()
+	tlsFingerprintProfile = strings.TrimSpace(profile)
+	tlsFingerprintMu.Unlock()
+	resetProxyClientPool()
+	httpClient.Transport = newUTLSTransport((&net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext)
+}
+
+func getTLSFingerprintProfile() string {
+	tlsFingerprintMu.RLock()
+	p := tlsFingerprintProfile
+	tlsFingerprintMu.RUnlock()
+	if p != "" {
+		return p
+	}
+	if env := strings.TrimSpace(os.Getenv("OPENCODE2API_TLS_FINGERPRINT")); env != "" {
+		return env
+	}
+	return "chrome"
+}
+
+func isTLSFingerprintEnabled() bool {
+	p := strings.ToLower(getTLSFingerprintProfile())
+	return p != "off" && p != "none" && p != "false" && p != "0" && p != "golang"
+}
+
+func getTargetClientHelloID() utls.ClientHelloID {
+	p := strings.ToLower(getTLSFingerprintProfile())
+	switch p {
+	case "chrome", "auto", "bun", "boringssl":
+		return utls.HelloChrome_Auto
+	default:
+		return utls.HelloChrome_Auto
+	}
+}
+
+type uTLSTransport struct {
+	dialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
+	h2Transport   *http2.Transport
+	h1Transport   *http.Transport
+	clientHelloID utls.ClientHelloID
+}
+
+func (t *uTLSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme == "http" {
+		return t.h1Transport.RoundTrip(req)
+	}
+
+	resp, err := t.h2Transport.RoundTrip(req)
+	if err != nil {
+		if errors.Is(err, errNotHTTP2) {
+			return t.h1Transport.RoundTrip(req)
+		}
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (t *uTLSTransport) CloseIdleConnections() {
+	if t.h2Transport != nil {
+		t.h2Transport.CloseIdleConnections()
+	}
+	if t.h1Transport != nil {
+		t.h1Transport.CloseIdleConnections()
+	}
+}
+
+func newUTLSTransport(dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) http.RoundTripper {
+	if dialContext == nil {
+		dialContext = (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext
+	}
+	if !isTLSFingerprintEnabled() {
+		return &http.Transport{
+			DialContext:           dialContext,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+			MaxIdleConns:          500,
+			MaxIdleConnsPerHost:   100,
+			MaxConnsPerHost:       200,
+			IdleConnTimeout:       90 * time.Second,
+		}
+	}
+
+	helloID := getTargetClientHelloID()
+
+	t := &uTLSTransport{
+		dialContext:   dialContext,
+		clientHelloID: helloID,
+	}
+
+	t.h2Transport = &http2.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			rawConn, err := dialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+
+			uConfig := &utls.Config{
+				ServerName: host,
+			}
+
+			uconn := utls.UClient(rawConn, uConfig, helloID)
+			if err := uconn.HandshakeContext(ctx); err != nil {
+				rawConn.Close()
+				return nil, fmt.Errorf("utls handshake failed to %s: %w", addr, err)
+			}
+
+			proto := uconn.ConnectionState().NegotiatedProtocol
+			if proto != "h2" {
+				uconn.Close()
+				return nil, errNotHTTP2
+			}
+
+			return uconn, nil
+		},
+		MaxHeaderListSize: 262144,
+		MaxReadFrameSize:  16384,
+		ReadIdleTimeout:   0,
+		PingTimeout:       15 * time.Second,
+	}
+
+	t.h1Transport = &http.Transport{
+		DialContext: dialContext,
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			rawConn, err := dialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+			uconn := utls.UClient(rawConn, &utls.Config{ServerName: host}, helloID)
+			if err := uconn.HandshakeContext(ctx); err != nil {
+				rawConn.Close()
+				return nil, fmt.Errorf("utls h1 handshake failed to %s: %w", addr, err)
+			}
+			return uconn, nil
+		},
+		ResponseHeaderTimeout: 10 * time.Second,
+		MaxIdleConns:          500,
+		MaxIdleConnsPerHost:   100,
+		MaxConnsPerHost:       200,
+		IdleConnTimeout:       90 * time.Second,
+	}
+
+	return t
+}
+
 var httpClient = &http.Client{
 	Timeout: upstreamTimeout(),
-	Transport: &http.Transport{
-		// TCP 连接建立超时
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,  // TCP 三次握手超时
-			KeepAlive: 30 * time.Second, // TCP keep-alive 探测间隔
-		}).DialContext,
-		// TLS 握手超时
-		TLSHandshakeTimeout: 5 * time.Second,
-		// 等待响应头超时（避免上游卡住）
-		ResponseHeaderTimeout: 10 * time.Second,
-		// 连接池优化：高并发下单 host 需要更多空闲连接
-		MaxIdleConns:        500, // 全局空闲连接池（原 100）
-		MaxIdleConnsPerHost: 100, // 单 host 空闲连接（原 20）
-		MaxConnsPerHost:     200, // 单 host 最大连接数（新增）
-		IdleConnTimeout:     90 * time.Second,
-	},
+	Transport: newUTLSTransport((&net.Dialer{
+		Timeout:   5 * time.Second,  // TCP 三次握手超时
+		KeepAlive: 30 * time.Second, // TCP keep-alive 探测间隔
+	}).DialContext),
 }
 
 // ======================== SOCKS5 代理 ========================
@@ -445,8 +606,8 @@ func resetProxyClientPool() {
 	proxyClientMu.Lock()
 	defer proxyClientMu.Unlock()
 	for addr, c := range proxyClientPool {
-		if t, ok := c.Transport.(*http.Transport); ok {
-			t.CloseIdleConnections()
+		if cl, ok := c.Transport.(interface{ CloseIdleConnections() }); ok {
+			cl.CloseIdleConnections()
 		}
 		delete(proxyClientPool, addr)
 	}
@@ -455,19 +616,8 @@ func resetProxyClientPool() {
 // buildProxyClient 为指定代理构建带 SOCKS5 dial 的 HTTP 客户端。
 func buildProxyClient(proxy Socks5Proxy) *http.Client {
 	return &http.Client{
-		Timeout: 300 * time.Second,
-		Transport: &http.Transport{
-			DialContext: socks5Dial(proxy),
-			// TLS 握手超时
-			TLSHandshakeTimeout: 5 * time.Second,
-			// 等待响应头超时
-			ResponseHeaderTimeout: 10 * time.Second,
-			// 连接池优化：高并发下单 host 需要更多空闲连接
-			MaxIdleConns:        500,
-			MaxIdleConnsPerHost: 100,
-			MaxConnsPerHost:     200,
-			IdleConnTimeout:     90 * time.Second,
-		},
+		Timeout:   upstreamTimeout(),
+		Transport: newUTLSTransport(socks5Dial(proxy)),
 	}
 }
 
