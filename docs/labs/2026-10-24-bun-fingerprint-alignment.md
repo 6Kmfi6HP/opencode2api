@@ -143,6 +143,7 @@ Content-Length: N
 
 ```bash
 go test ./internal/app -run 'TestBunClientHelloSpec|TestFP1Transport'
+go test ./internal/app -run 'TestEgressProxy|TestDialViaHTTPProxy|TestFingerprintTLSSettings'
 go test ./...            # 全量
 ```
 
@@ -165,7 +166,8 @@ go test ./...            # 全量
 - **无会话恢复**：不带 PSK / 0-RTT / session ticket 复用，每次全握手（真实 CLI 多次连接
   也未见 `pre_shared_key`，此处等价）。
 - **无 h2**：真实客户端也不发 h2；若上游将来强制 h2，本档需要重做（`chrome` 档仍走 h2）。
-- **HTTP/1.1 连接复用策略**：按 host 单池、空闲 90s，未做 pipeline；CLI 侧同样串行复用。
+- **HTTP/1.1 连接复用策略**：按 host 单池、空闲 90s（取出时比对入池时间，超龄关闭重建）、未做 pipeline；CLI 侧同样串行复用。落在失效池化连接上的幂等请求（GET/HEAD/OPTIONS/TRACE）会换新连接重放一次，POST 不重放。
+- **出站可选能力**（不属于指纹，默认关闭）：环境变量 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` CONNECT 隧道、`OPENCODE2API_TLS_INSECURE` / `OPENCODE2API_TLS_CA_FILE` 信任配置、`OPENCODE2API_FP_TRACE` / `OPENCODE2API_FP_DUMP` 调试开关。ClientHello 与请求字节不受影响。
 - **body 字段差异是有意的**：项目会注入缓存相关字段（`prompt_cache_key` 等），属于功能而非指纹。
 
 ## 回滚

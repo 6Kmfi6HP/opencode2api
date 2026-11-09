@@ -10,12 +10,15 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,7 +58,7 @@ func newTestBunClient(t *testing.T) (*http.Client, *int32) {
 		atomic.AddInt32(&dials, 1)
 		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
 	}
-	tr := newBunFingerprintTransportWithSkipVerify(dial, true)
+	tr := newBunFingerprintTransport(dial, dial, fpTLSSettings{InsecureSkipVerify: true})
 	return &http.Client{Transport: tr, Timeout: 20 * time.Second}, &dials
 }
 
@@ -369,5 +372,111 @@ func TestFP1Transport_WireFormat(t *testing.T) {
 	}
 	if a, b := nameOf(string(s.raws[0])), nameOf(string(s.raws[1])); strings.Join(a, ",") != strings.Join(b, ",") {
 		t.Fatalf("header order unstable:\n1: %v\n2: %v", a, b)
+	}
+}
+
+// ======================== TLS 信任配置 ========================
+
+func TestFingerprintTLSSettings_Env(t *testing.T) {
+	t.Setenv("OPENCODE2API_TLS_INSECURE", "")
+	t.Setenv("OPENCODE2API_TLS_CA_FILE", "")
+	if s := fingerprintTLSSettings(); s.InsecureSkipVerify || s.RootCAs != nil {
+		t.Fatalf("no env should mean default settings, got %+v", s)
+	}
+
+	t.Setenv("OPENCODE2API_TLS_INSECURE", "1")
+	if s := fingerprintTLSSettings(); !s.InsecureSkipVerify {
+		t.Fatal("OPENCODE2API_TLS_INSECURE=1 未生效")
+	}
+	t.Setenv("OPENCODE2API_TLS_INSECURE", "0")
+	if s := fingerprintTLSSettings(); s.InsecureSkipVerify {
+		t.Fatal("OPENCODE2API_TLS_INSECURE=0 不应跳过校验")
+	}
+
+	cert := generateSelfSignedTLS(t)
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENCODE2API_TLS_CA_FILE", path)
+	s := fingerprintTLSSettings()
+	if s.RootCAs == nil {
+		t.Fatal("OPENCODE2API_TLS_CA_FILE 未装载根池")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: s.RootCAs, DNSName: "localhost"}); err != nil {
+		t.Fatalf("CA 未进入返回的根池: %v", err)
+	}
+}
+
+// TestFingerprintTLSSettings_CAFileEnablesHandshake 用 CA 文件（不跳过校验）
+// 连自签服务器，验证配置真的接到了握手路径上。
+func TestFingerprintTLSSettings_CAFileEnablesHandshake(t *testing.T) {
+	cert := generateSelfSignedTLS(t)
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENCODE2API_TLS_INSECURE", "")
+	t.Setenv("OPENCODE2API_TLS_CA_FILE", path)
+
+	// httptest 默认自签证书与我们写入 CA 文件的那张不同，必须显式装上。
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "trusted")
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	tr := newBunFingerprintTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext, nil, fingerprintTLSSettings())
+	c := &http.Client{Transport: tr, Timeout: 20 * time.Second}
+	resp, err := c.Get(srv.URL + "/ca")
+	if err != nil {
+		t.Fatalf("CA 文件未生效，握手失败: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "trusted" {
+		t.Fatalf("body = %q", body)
+	}
+
+	// 同一台服务器，不配置 CA 时必须失败（证明上面的成功来自 RootCAs）。
+	t.Setenv("OPENCODE2API_TLS_CA_FILE", "")
+	tr2 := newBunFingerprintTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext, nil, fingerprintTLSSettings())
+	c2 := &http.Client{Transport: tr2, Timeout: 20 * time.Second}
+	if _, err := c2.Get(srv.URL + "/ca"); err == nil {
+		t.Fatal("未配置 CA 时自签证书不应通过校验")
+	}
+}
+
+// TestFP1Transport_DumpHook OPENCODE2API_FP_DUMP 落盘的就是线上字节（头 + 体）。
+func TestFP1Transport_DumpHook(t *testing.T) {
+	s := newRecordH1Server(t)
+	path := filepath.Join(t.TempDir(), "req.bin")
+	t.Setenv("OPENCODE2API_FP_DUMP", path)
+
+	c, _ := newTestBunClient(t)
+	req, _ := http.NewRequest("POST", "https://"+s.addr()+"/dump", strings.NewReader(`{"x":1}`))
+	req.Header.Set("Authorization", "Bearer public")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("dump file: %v", err)
+	}
+	s.mu.Lock()
+	raw := s.raws[0]
+	s.mu.Unlock()
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("dump 与线上字节不一致:\ndump=%q\nwire=%q", got, raw)
 	}
 }

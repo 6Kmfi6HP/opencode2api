@@ -285,7 +285,7 @@ func TestUTLSTransport_PlainHTTPRouting(t *testing.T) {
 	defer ts.Close()
 
 	client := &http.Client{
-		Transport: newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext),
+		Transport: newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext, true),
 	}
 
 	resp, err := client.Get(ts.URL)
@@ -310,7 +310,7 @@ func TestUTLSTransport_ToggleOffFallback(t *testing.T) {
 		t.Fatalf("expected isTLSFingerprintEnabled() to be false when off")
 	}
 
-	tr := newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext)
+	tr := newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext, true)
 	if _, ok := tr.(*http.Transport); !ok {
 		t.Fatalf("expected fallback to *http.Transport when disabled, got %T", tr)
 	}
@@ -320,7 +320,7 @@ func TestUTLSTransport_ToggleOffFallback(t *testing.T) {
 		t.Fatalf("expected isTLSFingerprintEnabled() to be true for chrome")
 	}
 
-	trChrome := newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext)
+	trChrome := newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext, true)
 	if _, ok := trChrome.(*uTLSTransport); !ok {
 		t.Fatalf("expected *uTLSTransport when enabled, got %T", trChrome)
 	}
@@ -343,7 +343,7 @@ func TestUTLSTransport_DefaultIsCLIProfile(t *testing.T) {
 		t.Fatalf("expected default profile to route to the CLI (bun) implementation")
 	}
 
-	tr := newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext)
+	tr := newUTLSTransport((&net.Dialer{Timeout: 5 * time.Second}).DialContext, true)
 	if _, ok := tr.(*fp1Transport); !ok {
 		t.Fatalf("expected *fp1Transport by default, got %T", tr)
 	}

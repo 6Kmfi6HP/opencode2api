@@ -359,6 +359,8 @@ Config lives in `config.json` (copy from `config.example.json`). Key fields:
 | `upstream_base_urls` | Upstream opencode zen base URLs (e.g. your reversed domains). Unset/empty defaults to `["https://opencode.ai"]`. When multiple are configured, sessions stick to one (base URL, proxy) pair for load balancing with cache affinity. |
 | `text_only_models` | Optional extra model prefixes forced to text-only on top of the models.dev input-modality data (default: none); images are silently downgraded to an `[image attached]` text annotation. |
 
+Egress supports both SOCKS5 (above) and the standard `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` environment variables; precedence is `active_socks5` > env proxy > direct. Private upstream CAs: `OPENCODE2API_TLS_CA_FILE` / `OPENCODE2API_TLS_INSECURE`.
+
 Full details: [Configuration](docs/CONFIGURATION.md).
 
 ## Documentation

@@ -233,6 +233,43 @@ SOCKS5 代理列表。
 }
 ```
 
+### 环境变量 HTTP(S) 代理（`HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`）
+
+除 `socks5_proxies` 之外，出口也支持标准环境变量代理（仅针对 `https://` 上游，CONNECT 隧道；代理本身是 `https://` 时用标准库 TLS 连它）。
+
+代理 URL 支持内联凭证：`http://user:pass@proxy:8080`，会转成 `Proxy-Authorization: Basic`。
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:8080 NO_PROXY=127.0.0.1,localhost ./opencode2api
+```
+
+出口优先级：
+
+1. 显式配置的 `active_socks5`（按 **addr** 匹配，不是 `name`；只要命中就不再读环境变量）
+2. 环境变量 `HTTPS_PROXY` / `HTTP_PROXY`（尊重 `NO_PROXY`）
+3. 直连
+
+`active_socks5` 写错（例如填成 `name` 或死端口）会回落直连或直接失败，不会自动改用环境代理——排查时先确认它等于 `socks5_proxies[].addr`。
+
+实现用 `golang.org/x/net/http/httpproxy`，每次连接读一次环境变量（不是 `net/http.ProxyFromEnvironment` 的进程级缓存），因此改环境变量后重建连接池即可生效。写坏的环境变量（无 host、非法端口、非 http/https scheme）会先被本地校验拦下，只记一条 debug 日志并退回直连。
+
+代理本身是 `https://` 时，到代理的那一段 TLS 也吃 `OPENCODE2API_TLS_INSECURE` / `OPENCODE2API_TLS_CA_FILE`——企业代理常用私有 CA，只信任上游不够。
+
+### 上游 TLS 信任配置
+
+自签证书或私有 CA 的上游，用两个环境变量放开信任（三个指纹档位都生效）：
+
+| 环境变量 | 作用 |
+| --- | --- |
+| `OPENCODE2API_TLS_INSECURE` | `1` / `true` / `yes` / `on` 时跳过证书校验 |
+| `OPENCODE2API_TLS_CA_FILE` | PEM 证书包路径，追加到系统根池之上 |
+
+```bash
+OPENCODE2API_TLS_CA_FILE=/etc/ssl/private-ca.pem ./opencode2api
+```
+
+文件读不到或没有任何证书被追加时记 `warn` 并继续使用系统根池。CLI 档的 ClientHello 与请求字节不受这两个开关影响。
+
 ### `upstream_base_urls`
 
 opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为 `["https://opencode.ai"]`。典型用途：你自己反代的多个域名，配合 `socks5_proxies` 实现多入口负载均衡、提高可用性。
@@ -274,7 +311,14 @@ opencode zen 上游的 base URL 列表。默认（未设置或为空数组）为
 - 环境变量 `OPENCODE2API_TLS_FINGERPRINT` 提供同样的取值；`config.json` 中显式配置优先于环境变量。
 - 切换后连接池自动重建（`setTLSFingerprintProfile` → `resetProxyClientPool`），无需重启。
 - 抓包对照、实现细节与已知差异见 `docs/labs/2026-10-24-bun-fingerprint-alignment.md`。
-- 注意：CLI 档的上游请求**不复用** `net/http` 发头，所以不会出现 Go 默认的 `accept-encoding: gzip`、随机化的头序与 `Content-Length` 位置差异；需要自己维护连接池（keep-alive、空闲 90s、按 host 复用）。
+- 注意：CLI 档的上游请求**不复用** `net/http` 发头，所以不会出现 Go 默认的 `accept-encoding: gzip`、随机化的头序与 `Content-Length` 位置差异；需要自己维护连接池（keep-alive、空闲 90s 后丢弃、按 host 复用）。落在已失效的池化连接上时，GET/HEAD/OPTIONS/TRACE 会自动换新连接重放一次；POST 不重放，交给上层重试。
+
+调试开关（不影响线上行为）：
+
+| 环境变量 | 作用 |
+| --- | --- |
+| `OPENCODE2API_FP_TRACE=1` | 每请求向进程日志打一行 `[fp] …`，含请求行与完整头（`\r\n` 替换为 ` \| `） |
+| `OPENCODE2API_FP_DUMP=<path>` | 把每个请求的线上字节（头 + 体）写到该路径，权限 0600 |
 
 ### `prompt_cache_key` / `prompt_cache_retention` / `cache_control_breakpoints`
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Port tlsfp egress capabilities into the fingerprint stack (`feat(fingerprint)`):
+  - 支持标准环境变量 HTTP(S) 代理（`HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`，含 `https://` 代理与 Basic 凭证），三个指纹档位都生效；出口优先级为 `active_socks5` > 环境代理 > 直连。
+  - `bun` / `chrome` / `off` 档接入 TLS 信任配置：`OPENCODE2API_TLS_INSECURE` 跳过校验，`OPENCODE2API_TLS_CA_FILE` 追加私有 CA 到根池。
+  - `fp1Transport` 连接池增加 90s 空闲过期，并对复用的失效连接按幂等方法（GET/HEAD/OPTIONS/TRACE）自动重放一次；POST 不重放。
+  - `deflate` 同时支持 zlib 包装与裸 deflate。
+  - 新增 `OPENCODE2API_FP_TRACE`（打印线上请求头）与 `OPENCODE2API_FP_DUMP=<path>`（落盘线上请求字节）调试开关。
+  - ClientHello 与 h1 请求字节未变，`TestBunClientHelloSpec_MatchesCapture` / `TestFP1Transport_WireFormat` 仍逐字节通过。
+
 ## v0.14.40
 
 - Fix free-tier upstream fake 429 errors by injecting required `<env>` system prompt block (`feat(fingerprint)`):

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -67,7 +68,7 @@ func setTLSFingerprintProfile(profile string) {
 	httpClient.Transport = newUTLSTransport((&net.Dialer{
 		Timeout:   5 * time.Second,
 		KeepAlive: 30 * time.Second,
-	}).DialContext)
+	}).DialContext, true)
 }
 
 func getTLSFingerprintProfile() string {
@@ -117,6 +118,7 @@ type uTLSTransport struct {
 	h2Transport   *http2.Transport
 	h1Transport   *http.Transport
 	clientHelloID utls.ClientHelloID
+	settings      fpTLSSettings
 }
 
 func (t *uTLSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -143,15 +145,20 @@ func (t *uTLSTransport) CloseIdleConnections() {
 	}
 }
 
-func newUTLSTransport(dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) http.RoundTripper {
+func newUTLSTransport(dialContext func(ctx context.Context, network, addr string) (net.Conn, error), useEnvProxy bool) http.RoundTripper {
 	if dialContext == nil {
 		dialContext = (&net.Dialer{
 			Timeout:   5 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext
 	}
+	settings := fingerprintTLSSettings()
+	tlsDial := dialContext
+	if useEnvProxy {
+		tlsDial = withHTTPProxy(dialContext, settings)
+	}
 	if !isTLSFingerprintEnabled() {
-		return &http.Transport{
+		off := &http.Transport{
 			DialContext:           dialContext,
 			TLSHandshakeTimeout:   5 * time.Second,
 			ResponseHeaderTimeout: 10 * time.Second,
@@ -159,13 +166,35 @@ func newUTLSTransport(dialContext func(ctx context.Context, network, addr string
 			MaxIdleConnsPerHost:   100,
 			MaxConnsPerHost:       200,
 			IdleConnTimeout:       90 * time.Second,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: settings.InsecureSkipVerify,
+				RootCAs:            settings.RootCAs,
+			},
 		}
+		if useEnvProxy {
+			// 这条路径的 CONNECT 由标准库自己发（同一个 Transport.Proxy），
+			// DialContext 不能再包一层，否则会拨两次代理。明文 http:// 目标
+			// 保持直连，与 bun/chrome 档的取舍一致。
+			off.Proxy = func(req *http.Request) (*url.URL, error) {
+				if req.URL.Scheme != "https" {
+					return nil, nil
+				}
+				pu, err := egressProxyFor(req.URL.Host)
+				if err != nil {
+					// 坏环境变量按「没有代理」处理：直连，不要连坐所有出站。
+					slog.Debug("fp proxy env ignored", "error", err)
+					return nil, nil
+				}
+				return pu, nil
+			}
+		}
+		return off
 	}
 
 	// Bun/BoringSSL 档：ClientHello 与 HTTP/1.1 请求字节都由项目自己产出，
 	// 见 fp_bun_hello.go / fp_h1.go。
 	if isBunFingerprintProfile() {
-		return newBunFingerprintTransport(dialContext)
+		return newBunFingerprintTransport(dialContext, tlsDial, settings)
 	}
 
 	helloID := getTargetClientHelloID()
@@ -173,11 +202,12 @@ func newUTLSTransport(dialContext func(ctx context.Context, network, addr string
 	t := &uTLSTransport{
 		dialContext:   dialContext,
 		clientHelloID: helloID,
+		settings:      settings,
 	}
 
 	t.h2Transport = &http2.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			rawConn, err := dialContext(ctx, network, addr)
+			rawConn, err := tlsDial(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
@@ -188,7 +218,9 @@ func newUTLSTransport(dialContext func(ctx context.Context, network, addr string
 			}
 
 			uConfig := &utls.Config{
-				ServerName: host,
+				ServerName:         host,
+				InsecureSkipVerify: t.settings.InsecureSkipVerify,
+				RootCAs:            t.settings.RootCAs,
 			}
 
 			uconn := utls.UClient(rawConn, uConfig, helloID)
@@ -214,7 +246,7 @@ func newUTLSTransport(dialContext func(ctx context.Context, network, addr string
 	t.h1Transport = &http.Transport{
 		DialContext: dialContext,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			rawConn, err := dialContext(ctx, network, addr)
+			rawConn, err := tlsDial(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
@@ -222,7 +254,11 @@ func newUTLSTransport(dialContext func(ctx context.Context, network, addr string
 			if err != nil {
 				host = addr
 			}
-			uconn := utls.UClient(rawConn, &utls.Config{ServerName: host}, helloID)
+			uconn := utls.UClient(rawConn, &utls.Config{
+				ServerName:         host,
+				InsecureSkipVerify: t.settings.InsecureSkipVerify,
+				RootCAs:            t.settings.RootCAs,
+			}, helloID)
 			if err := uconn.HandshakeContext(ctx); err != nil {
 				rawConn.Close()
 				return nil, fmt.Errorf("utls h1 handshake failed to %s: %w", addr, err)
@@ -244,7 +280,7 @@ var httpClient = &http.Client{
 	Transport: newUTLSTransport((&net.Dialer{
 		Timeout:   5 * time.Second,  // TCP 三次握手超时
 		KeepAlive: 30 * time.Second, // TCP keep-alive 探测间隔
-	}).DialContext),
+	}).DialContext, true),
 }
 
 // ======================== SOCKS5 代理 ========================
@@ -639,10 +675,13 @@ func resetProxyClientPool() {
 }
 
 // buildProxyClient 为指定代理构建带 SOCKS5 dial 的 HTTP 客户端。
+//
+// 出口优先级：显式配置的 active_socks5 > 环境变量 HTTPS_PROXY / HTTP_PROXY
+// （含 NO_PROXY）> 直连。走 SOCKS5 时不再叠加环境代理。
 func buildProxyClient(proxy Socks5Proxy) *http.Client {
 	return &http.Client{
 		Timeout:   upstreamTimeout(),
-		Transport: newUTLSTransport(socks5Dial(proxy)),
+		Transport: newUTLSTransport(socks5Dial(proxy), false),
 	}
 }
 

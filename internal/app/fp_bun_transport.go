@@ -2,9 +2,13 @@ package app
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -20,8 +24,48 @@ import (
 
 type fpDialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
+// fpTLSSettings 是出站 TLS 的信任配置（三个指纹档共用）。
+type fpTLSSettings struct {
+	InsecureSkipVerify bool
+	RootCAs            *x509.CertPool
+}
+
+// fingerprintTLSSettings 从环境变量读取 TLS 信任配置：
+//   - OPENCODE2API_TLS_INSECURE=1|true|yes|on 跳过证书校验；
+//   - OPENCODE2API_TLS_CA_FILE=<PEM> 在系统根池之上追加私有 CA。
+//
+// 只走环境变量、不加 config.json 键：与既有 OPENCODE2API_* 开关一致，
+// 也避免引入需要管理后台支撑的配置项。
+func fingerprintTLSSettings() fpTLSSettings {
+	var s fpTLSSettings
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPENCODE2API_TLS_INSECURE"))) {
+	case "1", "true", "yes", "on":
+		s.InsecureSkipVerify = true
+	}
+
+	path := strings.TrimSpace(os.Getenv("OPENCODE2API_TLS_CA_FILE"))
+	if path == "" {
+		return s
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		slog.Warn("fp tls ca file ignored", "path", path, "error", err)
+		return s
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		slog.Warn("fp tls ca file ignored", "path", path, "error", "no certificates appended")
+		return s
+	}
+	s.RootCAs = pool
+	return s
+}
+
 // bunTLSHandshake 在已建立的 TCP 连接上完成 CLI 档 uTLS 握手。
-func bunTLSHandshake(ctx context.Context, dial fpDialFunc, addr string, alpn []string, insecure bool) (net.Conn, error) {
+func bunTLSHandshake(ctx context.Context, dial fpDialFunc, addr string, alpn []string, settings fpTLSSettings) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
@@ -30,7 +74,11 @@ func bunTLSHandshake(ctx context.Context, dial fpDialFunc, addr string, alpn []s
 	if err != nil {
 		return nil, err
 	}
-	cfg := &utls.Config{ServerName: host, InsecureSkipVerify: insecure}
+	cfg := &utls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: settings.InsecureSkipVerify,
+		RootCAs:            settings.RootCAs,
+	}
 	uconn := utls.UClient(raw, cfg, utls.HelloCustom)
 	if err := uconn.ApplyPreset(bunClientHelloSpec(alpn)); err != nil {
 		raw.Close()
@@ -48,19 +96,21 @@ func bunTLSHandshake(ctx context.Context, dial fpDialFunc, addr string, alpn []s
 }
 
 // newBunFingerprintTransport 返回线上使用的 CLI 档 RoundTripper。
-func newBunFingerprintTransport(dial fpDialFunc) http.RoundTripper {
-	return newBunFingerprintTransportWithSkipVerify(dial, false)
-}
-
-func newBunFingerprintTransportWithSkipVerify(dial fpDialFunc, insecure bool) http.RoundTripper {
+//
+// dial 只用于明文 http:// 兜底路径，dialTLS 用于 https 握手（可能已包了
+// 环境代理）。两者分开传：环境代理只接管 https，明文不该被 CONNECT 隧道带走。
+func newBunFingerprintTransport(dial fpDialFunc, dialTLS fpDialFunc, settings fpTLSSettings) http.RoundTripper {
 	if dial == nil {
 		dial = (&net.Dialer{
 			Timeout:   5 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext
 	}
-	dialTLS := func(ctx context.Context, addr string) (net.Conn, error) {
-		return bunTLSHandshake(ctx, dial, addr, bunFingerprintALPN, insecure)
+	if dialTLS == nil {
+		dialTLS = dial
 	}
-	return newFP1Transport(dial, dialTLS)
+	tlsHandshake := func(ctx context.Context, addr string) (net.Conn, error) {
+		return bunTLSHandshake(ctx, dialTLS, addr, bunFingerprintALPN, settings)
+	}
+	return newFP1Transport(dial, tlsHandshake)
 }

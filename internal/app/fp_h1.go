@@ -4,10 +4,14 @@ import (
 	"bufio"
 	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
+	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,6 +85,10 @@ func fp1CanonicalAddr(host string) string {
 // fpTLSDial 建立一条 TLS 已就绪（ALPN 已按档位协商）的连接。
 type fpTLSDial func(ctx context.Context, addr string) (net.Conn, error)
 
+// fp1IdleTimeout 是空闲连接的存活上限：超龄条目在取出时直接关闭重建，
+// 避免服务端已按 keep-alive 超时关掉连接、下一次请求却读到 EOF。
+const fp1IdleTimeout = 90 * time.Second
+
 type fp1Transport struct {
 	dialTLS fpTLSDial
 	// plain 只兜底 http:// 明文上游（正常配置都是 https）。该路径没有 TLS
@@ -116,51 +124,90 @@ func (t *fp1Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return t.plain.RoundTrip(req)
 	}
 	addr := fp1CanonicalAddr(req.URL.Host)
-	conn, err := t.getConn(req.Context(), addr)
+	// 请求体只读一次：重放时复用同一份字节，避免第二次发送空体。
+	bodyBytes, err := fp1BodyBytes(req)
 	if err != nil {
 		return nil, err
 	}
-	// 请求取消（http.Client.Timeout / ctx）时直接关掉连接，让阻塞在
-	// 读响应头或读响应体上的调用立刻返回，而不是等到对端超时。
-	stop := make(chan struct{})
-	go func() {
-		select {
-		case <-req.Context().Done():
-			conn.close()
-		case <-stop:
+	for attempt := 0; ; attempt++ {
+		conn, reused, err := t.getConn(req.Context(), addr)
+		if err != nil {
+			return nil, err
 		}
-	}()
+		// 请求取消（http.Client.Timeout / ctx）时直接关掉连接，让阻塞在
+		// 读响应头或读响应体上的调用立刻返回，而不是等到对端超时。
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-req.Context().Done():
+				conn.close()
+			case <-stop:
+			}
+		}()
 
-	resp, body, err := conn.roundTrip(req)
-	if err != nil {
-		close(stop)
-		conn.close()
-		return nil, err
+		resp, body, err := conn.roundTrip(req, bodyBytes)
+		if err != nil {
+			close(stop)
+			conn.close()
+			// 复用连接才可能是「服务端已关掉空闲 keep-alive」，且只对幂等方法
+			// 重试一次：POST 交给上层的显式重试，避免重复提交。
+			if attempt == 0 && reused && fp1RetryableStaleConn(req.Method, err) {
+				continue
+			}
+			return nil, err
+		}
+		resp.Body = &fp1Body{conn: conn, t: t, dec: body, closable: resp.Close, req: req, stop: stop}
+		return resp, nil
 	}
-	resp.Body = &fp1Body{conn: conn, t: t, dec: body, closable: resp.Close, req: req, stop: stop}
-	return resp, nil
 }
 
-func (t *fp1Transport) getConn(ctx context.Context, addr string) (*fp1Conn, error) {
+// fp1RetryableStaleConn 报告连接级失败是否值得在新连接上重放一次。
+func fp1RetryableStaleConn(method string, err error) bool {
+	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return false
+	}
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+// getConn 从池尾取一条连接；超龄条目就地关闭并丢弃，直到拿到可用连接或池空。
+// reused 表示返回的连接来自池（重试判定只对复用的连接放开）。
+func (t *fp1Transport) getConn(ctx context.Context, addr string) (*fp1Conn, bool, error) {
+	var expired []*fp1Conn
 	t.mu.Lock()
-	if list := t.idle[addr]; len(list) > 0 {
+	for len(t.idle[addr]) > 0 {
+		list := t.idle[addr]
 		c := list[len(list)-1]
 		t.idle[addr] = list[:len(list)-1]
+		if time.Since(c.usedAt) > fp1IdleTimeout {
+			expired = append(expired, c)
+			continue
+		}
 		t.mu.Unlock()
-		return c, nil
+		for _, e := range expired {
+			e.close()
+		}
+		return c, true, nil
 	}
 	t.mu.Unlock()
+	for _, e := range expired {
+		e.close()
+	}
 
 	nc, err := t.dialTLS(ctx, addr)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	return &fp1Conn{
 		nc:   nc,
 		br:   bufio.NewReaderSize(nc, 32*1024),
 		bw:   bufio.NewWriterSize(nc, 32*1024),
 		addr: addr,
-	}, nil
+	}, false, nil
 }
 
 func (t *fp1Transport) putConn(c *fp1Conn) {
@@ -170,6 +217,7 @@ func (t *fp1Transport) putConn(c *fp1Conn) {
 		go c.close()
 		return
 	}
+	c.usedAt = time.Now()
 	t.idle[c.addr] = append(t.idle[c.addr], c)
 }
 
@@ -189,10 +237,11 @@ func (t *fp1Transport) CloseIdleConnections() {
 }
 
 type fp1Conn struct {
-	nc   net.Conn
-	br   *bufio.Reader
-	bw   *bufio.Writer
-	addr string
+	nc     net.Conn
+	br     *bufio.Reader
+	bw     *bufio.Writer
+	addr   string
+	usedAt time.Time
 }
 
 func (c *fp1Conn) close() {
@@ -200,12 +249,8 @@ func (c *fp1Conn) close() {
 }
 
 // roundTrip 拼装并写出请求，读回响应头。返回的 *http.Response.Body 由调用方接管。
-func (c *fp1Conn) roundTrip(req *http.Request) (*http.Response, io.ReadCloser, error) {
-	bodyBytes, err := fp1BodyBytes(req)
-	if err != nil {
-		return nil, nil, err
-	}
-
+// bodyBytes 由调用方一次性读出，重放时复用。
+func (c *fp1Conn) roundTrip(req *http.Request, bodyBytes []byte) (*http.Response, io.ReadCloser, error) {
 	if err := c.writeRequest(req, bodyBytes); err != nil {
 		return nil, nil, err
 	}
@@ -305,6 +350,14 @@ func (c *fp1Conn) writeRequest(req *http.Request, body []byte) error {
 	}
 	sb.WriteString("\r\n")
 
+	// 调试钩子：只在设了环境变量时生效，线上路径不产生额外开销。
+	if path := os.Getenv("OPENCODE2API_FP_DUMP"); path != "" {
+		_ = os.WriteFile(path, append([]byte(sb.String()), body...), 0o600)
+	}
+	if os.Getenv("OPENCODE2API_FP_TRACE") != "" {
+		log.Printf("[fp] %s", strings.ReplaceAll(strings.TrimSuffix(sb.String(), "\r\n\r\n"), "\r\n", " | "))
+	}
+
 	if _, err := c.bw.WriteString(sb.String()); err != nil {
 		return err
 	}
@@ -334,7 +387,19 @@ func fp1DecodeBody(resp *http.Response) (io.ReadCloser, error) {
 		}
 		return &fp1WrapCloser{Reader: zr, closers: []io.Closer{zr, resp.Body}}, nil
 	case "deflate":
-		return &fp1WrapCloser{Reader: flate.NewReader(resp.Body), closers: []io.Closer{resp.Body}}, nil
+		// 上游可能发 zlib 包装（RFC 1950）也可能发裸 deflate（RFC 1951）。
+		// 看头两字节是否为合法的 zlib 头（CM=8 且 (CMF<<8|FLG)%31==0），
+		// 是则用 zlib，否则交给 flate。只 Peek 不消费，两种 reader 都从
+		// 同一个 bufio 读起。
+		br := bufio.NewReaderSize(resp.Body, 2)
+		if p, _ := br.Peek(2); len(p) == 2 && p[0]&0x0f == 8 && (uint16(p[0])<<8|uint16(p[1]))%31 == 0 {
+			zr, err := zlib.NewReader(br)
+			if err != nil {
+				return nil, err
+			}
+			return &fp1WrapCloser{Reader: zr, closers: []io.Closer{resp.Body}}, nil
+		}
+		return &fp1WrapCloser{Reader: flate.NewReader(br), closers: []io.Closer{resp.Body}}, nil
 	case "br":
 		return &fp1WrapCloser{Reader: brotli.NewReader(resp.Body), closers: []io.Closer{resp.Body}}, nil
 	case "zstd":
