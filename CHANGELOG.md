@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.14.41
+
+- Prepend the captured OpenCode harness preamble and tool manifest on free-tier requests (`feat(fingerprint)`):
+  - 免费层请求带上 CLI 捕获的 preamble，以及六件可映射的 manifest 工具，对齐现行门禁。
+  - 回复侧把这些调用改回调用方自己的工具名，并丢弃调用方无法执行的调用。
 
 - Port tlsfp egress capabilities into the fingerprint stack (`feat(fingerprint)`):
   - 支持标准环境变量 HTTP(S) 代理（`HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`，含 `https://` 代理与 Basic 凭证），三个指纹档位都生效；出口优先级为 `active_socks5` > 环境代理 > 直连。
