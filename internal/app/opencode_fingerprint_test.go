@@ -83,9 +83,9 @@ func TestOCRequest_FreeTierInjectsSessionHeadersAndStream(t *testing.T) {
 			seen[name] = true
 		}
 	}
-	for _, name := range []string{"bash", "glob", "grep", "read"} {
+	for _, name := range []string{"edit", "glob", "grep", "read", "shell", "write"} {
 		if !seen[name] {
-			t.Fatalf("free-tier tool %q not injected into no-tools request; got %v", name, tools)
+			t.Fatalf("manifest tool %q not injected into no-tools request; got %v", name, tools)
 		}
 	}
 }
@@ -141,14 +141,14 @@ func TestOCRequest_FreeTierKeepsClientToolsWhenPresent(t *testing.T) {
 		t.Fatal(err)
 	}
 	names := toolNames(t, sent)
-	if len(names) != 5 || names[0] != "weather" {
-		t.Fatalf("tools = %#v, want client weather kept first followed by the four required tools", sent["tools"])
+	if len(names) != 7 || names[len(names)-1] != "weather" {
+		t.Fatalf("tools = %#v, want manifest first and client weather kept last", sent["tools"])
 	}
 	seen := map[string]bool{}
 	for _, n := range names {
 		seen[n] = true
 	}
-	for _, want := range []string{"bash", "glob", "grep", "read"} {
+	for _, want := range []string{"edit", "glob", "grep", "read", "shell", "write"} {
 		if !seen[want] {
 			t.Fatalf("missing required tool %q, got %v", want, names)
 		}

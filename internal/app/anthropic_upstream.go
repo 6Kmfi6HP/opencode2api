@@ -148,9 +148,13 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 	// peek 消费的首帧也要过 name 还原(帧尾常与首个 content_block_start 同行,
 	// 而主循环的还原按行生效),否则首个 tool_use 的 name 会被原样透传。
 	rw := nameRewritesFor(ctx)
+	reply := agentToolReplyFromContext(ctx)
 	for _, res := range peek.Consumed {
 		if res.line != "" {
-			res.line = restoreAnthropicStreamLine(res.line, rw)
+			res.line = presentAnthropicStreamLine(res.line, rw, reply)
+		}
+		if res.line == "" {
+			continue
 		}
 		if _, err := io.WriteString(w, res.line); err != nil {
 			return true, err
@@ -217,14 +221,15 @@ func pipeAnthropicStream(ctx context.Context, w http.ResponseWriter, rc io.Reade
 			line := result.line
 			pendingErr := result.err
 			if line != "" {
-				observeLine(line)
-				// name 还原(缩短名回原名 + 免费层占位名大小写,经 rw 统一
-				// 门控),未命中的行字节原样。
-				frameBuf.WriteString(restoreAnthropicStreamLine(line, rw))
-				// 空行 = 帧边界:整帧一次写出再 Flush。
-				if strings.TrimRight(line, "\r\n") == "" {
-					if err := flushFrame(); err != nil {
-						return true, err
+				line = presentAnthropicStreamLine(line, rw, agentToolReplyFromContext(ctx))
+				if line != "" {
+					observeLine(line)
+					frameBuf.WriteString(line)
+					// 空行 = 帧边界:整帧一次写出再 Flush。
+					if strings.TrimRight(line, "\r\n") == "" {
+						if err := flushFrame(); err != nil {
+							return true, err
+						}
 					}
 				}
 			}
@@ -331,7 +336,7 @@ func relayAnthropicBuffered(ctx context.Context, w http.ResponseWriter, rc io.Re
 	// 非流式直通路径在写回前还原 tool_use name(缩短名回原名 + 免费层占位
 	// 工具大小写,经 nameRewritesFor 统一门控),与流式 byte-relay 的
 	// restoreAnthropicStreamLine 对应（幂等）。
-	w.Write(restoreAnthropicBodyNames(body, nameRewritesFor(ctx)))
+	w.Write(presentAnthropicBody(body, nameRewritesFor(ctx), agentToolReplyFromContext(ctx)))
 
 	if status >= 200 && status < 300 {
 		var raw map[string]any

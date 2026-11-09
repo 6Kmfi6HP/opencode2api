@@ -1106,6 +1106,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	modelIn := claudeReq.Model
 	claudeReq.Model = resolveModelForAuth(auth, claudeReq.Model)
 	claudeReq.Model = mapPublicToFreeModel(auth, claudeReq.Model)
+	r = r.WithContext(attachFreeTierToolReply(r.Context(), claudeReq.Model, offeredClaudeToolNames(claudeReq.Tools), true))
 	if !validateRequestTemperature(w, claudeReq.Temperature, "claude", 0, 1) {
 		return
 	}
@@ -1503,7 +1504,7 @@ loop:
 			// the line first, then handle the accompanying error via pendingErr.
 			pendingErr := result.err
 
-			line := result.line
+			line := rewriteChatSSELine(result.line, agentToolReplyFromContext(ctx))
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
 				stats.DoneSeen = true

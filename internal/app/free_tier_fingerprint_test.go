@@ -63,9 +63,9 @@ func firstIndex(names []string, target string) int {
 func assertFreeTierToolsPresent(t *testing.T, sent map[string]any) []string {
 	t.Helper()
 	names := toolNames(t, sent)
-	for _, want := range []string{"bash", "glob", "grep", "read"} {
+	for _, want := range []string{"edit", "glob", "grep", "read", "shell", "write"} {
 		if firstIndex(names, want) < 0 {
-			t.Fatalf("missing required free-tier tool %q, got tools order %v", want, names)
+			t.Fatalf("missing manifest tool %q, got tools order %v", want, names)
 		}
 	}
 	return names
@@ -138,15 +138,12 @@ func TestFreeTierFingerprint_PublicPartialClientTools(t *testing.T) {
 		t.Fatalf("stream = %#v, want true", got)
 	}
 	names := assertFreeTierToolsPresent(t, sent)
-	if len(names) != 5 {
-		t.Fatalf("tools = %v, want exactly weather + 4 required", names)
+	if len(names) != 7 || names[len(names)-1] != "weather" {
+		t.Fatalf("tools = %v, want 6 manifest tools then weather", names)
 	}
-	if names[0] != "weather" {
-		t.Fatalf("client tool must stay first, got order %v", names)
-	}
-	for i, want := range []string{"bash", "glob", "grep", "read"} {
-		if names[1+i] != want {
-			t.Fatalf("appended tools order = %v, want bash,glob,grep,read appended after weather", names)
+	for i, want := range []string{"edit", "glob", "grep", "read", "shell", "write"} {
+		if names[i] != want {
+			t.Fatalf("manifest prefix = %v, want edit,glob,grep,read,shell,write", names)
 		}
 	}
 }
@@ -306,9 +303,8 @@ func TestFreeTierFingerprint_ResponsesSubpathInjectsResponsesShape(t *testing.T)
 		t.Fatal(err)
 	}
 	tools, _ := out["tools"].([]any)
-	if len(tools) != len(freeTierRequiredToolsResponses) {
-		t.Fatalf("expected all %d free-tier tools injected on responses subpath, got %d: %s",
-			len(freeTierRequiredToolsResponses), len(tools), mustJSON(out))
+	if len(tools) != 6 {
+		t.Fatalf("expected 6 manifest tools on responses subpath, got %d: %s", len(tools), mustJSON(out))
 	}
 	for i, raw := range tools {
 		tm, _ := raw.(map[string]any)
@@ -381,11 +377,11 @@ func TestFreeTierFingerprint_SubpathMessages(t *testing.T) {
 		t.Fatalf("stream_options must not be injected into anthropic schema, got %#v", sent["stream_options"])
 	}
 	names := assertFreeTierToolsPresent(t, sent)
-	if len(names) != 4 {
-		t.Fatalf("tools = %v, want client bash + glob/grep/read (no duplicate bash)", names)
+	if len(names) != 7 || names[len(names)-1] != "bash" {
+		t.Fatalf("tools = %v, want 6 manifest tools then client bash", names)
 	}
-	if names[0] != "bash" {
-		t.Fatalf("client-provided bash must stay first, got %v", names)
+	if names[0] == "bash" {
+		t.Fatalf("manifest must precede client bash, got %v", names)
 	}
 	// Anthropic 形状: 补齐的工具也应挂在 name 字段下,而不是 OpenAI 的 function 包装。
 	rawTools, _ := sent["tools"].([]any)

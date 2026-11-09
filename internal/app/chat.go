@@ -674,6 +674,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	req.Model = mapPublicToFreeModel(auth, req.Model)
+	r = r.WithContext(attachFreeTierToolReply(r.Context(), req.Model, offeredToolNames(req.Tools), false))
 	if !validateRequestTemperature(w, req.Temperature, "chat", 0, 2) {
 		return
 	}
@@ -967,6 +968,7 @@ func chatStreamRunOnce(
 			case res = <-reader.Read():
 			}
 		}
+		res.line = rewriteChatSSELine(res.line, agentToolReplyFromContext(ctx))
 
 		if res.err != nil {
 			// 读到错(含 EOF):先结算手头这一行(可能是末尾不带 \n 的

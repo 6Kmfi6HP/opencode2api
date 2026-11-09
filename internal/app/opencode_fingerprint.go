@@ -8,14 +8,11 @@ import (
 	"time"
 )
 
-// ======================== 免费层指纹: 工具与 stream 门禁 ========================
+// ======================== 免费层指纹: 回复侧大小写还原 ========================
 //
-// 上游 2026-09-18 新增校验(移植自 lite opencode2api-lite.go L1468-1548):
-// 免费层请求 body 的 tools 必须包含 bash / glob / grep / read 四件工具
-// (顺序、描述、额外工具均无所谓,缺任一即 403 FreeTierError)。
-// 客户端(cherry studio / codex / 普通聊天)通常不带全这些工具,这里准备
-// 最小定义,由 ensureFreeTierTools 把缺失的补进请求。描述与参数结构可任意,
-// 仅需名字命中。大小写还原只对 Claude 系客户端生效,见 shouldRestoreToolCase。
+// 请求体指纹（harness preamble + CLI 工具 manifest）在 fingerprint_manifest.go。
+// applyFreeTierFingerprint 只是它的入口。本文件保留 Claude 系客户端的占位名
+// 大小写还原，以及非流 SSE 聚合。
 
 var freeTierRequiredTools = []map[string]any{
 	{"type": "function", "function": map[string]any{
@@ -378,40 +375,12 @@ func ensureFreeTierSystemEnv(bodyMap map[string]any, subpath string) {
 	}
 }
 
-// applyFreeTierFingerprint 对"解析后的上游模型本身是免费"的请求执行免费层
-// 指纹重做(issue #19,2026-09-18 实测门禁口径:按解析后的上游模型判定,
-// 不按客户端 Authorization tier):
-//   - tools: 缺 bash/glob/grep/read 任何一件时按上游协议形状补齐缺失项;
-//   - system prompt: 补齐上游第 6 层门禁要求的 <env> 自证块(缺则报假 429);
-//   - stream: 一律强制 true(上游仅接受流式);
-//   - stream_options: chat/completions 与 responses 子路径保留客户端自定义键、
-//     仅补 include_usage=true;messages 子路径不写 stream_options(不属于
-//     Anthropic schema)。
-//
-// count_tokens 及其它非三协议子路径不套该门禁。
+// applyFreeTierFingerprint 对解析后的上游模型本身免费的请求执行免费层指纹
+// 重做（按模型判定，不按客户端 Authorization tier）。tools / system 对齐
+// zen-proxy：前置 CLI harness preamble 与工具 manifest。stream 强制 true；
+// chat/responses 补 include_usage。count_tokens / systemone 不套该门禁。
 func applyFreeTierFingerprint(bodyMap map[string]any, subpath, modelID string) {
-	if bodyMap == nil {
-		return
-	}
-	switch subpath {
-	case "chat/completions", "messages", "responses":
-	default:
-		return
-	}
-	if !isFreeModel(modelID) {
-		return
-	}
-	ensureFreeTierTools(bodyMap, subpath)
-	ensureFreeTierSystemEnv(bodyMap, subpath)
-	bodyMap["stream"] = true
-	if subpath == "messages" {
-		return
-	}
-	if existing, ok := bodyMap["stream_options"].(map[string]any); ok {
-		existing["include_usage"] = true
-	} else {
-		bodyMap["stream_options"] = map[string]any{"include_usage": true}
-	}
+	applyFreeTierBodyFingerprint(bodyMap, subpath, modelID)
 }
 
 // ======================== 非流聚合 ========================
