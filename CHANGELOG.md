@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.14.42
 
 - Cut steady-state memory in the hot request path (`perf(memory)`):
   - `modelsdev.getCached` 不再每次调用深拷贝整份 models.dev 目录（4203 条 catalog + 4339 条 modalities）；每次查询从 3 次分配 / 418 B 降到 0 次分配。调用方只读返回的 map，写入路径改为整体替换缓存对象。
