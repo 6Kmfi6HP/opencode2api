@@ -13,7 +13,14 @@ import (
 // TestLoginHandler_ConstantTimeComparison 验证登录使用常量时间比对防止时序攻击
 func TestLoginHandler_ConstantTimeComparison(t *testing.T) {
 	adminPassword = "correct-password"
-	defer func() { adminPassword = "" }()
+	// 登录成功的子用例会往全局 sessions 写一条记录；不清理就会污染后续
+	// 依赖 sessions 计数的测试（如 TestSessionExpiration），-shuffle 下随机失败。
+	defer func() {
+		adminPassword = ""
+		sessionsMu.Lock()
+		sessions = map[string]sessionEntry{}
+		sessionsMu.Unlock()
+	}()
 
 	tests := []struct {
 		name     string

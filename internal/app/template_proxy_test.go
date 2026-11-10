@@ -46,6 +46,7 @@ func TestExpandProxyCredentials(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			origU, origP := c.proxy.Username, c.proxy.Password
 			got := expandProxyCredentials(c.proxy, c.scope)
 			if got.Username != c.wantU {
 				t.Errorf("Username: got %q want %q", got.Username, c.wantU)
@@ -54,8 +55,8 @@ func TestExpandProxyCredentials(t *testing.T) {
 				t.Errorf("Password: got %q want %q", got.Password, c.wantP)
 			}
 			// original must not be mutated
-			if c.proxy.Username != c.proxy.Username {
-				t.Error("original mutated")
+			if c.proxy.Username != origU || c.proxy.Password != origP {
+				t.Errorf("original mutated: got (%q,%q) want (%q,%q)", c.proxy.Username, c.proxy.Password, origU, origP)
 			}
 		})
 	}
