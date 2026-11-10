@@ -127,6 +127,7 @@
 - Responses 会通过 Chat Completions 上游实现；内置工具被编码为函数工具后再还原。
 - `/v1/responses` 入站只走翻译路径（Chat / Anthropic 上游），不透传到上游原生 `/responses` 端点。Chat 与 Claude Messages 入站在 Chat 翻译失败后仍会回退探测上游原生 `/responses`（请求与响应在网关内自动转换，路由见 `native_responses_models` 配置项）。
 - 仅在上游实际返回 reasoning 时生成 reasoning output item。
+- `previous_response_id` 的会话状态只保存在进程内存中：重启即丢失，且只保留最近 512 条 / 约 32 MiB（FIFO 驱逐）。被驱逐后 `previous_response_id` 退化为普通请求（不会报错），客户端需自行重发历史。
 - `input` 中的 top-level item 或 message content 可使用 `input_file`；支持 flat 字段 `file_data`、`file_id`、`file_url`、`filename` 以及 nested `input_file` object，并映射为 `{type:"file",file:{...}}`。模型不支持 file 模态时上游可能拒绝。
 
 ### 不支持

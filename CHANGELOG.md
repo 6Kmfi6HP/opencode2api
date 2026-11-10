@@ -9,6 +9,16 @@
   - 稳定 instructions 注册表增加 16 MiB 总字节预算（原仅 1024 条上限，单条约 30–80 KB，最坏约 80 MB）；驱逐顺序为最久未使用，写入中的条目本身不会被立即驱逐，故单条超预算时预算会暂时超出。
   - 启动初始化结束后调用一次 `debug.FreeOSMemory()`，把模型目录解析留下的大量死堆立刻归还 OS（实测常驻 RSS 42.9 MB → 24.1 MB，活堆 3.1 MB）。
 
+- Shrink the Docker image from ~37 MB to ~16 MB (`chore(docker)`):
+  - Runtime stage switched from `alpine:3.20` to `scratch`; only the static binary, CA bundle, and `config.example.json` remain.
+  - Removed `docker/entrypoint.sh`; the binary now creates the initial config (including the SOCKS5 template), fixes `/data` ownership, and drops root to UID/GID `65532`.
+  - Docker healthcheck now invokes `opencode2api -healthcheck` instead of `wget`; the image has no shell or busybox.
+  - Embedded `time/tzdata` so `TZ` still works without a tzdata package.
+- Make `/data` permission failures self-explanatory (`fix(container)`):
+  - 启动自检改为在写初始配置前先探测目标目录可写，并在降权后复查一次（`chownTree` 按设计吞掉错误，只读挂载/ID-mapped 存储下会静默失败）。失败时直接指出目录、当前 uid 与三种修复方式（命名卷 / 预 chown / 去掉 `--user`），不再把问题暴露成 `read example config: ...` 这种误导错误。
+  - 修正 Dockerfile 与 README 的 `--user 65532:65532` 说明：该用法只对命名卷成立（Docker 用镜像内 `/data` 初始化，属主已是 65532）；bind mount 保留宿主机属主，需先 `chown -R 65532:65532` 或省略 `--user`。
+  - 区分致命与可降级：config 缺失且目录不可写时快速失败（无法生成配置也无法持久化，静默用默认口令启动等于安全回退）；config 已存在时只告警一次，说明 `stats.json`、日志文件与 models.dev 缓存不会落盘。只读 config 挂载（K8s ConfigMap、`:ro`）是合法部署，不应崩溃循环。此前该场景会带病运行，直到日志轮换或配置保存时才零散报错。
+
 ## v0.14.41
 
 - Prepend the captured OpenCode harness preamble and tool manifest on free-tier requests (`feat(fingerprint)`):

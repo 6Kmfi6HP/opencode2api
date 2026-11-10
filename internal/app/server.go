@@ -47,33 +47,64 @@ func Run() {
 	}
 
 	var showVersion bool
+	var healthcheck bool
 	var statsFile string
 	var logLevel, logFile string
 	var logBodies bool
-	flag.StringVar(&port, "port", "8000", "服务端口")
-	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
+	// Container defaults mirror what docker/entrypoint.sh used to pass on the
+	// command line. They are gated on inContainer() so a bare-metal run that
+	// happens to export OPENCODE2API_PASSWORD cannot silently change the admin
+	// password: before the entrypoint removal those variables had no effect
+	// outside the image.
+	defaultPort, defaultAdminPassword, defaultLogStdout := "8000", "123456", true
+	defaultConfigPath := "config.json"
+	if inContainer() {
+		defaultConfigPath = "/data/config.json"
+		defaultPort = envString("OPENCODE2API_PORT", defaultPort)
+		defaultAdminPassword = envString("OPENCODE2API_PASSWORD", defaultAdminPassword)
+		defaultLogStdout = envBool("OPENCODE2API_LOG_STDOUT", defaultLogStdout)
+	}
+	flag.StringVar(&port, "port", defaultPort, "服务端口")
+	flag.StringVar(&configPath, "config", defaultConfigPath, "配置文件路径")
 	flag.StringVar(&statsFile, "stats-file", "stats.json", "统计文件路径")
-	flag.StringVar(&adminPassword, "password", "123456", "管理面板密码（留空则不启用登录验证）")
+	flag.StringVar(&adminPassword, "password", defaultAdminPassword, "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
 	flag.StringVar(&logLevel, "log-level", "info", "日志级别: debug/info/warn/error")
 	flag.StringVar(&logFile, "log-file", "opencode2api.log", "日志文件路径")
-	flag.BoolVar(&logging.Stdout, "log-stdout", true, "是否同时写 stdout")
+	flag.BoolVar(&logging.Stdout, "log-stdout", defaultLogStdout, "是否同时写 stdout")
 	flag.IntVar(&logging.MaxSize, "log-max-size", 100, "单日志文件最大 MB，超过即轮换")
 	flag.IntVar(&logging.MaxBackups, "log-max-backups", 7, "保留的旧日志文件个数")
 	flag.IntVar(&logging.MaxAge, "log-max-age", 14, "旧日志保留天数")
 	flag.BoolVar(&logging.Compress, "log-compress", true, "轮换后 gzip 压缩")
 	flag.BoolVar(&logBodies, "log-bodies", false, "Debug 下记录截断的 body 摘要")
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
+	flag.BoolVar(&healthcheck, "healthcheck", false, "探测本地 /health 后退出（容器健康检查用）")
 	flag.Parse()
 
+	if healthcheck {
+		if err := probeHealth(port); err != nil {
+			fmt.Fprintf(os.Stderr, "healthcheck failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	configExplicit := flagSet("config")
+
+	// 容器镜像没有 shell/entrypoint 脚本：由二进制自身创建初始配置、
+	// 修正 /data 属主并降权到 nonroot（UID/GID 65532）。
+	if inContainer() {
+		configPath, _ = resolveConfigPath(configPath, configExplicit)
+		if err := prepareContainer(configPath); err != nil {
+			fmt.Fprintf(os.Stderr, "container bootstrap failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	// 环境变量 OPENCODE2API_LOG_LEVEL 作为 -log-level 的默认值。
 	// 命令行显式传入时优先级更高；-debug 标志仍可覆盖。
 	if !flagSet("log-level") {
-		if envLevel := os.Getenv("OPENCODE2API_LOG_LEVEL"); envLevel != "" {
-			logLevel = envLevel
-		}
+		logLevel = envString("OPENCODE2API_LOG_LEVEL", logLevel)
 	}
 	if debugMode && strings.EqualFold(logLevel, "info") {
 		logLevel = "debug"

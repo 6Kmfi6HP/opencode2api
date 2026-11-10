@@ -28,7 +28,7 @@
 
 - 显式 `-config /path/config.json` 时，未单独配置的默认路径是 `/path/stats.json` 和 `/path/opencode2api.log`；当前目录已有旧文件不会覆盖该规则。
 - 未显式指定 config 时，已有当前目录旧文件继续兼容使用；否则使用 config 回退目录，通常是 `<UserConfigDir>/opencode2api/stats.json` 和 `<UserConfigDir>/opencode2api/opencode2api.log`。
-- 空环境值会被忽略。现有容器 entrypoint 显式传入 `-config /data/config.json`，并保持 `/data/config.json` 与 `/data/opencode2api.log` 行为不变。
+- 空环境值会被忽略。容器镜像通过 `OPENCODE2API_CONFIG=/data/config.json` 与 `OPENCODE2API_LOG_FILE=/data/opencode2api.log` 保持原有路径；镜像内由二进制自身读取环境变量，不再有 entrypoint 脚本。
 
 仓库开发流程仍可先从示例复制当前目录文件：
 

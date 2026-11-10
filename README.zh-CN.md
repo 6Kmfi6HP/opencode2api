@@ -137,6 +137,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     轮换后 gzip 压缩，默认 true
 -log-bodies
     Debug 下记录截断的 body 形状摘要，默认 false
+-healthcheck
+    探测本地 /health 后退出，供 Docker 健康检查使用
 -version
     显示构建版本
 ```
@@ -257,7 +259,7 @@ rg 'request_id=XXXX' opencode2api.log
 rg 'promoted_reasoning=true' opencode2api.log
 ```
 
-容器内默认日志路径是 `/data/opencode2api.log`（挂载卷持久化）。entrypoint 读取以下环境变量（均为可选——显式传入 CLI flag 时仍以 flag 为准）：
+容器内默认日志路径是 `/data/opencode2api.log`（挂载卷持久化）。镜像启动时读取以下环境变量（均为可选——显式传入 CLI flag 时仍以 flag 为准）：
 
 | 环境变量 | 默认值 | 对应 flag |
 | --- | --- | --- |
@@ -270,6 +272,14 @@ rg 'promoted_reasoning=true' opencode2api.log
 | `OPENCODE2API_LOG_STDOUT` | `true` | `-log-stdout` |
 | `OPENCODE2API_SOCKS5_ADDR` | *(未设置)* | 设置时在 `config.json` 中引导一个 SOCKS5 条目 |
 | `OPENCODE2API_SOCKS5_NAME` | `proxy` | 引导的 SOCKS5 条目名称 |
+| `OPENCODE2API_CONTAINER` | *(unset)* | 置为 true 时启用容器自举：`/data/config.json` 作为默认配置路径、创建初始配置、修正 `/data` 属主并降权到 UID/GID `65532`。镜像已默认设置，裸机运行请保持未设置 |
+
+运行镜像基于 `scratch`：没有 shell、包管理器或 `wget`。启动时以 root 创建初始配置、修正 `/data` 属主，随后降权到 UID/GID `65532`；Docker 健康检查直接调用二进制的 `-healthcheck`。排障请用 `docker logs` 或管理面板——`docker exec ... sh` 不可用。
+
+`/data` 在启动后必须对 UID `65532` 可写：配置、`stats.json`、日志文件和 models.dev 缓存都存放在这里。config 缺失且目录不可写时启动即失败并打印修复提示；config 已存在时进程继续服务，只告警一次说明统计、日志文件与目录缓存不会落盘。
+
+- **命名卷**（compose 文件的默认用法）：无论是否加 `--user 65532:65532` 都可用——Docker 会用镜像内 `/data` 初始化命名卷，其属主已是 `65532`。
+- **bind mount**：目录保留宿主机属主，只有容器以 root 启动时才会被 chown。要么不加 `--user`，要么先对宿主机目录执行 `chown -R 65532:65532`。只读挂载仍可服务（例如由 ConfigMap 提供配置），但会按上述方式降级。
 
 ## 本地构建
 

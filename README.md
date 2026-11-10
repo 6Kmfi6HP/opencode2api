@@ -137,6 +137,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     gzip rotated logs, default true
 -log-bodies
     Under debug, log truncated body-shape summaries, default false
+-healthcheck
+    Probe the local /health endpoint and exit; used by the Docker healthcheck
 -version
     Print build version
 ```
@@ -257,7 +259,7 @@ rg 'request_id=XXXX' opencode2api.log
 rg 'promoted_reasoning=true' opencode2api.log
 ```
 
-In the container, the default log path is `/data/opencode2api.log` (persisted on the mounted volume). The entrypoint reads the following environment variables (all optional — CLI flags still win when passed explicitly):
+In the container, the default log path is `/data/opencode2api.log` (persisted on the mounted volume). The image startup code reads the following environment variables (all optional — CLI flags still win when passed explicitly):
 
 | Env var | Default | Maps to flag |
 | --- | --- | --- |
@@ -270,6 +272,14 @@ In the container, the default log path is `/data/opencode2api.log` (persisted on
 | `OPENCODE2API_LOG_STDOUT` | `true` | `-log-stdout` |
 | `OPENCODE2API_SOCKS5_ADDR` | *(unset)* | bootstraps a SOCKS5 entry in `config.json` when set |
 | `OPENCODE2API_SOCKS5_NAME` | `proxy` | name of the bootstrapped SOCKS5 entry |
+| `OPENCODE2API_CONTAINER` | *(unset)* | when true, enables container bootstrap: defaults the config path to `/data/config.json`, creates the initial config, chowns `/data`, and drops to UID/GID `65532`. The image sets it; leave it unset on bare metal |
+
+The runtime image is built `FROM scratch`: no shell, package manager, or `wget`. It starts as root only long enough to create the initial config, fix `/data` ownership, and drop to UID/GID `65532`; the Docker healthcheck calls the binary's own `-healthcheck` probe. Diagnose with `docker logs` or the admin panel — `docker exec ... sh` is unavailable.
+
+`/data` must be writable by UID `65532` after startup: the config, `stats.json`, the log file, and the models.dev cache all live there. A missing config with an unwritable directory is fatal and reports the remedy; when the config already exists the process keeps serving and warns once that stats, the log file, and the catalog cache will not persist.
+
+- **Named volume** (the compose files' default): works with or without `--user 65532:65532`, because Docker seeds the volume from the image's `/data`, which is already owned by `65532`.
+- **Bind mount**: the directory keeps its host owner and is only chowned when the container starts as root. Either omit `--user`, or `chown -R 65532:65532` the host path first. A read-only mount still serves (for example a ConfigMap-delivered config) but degrades as described above.
 
 ## Local build
 

@@ -71,7 +71,7 @@ docker logs opencode2api-warp
 容器只在 `/data/config.json` 不存在时根据环境变量生成初始配置。已经启动过的部署可以用两种方式切换：
 
 - 打开管理面板修改 SOCKS5 代理和启用项。
-- 删除 compose volume 后重新启动，让入口脚本重新生成配置。
+- 删除 compose volume 后重新启动，让容器启动逻辑重新生成配置。
 
 ```bash
 docker compose -f deploy/compose/compose.tor.yml down -v
