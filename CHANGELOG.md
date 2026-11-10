@@ -9,7 +9,7 @@
   - 稳定 instructions 注册表增加 16 MiB 总字节预算（原仅 1024 条上限，单条约 30–80 KB，最坏约 80 MB）；驱逐顺序为最久未使用，写入中的条目本身不会被立即驱逐，故单条超预算时预算会暂时超出。
   - 启动初始化结束后调用一次 `debug.FreeOSMemory()`，把模型目录解析留下的大量死堆立刻归还 OS（实测常驻 RSS 42.9 MB → 24.1 MB，活堆 3.1 MB）。
 
-- Shrink the Docker image from ~37 MB to ~16 MB (`chore(docker)`):
+- Shrink the Docker image from 23.4 MB to 11.9 MB uncompressed, 9.7 MB to 4.9 MB compressed (`chore(docker)`):
   - Runtime stage switched from `alpine:3.20` to `scratch`; only the static binary, CA bundle, and `config.example.json` remain.
   - Removed `docker/entrypoint.sh`; the binary now creates the initial config (including the SOCKS5 template), fixes `/data` ownership, and drops root to UID/GID `65532`.
   - Docker healthcheck now invokes `opencode2api -healthcheck` instead of `wget`; the image has no shell or busybox.
