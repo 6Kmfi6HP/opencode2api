@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Cut steady-state memory in the hot request path (`perf(memory)`):
+  - `modelsdev.getCached` 不再每次调用深拷贝整份 models.dev 目录（4203 条 catalog + 4339 条 modalities）；每次查询从 3 次分配 / 418 B 降到 0 次分配。调用方只读返回的 map，写入路径改为整体替换缓存对象。
+  - 目录拉取与落盘改为流式：`fetchCatalog` 直接 `json.Decoder` 解码响应体（不再 `io.ReadAll` 保留整份 JSON），`saveDiskCache` 用 `json.Encoder` 写临时文件后 `rename`（不再 `MarshalIndent` 生成整份字节）。
+  - `storedResponses`（Responses API `previous_response_id` 状态）加上限：512 条 / 32 MiB，按 FIFO 驱逐，记录字节数在覆盖写入时正确回退。每条状态的驻留字节由 `storedStateSize` 估算，其中的结构开销系数已命名（`storedStateStructOverhead` / `storedToolEntryOverhead`）。
+  - 稳定 instructions 注册表增加 16 MiB 总字节预算（原仅 1024 条上限，单条约 30–80 KB，最坏约 80 MB）；驱逐顺序为最久未使用，写入中的条目本身不会被立即驱逐，故单条超预算时预算会暂时超出。
+  - 启动初始化结束后调用一次 `debug.FreeOSMemory()`，把模型目录解析留下的大量死堆立刻归还 OS（实测常驻 RSS 42.9 MB → 24.1 MB，活堆 3.1 MB）。
+
 ## v0.14.41
 
 - Prepend the captured OpenCode harness preamble and tool manifest on free-tier requests (`feat(fingerprint)`):

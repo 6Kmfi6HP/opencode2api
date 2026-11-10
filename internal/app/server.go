@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -228,6 +230,25 @@ func initProxyCoreWithSave(save bool) {
 	if adminAPIEnabled() {
 		startSessionCleanup()
 	}
+	releaseStartupMemory()
+}
+
+// releaseStartupMemory returns the startup parse garbage to the OS once.
+// Fetching and decoding the upstream catalogs (models.dev alone is a multi-MB
+// JSON document) leaves tens of MB of dead heap behind; without this the
+// process parks its RSS at the startup peak even though live heap settles at a
+// few MB. Called exactly once after init so the cost is a single GC cycle.
+func releaseStartupMemory() {
+	start := time.Now()
+	runtime.GC()
+	debug.FreeOSMemory()
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	slog.Info("startup memory released",
+		"heap_inuse_bytes", ms.HeapInuse,
+		"heap_sys_bytes", ms.HeapSys,
+		"elapsed_ms", time.Since(start).Milliseconds(),
+	)
 }
 
 // startServer binds the HTTP server to addr and starts serving. Returns the

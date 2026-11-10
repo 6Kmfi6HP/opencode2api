@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -983,6 +984,69 @@ func cloneJSONValue[T any](value T) T {
 	return cloned
 }
 
+// storedResponses 保存 Responses API 的上一轮状态，供 previous_response_id
+// 续链取回 tools/instructions/output。每轮 store:true 的响应都带完整输出
+// （可能数百 KB），旧实现无上限，长跑进程会持续上涨；这里按条数 + 字节预算
+// 做 FIFO 驱逐，并把保留窗口显式化：只有紧邻的上一轮才可能命中，驱逐旧条目
+// 只会让客户端失去续链上下文（下游本来也需重发），不会产生错误数据。
+const (
+	storedResponseMaxEntries = 512
+	storedResponseMaxBytes   = 32 << 20
+
+	// 下面两个是驻留开销的粗估系数，只参与预算判断，不追求精确：
+	//   - storedStateStructOverhead：StoredResponseState 自身（5 个字段的头、
+	//     两个 string 头、slice 头）在 64 位下的固定开销，约一百多字节。
+	//   - storedToolEntryOverhead：req.Tools 每个元素的 map/slice 头 + 键值
+	//     引用，量级不到 100 字节；工具定义本身是共享引用，不计入。
+	storedStateStructOverhead = 128
+	storedToolEntryOverhead   = 96
+)
+
+var (
+	storedResponsesMu sync.RWMutex
+	storedResponses   = map[string]StoredResponseState{}
+	storedOrder       []string
+	storedBytes       int
+)
+
+// storedStateSize 估算一条状态的驻留字节数，只用于预算判断，不要求精确。
+// 走一遍 any 树而不是 json.Marshal：这里的调用发生在每次 store 时，序列化
+// 整份输出会额外产生与输出等长的临时字节。
+func storedStateSize(state StoredResponseState) int {
+	size := len(state.Model) + len(state.Instructions) + storedStateStructOverhead
+	size += len(state.Tools) * storedToolEntryOverhead
+	size += anyValueSize(state.ToolChoice)
+	for _, item := range state.Output {
+		size += anyValueSize(item)
+	}
+	return size
+}
+
+// anyValueSize 递归估算解码后的 JSON 值驻留占用：容器按 4 倍指针/头开销估，
+// 字符串按长度 + 16 字节头。
+func anyValueSize(v any) int {
+	switch value := v.(type) {
+	case nil:
+		return 0
+	case string:
+		return len(value) + 16
+	case map[string]any:
+		size := 48
+		for k, item := range value {
+			size += len(k) + 16 + anyValueSize(item)
+		}
+		return size + 4*len(value)
+	case []any:
+		size := 24
+		for _, item := range value {
+			size += anyValueSize(item)
+		}
+		return size + 4*len(value)
+	default:
+		return 16
+	}
+}
+
 func storeResponseState(response map[string]any, req ResponsesAPIRequest) {
 	if req.Store != nil && !*req.Store {
 		return
@@ -992,15 +1056,32 @@ func storeResponseState(response map[string]any, req ResponsesAPIRequest) {
 		return
 	}
 	output, _ := response["output"].([]any)
-	storedResponsesMu.Lock()
-	storedResponses[responseID] = StoredResponseState{
+	state := StoredResponseState{
 		Model:        req.Model,
 		Instructions: req.Instructions,
 		Tools:        cloneJSONValue(req.Tools),
 		ToolChoice:   cloneJSONValue(req.ToolChoice),
 		Output:       cloneJSONValue(output),
 	}
-	storedResponsesMu.Unlock()
+	size := storedStateSize(state)
+
+	storedResponsesMu.Lock()
+	defer storedResponsesMu.Unlock()
+	if prev, ok := storedResponses[responseID]; ok {
+		storedBytes -= storedStateSize(prev)
+	} else {
+		storedOrder = append(storedOrder, responseID)
+	}
+	storedResponses[responseID] = state
+	storedBytes += size
+	for (len(storedOrder) > storedResponseMaxEntries || storedBytes > storedResponseMaxBytes) && storedOrder[0] != responseID {
+		oldest := storedOrder[0]
+		storedOrder = storedOrder[1:]
+		if prev, ok := storedResponses[oldest]; ok {
+			storedBytes -= storedStateSize(prev)
+			delete(storedResponses, oldest)
+		}
+	}
 }
 
 func loadResponseState(responseID string) (StoredResponseState, bool) {

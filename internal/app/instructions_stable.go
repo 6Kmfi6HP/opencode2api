@@ -411,14 +411,22 @@ func stripHookPrefixFromLastUser(input []any) bool {
 	return false
 }
 
-// instructionsClipMaxEntries 限制稳定 instructions 注册表条数，防止长期运行
-// 内存无界增长；超出后按 FIFO 驱逐最旧条目。
-const instructionsClipMaxEntries = 1024
+// 稳定 instructions 注册表的边界：条数上限挡不住内存，因为每条保存的是
+// 整个首轮 system 提示原文（Claude Code 单条 30–80 KB）。1024 条最坏可占
+// ~80 MB，故再加总字节预算，按最久未使用顺序驱逐（更新命中会把条目移到队尾）。
+//
+// 边界不保证严格成立：正在写入的这一条不会被自己驱逐，因此单条超过 16 MiB
+// 时注册表会暂时超出预算，直到它被后续写入挤出。
+const (
+	instructionsClipMaxEntries = 1024
+	instructionsClipMaxBytes   = 16 << 20
+)
 
 var (
 	instructionsMu     sync.Mutex
 	instructionsStable = map[string]string{}
 	instructionsOrder  []string
+	instructionsBytes  int
 )
 
 // instructionsRegistryKey 以稳定头（前 stableInstrHeadSegs 段）哈希 + 首条
@@ -447,14 +455,35 @@ func clipInstructionsToStablePrefix(instr, firstUser string) (stable, delta stri
 	defer instructionsMu.Unlock()
 	stored, ok := instructionsStable[key]
 	if !ok || !strings.HasPrefix(instr, stored) {
-		if !ok {
-			instructionsOrder = append(instructionsOrder, key)
-			if len(instructionsOrder) > instructionsClipMaxEntries {
-				delete(instructionsStable, instructionsOrder[0])
-				instructionsOrder = instructionsOrder[1:]
+		if ok {
+			instructionsBytes += len(instr) - len(stored)
+			instructionsStable[key] = instr
+			// A replaced entry is the newest value; move it to the FIFO tail
+			// before applying the same bounds used for inserts.
+			for i, existingKey := range instructionsOrder {
+				if existingKey == key {
+					instructionsOrder = append(instructionsOrder[:i], instructionsOrder[i+1:]...)
+					break
+				}
 			}
+		} else {
+			instructionsStable[key] = instr
+			instructionsOrder = append(instructionsOrder, key)
+			instructionsBytes += len(instr)
 		}
-		instructionsStable[key] = instr
+		// 驱逐最久未使用的条目直到回到边界内；刚插入/刚更新的这条不驱逐，
+		// 否则单条超预算时会把本次会话的记录立刻删掉（此时注册表会暂时超出
+		// 预算，见常量注释）。
+		if ok {
+			instructionsOrder = append(instructionsOrder, key)
+		}
+		for (len(instructionsOrder) > instructionsClipMaxEntries ||
+			instructionsBytes > instructionsClipMaxBytes) && instructionsOrder[0] != key {
+			oldest := instructionsOrder[0]
+			instructionsOrder = instructionsOrder[1:]
+			instructionsBytes -= len(instructionsStable[oldest])
+			delete(instructionsStable, oldest)
+		}
 		return instr, ""
 	}
 	return stored, strings.TrimPrefix(instr, stored)

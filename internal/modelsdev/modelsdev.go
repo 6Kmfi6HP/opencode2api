@@ -5,10 +5,10 @@
 package modelsdev
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -193,28 +193,14 @@ func cloneModalities(src Modalities) Modalities {
 	return dst
 }
 
-func cloneFreeSet(src map[string]bool) map[string]bool {
-	if src == nil {
-		return nil
-	}
-	dst := make(map[string]bool, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
-func cloneCache(src cache) cache {
-	return cache{catalog: cloneCatalog(src.catalog), modalities: cloneModalities(src.modalities), free: cloneFreeSet(src.free)}
-}
-
 func loadDiskCache(path string) (cache, time.Time, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return cache{}, time.Time{}, err
 	}
+	defer func() { _ = f.Close() }()
 	var dc diskCache
-	if err := json.Unmarshal(data, &dc); err != nil {
+	if err := json.NewDecoder(bufio.NewReaderSize(f, 64*1024)).Decode(&dc); err != nil {
 		return cache{}, time.Time{}, err
 	}
 	c := cache{catalog: dc.Catalog, modalities: dc.Modalities, free: dc.Free}
@@ -235,16 +221,39 @@ func saveDiskCache(path string, c cache) error {
 		return fmt.Errorf("empty cache path")
 	}
 	dc := diskCache{UpdatedAt: time.Now(), Catalog: c.catalog, Modalities: c.modalities, Free: c.free}
-	data, err := json.MarshalIndent(dc, "", "  ")
-	if err != nil {
-		return err
-	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
 	}
-	return os.WriteFile(path, data, 0o644)
+	// Stream the encoder straight to disk instead of materializing the whole
+	// indented document in memory (~0.5 MB here, several MB on a fresh
+	// catalog). Write to a sibling temp file and rename so a crash mid-write
+	// cannot leave a truncated cache behind.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".modelsdev_cache-*.json")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	bw := bufio.NewWriterSize(tmp, 64*1024)
+	enc := json.NewEncoder(bw)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(dc); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := bw.Flush(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // fetchCatalog downloads the models.dev catalog and builds a map from
@@ -272,12 +281,10 @@ func fetchCatalog() (cache, error) {
 	if resp.StatusCode != http.StatusOK {
 		return cache{}, fmt.Errorf("models.dev returned %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return cache{}, err
-	}
+	// Decode straight off the wire: the catalog is multi-MB and buffering it
+	// with io.ReadAll keeps the raw JSON alive next to the parse tree.
 	var parsed response
-	if err := json.Unmarshal(body, &parsed); err != nil {
+	if err := json.NewDecoder(bufio.NewReaderSize(resp.Body, 64*1024)).Decode(&parsed); err != nil {
 		return cache{}, err
 	}
 	c := cache{
@@ -330,7 +337,7 @@ func RefreshCatalog() (Catalog, error) {
 		return nil, err
 	}
 	mu.Lock()
-	memoryCache = cloneCache(c)
+	memoryCache = c
 	memoryTime = time.Now()
 	path := cachePath
 	mu.Unlock()
@@ -343,9 +350,12 @@ func RefreshCatalog() (Catalog, error) {
 
 // getCached retrieves the full cache from memory, disk, or the network,
 // applying stale-while-revalidate when the disk cache is reasonably fresh.
+// The returned cache maps are shared with memoryCache and must be treated as
+// read-only by callers. Deep-cloning the catalog here cost ~500 KB of
+// allocation per call, and every request asks for it several times.
 func getCached() cache {
 	mu.RLock()
-	memCache := cloneCache(memoryCache)
+	memCache := memoryCache
 	memTime := memoryTime
 	path := cachePath
 	mu.RUnlock()
@@ -362,7 +372,7 @@ func getCached() cache {
 		age := time.Since(diskTime)
 		if age < diskTTL {
 			mu.Lock()
-			memoryCache = cloneCache(diskCache)
+			memoryCache = diskCache
 			memoryTime = diskTime
 			mu.Unlock()
 
@@ -380,7 +390,7 @@ func getCached() cache {
 	freshCache, fetchErr := fetchCatalog()
 	if fetchErr == nil && len(freshCache.catalog) > 0 {
 		mu.Lock()
-		memoryCache = cloneCache(freshCache)
+		memoryCache = freshCache
 		memoryTime = time.Now()
 		mu.Unlock()
 

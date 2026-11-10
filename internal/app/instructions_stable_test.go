@@ -463,3 +463,131 @@ func TestStripVolatileCountersInMapHookPrefix(t *testing.T) {
 		t.Fatalf("second map strip should be a no-op")
 	}
 }
+
+func resetInstructionsRegistry(t *testing.T) {
+	t.Helper()
+	instructionsMu.Lock()
+	instructionsStable = map[string]string{}
+	instructionsOrder = nil
+	instructionsBytes = 0
+	instructionsMu.Unlock()
+	t.Cleanup(func() {
+		instructionsMu.Lock()
+		instructionsStable = map[string]string{}
+		instructionsOrder = nil
+		instructionsBytes = 0
+		instructionsMu.Unlock()
+	})
+}
+
+func TestClipInstructionsRegistryByteBudget(t *testing.T) {
+	resetInstructionsRegistry(t)
+
+	// 单条指令约 1 MB（远大于真实长度，便于在 16 MB 预算内驱动驱逐）。
+	seg := strings.Repeat("x", 1<<20)
+	for i := range 20 {
+		clipInstructionsToStablePrefix(fmt.Sprintf("%s-%02d", seg, i), fmt.Sprintf("user-%d", i))
+	}
+	instructionsMu.Lock()
+	gotBytes := instructionsBytes
+	gotEntries := len(instructionsStable)
+	sumLen := 0
+	for _, v := range instructionsStable {
+		sumLen += len(v)
+	}
+	instructionsMu.Unlock()
+
+	if gotEntries > instructionsClipMaxEntries {
+		t.Fatalf("entries %d exceeds cap %d", gotEntries, instructionsClipMaxEntries)
+	}
+	if gotBytes > instructionsClipMaxBytes {
+		t.Fatalf("bytes %d exceeds budget %d", gotBytes, instructionsClipMaxBytes)
+	}
+	// 预算记账必须与实际驻留一致，否则驱逐会提前或滞后。
+	if gotBytes != sumLen {
+		t.Fatalf("byte accounting drifted: counter=%d actual=%d", gotBytes, sumLen)
+	}
+}
+
+func TestClipInstructionsRegistryByteBudgetOnReplacement(t *testing.T) {
+	resetInstructionsRegistry(t)
+
+	stableHead := strings.TrimSuffix(strings.Repeat("stable\n\n", stableInstrHeadSegs), "\n\n")
+	makeInstructions := func(fill byte, size int) string {
+		return stableHead + "\n\n" + strings.Repeat(string(fill), size)
+	}
+	for i := range 15 {
+		clipInstructionsToStablePrefix(makeInstructions('a', 1<<20), fmt.Sprintf("user-%d", i))
+	}
+
+	// Replacing the oldest entry with a different value keeps the same registry
+	// key, but pushes the total over budget until older entries are evicted.
+	updated := makeInstructions('b', 2<<20)
+	clipInstructionsToStablePrefix(updated, "user-0")
+
+	instructionsMu.Lock()
+	gotBytes := instructionsBytes
+	gotEntries := len(instructionsStable)
+	sumLen := 0
+	for _, value := range instructionsStable {
+		sumLen += len(value)
+	}
+	_, updatedEntryRetained := instructionsStable[instructionsRegistryKey(stableInstructionsHead(updated), "user-0")]
+	instructionsMu.Unlock()
+
+	if gotBytes > instructionsClipMaxBytes {
+		t.Fatalf("replacement exceeded byte budget: %d > %d", gotBytes, instructionsClipMaxBytes)
+	}
+	if gotBytes != sumLen {
+		t.Fatalf("byte accounting drifted after replacement: counter=%d actual=%d", gotBytes, sumLen)
+	}
+	if gotEntries >= 16 {
+		t.Fatalf("expected older entries to be evicted after replacement, entries=%d", gotEntries)
+	}
+	if !updatedEntryRetained {
+		t.Fatalf("replaced entry was evicted instead of older entries")
+	}
+}
+
+func TestClipInstructionsOversizedEntryNotEvictedByItsOwnInsert(t *testing.T) {
+	resetInstructionsRegistry(t)
+
+	// 单条超过总预算时仍须保留本次会话的条目，否则同会话每轮都拿不到
+	// 稳定前缀（缓存命中的全部收益就在这条记录上）。
+	huge := strings.Repeat("y", instructionsClipMaxBytes+1)
+	first, delta := clipInstructionsToStablePrefix(huge, "solo-user")
+	if first != huge || delta != "" {
+		t.Fatalf("first call must return input verbatim")
+	}
+	key := instructionsRegistryKey(stableInstructionsHead(huge), "solo-user")
+	instructionsMu.Lock()
+	_, ok := instructionsStable[key]
+	gotBytes := instructionsBytes
+	instructionsMu.Unlock()
+	if !ok {
+		t.Fatalf("oversized entry evicted before it could be reused")
+	}
+	if gotBytes != len(huge) {
+		t.Fatalf("byte counter=%d want %d", gotBytes, len(huge))
+	}
+
+	// 再来一个独立会话的条目：总预算已超，按 FIFO 驱逐最旧的（即上面那条
+	// 超预算条目），新插入的保留。
+	other := strings.Repeat("z", 1<<20)
+	clipInstructionsToStablePrefix(other, "second-user")
+	otherKey := instructionsRegistryKey(stableInstructionsHead(other), "second-user")
+	instructionsMu.Lock()
+	_, firstStillThere := instructionsStable[key]
+	_, secondThere := instructionsStable[otherKey]
+	gotBytes = instructionsBytes
+	instructionsMu.Unlock()
+	if firstStillThere {
+		t.Fatalf("oldest entry survived after budget overflow")
+	}
+	if !secondThere {
+		t.Fatalf("just-inserted entry was evicted")
+	}
+	if gotBytes != len(other) {
+		t.Fatalf("bytes=%d want %d", gotBytes, len(other))
+	}
+}
