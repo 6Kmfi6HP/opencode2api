@@ -677,6 +677,15 @@ func buildOCRequestWithSubpath(modelID string, bodyMap map[string]any, auth Upst
 }
 
 func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string, subpath string, ocSession string, state *opencodeSessionState) (*http.Request, error) {
+	return buildOCRequestWithSubpathAndProject(modelID, bodyMap, auth, useGoEndpoint, baseURL, subpath, ocSession, "", state)
+}
+
+// buildOCRequestWithSubpathAndProject is buildOCRequestWithSubpathAndState with
+// an explicit per-request project id. The free tier ledgers quota per project
+// and egress together, so a long-lived process-level id lets one busy project
+// exhaust the bucket for every conversation. callOpenCodeEndpoint mints one id
+// per request and passes it here; an empty value keeps the legacy state id.
+func buildOCRequestWithSubpathAndProject(modelID string, bodyMap map[string]any, auth UpstreamAuth, useGoEndpoint bool, baseURL string, subpath string, ocSession string, projectID string, state *opencodeSessionState) (*http.Request, error) {
 	bodyMap["model"] = modelID
 	// 上游 2026-09-18 实测门禁(docs/labs/2026-09-18-fingerprint-ablation.md):
 	// 是否执行免费层指纹重做**只看解析后的上游模型是否免费**,与客户端
@@ -748,8 +757,11 @@ func buildOCRequestWithSubpathAndState(modelID string, bodyMap map[string]any, a
 	// UA 对齐 lite L1931: ai-sdk/runtime 后缀贴近真实 opencode 客户端。
 	req.Header.Set("User-Agent", ocUserAgent(state))
 	req.Header.Set("x-opencode-client", "cli")
-	projectID := state.projectID
-	if strings.TrimSpace(projectID) == "" {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		projectID = strings.TrimSpace(state.projectID)
+	}
+	if projectID == "" {
 		projectID = randomHex(40)
 	}
 	req.Header.Set("x-opencode-project", projectID)
@@ -834,6 +846,16 @@ func truncateKeyErrBytes(b []byte) []byte {
 
 // callOpenCodeEndpoint 统一封装所有对上游 /zen/v1/* 和 /zen/go/v1/* 端点的 HTTP 调用，
 // 包含重试机制、SOCKS5 会话粘性与轮换、多域名轮换、错误归一与结构化日志输出。
+// freeTierRequestProjectID returns the per-request project id for a free model.
+// Key-tier requests keep the long-lived state id; only the free lane ledgers
+// quota per project and needs the id to vary with the downstream request.
+func freeTierRequestProjectID(modelID string) string {
+	if !isFreeModel(modelID) {
+		return ""
+	}
+	return randomHex(40)
+}
+
 func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamBody []byte, modelID string, auth UpstreamAuth) (io.ReadCloser, int, http.Header, error) {
 	sessionState := initOCSession()
 
@@ -886,6 +908,11 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		// newOCSessionID() 兜底下换 session 破坏 sticky egress。
 		ocSession = newOCSessionID()
 	}
+	// The free-tier quota is attributed to (project, egress). Mint one project
+	// per downstream request, not one per process: a busy conversation must not
+	// exhaust the bucket for every other conversation on the same gateway.
+	// Retries reuse this value so one logical request keeps one identity.
+	requestProjectID := freeTierRequestProjectID(modelID)
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		attemptAuth, keyID, pooled := selectPoolKey(auth, modelID, bodyMap, upstreamHeaders, normalizedTransportScope(ocSession), attempt)
@@ -895,7 +922,7 @@ func callOpenCodeEndpoint(ctx context.Context, endpointSubpath string, upstreamB
 		}
 		baseURL, client := selectUpstreamTarget(targetAuth, bodyMap, upstreamHeaders, normalizedTransportScope(ocSession))
 		lastBaseURL = baseURL
-		up, err := buildOCRequestWithSubpathAndState(modelID, bodyMap, targetAuth, useGoEndpoint, baseURL, endpointSubpath, ocSession, sessionState)
+		up, err := buildOCRequestWithSubpathAndProject(modelID, bodyMap, targetAuth, useGoEndpoint, baseURL, endpointSubpath, ocSession, requestProjectID, sessionState)
 		if err != nil {
 			return nil, 500, nil, err
 		}

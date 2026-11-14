@@ -377,8 +377,9 @@ func ensureFreeTierSystemEnv(bodyMap map[string]any, subpath string) {
 
 // applyFreeTierFingerprint 对解析后的上游模型本身免费的请求执行免费层指纹
 // 重做（按模型判定，不按客户端 Authorization tier）。tools / system 对齐
-// zen-proxy：前置 CLI harness preamble 与工具 manifest。stream 强制 true；
-// chat/responses 补 include_usage。count_tokens / systemone 不套该门禁。
+// zen-proxy：前置官方 2.x CLI prompt 与完整工具 manifest，调用方工具改成
+// 不透明别名。stream 强制 true；chat/responses 补 include_usage。
+// count_tokens / systemone 不套该门禁。
 func applyFreeTierFingerprint(bodyMap map[string]any, subpath, modelID string) {
 	applyFreeTierBodyFingerprint(bodyMap, subpath, modelID)
 }

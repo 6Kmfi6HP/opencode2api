@@ -760,6 +760,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			if driveErr != nil && errors.Is(driveErr, context.Canceled) {
 				return
 			}
+			// 标题生成是内部装饰性调用：上游对无工具标题请求仍可能返回
+			// 429。此时本地合成标题，避免客户端把一次标题失败暴露给用户。
+			if writeTitleFallbackIfNeeded(w, req.Model, body, upstreamCap.Status, true) {
+				if upstreamCap.RC != nil {
+					_ = upstreamCap.RC.Close()
+				}
+				return
+			}
 			// 优先把上游真实 status + body 透回去:4xx/5xx 客户端能从 body
 			// 里看到具体错误信息(max_tokens 越界、rate limit 等),比 502
 			// 通用错误更有用。仅在没拿到上游 body 时落在通用 502。
@@ -784,6 +792,9 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	respBody, status, header, err := callOpenCodeAPI(r.Context(), upstreamBody, req.Model, auth)
 	if err != nil || status < 200 || status >= 300 {
+		if writeTitleFallbackIfNeeded(w, req.Model, body, status, false) {
+			return
+		}
 		if err != nil {
 			writeUpstreamError(w, status, err, "chat")
 		} else {

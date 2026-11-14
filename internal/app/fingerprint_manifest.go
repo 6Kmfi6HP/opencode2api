@@ -3,72 +3,161 @@ package app
 import (
 	_ "embed"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
+	"sync"
+	"time"
 )
 
-// ======================== 免费层指纹: harness preamble + 工具 manifest ========================
+// ======================== 免费层指纹: 官方 CLI prompt + 工具 manifest ========================
 //
 // 上游免费层门禁按"真实 OpenCode CLI 请求"校验请求体（zen-proxy 对线上网关的
 // 实测口径，2026-11）：
-//   - system 文本必须是 CLI 自己的 harness preamble（agent-preamble.txt，
-//     截断到 ~1.8 KB 或换成通用提示词都按 429 FreeUsageLimitError 拒绝）；
-//   - tools 必须携带 CLI 自己的工具 manifest（agent-tools.json 里能映射回
-//     调用方工具的 6 件：read/edit/glob/grep/shell/write），排在调用方工具之前。
+//   - system 文本必须是 CLI 自己的 prompt（opencode-prompt-v2.txt），截断或
+//     换成通用 agent 提示词都会按 429 FreeUsageLimitError 拒绝；
+//   - tools 必须携带 CLI 2.x 的完整工具集（13 件：edit/execute/glob/grep/
+//     question/read/shell/skill/subagent/webfetch/websearch/write/patch）。
 //
-// 旧实现只补 <env> 自证块 + bash/glob/grep/read 四件小写 stub，已被该门禁拒绝。
-// 本文件按 zen-proxy 的逻辑重做：preamble 前置（不替换调用方原文）、manifest
-// 前置（与 manifest 同名的调用方工具丢弃）、无工具调用方强制 tool_choice=none。
-// 回复侧把 manifest 调用映射回调用方工具名并丢弃调用方无法执行的调用，见
-// agent_tool_reply.go。
+// 本文件按 zen-proxy 的逻辑重做：官方 prompt 前置（不替换调用方原文）、完整
+// manifest 前置、所有调用方工具改成不透明别名（避免调用方工具词汇泄漏给门禁，
+// 也避免与官方 manifest 重名）。回复侧把 manifest 调用映射回调用方工具名并
+// 丢弃调用方无法执行的调用，见 agent_tool_reply.go。
 
-//go:embed fingerprint/agent-preamble.txt
-var agentPreambleText string
+//go:embed fingerprint/opencode-prompt-v2.txt
+var opencodePromptV2 string
 
-//go:embed fingerprint/agent-tools.json
-var agentToolsJSON []byte
+//go:embed fingerprint/opencode-tools-v2.json
+var opencodeToolsV2JSON []byte
 
-// agentPreambleMarker 是 harness preamble 的首行。system 文本已以此开头时
-// 视为 OpenCode 自己（或串联的代理）的请求，不再重复前置。
-const agentPreambleMarker = "You are an AI agent running in OpenCode"
+// opencodePromptMarker 是官方 prompt 的首行。system 文本已以此开头时视为
+// OpenCode 自己（或串联的代理）的请求，不再重复前置。
+const opencodePromptMarker = "You are opencode, an interactive CLI tool"
 
-// agentToolSpec 是 manifest 工具名到调用方工具的映射（对齐 zen-proxy
-// AGENT_TOOL_MAP）：Name 是 Anthropic 官方名（Claude Code 注册的 PascalCase），
-// Args 是 manifest 参数名 → 调用方参数名，值为 nil 的参数在映射时丢弃
-// （bash/shell 的 workdir 在调用方 Bash 工具上没有对应物）。
+// opencodeSkills is the built-in skill listing the CLI appends after its
+// environment block. It is static, so it is part of the injected prompt.
+const opencodeSkills = `Skills provide specialized instructions and workflows for specific tasks.
+Use the skill tool to load a skill when a task matches its description.
+<available_skills>
+  <skill>
+    <name>customize-opencode</name>
+    <description>Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself.</description>
+    <location>&lt;built-in&gt;</location>
+  </skill>
+</available_skills>`
+
+var (
+	opencodeEnvOnce sync.Once
+	opencodeWorkDir string
+)
+
+// opencodeEnvironment renders the <env> block the CLI puts after its base
+// prompt. The working directory is resolved once per process; a platform
+// without one falls back to the official container path.
+func opencodeEnvironment(model string) string {
+	opencodeEnvOnce.Do(func() {
+		directory := ""
+		if current, err := os.Getwd(); err == nil {
+			directory = filepath.Clean(strings.TrimSpace(current))
+		}
+		if directory == "" || directory == "." {
+			directory = "/workspace"
+		}
+		opencodeWorkDir = directory
+	})
+	apiModel := strings.TrimSpace(strings.TrimPrefix(model, "opencode/"))
+	if apiModel == "" {
+		apiModel = "unknown"
+	}
+	platform := runtime.GOOS
+	if platform == "windows" {
+		platform = "win32"
+	}
+	return strings.Join([]string{
+		"You are powered by the model named " + apiModel + ". The exact model ID is opencode/" + apiModel,
+		"Here is some useful information about the environment you are running in:",
+		"<env>",
+		"  Working directory: " + opencodeWorkDir,
+		"  Workspace root folder: " + opencodeWorkDir,
+		"  Is directory a git repo: yes",
+		"  Platform: " + platform,
+		"  Today's date: " + time.Now().UTC().Format("Mon Jan 02 2006"),
+		"</env>",
+	}, "\n")
+}
+
+// agentPreambleFor assembles the official CLI system prompt for modelID. The
+// prompt bytes are static apart from the live environment block, so a
+// conversation keeps the same prefix across turns and the upstream prefix
+// cache stays warm.
+func agentPreambleFor(modelID string) string {
+	if opencodePromptV2 == "" {
+		return ""
+	}
+	return opencodePromptV2 + opencodeEnvironment(modelID) + "\n" + opencodeSkills
+}
+
+// agentToolSpec 是官方工具名到调用方工具的映射（对齐 zen-proxy
+// OfficialToolCandidates）：Name 是 Anthropic 官方名（Claude Code 注册的
+// PascalCase），Args 是官方参数名 → 调用方参数名，值为 nil 的参数在映射时
+// 丢弃（shell 的 workdir 在调用方 Bash 工具上没有对应物）。
 type agentToolSpec struct {
 	Name string
 	Args map[string]*string
 }
 
 var agentToolMap = map[string]agentToolSpec{
-	"read":  {Name: "Read", Args: map[string]*string{"filePath": new("file_path")}},
-	"edit":  {Name: "Edit", Args: map[string]*string{"filePath": new("file_path"), "oldString": new("old_string"), "newString": new("new_string"), "replaceAll": new("replace_all")}},
-	"write": {Name: "Write", Args: map[string]*string{"filePath": new("file_path")}},
-	// nil 表示该参数在调用方工具上没有对应物，映射时丢弃。
-	"bash":  {Name: "Bash", Args: map[string]*string{"workdir": nil}},
-	"shell": {Name: "Bash", Args: map[string]*string{"workdir": nil}},
-	"grep":  {Name: "Grep", Args: map[string]*string{}},
-	"glob":  {Name: "Glob", Args: map[string]*string{}},
-	"list":  {Name: "LS", Args: map[string]*string{}},
+	"read":      {Name: "Read", Args: map[string]*string{"path": new("file_path")}},
+	"edit":      {Name: "Edit", Args: map[string]*string{"path": new("file_path"), "oldString": new("old_string"), "newString": new("new_string"), "replaceAll": new("replace_all")}},
+	"write":     {Name: "Write", Args: map[string]*string{"path": new("file_path")}},
+	"bash":      {Name: "Bash", Args: map[string]*string{"workdir": nil}},
+	"shell":     {Name: "Bash", Args: map[string]*string{"workdir": nil}},
+	"execute":   {Name: "Bash", Args: map[string]*string{"workdir": nil}},
+	"grep":      {Name: "Grep", Args: map[string]*string{}},
+	"glob":      {Name: "Glob", Args: map[string]*string{}},
+	"question":  {Name: "AskUserQuestion", Args: map[string]*string{}},
+	"skill":     {Name: "Skill", Args: map[string]*string{"id": new("skill")}},
+	"subagent":  {Name: "Task", Args: map[string]*string{"agent": new("subagent_type")}},
+	"webfetch":  {Name: "WebFetch", Args: map[string]*string{}},
+	"websearch": {Name: "WebSearch", Args: map[string]*string{}},
+}
+
+// opencodeToolOrder is the official 2.x manifest order. It is fixed so the
+// injected prefix stays byte-stable across requests.
+var opencodeToolOrder = []string{
+	"edit", "execute", "glob", "grep", "question", "read", "shell",
+	"skill", "subagent", "webfetch", "websearch", "write", "patch",
 }
 
 // agentManifestChat 是 manifest 的 chat 形状（{"type":"function","function":{...}}），
-// 与嵌入文件逐字节一致，init 时一次性解析。
+// init 时从官方 2.x 抓包一次性构建。
 var agentManifestChat []map[string]any
 
 func init() {
-	var parsed struct {
-		Tools []map[string]any `json:"tools"`
+	var defs map[string]struct {
+		Description string         `json:"description"`
+		Parameters  map[string]any `json:"parameters"`
 	}
-	if err := json.Unmarshal(agentToolsJSON, &parsed); err != nil {
+	if err := json.Unmarshal(opencodeToolsV2JSON, &defs); err != nil {
 		return
 	}
-	for _, t := range parsed.Tools {
-		fn, _ := t["function"].(map[string]any)
-		name, _ := fn["name"].(string)
-		if _, ok := agentToolMap[name]; ok {
-			agentManifestChat = append(agentManifestChat, t)
+	for _, name := range opencodeToolOrder {
+		def, ok := defs[name]
+		if !ok {
+			continue
 		}
+		fn := map[string]any{
+			"name":        name,
+			"description": def.Description,
+			"parameters":  def.Parameters,
+			"strict":      false,
+		}
+		agentManifestChat = append(agentManifestChat, map[string]any{
+			"type":     "function",
+			"function": fn,
+		})
 	}
 }
 
@@ -122,29 +211,16 @@ func cloneToolMap(t map[string]any) map[string]any {
 	return out
 }
 
-// manifestToolNames 返回 manifest 工具名集合（小写，与协议形状无关）。
-func manifestToolNames() map[string]bool {
-	names := make(map[string]bool, len(agentManifestChat))
-	for _, t := range agentManifestChat {
-		if fn, ok := t["function"].(map[string]any); ok {
-			if name, _ := fn["name"].(string); name != "" {
-				names[name] = true
-			}
-		}
-	}
-	return names
-}
+// ======================== 请求侧：官方 prompt 前置 ========================
 
-// ======================== 请求侧：preamble 前置 ========================
-
-// combinePreamble 把 harness preamble 前置到调用方 system 文本。已以 marker
-// 开头的文本（OpenCode 自己或串联代理）原样返回，避免双重 preamble。
-func combinePreamble(systemText string) string {
-	preamble := strings.TrimRight(agentPreambleText, "\n")
+// combinePreamble 把官方 CLI prompt 前置到调用方 system 文本。已以 marker
+// 开头的文本（OpenCode 自己或串联代理）原样返回，避免双重 prompt。
+func combinePreamble(modelID, systemText string) string {
+	preamble := agentPreambleFor(modelID)
 	if preamble == "" {
 		return systemText
 	}
-	if strings.HasPrefix(strings.TrimLeft(systemText, " \t\r\n"), agentPreambleMarker) {
+	if strings.HasPrefix(strings.TrimLeft(systemText, " \t\r\n"), opencodePromptMarker) {
 		return systemText
 	}
 	if strings.TrimSpace(systemText) == "" {
@@ -181,14 +257,14 @@ func messageTextContentOf(m map[string]any) string {
 
 // injectPreambleChat 把 preamble 前置到首条 system 消息（与调用方原文合并为
 // 单条，门禁按单条 system 文本校验）；没有 system 消息时在头部插入一条。
-func injectPreambleChat(bodyMap map[string]any) {
+func injectPreambleChat(bodyMap map[string]any, modelID string) {
 	msgs, _ := bodyMap["messages"].([]any)
 	for i, raw := range msgs {
 		m, ok := raw.(map[string]any)
 		if !ok || m["role"] != "system" {
 			continue
 		}
-		combined := combinePreamble(messageTextContentOf(m))
+		combined := combinePreamble(modelID, messageTextContentOf(m))
 		if combined == messageTextContentOf(m) {
 			return
 		}
@@ -196,7 +272,7 @@ func injectPreambleChat(bodyMap map[string]any) {
 		msgs[i] = m
 		return
 	}
-	preamble := strings.TrimRight(agentPreambleText, "\n")
+	preamble := agentPreambleFor(modelID)
 	if preamble == "" {
 		return
 	}
@@ -206,8 +282,8 @@ func injectPreambleChat(bodyMap map[string]any) {
 
 // injectPreambleMessages 把 preamble 前置到 Anthropic system（string 或 text
 // parts 数组都折叠为单条字符串：门禁按单条 system 文本校验）。
-func injectPreambleMessages(bodyMap map[string]any) {
-	bodyMap["system"] = combinePreamble(anthropicSystemTextOf(bodyMap["system"]))
+func injectPreambleMessages(bodyMap map[string]any, modelID string) {
+	bodyMap["system"] = combinePreamble(modelID, anthropicSystemTextOf(bodyMap["system"]))
 }
 
 // anthropicSystemTextOf 把 Anthropic system 字段（string 或 text parts）折叠
@@ -245,17 +321,19 @@ func anthropicSystemTextOf(system any) string {
 }
 
 // injectPreambleResponses 把 preamble 前置到 Responses instructions。
-func injectPreambleResponses(bodyMap map[string]any) {
+func injectPreambleResponses(bodyMap map[string]any, modelID string) {
 	instr, _ := bodyMap["instructions"].(string)
-	bodyMap["instructions"] = combinePreamble(instr)
+	bodyMap["instructions"] = combinePreamble(modelID, instr)
 }
 
 // ======================== 请求侧：manifest 前置 ========================
 
-// applyAgentManifest 把 manifest 前置到 tools，并丢弃与 manifest 同名的调用方
-// 工具（门禁要的是 CLI 自己的 schema；回复侧按映射把 manifest 调用改回调用方
-// 工具名）。返回调用方是否自带工具：无工具的请求（标题生成、普通问答）被强制
-// tool_choice=none——manifest 只为过门禁，答案必须是文本。
+// applyAgentManifest 把 manifest 前置到 tools。与 manifest 同名的调用方工具
+// 不能继续用原名（门禁要的是 CLI 自己的 schema），但也不能直接丢弃——调用方
+// 可能依赖它自己的 schema。改为可逆的 clnt_ 别名，回复侧再解回原名；
+// tool_choice 与历史里的工具引用同步改写。返回调用方是否自带工具：无工具的
+// 请求（标题生成、普通问答）被强制 tool_choice=none——manifest 只为过门禁，
+// 答案必须是文本。
 //
 // 名字按协议形状读取（chat 的 function.name、messages/responses 的裸 name），
 // 冲突判定大小写敏感（Read 与 read 不冲突，对齐 zen-proxy）。
@@ -265,27 +343,63 @@ func applyAgentManifest(bodyMap map[string]any, subpath string) (callerHasTools 
 		_, callerHasTools = bodyMap["tools"].([]any)
 		return callerHasTools && len(bodyMap["tools"].([]any)) > 0
 	}
-	manifestNames := manifestToolNames()
+	manifestByName := make(map[string]map[string]any, len(manifest))
+	for _, t := range manifest {
+		if name := freeTierToolNameOf(t); name != "" {
+			manifestByName[name] = t
+		}
+	}
 	rawTools, _ := bodyMap["tools"].([]any)
 	caller := make([]any, 0, len(rawTools))
+	aliases := make(map[string]string)
 	for _, t := range rawTools {
 		tm, ok := t.(map[string]any)
 		if !ok {
 			continue
 		}
 		name := freeTierToolNameOf(tm)
-		if name != "" && manifestNames[name] {
-			continue
+		if name != "" {
+			// buildOCRequest* runs once per retry on the same body map. A
+			// manifest tool injected by the previous attempt is already in
+			// the canonical shape; keep it instead of aliasing our own tool.
+			if canonical, ok := manifestByName[name]; ok && reflect.DeepEqual(tm, canonical) {
+				caller = append(caller, t)
+				callerHasTools = true
+				continue
+			}
+			// Every caller tool gets an opaque name, even when it does not
+			// collide with the manifest: the free-tier gate rejects bodies
+			// that still look like another agent's toolset (Claude Code's
+			// Read/Edit/Bash/Task/... vocabulary).
+			if !isCallerToolAlias(name) {
+				alias := callerToolAlias(name)
+				if alias == "" {
+					// No safe wire name; dropping is the only fallback.
+					continue
+				}
+				setFreeTierToolName(tm, alias)
+				aliases[name] = alias
+			}
 		}
 		caller = append(caller, t)
 		callerHasTools = true
 	}
 	merged := make([]any, 0, len(manifest)+len(caller))
 	for _, t := range manifest {
-		merged = append(merged, t)
+		present := false
+		for _, existing := range caller {
+			if em, ok := existing.(map[string]any); ok && reflect.DeepEqual(t, em) {
+				present = true
+				break
+			}
+		}
+		if !present {
+			merged = append(merged, t)
+		}
 	}
 	merged = append(merged, caller...)
 	bodyMap["tools"] = merged
+	rewriteAliasedToolReferences(bodyMap, subpath, aliases)
 	if !callerHasTools {
 		// 无工具调用方：manifest 只为过门禁，答案必须是文本。
 		// /responses 只接受 "auto"，故删除；messages 用 Anthropic 对象形。
@@ -300,6 +414,10 @@ func applyAgentManifest(bodyMap map[string]any, subpath string) (callerHasTools 
 	}
 	return callerHasTools
 }
+
+// freeTierCompletionLimit is the max_completion_tokens the official 2.x client
+// puts on every chat body.
+const freeTierCompletionLimit = 32000
 
 // applyFreeTierBodyFingerprint 对免费模型请求执行请求体指纹重做：
 //   - tools：manifest 前置，同名调用方工具丢弃，无工具调用方强制 tool_choice；
@@ -319,18 +437,34 @@ func applyFreeTierBodyFingerprint(bodyMap map[string]any, subpath, modelID strin
 	default:
 		return
 	}
-	applyAgentManifest(bodyMap, subpath)
+	// A title call is the one request the free tier wants without tools: an
+	// attached agent manifest turns it into a 403/429. Keep the preamble so it
+	// still looks like the CLI, but preserve the tool-less request.
+	if !isTitleGenerationRequest(bodyMap) {
+		applyAgentManifest(bodyMap, subpath)
+	}
 	switch subpath {
 	case "messages":
-		injectPreambleMessages(bodyMap)
+		injectPreambleMessages(bodyMap, modelID)
 	case "responses":
-		injectPreambleResponses(bodyMap)
+		injectPreambleResponses(bodyMap, modelID)
 	default:
-		injectPreambleChat(bodyMap)
+		injectPreambleChat(bodyMap, modelID)
 	}
 	bodyMap["stream"] = true
 	if subpath == "messages" {
 		return
+	}
+	// The official 2.x client always puts a completion ceiling on a chat body.
+	// Keep the same shape when the caller did not express a preference; an
+	// explicit max_tokens/max_completion_tokens still wins (convertRequest also
+	// injects the configured cap as max_tokens when one is set).
+	if subpath == "chat/completions" {
+		_, hasMaxCompletionTokens := bodyMap["max_completion_tokens"]
+		_, hasMaxTokens := bodyMap["max_tokens"]
+		if !hasMaxCompletionTokens && !hasMaxTokens {
+			bodyMap["max_completion_tokens"] = freeTierCompletionLimit
+		}
 	}
 	if existing, ok := bodyMap["stream_options"].(map[string]any); ok {
 		existing["include_usage"] = true

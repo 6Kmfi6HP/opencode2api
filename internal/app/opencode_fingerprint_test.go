@@ -117,10 +117,9 @@ func TestOCRequest_PaidTierKeepsClientBody(t *testing.T) {
 	}
 }
 
-// 按模型判定后(与 free_tier_fingerprint_test.go 同一口径,issue #19 消融
-// 修复建议): 免费模型 + 客户端自带工具时不再整包跳过,而是保留客户端工具
-// 在前、把缺失的 bash/glob/grep/read 追加在后——上游按"有无四件"整体判定,
-// 客户端带了 weather 改变不了缺四件就 403 的事实。
+// 按模型判定后(与 free_tier_fingerprint_test.go 同一口径): 免费模型 + 客户端
+// 自带工具时保留客户端工具(改成不透明别名),官方 manifest 前置;客户端词汇
+// 不再泄漏给门禁。
 func TestOCRequest_FreeTierKeepsClientToolsWhenPresent(t *testing.T) {
 	setOCSessionStateForTest(&opencodeSessionState{clientVersion: "1.18.31"})
 	auth := UpstreamAuth{Mode: AuthRoutePublic}
@@ -138,17 +137,18 @@ func TestOCRequest_FreeTierKeepsClientToolsWhenPresent(t *testing.T) {
 	body, _ := io.ReadAll(req.Body)
 	var sent map[string]any
 	if err := json.Unmarshal(body, &sent); err != nil {
-		t.Fatal(err)
+		t.Fatalf("unmarshal sent body: %v", err)
 	}
 	names := toolNames(t, sent)
-	if len(names) != 7 || names[len(names)-1] != "weather" {
-		t.Fatalf("tools = %#v, want manifest first and client weather kept last", sent["tools"])
+	alias := callerToolAlias("weather")
+	if len(names) != len(opencodeToolOrder)+1 || names[len(names)-1] != alias {
+		t.Fatalf("tools = %#v, want manifest first and client weather alias last", sent["tools"])
 	}
 	seen := map[string]bool{}
 	for _, n := range names {
 		seen[n] = true
 	}
-	for _, want := range []string{"edit", "glob", "grep", "read", "shell", "write"} {
+	for _, want := range opencodeToolOrder {
 		if !seen[want] {
 			t.Fatalf("missing required tool %q, got %v", want, names)
 		}

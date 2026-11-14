@@ -63,7 +63,7 @@ func firstIndex(names []string, target string) int {
 func assertFreeTierToolsPresent(t *testing.T, sent map[string]any) []string {
 	t.Helper()
 	names := toolNames(t, sent)
-	for _, want := range []string{"edit", "glob", "grep", "read", "shell", "write"} {
+	for _, want := range []string{"edit", "execute", "glob", "grep", "question", "read", "shell", "skill", "subagent", "webfetch", "websearch", "write", "patch"} {
 		if firstIndex(names, want) < 0 {
 			t.Fatalf("missing manifest tool %q, got tools order %v", want, names)
 		}
@@ -116,8 +116,8 @@ func TestFreeTierFingerprint_SKKeyFreeModelNoTools(t *testing.T) {
 	}
 }
 
-// A2: Bearer public + big-pickle + 客户端自带 weather ⇒ 保留 weather 在前,
-// 仅追加缺失的 bash/glob/grep/read(顺序 bash,glob,grep,read)。
+// A2: Bearer public + big-pickle + 客户端自带 weather ⇒ 官方 manifest 在前,
+// weather 改名成不透明别名排在后面(门禁不接受调用方工具词汇)。
 func TestFreeTierFingerprint_PublicPartialClientTools(t *testing.T) {
 	modelsdev.SetFreeModelsForTest("big-pickle")
 	t.Cleanup(func() { modelsdev.SetFreeModelsForTest() })
@@ -138,13 +138,9 @@ func TestFreeTierFingerprint_PublicPartialClientTools(t *testing.T) {
 		t.Fatalf("stream = %#v, want true", got)
 	}
 	names := assertFreeTierToolsPresent(t, sent)
-	if len(names) != 7 || names[len(names)-1] != "weather" {
-		t.Fatalf("tools = %v, want 6 manifest tools then weather", names)
-	}
-	for i, want := range []string{"edit", "glob", "grep", "read", "shell", "write"} {
-		if names[i] != want {
-			t.Fatalf("manifest prefix = %v, want edit,glob,grep,read,shell,write", names)
-		}
+	alias := callerToolAlias("weather")
+	if len(names) != len(opencodeToolOrder)+1 || names[0] != "edit" || names[len(names)-1] != alias {
+		t.Fatalf("tools = %v, want official manifest then %q", names, alias)
 	}
 }
 
@@ -303,8 +299,8 @@ func TestFreeTierFingerprint_ResponsesSubpathInjectsResponsesShape(t *testing.T)
 		t.Fatal(err)
 	}
 	tools, _ := out["tools"].([]any)
-	if len(tools) != 6 {
-		t.Fatalf("expected 6 manifest tools on responses subpath, got %d: %s", len(tools), mustJSON(out))
+	if len(tools) != len(opencodeToolOrder) {
+		t.Fatalf("expected %d manifest tools on responses subpath, got %d: %s", len(opencodeToolOrder), len(tools), mustJSON(out))
 	}
 	for i, raw := range tools {
 		tm, _ := raw.(map[string]any)
@@ -377,10 +373,11 @@ func TestFreeTierFingerprint_SubpathMessages(t *testing.T) {
 		t.Fatalf("stream_options must not be injected into anthropic schema, got %#v", sent["stream_options"])
 	}
 	names := assertFreeTierToolsPresent(t, sent)
-	if len(names) != 7 || names[len(names)-1] != "bash" {
-		t.Fatalf("tools = %v, want 6 manifest tools then client bash", names)
+	alias := callerToolAlias("bash")
+	if len(names) != len(opencodeToolOrder)+1 || names[len(names)-1] != alias {
+		t.Fatalf("tools = %v, want official manifest then %q", names, alias)
 	}
-	if names[0] == "bash" {
+	if firstIndex(names, alias) != len(names)-1 {
 		t.Fatalf("manifest must precede client bash, got %v", names)
 	}
 	// Anthropic 形状: 补齐的工具也应挂在 name 字段下,而不是 OpenAI 的 function 包装。

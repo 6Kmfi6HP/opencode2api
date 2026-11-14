@@ -38,6 +38,10 @@ type agentToolReplyContext struct {
 	// offeredLower 是小写索引：manifest 名与调用方声明同名（大小写不敏感）
 	// 时，映射回调用方声明的原始大小写而不是官方 PascalCase。
 	offeredLower map[string]string
+	// wireToClient maps every opaque alias to the caller's original tool name.
+	// Both sides derive the alias from the declared name, so this stays local
+	// to the reply context.
+	wireToClient map[string]string
 	// dropped / rawByIndex 是流式回复的 per-index 状态：名字块决定丢弃，
 	// 后续参数块跟随。单请求单流，就地改写。
 	dropped    map[int]bool
@@ -76,6 +80,12 @@ func (c *agentToolReplyContext) keepRawName(rawName string) bool {
 	if c == nil {
 		return true
 	}
+	if original, ok := c.wireToClient[rawName]; ok {
+		return c.callerHasTools && c.offered[original]
+	}
+	if isCallerToolAlias(rawName) {
+		return false
+	}
 	if !c.callerHasTools {
 		return false
 	}
@@ -92,12 +102,22 @@ func (c *agentToolReplyContext) keepRawName(rawName string) bool {
 // （nil 映射的参数丢弃，未知参数原样保留）。rawArgs 为非法 JSON 时参数置空
 // 对象（对齐 zen-proxy remapAgentTool 的容错）。非 manifest 名原样返回。
 func (c *agentToolReplyContext) remapAgentToolCall(rawName, rawArgs string) (string, string) {
+	if c != nil {
+		if original, ok := c.wireToClient[rawName]; ok {
+			return original, rawArgs
+		}
+	}
 	spec, ok := agentToolMap[rawName]
 	if !ok {
 		return rawName, rawArgs
 	}
 	name, _ := c.callerToolName(rawName)
 	if rawArgs == "" {
+		return name, rawArgs
+	}
+	if c == nil || !c.viaMap {
+		// chat/responses callers declare their own schemas; an official name
+		// bound back to such a tool must keep its arguments untouched.
 		return name, rawArgs
 	}
 	var args map[string]any
@@ -125,6 +145,11 @@ func (c *agentToolReplyContext) remapAgentToolCall(rawName, rawArgs string) (str
 // remapAgentToolInput 同 remapAgentToolCall，但参数是已解析的对象（Anthropic
 // tool_use input）。返回改写后的名字与 input；非 manifest 名原样返回。
 func (c *agentToolReplyContext) remapAgentToolInput(rawName string, input any) (string, any) {
+	if c != nil {
+		if original, ok := c.wireToClient[rawName]; ok {
+			return original, input
+		}
+	}
 	spec, ok := agentToolMap[rawName]
 	if !ok {
 		return rawName, input
@@ -132,6 +157,9 @@ func (c *agentToolReplyContext) remapAgentToolInput(rawName string, input any) (
 	name, _ := c.callerToolName(rawName)
 	args, ok := input.(map[string]any)
 	if !ok || args == nil {
+		return name, input
+	}
+	if c == nil || !c.viaMap {
 		return name, input
 	}
 	out := make(map[string]any, len(args))
@@ -195,17 +223,22 @@ func newAgentToolReplyContext(offered map[string]bool, viaMap, callerHasTools bo
 		return nil
 	}
 	if len(offered) == 0 && !callerHasTools {
-		return &agentToolReplyContext{viaMap: viaMap}
+		return &agentToolReplyContext{viaMap: viaMap, wireToClient: map[string]string{}}
 	}
 	lower := make(map[string]string, len(offered))
+	wire := make(map[string]string, len(offered))
 	for name := range offered {
 		lower[lowerASCII(name)] = name
+		if alias := callerToolAlias(name); alias != "" {
+			wire[alias] = name
+		}
 	}
 	return &agentToolReplyContext{
 		viaMap:         viaMap,
 		callerHasTools: callerHasTools,
 		offered:        offered,
 		offeredLower:   lower,
+		wireToClient:   wire,
 	}
 }
 
@@ -383,7 +416,7 @@ func (c *agentToolReplyContext) filterChatToolCallDelta(fields map[string]any) {
 			}
 			c.noteRaw(idx, name)
 			mapped, mappedArgs := c.remapAgentToolCall(name, args)
-			if _, isManifest := agentToolMap[name]; isManifest && args != "" {
+			if _, isManifest := agentToolMap[name]; isManifest && c.viaMap && args != "" {
 				mappedArgs = remapArgFragment(name, args)
 				if mappedArgs == args {
 					_, mappedArgs = c.remapAgentToolCall(name, args)

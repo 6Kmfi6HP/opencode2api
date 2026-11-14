@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Align free-tier request shaping with the reference gateway (`feat(fingerprint)`):
+  - 免费模型改用官方 OpenCode 2.x CLI prompt（`opencode-prompt-v2.txt`）替换旧 harness preamble：`<env>`、`Today's date` 与模型 ID 按当前进程/模型渲染，不再发送抓包机上的 `/tmp/opencode/fhome`、`linux` 和固定日期；工作目录与平台在进程内只解析一次。
+  - 免费模型注入官方 2.x 完整工具集（13 件），不再只补 6 件 stub；调用方工具全部改成不透明 `clnt_` 摘要别名，避免 Claude Code 等调用方的工具词汇触发免费层门禁。
+  - 标题生成请求（无 tools、至多 3 条消息、匹配 OpenCode title prompt）不再注入 CLI 工具 manifest，避免把本应无工具的标题调用变成带工具请求而被 403/429；上游仍返回 429 时本地合成标题（JSON 或 `[DONE]` 收尾的 SSE），不再把装饰性失败暴露给用户。
+  - 回复侧把官方工具/别名调用映射回调用方工具名；Claude 路由按官方参数名改写，Chat/Responses 路由保留调用方自己的 schema。`tool_choice` 与历史中的工具引用同步改写。
+  - 免费模型每次下游请求生成独立的 40-hex `x-opencode-project`（重试复用同一值），避免进程级 project id 把额度归因到同一桶；付费请求保持原行为。
+  - 免费 Chat 请求未显式设置输出上限时补 `max_completion_tokens: 32000`，对齐 2.x 客户端；调用方显式 `max_tokens` / `max_completion_tokens` 仍优先。
+
 ## v0.14.42
 
 - Cut steady-state memory in the hot request path (`perf(memory)`):
