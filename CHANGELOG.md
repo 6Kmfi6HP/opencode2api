@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.15.0
 
 - Align free-tier request shaping with the reference gateway (`feat(fingerprint)`):
   - 免费模型改用官方 OpenCode 2.x CLI prompt（`opencode-prompt-v2.txt`）替换旧 harness preamble：`<env>`、`Today's date` 与模型 ID 按当前进程/模型渲染，不再发送抓包机上的 `/tmp/opencode/fhome`、`linux` 和固定日期；工作目录与平台在进程内只解析一次。
