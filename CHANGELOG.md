@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.15.1
+
+- Fix tool reply remapping, streaming arg splits, and cross-protocol bridges (`fix(fingerprint)`):
+  - 回复侧工具映射接入调用方真实 tool schema（`shouldRemapArg`）：仅当目标工具声明了目标参数名（如 `file_path`、`old_string`）且未声明原名（如 `path`、`oldString`）时才改写参数名，避免 `/v1/messages` 下使用 `path` 的客户端（如 `pi`）被误改而校验失败，同时保持 `/v1/chat/completions` 与 `/v1/responses` 原有 schema 不回归。
+  - 修复活跃 `agentToolReplyContext` 与 `shouldRestoreToolCase` 的叠加冲突，以及 `callOpenCodeAPI` 在非流聚合后将 `"read"` 提前转为 `"Read"` 导致跳过参数映射、和 `presentAnthropicBody` 比较两个 `map[string]any` 触发运行时 panic 的问题。
+  - 流式参数片段改用 JSON 键位置状态机 `remapArgStream` / `flushArgPending`，跨分片缓冲键名前缀并仅匹配未转义的 JSON 键，避免被拆分的参数名漏映射或误改字符串值内容。
+  - 为 `claude_responses`、`responses_passthrough`、`chat_to_responses_upstream` 与 `chat_to_anthropic` 四条跨协议/原生 Responses 路径补齐流式与非流式 `agentToolReplyFromContext` 回复映射、别名还原与未知工具过滤。
+
 ## v0.15.0
 
 - Align free-tier request shaping with the reference gateway (`feat(fingerprint)`):
