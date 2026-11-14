@@ -88,6 +88,9 @@ func shouldRestoreToolCase(ctx context.Context) bool {
 	if ctx == nil {
 		return false
 	}
+	if reply := agentToolReplyFromContext(ctx); reply != nil && reply.active() {
+		return false
+	}
 	return isClaudeCodeClient(upstreamHeadersFromContext(ctx).Get("User-Agent"))
 }
 

@@ -1472,7 +1472,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	respReq.Model = mapPublicToFreeModel(auth, respReq.Model)
-	r = r.WithContext(attachFreeTierToolReply(r.Context(), respReq.Model, offeredResponsesToolNames(respReq.Tools), false))
+	r = r.WithContext(attachFreeTierToolReplyWithSchemas(r.Context(), respReq.Model, offeredResponsesToolNames(respReq.Tools), offeredResponsesToolSchemas(respReq.Tools), false))
 
 	// 协议路由：显式规则 > native-responses 运行时记忆 > 默认 chat。
 	// responses 分支为既有透传（muse-spark 系上游 chat 通道整档 500/整档

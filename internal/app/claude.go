@@ -1106,7 +1106,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	modelIn := claudeReq.Model
 	claudeReq.Model = resolveModelForAuth(auth, claudeReq.Model)
 	claudeReq.Model = mapPublicToFreeModel(auth, claudeReq.Model)
-	r = r.WithContext(attachFreeTierToolReply(r.Context(), claudeReq.Model, offeredClaudeToolNames(claudeReq.Tools), true))
+	r = r.WithContext(attachFreeTierToolReplyWithSchemas(r.Context(), claudeReq.Model, offeredClaudeToolNames(claudeReq.Tools), offeredClaudeToolSchemas(claudeReq.Tools), true))
 	if !validateRequestTemperature(w, claudeReq.Temperature, "claude", 0, 1) {
 		return
 	}
@@ -1283,7 +1283,8 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claudeRespBody := openAIToClaudeResponse(respBody, claudeReq.Model, wantReasoning, isClaudeCodeClient(r.Header.Get("User-Agent")), claudeReq.StopSequences)
+	reply := agentToolReplyFromContext(r.Context())
+	claudeRespBody := openAIToClaudeResponse(respBody, claudeReq.Model, wantReasoning, isClaudeCodeClient(r.Header.Get("User-Agent")) && (reply == nil || !reply.active()), claudeReq.StopSequences)
 	result := logging.SummarizeClaudeResult(claudeRespBody)
 	if !wantReasoning {
 		var before map[string]any
@@ -1647,7 +1648,7 @@ loop:
 												name := rawName
 												if rw := anthropicNameRewritesFromContext(ctx); rw != nil {
 													name = rw.restore(rawName)
-												} else if restoreCase {
+												} else if reply := agentToolReplyFromContext(ctx); (reply == nil || !reply.active()) && restoreCase {
 													name = restoreToolNameCase(rawName)
 												}
 												toolCallAccumulator[upstreamIndex] = map[string]string{

@@ -1242,6 +1242,7 @@ func forwardChatViaAnthropic(w http.ResponseWriter, r *http.Request, auth Upstre
 	if cleaned, err := convertResponse(outBody, keepReasoning); err == nil {
 		outBody = cleaned
 	}
+	outBody = rewriteChatCompletionBody(outBody, agentToolReplyFromContext(ctx))
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
@@ -1298,11 +1299,14 @@ type anthropicToChatState struct {
 	skippedSig                int
 	skippedRedacted           int
 	finalized                 bool // finalize 幂等开关:message_stop 与 EOF 路径共用
+	reply                     *agentToolReplyContext
+	droppedBlocks             map[int]bool
 }
 
 type anthropicToolState struct {
 	sawInputDelta bool
 	initialInput  any // string 或 map[string]any;空/nil 表示没有
+	rawName       string
 }
 
 // 保留提供给 chat 端 arguments 的初值;在 content_block_stop 消费。
@@ -1353,6 +1357,8 @@ func anthropicSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		fullUsage:                 map[string]any{},
 		restoreCase:               shouldRestoreToolCase(ctx),
 		rewrites:                  nameRewritesFor(ctx),
+		reply:                     agentToolReplyFromContext(ctx),
+		droppedBlocks:             map[int]bool{},
 	}
 	defer func() {
 		st.stats.ToolCallCount = st.toolCount
@@ -1663,16 +1669,25 @@ func (st *anthropicToChatState) handleLine(line string) {
 			}
 		}
 		if bt == "tool_use" {
-			toolIdx := st.toolCount
-			st.toolCount++
-			st.toolIndices[idx] = toolIdx
-			tool := &anthropicToolState{}
-			st.toolStates[idx] = tool
 			// 上游 tool_use name 还原为客户端原始名（缩短名经 rewrites
 			// 映射；免费层小写占位名仅对 Claude 系客户端还原为规范大小写
 			// (bash/glob/grep/read -> Bash/Glob/Grep/Read),其余保持透传。
 			rawName, _ := cb["name"].(string)
 			name := st.rewrites.restore(rawName)
+			if st.reply != nil && st.reply.active() {
+				if !st.reply.keepRawName(name) {
+					st.droppedBlocks[idx] = true
+					return
+				}
+			}
+			toolIdx := st.toolCount
+			st.toolCount++
+			st.toolIndices[idx] = toolIdx
+			tool := &anthropicToolState{rawName: name}
+			st.toolStates[idx] = tool
+			if st.reply != nil && st.reply.active() {
+				name, _ = st.reply.remapAgentToolCall(name, "")
+			}
 			id, _ := cb["id"].(string)
 			// 缓存 start 块的 initial input(常见 {});不要立刻 emit 给 chat 端
 			// —— OpenAI 客户端会 concat 所有 arguments 片段,若 start 下发了
@@ -1692,6 +1707,9 @@ func (st *anthropicToChatState) handleLine(line string) {
 		}
 	case "content_block_delta":
 		idx := numberToInt(evt["index"])
+		if st.droppedBlocks[idx] {
+			return
+		}
 		d, _ := evt["delta"].(map[string]any)
 		dt, _ := d["type"].(string)
 		switch dt {
@@ -1719,14 +1737,20 @@ func (st *anthropicToChatState) handleLine(line string) {
 			}
 		case "input_json_delta":
 			if toolIdx, ok := st.toolIndices[idx]; ok {
-				if tool, ok := st.toolStates[idx]; ok {
+				tool := st.toolStates[idx]
+				if tool != nil {
 					tool.sawInputDelta = true
 				}
 				if pj, _ := d["partial_json"].(string); pj != "" {
-					st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
-						"index": toolIdx, "id": nil, "type": "function",
-						"function": map[string]any{"name": "", "arguments": pj},
-					}}}, "", nil)
+					if st.reply != nil && st.reply.active() && tool != nil && tool.rawName != "" {
+						pj = st.reply.remapArgStream(toolIdx, tool.rawName, pj)
+					}
+					if pj != "" {
+						st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
+							"index": toolIdx, "id": nil, "type": "function",
+							"function": map[string]any{"name": "", "arguments": pj},
+						}}}, "", nil)
+					}
 				}
 			}
 		case "signature_delta":
@@ -1754,20 +1778,35 @@ func (st *anthropicToChatState) handleLine(line string) {
 		}
 	case "content_block_stop":
 		idx := numberToInt(evt["index"])
+		if st.droppedBlocks[idx] {
+			delete(st.droppedBlocks, idx)
+			return
+		}
 		// 若 tool_use 全程没收到 input_json_delta,在 stop 时兜底 emit 一次:
 		// 有 initial input 用 initial,否则补 "{}"。OpenAI 客户端 concat 各
 		// chunk 的 arguments 后须得到合法 JSON —— 空串会让 json.Unmarshal
 		// 失败;"{}" 对齐 buildOpenAIResponse 对 input nil/{} 的非流式语义。
-		if tool, ok := st.toolStates[idx]; ok && !tool.sawInputDelta {
+		if tool, ok := st.toolStates[idx]; ok {
 			if toolIdx, ok := st.toolIndices[idx]; ok {
-				s := tool.initialArguments()
-				if s == "" {
-					s = "{}"
+				if !tool.sawInputDelta {
+					s := tool.initialArguments()
+					if s == "" {
+						s = "{}"
+					} else if st.reply != nil && st.reply.active() && tool.rawName != "" {
+						_, s = st.reply.remapAgentToolCall(tool.rawName, s)
+					}
+					st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
+						"index": toolIdx, "id": nil, "type": "function",
+						"function": map[string]any{"name": "", "arguments": s},
+					}}}, "", nil)
+				} else if st.reply != nil && st.reply.active() {
+					if pending := st.reply.flushArgPending(toolIdx); pending != "" {
+						st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
+							"index": toolIdx, "id": nil, "type": "function",
+							"function": map[string]any{"name": "", "arguments": pending},
+						}}}, "", nil)
+					}
 				}
-				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
-					"index": toolIdx, "id": nil, "type": "function",
-					"function": map[string]any{"name": "", "arguments": s},
-				}}}, "", nil)
 			}
 		}
 		delete(st.blocks, idx)
@@ -1777,6 +1816,9 @@ func (st *anthropicToChatState) handleLine(line string) {
 		if delta, ok := evt["delta"].(map[string]any); ok {
 			if sr, _ := delta["stop_reason"].(string); sr != "" {
 				st.stopReason = normalizeFinishReason(sr)
+				if st.stopReason == "tool_calls" && st.toolCount == 0 && st.reply != nil && st.reply.active() {
+					st.stopReason = "stop"
+				}
 				if st.stopReason == "" {
 					// pause_turn/compaction 无 chat 等价物:置空不报完成态。
 					st.unmappableStop = true

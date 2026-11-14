@@ -431,6 +431,7 @@ func forwardChatViaResponses(w http.ResponseWriter, r *http.Request, auth Upstre
 	if !isChatCompletionBody(respBody) {
 		outBody = convertResponsesToChat(respBody, req.Model, keepReasoning)
 	}
+	outBody = rewriteChatCompletionBody(outBody, agentToolReplyFromContext(ctx))
 	var usageResp map[string]any
 	if json.Unmarshal(respBody, &usageResp) == nil {
 		if u, ok := usageResp["usage"].(map[string]any); ok {
@@ -943,7 +944,10 @@ type responsesToChatState struct {
 	finalized     bool // 已写 [DONE]/终态帧（幂等）
 	// restoreCase 为 true(Claude 系客户端)时把免费层小写占位工具名还原
 	// 为 PascalCase;其余客户端保持小写透传。
-	restoreCase bool
+	restoreCase  bool
+	reply        *agentToolReplyContext
+	droppedKeys  map[string]bool
+	rawToolNames map[int]string
 }
 
 // responsesSSEToChatStream 把上游 Responses SSE 翻译为 Chat SSE。
@@ -984,6 +988,9 @@ func responsesSSEToChatStream(ctx context.Context, w http.ResponseWriter, rc io.
 		arguments:     map[int]string{},
 		fullUsage:     map[string]any{},
 		restoreCase:   shouldRestoreToolCase(ctx),
+		reply:         agentToolReplyFromContext(ctx),
+		droppedKeys:   map[string]bool{},
+		rawToolNames:  map[int]string{},
 	}
 	defer func() {
 		st.stats.ToolCallCount = st.toolCount
@@ -1082,6 +1089,16 @@ func (st *responsesToChatState) finalize() {
 		st.finishReason = "stop"
 		if st.sawTool {
 			st.finishReason = "tool_calls"
+		}
+	}
+	if st.sentRole && st.reply != nil && st.reply.active() && len(st.reply.argPending) > 0 {
+		for toolIdx := range st.rawToolNames {
+			if pending := st.reply.flushArgPending(toolIdx); pending != "" {
+				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
+					"index": toolIdx, "id": nil, "type": "function",
+					"function": map[string]any{"name": "", "arguments": pending},
+				}}}, "", nil)
+			}
 		}
 	}
 	if st.sentRole {
@@ -1220,6 +1237,50 @@ func (st *responsesToChatState) registerToolKeys(evt, item map[string]any) (call
 // to. Responses names the item by item_id ("fc_...") — never by the call_id
 // that output_item.added announced — and may omit it entirely, leaving only
 // output_index. Both are registered by registerToolKeys.
+func (st *responsesToChatState) noteDroppedTool(evt, item map[string]any) {
+	if st.droppedKeys == nil {
+		st.droppedKeys = map[string]bool{}
+	}
+	if id, _ := item["id"].(string); id != "" {
+		st.droppedKeys[id] = true
+	}
+	if callID, _ := item["call_id"].(string); callID != "" {
+		st.droppedKeys[callID] = true
+	}
+	if oi, ok := evt["output_index"].(float64); ok {
+		st.droppedKeys[outputIndexKey(int(oi))] = true
+	}
+}
+
+func (st *responsesToChatState) isDroppedEvent(evt map[string]any) bool {
+	if len(st.droppedKeys) == 0 {
+		return false
+	}
+	if itemID, _ := evt["item_id"].(string); itemID != "" && st.droppedKeys[itemID] {
+		return true
+	}
+	if oi, ok := evt["output_index"].(float64); ok && st.droppedKeys[outputIndexKey(int(oi))] {
+		return true
+	}
+	return false
+}
+
+func (st *responsesToChatState) isDroppedItem(evt, item map[string]any) bool {
+	if st.isDroppedEvent(evt) {
+		return true
+	}
+	if len(st.droppedKeys) == 0 || item == nil {
+		return false
+	}
+	if id, _ := item["id"].(string); id != "" && st.droppedKeys[id] {
+		return true
+	}
+	if callID, _ := item["call_id"].(string); callID != "" && st.droppedKeys[callID] {
+		return true
+	}
+	return false
+}
+
 func (st *responsesToChatState) eventToolIdx(evt map[string]any) int {
 	itemID, _ := evt["item_id"].(string)
 	if itemID != "" {
@@ -1300,12 +1361,23 @@ func (st *responsesToChatState) handleLine(line string) {
 		// 按同一工具槽位注册(对齐 sub2api resToChatHandleOutputItemAdded)。
 		switch item["type"] {
 		case "function_call", "tool_call", "custom_tool_call":
+			rawName := toString(item["name"])
+			if st.reply != nil && st.reply.active() && !st.reply.keepRawName(rawName) {
+				st.noteDroppedTool(evt, item)
+				return
+			}
 			st.sawTool = true
 			callID, toolIdx := st.registerToolKeys(evt, item)
 			st.toolAnnounced[toolIdx] = true
 			st.ensureRole()
-			toolName := toString(item["name"])
-			if st.restoreCase {
+			toolName := rawName
+			if st.reply != nil && st.reply.active() {
+				if st.rawToolNames == nil {
+					st.rawToolNames = map[int]string{}
+				}
+				st.rawToolNames[toolIdx] = rawName
+				toolName, _ = st.reply.remapAgentToolCall(rawName, "")
+			} else if st.restoreCase {
 				toolName = restoreToolNameCase(toolName)
 			}
 			st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
@@ -1314,16 +1386,29 @@ func (st *responsesToChatState) handleLine(line string) {
 			}}}, "", nil)
 		}
 	case "response.function_call_arguments.delta", "response.tool_call_arguments.delta", "response.custom_tool_call_input.delta":
+		if st.isDroppedEvent(evt) {
+			return
+		}
 		st.ensureRole()
 		toolIdx := st.eventToolIdx(evt)
 		if pj, _ := evt["delta"].(string); pj != "" {
 			st.arguments[toolIdx] += pj
-			st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
-				"index": toolIdx, "id": nil, "type": "function",
-				"function": map[string]any{"name": "", "arguments": pj},
-			}}}, "", nil)
+			if st.reply != nil && st.reply.active() {
+				if rawName := st.rawToolNames[toolIdx]; rawName != "" {
+					pj = st.reply.remapArgStream(toolIdx, rawName, pj)
+				}
+			}
+			if pj != "" {
+				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
+					"index": toolIdx, "id": nil, "type": "function",
+					"function": map[string]any{"name": "", "arguments": pj},
+				}}}, "", nil)
+			}
 		}
 	case "response.function_call_arguments.done", "response.tool_call_arguments.done", "response.custom_tool_call_input.done":
+		if st.isDroppedEvent(evt) {
+			return
+		}
 		st.ensureRole()
 		toolIdx := st.eventToolIdx(evt)
 		// done 携带完整 arguments JSON:只补发已下发前缀之后的差量,
@@ -1333,16 +1418,30 @@ func (st *responsesToChatState) handleLine(line string) {
 		if completed == "" {
 			completed, _ = evt["input"].(string)
 		}
+		outDelta := ""
 		if completed != "" {
 			emitted := st.arguments[toolIdx]
 			if completed != emitted && strings.HasPrefix(completed, emitted) {
 				remainder := completed[len(emitted):]
 				st.arguments[toolIdx] = completed
-				st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
-					"index": toolIdx, "id": nil, "type": "function",
-					"function": map[string]any{"name": "", "arguments": remainder},
-				}}}, "", nil)
+				if st.reply != nil && st.reply.active() {
+					if rawName := st.rawToolNames[toolIdx]; rawName != "" {
+						remainder = st.reply.remapArgStream(toolIdx, rawName, remainder)
+					}
+				}
+				outDelta = remainder
 			}
+		}
+		if st.reply != nil && st.reply.active() {
+			if pending := st.reply.flushArgPending(toolIdx); pending != "" {
+				outDelta += pending
+			}
+		}
+		if outDelta != "" {
+			st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
+				"index": toolIdx, "id": nil, "type": "function",
+				"function": map[string]any{"name": "", "arguments": outDelta},
+			}}}, "", nil)
 		}
 	case "response.output_item.done":
 		item, _ := evt["item"].(map[string]any)
@@ -1351,14 +1450,28 @@ func (st *responsesToChatState) handleLine(line string) {
 		}
 		switch item["type"] {
 		case "function_call", "tool_call", "custom_tool_call":
+			if st.isDroppedItem(evt, item) {
+				return
+			}
+			rawName := toString(item["name"])
+			if st.reply != nil && st.reply.active() && !st.reply.keepRawName(rawName) {
+				st.noteDroppedTool(evt, item)
+				return
+			}
 			st.sawTool = true
 			callID, toolIdx := st.registerToolKeys(evt, item)
 			// 没有 add/delta 出现过（罕见）:补一次首 chunk 宣告工具调用,
 			// 并把 item 上的完整 arguments 作为单段增量发完。
 			if !st.toolAnnounced[toolIdx] {
 				st.toolAnnounced[toolIdx] = true
-				name := toString(item["name"])
-				if st.restoreCase {
+				name := rawName
+				if st.reply != nil && st.reply.active() {
+					if st.rawToolNames == nil {
+						st.rawToolNames = map[int]string{}
+					}
+					st.rawToolNames[toolIdx] = rawName
+					name, _ = st.reply.remapAgentToolCall(rawName, "")
+				} else if st.restoreCase {
 					name = restoreToolNameCase(name)
 				}
 				st.ensureRole()
@@ -1368,6 +1481,9 @@ func (st *responsesToChatState) handleLine(line string) {
 				}}}, "", nil)
 				if args, _ := item["arguments"].(string); args != "" && st.arguments[toolIdx] == "" {
 					st.arguments[toolIdx] = args
+					if st.reply != nil && st.reply.active() {
+						_, args = st.reply.remapAgentToolCall(rawName, args)
+					}
 					st.emitChunk(map[string]any{"tool_calls": []any{map[string]any{
 						"index": toolIdx, "id": nil, "type": "function",
 						"function": map[string]any{"name": "", "arguments": args},

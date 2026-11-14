@@ -1386,10 +1386,11 @@ func probeClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth Up
 	}
 	// 免费层上游强制 stream:true，客户端非流时先从 SSE 提取 response JSON。
 	respBody = extractResponsesJsonFromSse(respBody)
-	// 先还原缩短名（Responses 形 output[].function_call.name），转换器
-	// 天然携带客户端原始名。
-	respBody = restoreResponsesBodyNames(respBody, rewrites)
-	claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx), claudeReq.StopSequences)
+	// 先还原缩短名（Responses 形 output[].function_call.name），再应用免费层工具
+	// 映射/过滤，转换器天然携带客户端原始名。
+	reply := agentToolReplyFromContext(ctx)
+	respBody = rewriteResponsesOutputBody(restoreResponsesBodyNames(respBody, rewrites), reply)
+	claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx) && (reply == nil || !reply.active()), claudeReq.StopSequences)
 	result := logging.SummarizeClaudeResult(claudeBody)
 	logging.LogResult(ctx, result)
 	var usageResp map[string]any
@@ -1468,8 +1469,9 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 			if writeClaudeResponsesUpstreamError(ctx, w, modelID, respBody2) {
 				return true
 			}
-			respBody2 = restoreResponsesBodyNames(respBody2, rewrites)
-			claudeBody := convertResponsesToClaude(respBody2, modelID, wantReasoning, shouldRestoreToolCase(ctx), claudeReq.StopSequences)
+			reply := agentToolReplyFromContext(ctx)
+			respBody2 = rewriteResponsesOutputBody(restoreResponsesBodyNames(respBody2, rewrites), reply)
+			claudeBody := convertResponsesToClaude(respBody2, modelID, wantReasoning, shouldRestoreToolCase(ctx) && (reply == nil || !reply.active()), claudeReq.StopSequences)
 			result := logging.SummarizeClaudeResult(claudeBody)
 			logging.LogResult(ctx, result)
 			var usageResp map[string]any
@@ -1499,10 +1501,11 @@ func forwardClaudeViaResponses(ctx context.Context, w http.ResponseWriter, auth 
 		if writeClaudeResponsesUpstreamError(ctx, w, modelID, respBody) {
 			return true
 		}
-		// 先还原缩短名（Responses 形 output[].function_call.name），转换器
-		// 天然携带客户端原始名。
-		respBody = restoreResponsesBodyNames(respBody, rewrites)
-		claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx), claudeReq.StopSequences)
+		// 先还原缩短名（Responses 形 output[].function_call.name），再应用免费层工具
+		// 映射/过滤，转换器天然携带客户端原始名。
+		reply := agentToolReplyFromContext(ctx)
+		respBody = rewriteResponsesOutputBody(restoreResponsesBodyNames(respBody, rewrites), reply)
+		claudeBody := convertResponsesToClaude(respBody, modelID, wantReasoning, shouldRestoreToolCase(ctx) && (reply == nil || !reply.active()), claudeReq.StopSequences)
 		result := logging.SummarizeClaudeResult(claudeBody)
 		logging.LogResult(ctx, result)
 		var usageResp map[string]any
@@ -1530,8 +1533,10 @@ type claudeResponsesBlock struct {
 	claudeIndex int
 	kind        string // text | thinking | tool
 	open        bool
+	dropped     bool
 	toolID      string
 	toolName    string
+	rawToolName string
 	// signature 是 reasoning item 的 encrypted_content，关 thinking block
 	// 前以 signature_delta 发出（对齐 sub2api），供 Claude Code roundtrip。
 	signature string
@@ -1709,6 +1714,9 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 	}
 	getOrCreateBlock := func(outputIndex int, kind string) *claudeResponsesBlock {
 		if b, ok := blocks[outputIndex]; ok {
+			if b.dropped {
+				return b
+			}
 			if b.kind == kind {
 				if b.claudeIndex < 0 {
 					b.claudeIndex = blockIndex
@@ -1745,9 +1753,18 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 			"content_block": map[string]any{"type": "thinking", "thinking": ""},
 		})
 	}
+	reply := agentToolReplyFromContext(ctx)
 	startToolBlock := func(b *claudeResponsesBlock) {
-		if b.open {
+		if b.open || b.dropped {
 			return
+		}
+		if reply != nil && reply.active() && b.toolName != "" {
+			if !reply.keepRawName(b.toolName) {
+				b.dropped = true
+				return
+			}
+			b.rawToolName = b.toolName
+			b.toolName, _ = reply.remapAgentToolCall(b.toolName, "")
 		}
 		b.open = true
 		ensureStart()
@@ -1755,7 +1772,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 			b.toolID = "toolu_" + randomString(12)
 		}
 		toolName := b.toolName
-		if restoreCase {
+		if (reply == nil || !reply.active()) && restoreCase {
 			toolName = restoreToolNameCase(b.toolName)
 		}
 		emitEvent("content_block_start", map[string]any{
@@ -1807,10 +1824,19 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		}
 	}
 	emitToolDelta := func(b *claudeResponsesBlock, partial string) {
-		if partial == "" {
+		if partial == "" || b.dropped {
 			return
 		}
 		startToolBlock(b)
+		if b.dropped {
+			return
+		}
+		if reply != nil && reply.active() && b.rawToolName != "" {
+			partial = reply.remapArgStream(b.claudeIndex, b.rawToolName, partial)
+			if partial == "" {
+				return
+			}
+		}
 		emitEvent("content_block_delta", map[string]any{
 			"type": "content_block_delta", "index": b.claudeIndex,
 			"delta": map[string]any{"type": "input_json_delta", "partial_json": partial},
@@ -1835,6 +1861,7 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		emitThinking:    emitThinkingDelta,
 		emitTool:        emitToolDelta,
 		rewrites:        anthropicNameRewritesFromContext(ctx),
+		reply:           reply,
 		emitError:       emitError,
 		producedContent: func() bool { return producedText || len(toolOrder) > 0 },
 	}
@@ -1868,6 +1895,21 @@ func claudeResponsesStreamHandler(ctx context.Context, w http.ResponseWriter, rc
 		// claudeToResponsesBody),输出以停止串结尾只是自然生成的巧合,最小
 		// 往返仍恢复该终止形态。
 		finalStopSequence := (*string)(nil)
+		if reply != nil && reply.active() {
+			for _, b := range blocks {
+				if b.open && !b.dropped && b.kind == "tool" {
+					if pending := reply.flushArgPending(b.claudeIndex); pending != "" {
+						emitEvent("content_block_delta", map[string]any{
+							"type": "content_block_delta", "index": b.claudeIndex,
+							"delta": map[string]any{"type": "input_json_delta", "partial_json": pending},
+						})
+					}
+				}
+			}
+			if stopReason == "tool_use" && len(toolOrder) == 0 {
+				stopReason = "end_turn"
+			}
+		}
 		if stopReason == "end_turn" && len(toolOrder) == 0 {
 			if seq := claudeStopSequenceMatch(textAccumulator.String(), stopSequences); seq != nil {
 				stopReason = "stop_sequence"
@@ -2093,6 +2135,7 @@ type claudeResponsesEmitter struct {
 	// rewrites 携带本请求的缩短名还原映射（anthropic/responses 上游边界
 	// 注入 ctx）；nil 安全（restore 原样返回）。
 	rewrites *responsesNameRewrites
+	reply    *agentToolReplyContext
 }
 
 // markStreamed 在 delta 事件发出后登记该 item 已流出（去重键：item_id +
@@ -2199,6 +2242,10 @@ func (e *claudeResponsesEmitter) harvestTerminalOutput(resp map[string]any) bool
 			if e.rewrites != nil {
 				name = e.rewrites.restore(name)
 			}
+			if e.reply != nil && e.reply.active() && !e.reply.keepRawName(name) {
+				e.blocks[resolvedOI] = &claudeResponsesBlock{claudeIndex: -1, kind: "tool", dropped: true}
+				continue
+			}
 			b := e.getOrCreate(resolvedOI, "tool")
 			if callID != "" {
 				b.toolID = callID
@@ -2218,6 +2265,10 @@ func (e *claudeResponsesEmitter) harvestTerminalOutput(resp map[string]any) bool
 			name := "apply_patch"
 			if typ == "shell_call" {
 				name = "shell"
+			}
+			if e.reply != nil && e.reply.active() && !e.reply.keepRawName(name) {
+				e.blocks[resolvedOI] = &claudeResponsesBlock{claudeIndex: -1, kind: "tool", dropped: true}
+				continue
 			}
 			b := e.getOrCreate(resolvedOI, "tool")
 			if callID != "" {
@@ -2315,6 +2366,16 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 				name = e.rewrites.restore(name)
 			}
 			if outputIndex >= 0 {
+				if e.reply != nil && e.reply.active() && name != "" && !e.reply.keepRawName(name) {
+					e.blocks[outputIndex] = &claudeResponsesBlock{claudeIndex: -1, kind: "tool", dropped: true}
+					if id != "" {
+						e.itemToOutput[id] = outputIndex
+					}
+					if callID != "" {
+						e.itemToOutput[callID] = outputIndex
+					}
+					return
+				}
 				b := e.getOrCreate(outputIndex, "tool")
 				if b.claudeIndex < 0 {
 					// getOrCreate 已分配，这里补齐（兼容占位）。
@@ -2342,6 +2403,16 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 				name = "shell"
 			}
 			if outputIndex >= 0 {
+				if e.reply != nil && e.reply.active() && !e.reply.keepRawName(name) {
+					e.blocks[outputIndex] = &claudeResponsesBlock{claudeIndex: -1, kind: "tool", dropped: true}
+					if id != "" {
+						e.itemToOutput[id] = outputIndex
+					}
+					if callID != "" {
+						e.itemToOutput[callID] = outputIndex
+					}
+					return
+				}
 				b := e.getOrCreate(outputIndex, "tool")
 				if callID != "" {
 					b.toolID = callID
@@ -2490,7 +2561,17 @@ func (e *claudeResponsesEmitter) handleEvent(evt map[string]any, frameEvent stri
 					t, _ := im["type"].(string)
 					switch t {
 					case "function_call", "apply_patch_call", "shell_call", "tool_call":
-						*e.stopReason = "tool_use"
+						keepTool := true
+						if e.reply != nil && e.reply.active() {
+							rawName, _ := responsesToolItemRawName(im)
+							if e.rewrites != nil {
+								rawName = e.rewrites.restore(rawName)
+							}
+							keepTool = e.reply.keepRawName(rawName)
+						}
+						if keepTool {
+							*e.stopReason = "tool_use"
+						}
 					case "reasoning":
 						sig, _ := im["encrypted_content"].(string)
 						if sig == "" {

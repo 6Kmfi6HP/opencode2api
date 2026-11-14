@@ -611,6 +611,9 @@ func relayResponsesToClient(ctx context.Context, w http.ResponseWriter, rc io.Re
 			}
 		}
 	}
+	if status >= 200 && status < 300 {
+		respBody = rewriteResponsesOutputBody(respBody, agentToolReplyFromContext(ctx))
+	}
 
 	if ct := header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
@@ -697,7 +700,23 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 	// 关键不变量:WriteHeader(status) 已发出 —— 此后绝对不能再返回
 	// (false, ...) 让 Drive 二次 WriteHeader。flush 写错(连接已断)也
 	// 同样视为已 commit。
-	if err := FlushPeekedBytes(w, peek.Consumed); err != nil {
+	reply := agentToolReplyFromContext(ctx)
+	peekConsumed := peek.Consumed
+	if reply != nil && reply.active() && len(peek.Consumed) > 0 {
+		filtered := make([]streamReadResult, 0, len(peek.Consumed))
+		for _, res := range peek.Consumed {
+			if res.line != "" {
+				if rwLine, drop := rewriteResponsesSSELine([]byte(res.line), reply); drop {
+					continue
+				} else if rwLine != nil {
+					res.line = string(rwLine)
+				}
+			}
+			filtered = append(filtered, res)
+		}
+		peekConsumed = filtered
+	}
+	if err := FlushPeekedBytes(w, peekConsumed); err != nil {
 		return true, err
 	}
 	if flusher != nil {
@@ -714,7 +733,7 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 
 	var lastUsage map[string]any
 	var lastResponse map[string]any
-	sawData := len(peek.Consumed) > 0
+	sawData := len(peekConsumed) > 0
 	doneSeen := false
 	writeFailed := false
 	terminalSeen := false
@@ -728,7 +747,7 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 	// peek 阶段已看到完整帧，但终端事件（completed/failed/incomplete / [DONE]）
 	// 要逐行扫过目前 consumed 才知道——这里只预先回填终端标志，让末尾判定
 	// 与原有逻辑一致。
-	for _, res := range peek.Consumed {
+	for _, res := range peekConsumed {
 		trimmed := bytes.TrimSpace([]byte(res.line))
 		if bytes.Equal(trimmed, []byte("data: [DONE]")) || bytes.Equal(trimmed, []byte("[DONE]")) {
 			doneSeen = true
@@ -809,6 +828,13 @@ func relayResponsesStream(ctx context.Context, w http.ResponseWriter, rc io.Read
 				if isMuseSparkModel(modelID) {
 					if normalized, ok := normalizeResponsesStreamLine(lineBytes, argStates, argItemToOutput, rewrites); ok {
 						outLine = normalized
+					}
+				}
+				if reply != nil && reply.active() {
+					if rwLine, drop := rewriteResponsesSSELine(outLine, reply); drop {
+						continue
+					} else if rwLine != nil {
+						outLine = rwLine
 					}
 				}
 				// 内容跟踪（含 peek 期 serializer 已写过的字节：主循环重放

@@ -674,7 +674,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	req.Model = mapPublicToFreeModel(auth, req.Model)
-	r = r.WithContext(attachFreeTierToolReply(r.Context(), req.Model, offeredToolNames(req.Tools), false))
+	r = r.WithContext(attachFreeTierToolReplyWithSchemas(r.Context(), req.Model, offeredToolNames(req.Tools), offeredToolSchemas(req.Tools), false))
 	if !validateRequestTemperature(w, req.Temperature, "chat", 0, 2) {
 		return
 	}
