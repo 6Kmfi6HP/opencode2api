@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.15.2
+
+- Restore Chat Completions and Responses tool calling on free-tier models (`fix(fingerprint)`):
+  - `agent_tool_reply.go`：放开 Chat/Responses（`viaMap=false`）场景下 `callerToolName` 对 manifest 标准名的大小写匹配（如 `shell`/`execute` → `bash`/`Bash`、`subagent` → `task`/`Task`），并完善 `shouldRemapArg` 的 schema 校验以正确裁剪 `workdir` 等 manifest 专属参数，防止严格校验客户端报错；新增 `patch` → `apply_patch`（`patchText` → `input`）映射。
+  - `agent_tool_reply.go`：`offeredResponsesToolNames` 与 `offeredResponsesToolSchemas` 补充收集 `convertResponsesTools` 转换后的内建工具（`type: "shell"` / `"apply_patch"`）与 `namespace` 子工具，修复只携带这类工具时误判 `callerHasTools=false` 而丢弃全部工具调用的问题；同时在 Chat SSE 遇到 `finish_reason` 时刷新 `argPending` 尾流缓冲，并在前置 tool_calls 全被过滤时将后续单独分包的 `finish_reason: "tool_calls"` 降级为 `"stop"`。
+  - `responses_to_anthropic.go`：非流式与流式（`anthropicSSEToResponsesStream`）补齐 `agentToolReplyFromContext` 接入，修复 `clnt_*` 别名透出及 disallowed manifest 工具未过滤的问题；同步修复 `closeBlock` 未累计流式 `input_json_delta` 导致 `function_call_arguments.done` / `output_item.done` / `response.completed` 参数丢失的 bug。
+  - `opencode.go`：`callOpenCodeAPI` 调整为先执行 `convertRawToolCallsInBody` 提取文本形式 `<tool_call>`，再执行 `rewriteChatCompletionBody` 还原别名与映射参数。
+
 ## v0.15.1
 
 - Fix tool reply remapping, streaming arg splits, and cross-protocol bridges (`fix(fingerprint)`):
