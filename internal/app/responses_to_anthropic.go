@@ -75,8 +75,8 @@ func forwardResponsesViaAnthropic(w http.ResponseWriter, r *http.Request, auth U
 		writeUpstreamError(w, http.StatusBadGateway, fmt.Errorf("upstream read error"), "responses")
 		return
 	}
-	// 先还原缩短名（含 SSE 兜底），转换器天然携带客户端原始名。
-	respBody = restoreAnthropicResponseNames(respBody, rewrites)
+	// 先还原缩短名并应用免费层工具名/参数映射与过滤（含 SSE 兜底）。
+	respBody = presentAnthropicBody(respBody, rewrites, agentToolReplyFromContext(r.Context()))
 	responsesBody := convertAnthropicToResponses(respBody, chatReq.Model, wantReasoning)
 	result := logging.SummarizeChatResult(responsesBody)
 	logging.LogResult(ctx, result)
@@ -137,6 +137,7 @@ type anthropicToResponsesState struct {
 	// rewrites 携带本请求的缩短名还原映射（anthropic 上游边界注入 ctx）；
 	// nil 安全。
 	rewrites    *responsesNameRewrites
+	reply       *agentToolReplyContext
 	seq         int
 	outputIndex int
 	fullUsage   map[string]any
@@ -159,10 +160,13 @@ type responsesBlockState struct {
 	kind        string // "text" | "thinking" | "tool_use"
 	itemID      string
 	outputIndex int
+	blockIdx    int              // Anthropic content_block index
 	toolIdx     int              // 仅 tool_use 使用
 	callID      string           // 仅 tool_use：Anthropic tool_use id（fc_ 前缀前的原始 id）
-	name        string           // 仅 tool_use
+	rawName     string           // 仅 tool_use：未映射前的上游工具名（供流式参数键改写用）
+	name        string           // 仅 tool_use：呈现给客户端的工具名
 	text        *strings.Builder // kind=text → 累积 output_text;kind=thinking → 累积 reasoning summary
+	args        *strings.Builder // kind=tool_use → 累积已映射的 input_json_delta
 	// tool_use:content_block_start 的初始 input 缓存；若到 content_block_stop
 	// 仍没有任何 input_json_delta,closeBlock 先补发一条 argument.delta 带完整
 	// input JSON 再发 done（否则仅有 "in_progress" 的 item 与缺参数的 done）。
@@ -201,6 +205,7 @@ func anthropicSSEToResponsesStream(ctx context.Context, w http.ResponseWriter, r
 		model:         model,
 		wantReasoning: wantReasoning,
 		rewrites:      nameRewritesFor(ctx),
+		reply:         agentToolReplyFromContext(ctx),
 		blocks:        map[int]*responsesBlockState{},
 		fullUsage:     map[string]any{},
 	}
@@ -402,12 +407,29 @@ func (st *anthropicToResponsesState) closeBlock(b *responsesBlockState) {
 		// output_index 统一用 b.outputIndex（不是 b.toolIdx——后者是 per-turn
 		// 工具序号，会令 output_index 与实际 added 事件的 index 错位）。
 		// item 回填完整 {id, call_id, name, arguments, status:completed, type=function_call}。
+		if st.reply != nil && st.reply.active() {
+			if flushed := st.reply.flushArgPending(b.blockIdx); flushed != "" {
+				b.argDeltaSeen = true
+				if b.args != nil {
+					b.args.WriteString(flushed)
+				}
+				st.emitEvent("response.function_call_arguments.delta", map[string]any{
+					"item_id": b.itemID, "output_index": b.outputIndex, "delta": flushed,
+				})
+			}
+		}
 		if b.initialArguments != "" && !b.argDeltaSeen {
 			st.emitEvent("response.function_call_arguments.delta", map[string]any{
 				"item_id": b.itemID, "output_index": b.outputIndex, "delta": b.initialArguments,
 			})
 		}
-		arguments := b.initialArguments
+		arguments := ""
+		if b.argDeltaSeen && b.args != nil {
+			arguments = b.args.String()
+		}
+		if arguments == "" {
+			arguments = b.initialArguments
+		}
 		if arguments == "" {
 			arguments = "{}"
 		}
@@ -477,13 +499,11 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 			return
 		}
 		// 在 start 时分配并记录 output_index,确保 stop 时回填的是同一个 index。
-		b := &responsesBlockState{kind: bt, outputIndex: st.outputIndex}
-		st.blocks[idx] = b
-		st.outputIndex++
 		switch bt {
 		case "thinking":
-			b.itemID = "rs_" + randomHex(12)
-			b.text = &strings.Builder{}
+			b := &responsesBlockState{kind: bt, blockIdx: idx, outputIndex: st.outputIndex, itemID: "rs_" + randomHex(12), text: &strings.Builder{}}
+			st.blocks[idx] = b
+			st.outputIndex++
 			st.emitEvent("response.output_item.added", map[string]any{
 				"output_index": b.outputIndex,
 				"item": map[string]any{
@@ -491,8 +511,9 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 				},
 			})
 		case "text":
-			b.itemID = "msg_" + randomHex(12)
-			b.text = &strings.Builder{}
+			b := &responsesBlockState{kind: bt, blockIdx: idx, outputIndex: st.outputIndex, itemID: "msg_" + randomHex(12), text: &strings.Builder{}}
+			st.blocks[idx] = b
+			st.outputIndex++
 			st.emitEvent("response.output_item.added", map[string]any{
 				"output_index": b.outputIndex,
 				"item": map[string]any{
@@ -506,20 +527,47 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 				"part":          map[string]any{"type": "output_text", "text": ""},
 			})
 		case "tool_use":
-			b.itemID = "fc_" + randomHex(12)
-			b.toolIdx = st.toolCount
-			st.toolCount++
 			callID, _ := cb["id"].(string)
-			// 上游 tool_use name 还原为客户端原始名（缩短名经 rewrites
-			// 映射），覆盖 output_item.added / output_item.done /
-			// response.completed 全部呈现面。
-			name, _ := cb["name"].(string)
-			name = st.rewrites.restore(name)
-			b.callID = callID
+			// 上游 tool_use name 还原为客户端原始名（缩短名经 rewrites 映射），
+			// 并按免费层策略过滤/映射 manifest 工具与别名，覆盖全部 SSE 与
+			// response.completed 呈现面。
+			rawName, _ := cb["name"].(string)
+			rawName = st.rewrites.restore(rawName)
+			if st.reply != nil && st.reply.active() && !st.reply.keepRawName(rawName) {
+				st.reply.noteDrop(idx, callID)
+				return
+			}
+			b := &responsesBlockState{
+				kind:        bt,
+				blockIdx:    idx,
+				outputIndex: st.outputIndex,
+				itemID:      "fc_" + randomHex(12),
+				toolIdx:     st.toolCount,
+				callID:      callID,
+				rawName:     rawName,
+				args:        &strings.Builder{},
+			}
+			st.blocks[idx] = b
+			st.outputIndex++
+			st.toolCount++
+			name := rawName
+			inp := cb["input"]
+			if st.reply != nil && st.reply.active() {
+				st.reply.noteRaw(idx, rawName, callID)
+				if inpMap, ok := inp.(map[string]any); ok && len(inpMap) > 0 {
+					mappedName, mappedInp := st.reply.remapAgentToolInput(rawName, inpMap)
+					name = mappedName
+					inp = mappedInp
+				} else {
+					name, _ = st.reply.remapAgentToolCall(rawName, "")
+				}
+			}
 			b.name = name
-			if inp, ok := cb["input"]; ok && inp != nil {
-				if raw, err := json.Marshal(inp); err == nil {
-					b.initialArguments = string(raw)
+			if inp != nil {
+				if inpMap, ok := inp.(map[string]any); !ok || len(inpMap) > 0 {
+					if raw, err := json.Marshal(inp); err == nil {
+						b.initialArguments = string(raw)
+					}
 				}
 			}
 			st.emitEvent("response.output_item.added", map[string]any{
@@ -529,9 +577,16 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 					"name": name, "arguments": "", "status": "in_progress",
 				},
 			})
+		default:
+			b := &responsesBlockState{kind: bt, blockIdx: idx, outputIndex: st.outputIndex}
+			st.blocks[idx] = b
+			st.outputIndex++
 		}
 	case "content_block_delta":
 		idx := numberToInt(evt["index"])
+		if st.reply != nil && st.reply.isDropped(idx) {
+			return
+		}
 		b := st.blocks[idx]
 		if b == nil {
 			return
@@ -564,9 +619,17 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 		case "input_json_delta":
 			if pj, _ := d["partial_json"].(string); pj != "" {
 				b.argDeltaSeen = true
-				st.emitEvent("response.function_call_arguments.delta", map[string]any{
-					"item_id": b.itemID, "output_index": b.outputIndex, "delta": pj,
-				})
+				if st.reply != nil && st.reply.active() {
+					pj = st.reply.remapArgStream(idx, b.rawName, pj)
+				}
+				if pj != "" {
+					if b.args != nil {
+						b.args.WriteString(pj)
+					}
+					st.emitEvent("response.function_call_arguments.delta", map[string]any{
+						"item_id": b.itemID, "output_index": b.outputIndex, "delta": pj,
+					})
+				}
 			}
 		case "signature_delta":
 			// Anthropic thinking/redacted_thinking 的 signature_delta：仅计数，
@@ -576,6 +639,9 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 		}
 	case "content_block_stop":
 		idx := numberToInt(evt["index"])
+		if st.reply != nil && st.reply.isDropped(idx) {
+			return
+		}
 		b := st.blocks[idx]
 		if b == nil {
 			return
@@ -588,6 +654,9 @@ func (st *anthropicToResponsesState) handleLine(line string) {
 		}
 		if delta, ok := evt["delta"].(map[string]any); ok {
 			if sr, _ := delta["stop_reason"].(string); sr != "" {
+				if sr == "tool_use" && st.reply != nil && st.reply.active() && st.toolCount == 0 {
+					sr = "end_turn"
+				}
 				st.stats.FinishReason = sr
 				st.stats.SawFinish = true
 			}

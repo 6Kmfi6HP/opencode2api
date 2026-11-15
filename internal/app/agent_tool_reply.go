@@ -74,10 +74,8 @@ func (c *agentToolReplyContext) callerToolName(manifestName string) (string, boo
 		if declared, ok := c.offeredLower[manifestName]; ok {
 			return declared, true
 		}
-		if c.viaMap {
-			if declared, ok := c.offeredLower[lowerASCII(spec.Name)]; ok {
-				return declared, true
-			}
+		if declared, ok := c.offeredLower[lowerASCII(spec.Name)]; ok {
+			return declared, true
 		}
 	}
 	return spec.Name, true
@@ -107,7 +105,11 @@ func (c *agentToolReplyContext) shouldRemapArg(manifestName, from string, to *st
 	}
 	props := c.targetToolProps(manifestName)
 	if to == nil {
-		return c.viaMap && (len(props) == 0 || !props[from])
+		if len(props) > 0 {
+			return !props[from]
+		}
+		target, _ := c.callerToolName(manifestName)
+		return c.viaMap || (target != "" && lowerASCII(target) != manifestName)
 	}
 	if *to == from {
 		return false
@@ -332,16 +334,22 @@ func offeredClaudeToolSchemas(tools []ClaudeTool) map[string]map[string]bool {
 	return out
 }
 
-// offeredResponsesToolNames 收集 Responses 请求声明的工具名（顶层 name 与
-// function.name 都收）。
+// offeredResponsesToolNames 收集 Responses 请求声明的工具名（顶层 name、
+// function.name 以及 shell / apply_patch / namespace 转换后的有效工具名都收）。
 func offeredResponsesToolNames(tools []ResponsesTool) map[string]bool {
-	out := make(map[string]bool, len(tools))
+	converted := convertResponsesTools(tools)
+	out := make(map[string]bool, len(tools)+len(converted))
 	for _, t := range tools {
 		if t.Name != "" {
 			out[t.Name] = true
 		}
 		if t.Function != nil && t.Function.Name != "" {
 			out[t.Function.Name] = true
+		}
+	}
+	for _, ct := range converted {
+		if ct.Function.Name != "" {
+			out[ct.Function.Name] = true
 		}
 	}
 	return out
@@ -351,7 +359,8 @@ func offeredResponsesToolSchemas(tools []ResponsesTool) map[string]map[string]bo
 	if len(tools) == 0 {
 		return nil
 	}
-	out := make(map[string]map[string]bool, len(tools))
+	converted := convertResponsesTools(tools)
+	out := make(map[string]map[string]bool, len(tools)+len(converted))
 	for _, t := range tools {
 		if t.Name != "" {
 			if props := schemaPropertyNames(t.Parameters); len(props) > 0 {
@@ -361,6 +370,15 @@ func offeredResponsesToolSchemas(tools []ResponsesTool) map[string]map[string]bo
 		if t.Function != nil && t.Function.Name != "" {
 			if props := schemaPropertyNames(t.Function.Parameters); len(props) > 0 {
 				out[t.Function.Name] = props
+			}
+		}
+	}
+	for _, ct := range converted {
+		if ct.Function.Name != "" {
+			if props := schemaPropertyNames(ct.Function.Parameters); len(props) > 0 {
+				if _, exists := out[ct.Function.Name]; !exists {
+					out[ct.Function.Name] = props
+				}
 			}
 		}
 	}
@@ -824,6 +842,38 @@ func rewriteChatSSELine(line string, c *agentToolReplyContext) string {
 			changed = true
 			if _, still := fields["tool_calls"]; !still {
 				rewriteChatChoiceFinish(choice, false)
+			}
+		}
+		if fr, _ := choice["finish_reason"].(string); fr != "" {
+			if len(c.argPending) > 0 {
+				keys := make([]int, 0, len(c.argPending))
+				for idx := range c.argPending {
+					keys = append(keys, idx)
+				}
+				sort.Ints(keys)
+				var extra []any
+				for _, idx := range keys {
+					if flushed := c.flushArgPending(idx); flushed != "" {
+						extra = append(extra, map[string]any{
+							"index":    idx,
+							"function": map[string]any{"arguments": flushed},
+						})
+					}
+				}
+				if len(extra) > 0 {
+					delta, _ := choice["delta"].(map[string]any)
+					if delta == nil {
+						delta = map[string]any{}
+						choice["delta"] = delta
+					}
+					existing, _ := delta["tool_calls"].([]any)
+					delta["tool_calls"] = append(existing, extra...)
+					changed = true
+				}
+			}
+			if fr == "tool_calls" && len(c.dropped) > 0 && len(c.rawByIndex) == 0 {
+				rewriteChatChoiceFinish(choice, false)
+				changed = true
 			}
 		}
 	}

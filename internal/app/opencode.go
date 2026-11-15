@@ -1211,8 +1211,8 @@ func callOpenCodeAPI(ctx context.Context, upstreamBody []byte, modelID string, a
 		// 已是 JSON 或空体时 aggregateOpenAIStream 原样返回,天然幂等。
 		b = aggregateOpenAIStream(b, modelID, shouldRestoreToolCase(ctx))
 	}
-	b = rewriteChatCompletionBody(b, agentToolReplyFromContext(ctx))
 	b = convertRawToolCallsInBody(b)
+	b = rewriteChatCompletionBody(b, agentToolReplyFromContext(ctx))
 	return b, status, header, nil
 }
 

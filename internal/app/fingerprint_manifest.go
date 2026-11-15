@@ -122,6 +122,7 @@ var agentToolMap = map[string]agentToolSpec{
 	"subagent":  {Name: "Task", Args: map[string]*string{"agent": new("subagent_type")}},
 	"webfetch":  {Name: "WebFetch", Args: map[string]*string{}},
 	"websearch": {Name: "WebSearch", Args: map[string]*string{}},
+	"patch":     {Name: "apply_patch", Args: map[string]*string{"patchText": new("input")}},
 }
 
 // opencodeToolOrder is the official 2.x manifest order. It is fixed so the
